@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 use tessera_grid::Mark;
 use tessera_pty::{NativePty, Pty, PtyEvent, PtyEvents, SpawnOptions};
+use tessera_shell_integration::osc7::MAX_OSC7_LEN;
 use tessera_shell_integration::scripts::materialise;
 use tessera_shell_integration::{
     Injection, Launch, Shell, parse_osc7, parse_osc133, parse_osc1337,
@@ -1120,6 +1121,74 @@ fn osc7_encodes_like_terminal_app() {
         assert_eq!(
             parse_osc7(&want[1].as_bytes()[2..]).map(|cwd| cwd.path),
             Some(dir)
+        );
+    }
+}
+
+/// #358: a directory whose report would pass the 4096-byte payload cap
+/// (`MAX_OSC7_LEN`, which drops a longer one whole and so keeps the last
+/// report, another host's say, in effect) is reported as its deepest
+/// ancestor that fits, never as nothing. Eight levels of 120 `é` encode to
+/// about 5.8 KB. fish 4.3 and later send their own report, so only zsh and
+/// bash run.
+#[test]
+fn a_directory_past_the_osc7_cap_reports_its_deepest_ancestor_that_fits() {
+    let component = "\u{e9}".repeat(120);
+    let mut cases = vec![(Shell::Zsh, PathBuf::from(ZSH), ".zshrc")];
+    cases.extend(
+        bashes()
+            .into_iter()
+            .map(|bash| (Shell::Bash, bash, ".bashrc")),
+    );
+    for (shell, program, rc) in cases {
+        let observed = run_steps(
+            &Case {
+                shell,
+                program,
+                args: Some(&["-i"]),
+                files: &[(rc, "")],
+                env: &[("LANG", "en_US.UTF-8"), ("TESSERA_TEST_DIR", &component)],
+            },
+            &[
+                (
+                    Wait::Prompts(1),
+                    "for i in 1 2 3 4 5 6 7 8; do mkdir \"$TESSERA_TEST_DIR\" && cd \"$TESSERA_TEST_DIR\"; done\r",
+                ),
+                (Wait::Prompts(2), "exit\r"),
+            ],
+        );
+        let host = host_name();
+        let full = encode(&format!(
+            "{}{}",
+            observed.start_cwd,
+            format!("/{component}").repeat(8)
+        ));
+        let room = MAX_OSC7_LEN - "file://".len() - host.len();
+        assert!(full.len() > room, "the directory is past the cap");
+        let cut = full[..=room].rfind('/').expect("a slash");
+        let want = format!("7;file://{host}{}", &full[..cut]);
+        let reports: Vec<&Vec<u8>> = observed
+            .payloads
+            .iter()
+            .filter(|p| p.starts_with(b"7;"))
+            .collect();
+        for report in &reports {
+            assert!(
+                report.len() - 2 <= MAX_OSC7_LEN,
+                "{shell:?}: {} bytes",
+                report.len()
+            );
+            assert!(
+                parse_osc7(&report[2..]).is_some(),
+                "{shell:?}: {:?}",
+                String::from_utf8_lossy(report)
+            );
+        }
+        let last = reports.last().expect("a report");
+        assert_eq!(String::from_utf8_lossy(last), want, "{shell:?}");
+        assert!(
+            want.len() - 2 > MAX_OSC7_LEN - 721,
+            "{shell:?}: the deepest that fits"
         );
     }
 }

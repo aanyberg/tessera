@@ -50,17 +50,26 @@ mod native;
 pub use foreground::{ForegroundProcess, MAX_FOREGROUND_NAME_BYTES};
 pub use native::{IoThreads, NativePty, WRITE_QUEUE_BYTES, set_thread_start_hook};
 
-/// This machine's host name (`gethostname(3)`), or an empty string when it
-/// cannot be read or is not UTF-8. Read anew on every call: macOS changes
-/// it with the network. Compared with an OSC 7 report's host by
+/// This machine's host name (`gethostname(3)`), with any byte sequence that
+/// is not UTF-8 replaced by U+FFFD, or an empty string when it cannot be
+/// read. Read anew on every call: macOS changes it with the network.
+/// Compared with an OSC 7 report's host by
 /// `tessera_shell_integration::Cwd::is_local`, which treats an empty name
-/// as matching only the empty host and `localhost`.
+/// as matching only the empty host and `localhost`; a name that is not
+/// UTF-8 still matches what the shell integration scripts send for it (its
+/// `[A-Za-z0-9._-]` bytes, #358).
 #[must_use]
 pub fn local_hostname() -> String {
-    nix::unistd::gethostname()
-        .ok()
-        .and_then(|name| name.into_string().ok())
-        .unwrap_or_default()
+    match nix::unistd::gethostname() {
+        Ok(name) => host_name_text(&name),
+        Err(_) => String::new(),
+    }
+}
+
+/// `name` as text, with what is not UTF-8 replaced by U+FFFD.
+fn host_name_text(name: &std::ffi::OsStr) -> String {
+    use std::os::unix::ffi::OsStrExt as _;
+    String::from_utf8_lossy(name.as_bytes()).into_owned()
 }
 
 /// Value injected as `TERM` for every child.
@@ -500,6 +509,15 @@ mod tests {
         let expected = String::from_utf8(output.stdout).expect("UTF-8 host name");
         assert_eq!(local_hostname(), expected.trim_end());
         assert_ne!(local_hostname(), "");
+    }
+
+    #[test]
+    fn a_host_name_that_is_not_utf8_keeps_its_valid_bytes() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let name = std::ffi::OsString::from_vec(b"M\xe5rten.local".to_vec());
+        assert_eq!(host_name_text(&name), "M\u{fffd}rten.local");
+        let name = std::ffi::OsString::from("M\u{e5}rten.local");
+        assert_eq!(host_name_text(&name), "M\u{e5}rten.local");
     }
 
     #[test]

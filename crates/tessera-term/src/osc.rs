@@ -352,9 +352,14 @@ fn joined_len(args: &[Vec<u8>]) -> usize {
     args.iter().map(Vec::len).sum::<usize>() + args.len().saturating_sub(1)
 }
 
-/// Whether `ch` may appear in a window title: not a control character and
-/// not a bidirectional or line-separator format character.
-fn shown_in_title(ch: char) -> bool {
+/// Whether `ch` may appear in a window title (ADR 0022 S3): not a control
+/// character (C0, C1, DEL) and not a bidirectional or line-separator format
+/// character. The one filter for child-controlled title text: the OSC 0
+/// and 2 titles here, and in `tessera-app-core` the remote host a title is
+/// built from and plugin status text. Zero-width characters such as ZWJ
+/// and variation selectors are kept, since emoji sequences need them.
+#[must_use]
+pub fn shown_in_title(ch: char) -> bool {
     !ch.is_control()
         && !matches!(
             ch,

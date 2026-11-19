@@ -46,8 +46,8 @@ pub use tessera_plugin_api::{Capability, Plugin, StatusItem};
 use tessera_plugin_api::{Error as PluginError, Event, Host, Manifest};
 
 use crate::config_watch::Applied;
-use crate::remote::shown_in_title;
 use crate::session::{SessionEvent, SessionId, SessionObserver, lock, run_thread_start_hook};
+use tessera_term::shown_in_title;
 
 /// Plugin ids read from `[plugins] enabled`; later ones are ignored with
 /// one warning that gives their count.

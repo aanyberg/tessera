@@ -54,7 +54,10 @@ builtin typeset -gi _tessera_si_fd
 # Terminal.app's rule (every byte outside [/._~A-Za-z0-9-] becomes %XX), the
 # host from $HOST reduced to [A-Za-z0-9._-]. Sent at every prompt (as
 # kitty does: a program run from the shell, ssh say, may have reported
-# another directory meanwhile) and when the directory changes.
+# another directory meanwhile) and when the directory changes. Tessera
+# drops a payload over 4096 bytes (MAX_OSC7_LEN) whole, which would keep
+# the previous report (another host's, say) in effect, so a longer one
+# names the deepest ancestor directory that fits.
 _tessera_si_report_pwd() {
     builtin emulate -L zsh -o no_warn_create_global -o no_aliases -o no_multibyte
     builtin local LC_ALL=C host=${HOST//[^A-Za-z0-9._-]/} url=$PWD ch
@@ -71,6 +74,14 @@ _tessera_si_report_pwd() {
                 url+=$ch
             fi
         done
+    fi
+    # `file://` is 7 bytes; cut at the last `/` that leaves the rest within
+    # the cap (the encoding keeps `/` as is, so no %XX is split).
+    (( i = 4096 - 7 - $#host ))
+    if (( i > 0 && $#url > i )); then
+        url=${url[1,i+1]}
+        url=${url%/*}
+        [[ -n $url ]] || url=/
     fi
     builtin print -rnu $_tessera_si_fd -- $'\e]7;file://'"$host$url"$'\a'
 }

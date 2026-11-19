@@ -164,6 +164,36 @@ final class RemoteTitleTests: XCTestCase {
         XCTAssertEqual(window.title, "⇢ ssh", "dropped whole, never cut")
     }
 
+    func testAHostOfOnlyInvisibleCharactersShowsAsSsh() async throws {
+        // #358: U+200B (zero width space), U+FEFF and U+3164 (Hangul filler)
+        // are removed from a host, and with nothing visible left the
+        // session is remote without a name.
+        appDelegate.spawnOptions = reporting(#"\033]7;file://\342\200\213\357\273\277\343\205\244/srv\007"#)
+        let controller = try appDelegate.newWindow()
+        let window = try XCTUnwrap(controller.window)
+        try await waitUntil("the remote state reaches the title") { window.title != "Terminal" }
+        XCTAssertEqual(window.title, "⇢ ssh")
+        XCTAssertEqual(controller.focusedPane.remote, .unnamed)
+    }
+
+    func testAPaneWhoseRemoteShellExitedWithAnErrorShowsNoPrefix() async throws {
+        // #358: the pane stays open after a non-zero exit (as Terminal.app
+        // does) and nothing in it runs remote any more. The window is
+        // opened as the app opens one; the core sends the local state
+        // before the exit.
+        appDelegate.spawnOptions = .init(
+            program: "/bin/sh",
+            arguments: ["-c", #"printf '\033]7;file://far/srv\007'; sleep 1; exit 3"#])
+        let controller = try appDelegate.newWindow()
+        let window = try XCTUnwrap(controller.window)
+        let pane = controller.focusedPane
+        try await waitUntil("the report reaches the title") { window.title == "⇢ far" }
+        try await waitUntil("the pane shows the exit") { pane.view.status != nil }
+        XCTAssertEqual(pane.view.status, "shell exited with code 3", "the pane stays open")
+        XCTAssertEqual(pane.remote, .local)
+        XCTAssertEqual(window.title, "Terminal")
+    }
+
     func testAFloodOfHostReportsKeepsMemoryAndCloseBounded() async throws {
         // Warm-up: the first window of the process sets up the renderer,
         // Metal and fonts (about 90 MB and a third of a second cold under

@@ -5,7 +5,8 @@
 //! and Tessera's own scripts send it, or kitty's `kitty-shell-cwd://<host><raw
 //! path>`. [`parse_osc7`] decodes either into a [`Cwd`]. It judges the path
 //! (it must be absolute, decode to UTF-8 without control characters and have
-//! no `..` segment) but not the host, which comes back as sent: a report from
+//! no `..` segment) but not the host, which comes back decoded but otherwise
+//! as sent: a report from
 //! another machine (a shell over `ssh`) is still a valid report, and
 //! [`Cwd::is_local`] lets a consumer that needs a local directory (a new tab
 //! in the same directory) require one (ADR 0022).
@@ -20,7 +21,8 @@ pub const MAX_OSC7_LEN: usize = 4096;
 /// A working directory reported with OSC 7.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cwd {
-    /// The host part of the URL, without any `user@`. Empty for
+    /// The host part of the URL, without any `user@`, percent-decoded in
+    /// the `file://` form (bytes that are not UTF-8 as U+FFFD). Empty for
     /// `file:///path`, which means this machine (RFC 8089). Not checked
     /// against the local host name.
     pub host: String,
@@ -65,8 +67,9 @@ impl Cwd {
 ///
 /// Accepted forms (scheme names in any case):
 ///
-/// - `file://host/path` and `file:///path` (empty host). The path is
-///   percent-decoded (`%20`, multi-byte UTF-8 such as `%C3%A9`); a `?query`
+/// - `file://host/path` and `file:///path` (empty host). The path and the
+///   host are percent-decoded (`%20`, multi-byte UTF-8 such as `%C3%A9`; in
+///   the host, bytes that are not UTF-8 become U+FFFD); a `?query`
 ///   or `#fragment` after it is ignored, and so is a `user@` before the host
 ///   (`iTerm2` sends `file://user@host/path?machineID=...`).
 /// - `kitty-shell-cwd://host/path`: kitty's form, whose path is raw (never
@@ -77,9 +80,9 @@ impl Cwd {
 /// - a payload longer than [`MAX_OSC7_LEN`];
 /// - a path that is empty or not absolute;
 /// - a malformed escape (`%` not followed by two hex digits) or an encoded
-///   `/` (`%2F`), which would change the path's segments;
-/// - a path or host with a control character (NUL, newline, ...) or that is
-///   not UTF-8 once decoded;
+///   `/` (`%2F`), in the path or the host;
+/// - a path or host with a control character (NUL, newline, ...) once
+///   decoded, or a path that is not UTF-8 once decoded;
 /// - a path with a `..` segment once decoded.
 #[must_use]
 pub fn parse_osc7(payload: &[u8]) -> Option<Cwd> {
@@ -101,7 +104,17 @@ pub fn parse_osc7(payload: &[u8]) -> Option<Cwd> {
         Some(at) => &authority[at + 1..],
         None => authority,
     };
-    let host = text(host.to_vec())?;
+    let host = if encoded {
+        // A host is percent-encoded like the path (fish 4.3 and later send
+        // `M%C3%A5rten.local`); bytes that are not UTF-8 become U+FFFD, as
+        // in `tessera_pty::local_hostname`, so such a name still compares
+        // equal to this machine's.
+        let decoded = percent_decode(host)?;
+        let host = String::from_utf8_lossy(&decoded).into_owned();
+        (!host.chars().any(char::is_control)).then_some(host)?
+    } else {
+        text(host.to_vec())?
+    };
     let path = if encoded {
         let end = path
             .iter()
@@ -179,6 +192,37 @@ mod tests {
         assert_eq!(parse_osc7(b"file:///tmp"), cwd("", "/tmp"));
         assert_eq!(parse_osc7(b"file://Mac.home/tmp"), cwd("Mac.home", "/tmp"));
         assert_eq!(parse_osc7(b"file://h/tmp/a%20b"), cwd("h", "/tmp/a b"));
+    }
+
+    #[test]
+    fn a_fish_style_encoded_host_is_decoded() {
+        // fish 4.3 and later percent-encode the host (#358).
+        let utf8 = parse_osc7(b"file://M%C3%A5rten.local/tmp").unwrap();
+        assert_eq!(utf8.host, "M\u{e5}rten.local");
+        assert!(utf8.is_local("M\u{e5}rten.local"));
+        // Not UTF-8: U+FFFD, as `tessera_pty::local_hostname` reads the
+        // same bytes, so the two still compare equal.
+        let latin1 = parse_osc7(b"file://M%E5rten/tmp").unwrap();
+        assert_eq!(latin1.host, "M\u{fffd}rten");
+        assert!(latin1.is_local("M\u{fffd}rten"));
+        assert!(!latin1.is_local("Mrten"));
+        assert_eq!(parse_osc7(b"file://my%20host/tmp"), cwd("my host", "/tmp"));
+        // A decoded control character, an encoded `/` or a malformed escape
+        // reject the report, as in the path.
+        for payload in [
+            &b"file://a%0Ab/tmp"[..],
+            b"file://a%00/tmp",
+            b"file://a%2Fb/tmp",
+            b"file://a%zz/tmp",
+            b"file://a%4/tmp",
+        ] {
+            assert_eq!(parse_osc7(payload), None, "{payload:?}");
+        }
+        // kitty's form is raw: an escape in its host stays as sent.
+        assert_eq!(
+            parse_osc7(b"kitty-shell-cwd://my%20host/tmp"),
+            cwd("my%20host", "/tmp")
+        );
     }
 
     #[test]

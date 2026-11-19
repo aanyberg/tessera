@@ -224,9 +224,10 @@ pub enum SessionEvent {
     Exit(ExitStatus),
     /// Where the session's shell runs changed (#205, see the
     /// [`remote`](crate::remote) module): an OSC 7 report named another
-    /// machine or this one again, or `ssh` came to or left the foreground
-    /// while no report named a host. Reported only on a change (S6), at
-    /// most once per chunk of output.
+    /// machine or this one again, `ssh` came to or left the foreground
+    /// while no report named a host, or the session's program exited (local
+    /// again, just before [`Exit`](Self::Exit)). Reported only on a change
+    /// (S6), at most once per chunk of output.
     Remote(Remote),
     /// The shell reported that a command's output started (OSC 133 `C`,
     /// ADR 0039). Carries no command text (ADR 0021). Internal to the
@@ -648,15 +649,15 @@ pub(crate) struct ShellReports {
 
 impl ShellReports {
     /// Stores the OSC 7 `payload` as the working directory when
-    /// [`parse_osc7`] accepts it, and returns it; an invalid report keeps
-    /// the previous one and returns `None`.
-    fn report_cwd(&self, payload: &[u8]) -> Option<Cwd> {
+    /// [`parse_osc7`] accepts it (moved in, never copied), and returns
+    /// whether it did; an invalid report keeps the previous one.
+    fn report_cwd(&self, payload: &[u8]) -> bool {
         let Some(cwd) = parse_osc7(payload) else {
             tracing::trace!("invalid OSC 7 working directory ignored");
-            return None;
+            return false;
         };
-        *lock(&self.cwd) = Some(cwd.clone());
-        Some(cwd)
+        *lock(&self.cwd) = Some(cwd);
+        true
     }
 
     /// The working directory last reported, if any.
@@ -2174,7 +2175,7 @@ impl Pump {
                     // are replaced as they arrive (see `ChunkRequests`).
                     // The chunk's last valid OSC 7 report decides the
                     // remote state (one decision per chunk, S6).
-                    let mut cwd = None;
+                    let mut reported = false;
                     let mut clipboard_writes = requests
                         .requests
                         .iter()
@@ -2190,9 +2191,7 @@ impl Pump {
                             }
                         }
                         Request::SetCwd(payload) => {
-                            if let Some(reported) = self.reports.report_cwd(&payload) {
-                                cwd = Some(reported);
-                            }
+                            reported |= self.reports.report_cwd(&payload);
                         }
                         Request::ShellIntegrationHandshake(payload) => {
                             self.reports.handshake(self.id, &payload);
@@ -2209,9 +2208,14 @@ impl Pump {
                             self.deliver(event);
                         }
                     }
-                    self.update_remote(cwd.as_ref());
+                    self.update_remote(reported);
                 }
                 PtyEvent::Exited(status) => {
+                    // A dead pane runs nothing remote (#358): back to
+                    // local before the exit, so its title loses the prefix.
+                    if let Some(remote) = self.remote.exited() {
+                        self.deliver_remote(remote);
+                    }
                     self.deliver(SessionEvent::Exit(status));
                     break;
                 }
@@ -2219,16 +2223,21 @@ impl Pump {
         }
     }
 
-    /// Decides the remote state after a chunk of output: from its last
-    /// valid OSC 7 report `cwd`, if any, then from the program in front when
+    /// Decides the remote state after a chunk of output: when the chunk
+    /// held a valid OSC 7 report (`reported`), from the last one, read in
+    /// place under the leaf lock (never copied), then from the program in
+    /// front when
     /// a probe is due (see [`RemoteTracker::output`]): the foreground job,
     /// or with no job the session leader (a profile's `command = "ssh
     /// host"`, which `sh -c` `exec`s). Delivers
     /// [`SessionEvent::Remote`] when the state changed; the log names only
     /// the host's length (S8).
-    fn update_remote(&mut self, cwd: Option<&Cwd>) {
-        if let Some(cwd) = cwd {
-            self.remote.report(cwd, local_hostname());
+    fn update_remote(&mut self, reported: bool) {
+        if reported {
+            let local = local_hostname();
+            if let Some(cwd) = lock(&self.reports.cwd).as_ref() {
+                self.remote.report(cwd, local);
+            }
         }
         let pty = &self.pty;
         self.remote.output(Instant::now, || {
@@ -2238,13 +2247,19 @@ impl Pump {
                 .or_else(|| pty.session_leader_name())
         });
         if let Some(remote) = self.remote.changed() {
-            let host_len = match &remote {
-                Remote::Host(host) => host.len(),
-                Remote::Local | Remote::Unnamed => 0,
-            };
-            tracing::debug!(session = %self.id, ?host_len, local = remote == Remote::Local, "remote state changed");
-            self.deliver(SessionEvent::Remote(remote));
+            self.deliver_remote(remote);
         }
+    }
+
+    /// Delivers a change of the remote state; the log names only the
+    /// host's length (S8).
+    fn deliver_remote(&self, remote: Remote) {
+        let host_len = match &remote {
+            Remote::Host(host) => host.len(),
+            Remote::Local | Remote::Unnamed => 0,
+        };
+        tracing::debug!(session = %self.id, ?host_len, local = remote == Remote::Local, "remote state changed");
+        self.deliver(SessionEvent::Remote(remote));
     }
 
     /// Delivers a clipboard write when `[terminal] clipboard_write` allows
@@ -4175,6 +4190,83 @@ pub(crate) mod tests {
         app.close_session(id).expect("close");
         let (id, tx, events, _, _) = probe_session(&app, None, Some("zsh"));
         assert_eq!(remotes(pump_chunk(&tx, &events, b"$ ")), [], "local");
+        app.close_session(id).expect("close");
+    }
+
+    /// #358: a session whose program exits (with any status, so also a
+    /// dead pane the frontend keeps open) is local again just before its
+    /// exit event, whether `ssh` or a report made it remote; a local one
+    /// sends no remote event.
+    #[test]
+    fn an_exit_makes_a_remote_session_local_first() {
+        let app = App::new(Config::default(), ConfigPaths::new("/nonexistent/tessera"));
+        let exit_events = |tx: &SyncSender<PtyEvent>, events: &Receiver<SessionEvent>| {
+            tx.send(PtyEvent::Exited(ExitStatus::Exited(255)))
+                .expect("send");
+            let mut seen = Vec::new();
+            loop {
+                let event = events
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("events up to the exit");
+                let exit = matches!(event, SessionEvent::Exit(_));
+                seen.push(event);
+                if exit {
+                    return seen;
+                }
+            }
+        };
+        let (id, tx, events, _, _) = probe_session(&app, None, Some("ssh"));
+        assert_eq!(
+            remotes(pump_chunk(&tx, &events, b"login")),
+            [Remote::Unnamed]
+        );
+        assert_eq!(
+            exit_events(&tx, &events),
+            [
+                SessionEvent::Remote(Remote::Local),
+                SessionEvent::Exit(ExitStatus::Exited(255))
+            ]
+        );
+        let _ = app.close_session(id);
+        let (id, tx, events, _, _) = probe_session(&app, None, Some("zsh"));
+        assert_eq!(
+            remotes(pump_chunk(&tx, &events, b"\x1b]7;file://far/srv\x07")),
+            [Remote::Host("far".into())]
+        );
+        assert_eq!(
+            exit_events(&tx, &events),
+            [
+                SessionEvent::Remote(Remote::Local),
+                SessionEvent::Exit(ExitStatus::Exited(255))
+            ]
+        );
+        let _ = app.close_session(id);
+        let (id, tx, events, _, _) = probe_session(&app, None, Some("zsh"));
+        assert_eq!(remotes(pump_chunk(&tx, &events, b"$ ")), []);
+        assert_eq!(
+            exit_events(&tx, &events),
+            [SessionEvent::Exit(ExitStatus::Exited(255))],
+            "local all along: no remote event"
+        );
+        let _ = app.close_session(id);
+    }
+
+    /// #358: only a chunk's last valid OSC 7 report is stored as the
+    /// working directory, and it is the one the remote state follows.
+    #[test]
+    fn a_chunks_last_valid_report_is_the_working_directory() {
+        let app = App::new(Config::default(), ConfigPaths::new("/nonexistent/tessera"));
+        let (id, tx, events, _, _) = probe_session(&app, None, Some("zsh"));
+        assert_eq!(
+            remotes(pump_chunk(
+                &tx,
+                &events,
+                b"\x1b]7;file://one/a\x07\x1b]7;file://two/b\x07\x1b]7;nonsense\x07"
+            )),
+            [Remote::Host("two".into())]
+        );
+        let cwd = app.session_cwd(id).expect("live").expect("a report");
+        assert_eq!((cwd.host.as_str(), cwd.path.as_str()), ("two", "/b"));
         app.close_session(id).expect("close");
     }
 
