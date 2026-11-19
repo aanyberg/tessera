@@ -3213,23 +3213,31 @@ extension SettingsTests {
     }
 
     /// Forwards a control's action to the target SwiftUI gave it, and
-    /// counts it: an action sent means AppKit tracked the synthetic press.
+    /// keeps the control's value at each one. An action alone proves
+    /// nothing: the press itself sends one with the knob where it was (the
+    /// CI runner, macOS 15, sent that and no more). An action with a value
+    /// well away from the one at the press means AppKit moved the knob.
     @MainActor
     private final class ActionCounter: NSObject {
         let target: AnyObject?
         let action: Selector?
-        var count = 0
+        let pressedAt: Double
+        var values: [Double] = []
 
         init(_ control: NSControl) {
             target = control.target
             action = control.action
+            pressedAt = control.doubleValue
             super.init()
             control.target = self
             control.action = #selector(forward(_:))
         }
 
+        /// Whether a value is at least `distance` from the one at the press.
+        func moved(_ distance: Double) -> Bool { values.contains { abs($0 - pressedAt) >= distance } }
+
         @objc func forward(_ sender: Any?) {
-            count += 1
+            values.append((sender as? NSControl)?.doubleValue ?? .nan)
             NSApp.sendAction(action ?? #selector(forward(_:)), to: target, from: sender)
         }
     }
@@ -3242,13 +3250,14 @@ extension SettingsTests {
     /// instead, it takes them from the queue while the script runs on the
     /// main queue it keeps serving.
     ///
-    /// Where the first drag reaches nothing (no action from the slider, and
-    /// `touched` false: the model saw no change), the test is skipped with
-    /// what was seen: AppKit did not track the synthetic events, so the
-    /// product was not exercised. Once the drag is delivered, every check
-    /// of the test applies.
+    /// Where the first drag does not move the knob (no action from the
+    /// slider with a value 0.05 or more from the start, a seventh of the
+    /// drag), the test is skipped with what was seen: AppKit did not track
+    /// the synthetic drag, so the product was not exercised. Once the knob
+    /// has moved, every check of the test applies, and a model that did
+    /// not follow it fails.
     private func pressKnob(
-        of slider: NSSlider, in window: NSWindow, touched: @escaping @MainActor () -> Bool,
+        of slider: NSSlider, in window: NSWindow,
         whileHeld: @escaping @MainActor (_ drag: (CGFloat) -> Void) async throws -> Void
     ) async throws {
         let cell = try XCTUnwrap(slider.cell as? NSSliderCell)
@@ -3291,10 +3300,10 @@ extension SettingsTests {
             pressReturnedBeforeTheDrag = pressReturned
             drag(-40)
             let deadline = ContinuousClock.now + .seconds(2)
-            while actions.count == 0 && !touched() && ContinuousClock.now < deadline {
+            while !actions.moved(0.05) && ContinuousClock.now < deadline {
                 try await Task.sleep(for: .milliseconds(10))
             }
-            guard actions.count > 0 || touched() else { return false }
+            guard actions.moved(0.05) else { return false }
             try await whileHeld(drag)
             return true
         }
@@ -3304,7 +3313,8 @@ extension SettingsTests {
             let system = ProcessInfo.processInfo.operatingSystemVersionString
             throw XCTSkip(
                 """
-                the synthetic drag did not reach the NSSlider on macOS \(system): no action, no change; \
+                the synthetic drag did not move the NSSlider on macOS \(system): \
+                actions with the values \(actions.values) from \(actions.pressedAt); \
                 press returned before the drag: \(pressReturnedBeforeTheDrag), \
                 hit at the knob: \(hit.map { String(describing: type(of: $0)) } ?? "nothing"), \
                 slider bounds \(slider.bounds), knob \(knob)
@@ -3334,8 +3344,7 @@ extension SettingsTests {
             window.close()
         }
         var written = 0
-        let touched: @MainActor () -> Bool = { !writer.calls.isEmpty || model.isPending(key) }
-        try await pressKnob(of: slider, in: window, touched: touched) { _ in
+        try await pressKnob(of: slider, in: window) { _ in
             try await self.waitUntil("the drag written") { !writer.calls.isEmpty && !model.isWriting }
             written = writer.calls.count
             try self.applyOpacity("0.3", generation: 1, model, source)
@@ -3363,8 +3372,7 @@ extension SettingsTests {
             window.close()
         }
         var held: TesseraConfigValue?
-        let touched: @MainActor () -> Bool = { !writer.calls.isEmpty || model.isPending(key) }
-        try await pressKnob(of: slider, in: window, touched: touched) { drag in
+        try await pressKnob(of: slider, in: window) { drag in
             try await self.waitUntil("the drag written") { !writer.calls.isEmpty && !model.isWriting }
             let first = model.value(key)
             drag(-80)
