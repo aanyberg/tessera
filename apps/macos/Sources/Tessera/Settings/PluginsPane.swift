@@ -28,9 +28,13 @@ extension SettingsModel {
     /// words (tessera-app-core logs it; the FFI does not pass it on).
     static let pluginsSkippedWarning =
         "[plugins] enabled lists more than \(maxEnabledPlugins) ids; the rest are ignored"
-    /// Why a toggle turned on at ``maxEnabledPlugins`` ids did nothing.
+    /// Why a toggle turned on at ``maxEnabledPlugins`` ids or more did
+    /// nothing; true of any number of them.
     static let pluginsFullRefusal =
-        "[plugins] enabled lists \(maxEnabledPlugins) ids, as many as Tessera reads; take one out of config.toml to turn this plugin on."
+        "[plugins] enabled is full: Tessera reads its first \(maxEnabledPlugins) ids. "
+        + "To turn this plugin on, list fewer than \(maxEnabledPlugins) in config.toml."
+    /// How many characters of a shortened id's end are kept.
+    private static let pluginIDTailShown = 20
 
     /// Every id `[plugins] enabled` lists, as shown.
     private var listedPluginIDs: [String] {
@@ -119,22 +123,48 @@ extension SettingsModel {
     /// point as `\u{…}`, so ids that differ by an invisible or look-alike
     /// character (a zero-width or trailing space, another normalisation)
     /// show apart and nothing in one reaches the window unescaped. At most
-    /// ``maxPluginIDShown`` characters.
+    /// ``maxPluginIDShown`` characters: a longer id keeps its start and its
+    /// end around an ellipsis, so ids that differ only near the end show
+    /// apart too (those differing only in the part left out do not), and no
+    /// escape is cut.
     static func shownPluginID(_ id: String) -> String {
-        var text = ""
+        var whole = ""
         for scalar in id.unicodeScalars {
-            switch scalar.value {
-            case 0x22: text += "\\\""
-            case 0x5C: text += "\\\\"
-            case 0x20...0x7E: text.unicodeScalars.append(scalar)
-            default: text += "\\u{\(String(scalar.value, radix: 16))}"
-            }
-            if text.count > maxPluginIDShown {
-                text = String(text.prefix(maxPluginIDShown - 1)) + "…"
-                break
+            whole += shownScalar(scalar)
+            if whole.utf8.count > maxPluginIDShown {
+                return "\"\(shortenedPluginID(id))\""
             }
         }
-        return "\"\(text)\""
+        return "\"\(whole)\""
+    }
+
+    /// `id`, too long to show whole, as its start, "…" and its end. Every
+    /// piece is ASCII, so its bytes are its characters.
+    private static func shortenedPluginID(_ id: String) -> String {
+        var head = ""
+        let headLimit = maxPluginIDShown - 1 - pluginIDTailShown
+        for scalar in id.unicodeScalars {
+            let piece = shownScalar(scalar)
+            guard head.utf8.count + piece.utf8.count <= headLimit else { break }
+            head += piece
+        }
+        var tail = ""
+        for scalar in id.unicodeScalars.reversed() {
+            let piece = shownScalar(scalar)
+            guard tail.utf8.count + piece.utf8.count <= pluginIDTailShown else { break }
+            tail = piece + tail
+        }
+        return head + "…" + tail
+    }
+
+    /// One code point of an id as ``shownPluginID(_:)`` shows it.
+    private static func shownScalar(_ scalar: Unicode.Scalar) -> String {
+        switch scalar.value {
+        case 0x22: "\\\""
+        case 0x5C: "\\\\"
+        case 0x20...0x7E: String(scalar)
+        default: "\\u{\(String(scalar.value, radix: 16))}"
+        }
     }
 }
 

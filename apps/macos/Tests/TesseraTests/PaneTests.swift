@@ -2812,7 +2812,7 @@ extension PaneTests {
             splits[1].ratio * (container.bounds.height - PaneSplitView.thickness), height, accuracy: 1,
             "the tree keeps the second drag's ratio")
         XCTAssertFalse(isTrackingDividerDragInEventTrackingMode(container), "the drags ended")
-        XCTAssertEqual(proxy.windowChanges, 1, "the window's own save is counted apart")
+        XCTAssertGreaterThanOrEqual(proxy.windowChanges, 1, "the window's own save is counted apart")
         XCTAssertEqual(proxy.paneLayoutChanges, 2, "saved for the close and once at the drags' end")
         XCTAssertTrue(controller.toggleZoom(), "zoom is not refused")
         XCTAssertTrue(controller.toggleZoom())

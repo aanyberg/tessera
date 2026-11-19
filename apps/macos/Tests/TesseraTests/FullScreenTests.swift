@@ -220,13 +220,90 @@ final class FullScreenLayoutTests: XCTestCase {
         XCTAssertEqual(full.panes, windowed.panes, "the panes keep their frames")
         XCTAssertEqual(full.contentMinSize, windowed.contentMinSize, "the windowed smallest size is kept")
         XCTAssertFalse(tab.titlebarAppearsTransparent, "the other tab too")
+        XCTAssertEqual(try WindowLayout(second).stripHeight, 0, "the other tab has no strip either")
 
         for each in [window, tab] { ReportedFullScreen.set(each, false) }
+        // The exit is another transition, on a later pass of the run loop.
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.02))
         delegateDid(false, window)
         let exited = try WindowLayout(first)
         print("FULLSCREEN layout exited: \(exited)")
         XCTAssertEqual(exited, windowed, "leaving full screen restores the windowed layout")
         XCTAssertTrue(tab.titlebarAppearsTransparent, "the other tab too")
+        XCTAssertEqual(
+            try WindowLayout(second).stripHeight, windowed.stripHeight, "the other tab has its strip back")
+    }
+
+    /// However many of a window's tab delegates AppKit tells, a transition
+    /// brings each tab up to date once: told by all three, or by one, at
+    /// its end or when it fails. Each next transition (a later turn) does
+    /// it again. The failure callbacks are called here as AppKit would:
+    /// a real failed transition cannot be provoked in a test.
+    func testATransitionRefreshesEveryTabOnce() async throws {
+        let (first, second) = try openTabs(profile: nil)
+        let third = try XCTUnwrap(host).open(profile: nil)
+        try XCTUnwrap(first.window).addTabbedWindow(try XCTUnwrap(third.window), ordered: .above)
+        let tabs = [first, second, third]
+        let windows = try tabs.map { try XCTUnwrap($0.window) }
+        let enter = Notification(name: NSWindow.didEnterFullScreenNotification)
+        let exit = Notification(name: NSWindow.didExitFullScreenNotification)
+        let transitions: [(String, @MainActor (NSWindow) -> Void)] = [
+            ("entered", { $0.delegate?.windowDidEnterFullScreen?(enter) }),
+            ("exited", { $0.delegate?.windowDidExitFullScreen?(exit) }),
+            ("failed to enter", { $0.delegate?.windowDidFailToEnterFullScreen?($0) }),
+            ("failed to exit", { $0.delegate?.windowDidFailToExitFullScreen?($0) }),
+        ]
+        var expected = 0
+        for (name, tell) in transitions {
+            for told in [windows, Array(windows.prefix(1))] {
+                told.forEach(tell)
+                expected += 1
+                XCTAssertEqual(tabs.map(\.fullScreenRefreshCount), [expected, expected, expected], name)
+                // The next transition is a later turn of the main queue.
+                try await Task.sleep(for: .milliseconds(20))
+            }
+        }
+    }
+
+    /// The next transition counts even when the main queue is held: the
+    /// first ends inside a main-queue block that runs the run loop, as a
+    /// modal alert does, and the second follows in that same block.
+    func testATransitionUnderAHeldMainQueueLetsTheNextOneRefresh() async throws {
+        let (first, second) = try openTabs(profile: nil)
+        let window = try XCTUnwrap(first.window)
+        await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    self.delegateDid(true, window)
+                    RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.02))
+                    self.delegateDid(false, window)
+                }
+                done.resume()
+            }
+        }
+        XCTAssertEqual([first, second].map(\.fullScreenRefreshCount), [2, 2])
+    }
+
+    /// A transition that fails puts every tab's layout right: the window
+    /// says windowed again, and both tabs get their strip back.
+    func testAFailedTransitionRestoresEveryTabsLayout() throws {
+        XCTAssertTrue(ReportedFullScreen.installed)
+        let (first, second) = try openTabs(profile: nil)
+        let window = try XCTUnwrap(first.window)
+        let tab = try XCTUnwrap(second.window)
+        let windowed = try WindowLayout(first).stripHeight
+        XCTAssertGreaterThan(windowed, 0)
+        for each in [window, tab] { ReportedFullScreen.set(each, true) }
+        delegateDid(true, window)
+        XCTAssertEqual(try WindowLayout(second).stripHeight, 0)
+
+        for each in [window, tab] { ReportedFullScreen.set(each, false) }
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.02))
+        window.delegate?.windowDidFailToEnterFullScreen?(window)
+
+        XCTAssertEqual(try WindowLayout(first).stripHeight, windowed)
+        XCTAssertEqual(try WindowLayout(second).stripHeight, windowed)
+        XCTAssertTrue(tab.titlebarAppearsTransparent)
     }
 
     /// A layout pass in full screen (the transition resizes the window and

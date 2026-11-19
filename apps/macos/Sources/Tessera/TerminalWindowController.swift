@@ -40,6 +40,14 @@ protocol TerminalWindowControllerDelegate: AnyObject {
     /// Asks before a pane, tab or window whose sessions run a job closes;
     /// `nil` closes without asking.
     var closeConfirmationPresenter: (any CloseConfirmationPresenter)? { get }
+    /// Whether the event being handled is an Option-click on a close
+    /// button, which the delegate turns into one Close All: the tab then
+    /// neither closes nor asks.
+    func terminalWindowControllerTakesOptionClickOnCloseButton() -> Bool
+}
+
+extension TerminalWindowControllerDelegate {
+    func terminalWindowControllerTakesOptionClickOnCloseButton() -> Bool { false }
 }
 
 /// One terminal tab: one `NSWindow` whose panes each run a
@@ -60,6 +68,13 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, NSMe
     static let tabbingIdentifier = "com.aanyberg.tessera.terminal"
     /// The window title while the focused pane's session has not set one.
     static let defaultTitle = "Terminal"
+
+    /// This tab was brought up to date for the full-screen transition that
+    /// is ending (``fullScreenTransitionEnded()``); cleared on the run loop's
+    /// next pass.
+    private var refreshedForFullScreenTransition = false
+    /// How many full-screen transitions brought this tab up to date (tests).
+    private(set) var fullScreenRefreshCount = 0
 
     /// Whether a remote focused pane marks the title (`[general]
     /// remote_indicator`, #205); the application delegate sets it from the
@@ -588,7 +603,12 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, NSMe
     /// (D2), and closes only if the user confirms. A request is ignored
     /// while this tab is already asking, or while its window asks for all
     /// its tabs (⇧⌘W); another tab's own question holds back nothing here.
+    /// An Option-click on a close button, which AppKit passes to every
+    /// window, is one Close All instead, asked by the delegate.
     func windowShouldClose(_ sender: NSWindow) -> Bool {
+        if delegate?.terminalWindowControllerTakesOptionClickOnCloseButton() == true {
+            return false
+        }
         if pendingClose != nil || windowAsks {
             return false
         }
@@ -623,16 +643,46 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, NSMe
     /// under it (ADR 0043 D7). A tab not shown now is also brought up to
     /// date as it is selected and as its layout changes.
     func windowDidEnterFullScreen(_ notification: Notification) {
-        for tab in (window as? TerminalWindow)?.tabs ?? [] {
-            (tab.contentView as? TerminalWindowContentView)?.windowDidBecomeVisible()
-        }
+        fullScreenTransitionEnded()
     }
 
     /// The window left native full screen: every tab's title bar and strip
     /// are the windowed ones again.
     func windowDidExitFullScreen(_ notification: Notification) {
-        for tab in (window as? TerminalWindow)?.tabs ?? [] {
-            (tab.contentView as? TerminalWindowContentView)?.windowDidBecomeVisible()
+        fullScreenTransitionEnded()
+    }
+
+    /// The system could not enter full screen: the window stays as it was,
+    /// and what the transition began to change is put right.
+    func windowDidFailToEnterFullScreen(_ window: NSWindow) {
+        fullScreenTransitionEnded()
+    }
+
+    /// The system could not leave full screen, as above.
+    func windowDidFailToExitFullScreen(_ window: NSWindow) {
+        fullScreenTransitionEnded()
+    }
+
+    /// Brings every tab of this window up to date, once per transition:
+    /// AppKit may tell each tab's delegate, and the first one does it for
+    /// all of them.
+    private func fullScreenTransitionEnded() {
+        guard !refreshedForFullScreenTransition else { return }
+        let tabs = (window as? TerminalWindow)?.tabs ?? []
+        let controllers = tabs.compactMap { $0.windowController as? TerminalWindowController }
+        for controller in controllers {
+            controller.refreshedForFullScreenTransition = true
+            controller.fullScreenRefreshCount += 1
+            (controller.window?.contentView as? TerminalWindowContentView)?.windowDidBecomeVisible()
+        }
+        // On the run loop, not the main queue: a transition can end under a
+        // modal loop that a main-queue block runs, which holds that queue.
+        RunLoop.main.perform(inModes: [.common]) {
+            MainActor.assumeIsolated {
+                for controller in controllers {
+                    controller.refreshedForFullScreenTransition = false
+                }
+            }
         }
     }
 

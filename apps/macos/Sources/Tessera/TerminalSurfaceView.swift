@@ -1977,7 +1977,8 @@ extension TerminalSurfaceView: NSMenuItemValidation {
             guard let size = metrics?.fontSizePt, let attached = attachedFontSizePt else { return false }
             return size != attached
         case #selector(selectLastOutput(_:)):
-            // The command records alone, no search of the history. Disabled
+            // The core reads the lines from the bottom up to that output, in
+            // short lock holds, which a menu's validation can afford. Disabled
             // during a composition: it may scroll to the output (ADR 0032).
             return !hasMarkedText() && ((try? session.hasCommandOutput) ?? false)
         case #selector(scrollToTop(_:)), #selector(scrollToBottom(_:)), #selector(scrollPageUpInHistory(_:)),

@@ -117,7 +117,9 @@ enum MainMenu {
         // (`closeAll:`, aimed at NSApplication, which asks each busy tab on
         // its own sheet) when the menu bar is installed, unless an item
         // already has ⌥⌘W then; a later rebinding of this one does not
-        // bring it back.
+        // bring it back. AppKit pairs an alternate only with an item of the
+        // same key, so one rebound to another key is an ordinary, visible
+        // item (`apply(_:to:)`).
         let closeAll = add(
             menu, "close_all_windows", "Close All", #selector(AppDelegate.closeAllWindows(_:)), "w",
             [.command, .option])
@@ -262,22 +264,46 @@ enum MainMenu {
 
     // MARK: Key map
 
+    /// The commands whose item is shown under ⌥ in place of the item before
+    /// it, and that item's command.
+    private static let optionAlternates = ["quit_keep_windows": "quit", "close_all_windows": "close_tab"]
+
     /// Gives every item of `bar` whose `identifier` names a command the key
     /// map's menu chords: the first as its key equivalent (none if the
     /// command has none, as when `[keys]` rebinds or unbinds its chord), the
-    /// rest as hidden alternates after it. Idempotent: earlier alternates
-    /// are removed first. Items the key map does not name (the ones `AppKit`
-    /// adds) are left alone.
+    /// rest as hidden alternates after it, and after the item's ⌥ alternate,
+    /// which only works directly under its item. That alternate stays one
+    /// while it has its item's key; on another key it is an ordinary item.
+    /// Idempotent: earlier hidden alternates are removed first. Items the
+    /// key map does not name (the ones `AppKit` adds) are left alone.
     static func apply(_ keymap: TesseraKeymap, to bar: NSMenu) {
         for menu in menus(of: bar) {
             for item in menu.items where item.identifier?.rawValue.hasPrefix(aliasPrefix) ?? false {
                 menu.removeItem(item)
             }
-            for item in menu.items {
+            let items = menu.items
+            for item in items {
                 guard let name = item.identifier?.rawValue, let command = keymap.command(named: name) else { continue }
                 item.keyEquivalent = command.menu.first?.keyEquivalent ?? ""
                 item.keyEquivalentModifierMask = command.menu.first?.modifiers ?? []
+            }
+            for (position, item) in items.enumerated() where position > 0 {
+                guard let name = item.identifier?.rawValue, let primary = optionAlternates[name],
+                    items[position - 1].identifier?.rawValue == primary,
+                    let own = keymap.command(named: name), let other = keymap.command(named: primary)
+                else { continue }
+                // The key map's keys: AppKit may localise what an item reads.
+                let key = other.menu.first?.keyEquivalent ?? ""
+                item.isAlternate = !key.isEmpty && own.menu.first?.keyEquivalent == key
+            }
+            for item in items {
+                guard let name = item.identifier?.rawValue, let command = keymap.command(named: name) else { continue }
                 var index = menu.index(of: item)
+                if index + 1 < menu.numberOfItems, let next = menu.items[index + 1].identifier?.rawValue,
+                    optionAlternates[next] == name
+                {
+                    index += 1
+                }
                 for shortcut in command.menu.dropFirst() {
                     index += 1
                     menu.insertItem(alias(of: item, shortcut), at: index)

@@ -130,7 +130,8 @@ final class TerminalAccessibilityViewTests: XCTestCase {
         app = try TesseraApp()
         session = try app.spawn(
             .init(
-                program: "/bin/sh", arguments: ["-c", #"stty -echo -icanon; printf 'ls\r\na.txt  b.txt\r\n$ '; exec cat"#],
+                program: "/bin/sh",
+                arguments: ["-c", #"stty -echo -icanon; printf 'ls\r\na.txt  b.txt\r\n$ '; exec cat"#],
                 rows: 6, cols: 20))
         view = TerminalSurfaceView(session: session)
         // No client: nothing is posted while the rows read the view.
@@ -395,7 +396,8 @@ final class TerminalAccessibilityViewTests: XCTestCase {
         // a.txt: 2 pt in, row 1 from 2 + 16 to 2 + 32 pt from the top of 96.
         let expected = window.convertToScreen(view.convert(NSRect(x: 2, y: 96 - 34, width: 40, height: 16), to: nil))
         XCTAssertEqual(frame, expected)
-        let onB = window.convertToScreen(view.convert(NSRect(x: 2 + 7 * 8 + 1, y: 96 - 34 + 1, width: 0, height: 0), to: nil))
+        let onB = window.convertToScreen(
+            view.convert(NSRect(x: 2 + 7 * 8 + 1, y: 96 - 34 + 1, width: 0, height: 0), to: nil))
         XCTAssertEqual(view.accessibilityRange(for: onB.origin), NSRange(location: 10, length: 1), "the b of b.txt")
     }
 
@@ -407,7 +409,9 @@ final class TerminalAccessibilityViewTests: XCTestCase {
         let wide = try app.spawn(
             .init(
                 program: "/bin/sh",
-                arguments: ["-c", #"stty -echo -icanon; printf '\346\227\245\346\234\254x\r\ne\314\201y\r\n$ '; exec cat"#],
+                arguments: [
+                    "-c", #"stty -echo -icanon; printf '\346\227\245\346\234\254x\r\ne\314\201y\r\n$ '; exec cat"#,
+                ],
                 rows: 6, cols: 20))
         view = TerminalSurfaceView(session: wide)
         view.accessibility.monitor = FakeClientMonitor(attached: false)
@@ -421,12 +425,24 @@ final class TerminalAccessibilityViewTests: XCTestCase {
         XCTAssertEqual(view.accessibilityString(for: NSRange(location: 4, length: 2)), "e\u{301}")
         func screen(_ rect: NSRect) -> NSRect { window.convertToScreen(view.convert(rect, to: nil)) }
         // Rows from the top of a 96 pt view: row 0 is y 80 to 96, row 1 64 to 80.
-        XCTAssertEqual(view.accessibilityFrame(for: NSRange(location: 1, length: 1)), screen(NSRect(x: 16, y: 80, width: 16, height: 16)), "本: two cells")
-        XCTAssertEqual(view.accessibilityFrame(for: NSRange(location: 2, length: 1)), screen(NSRect(x: 32, y: 80, width: 8, height: 16)), "x after it")
-        XCTAssertEqual(view.accessibilityFrame(for: NSRange(location: 4, length: 2)), screen(NSRect(x: 0, y: 64, width: 8, height: 16)), "é: one cell")
-        XCTAssertEqual(view.accessibilityFrame(for: NSRange(location: 6, length: 1)), screen(NSRect(x: 8, y: 64, width: 8, height: 16)), "y")
-        XCTAssertEqual(view.accessibilityRange(for: screen(NSRect(x: 3 * 8 + 1, y: 81, width: 0, height: 0)).origin), NSRange(location: 1, length: 1), "the right half of 本")
-        XCTAssertEqual(view.accessibilityRange(for: screen(NSRect(x: 1, y: 65, width: 0, height: 0)).origin), NSRange(location: 4, length: 2), "é")
+        XCTAssertEqual(
+            view.accessibilityFrame(for: NSRange(location: 1, length: 1)),
+            screen(NSRect(x: 16, y: 80, width: 16, height: 16)), "本: two cells")
+        XCTAssertEqual(
+            view.accessibilityFrame(for: NSRange(location: 2, length: 1)),
+            screen(NSRect(x: 32, y: 80, width: 8, height: 16)), "x after it")
+        XCTAssertEqual(
+            view.accessibilityFrame(for: NSRange(location: 4, length: 2)),
+            screen(NSRect(x: 0, y: 64, width: 8, height: 16)), "é: one cell")
+        XCTAssertEqual(
+            view.accessibilityFrame(for: NSRange(location: 6, length: 1)),
+            screen(NSRect(x: 8, y: 64, width: 8, height: 16)), "y")
+        XCTAssertEqual(
+            view.accessibilityRange(for: screen(NSRect(x: 3 * 8 + 1, y: 81, width: 0, height: 0)).origin),
+            NSRange(location: 1, length: 1), "the right half of 本")
+        XCTAssertEqual(
+            view.accessibilityRange(for: screen(NSRect(x: 1, y: 65, width: 0, height: 0)).origin),
+            NSRange(location: 4, length: 2), "é")
     }
 }
 
@@ -454,7 +470,8 @@ final class TerminalAccessibilityNotificationTests: XCTestCase {
     override func setUp() async throws {
         app = try TesseraApp()
         session = try app.spawn(
-            .init(program: "/bin/sh", arguments: ["-c", "stty -echo -icanon; printf '$ '; exec cat"], rows: 6, cols: 20))
+            .init(
+                program: "/bin/sh", arguments: ["-c", "stty -echo -icanon; printf '$ '; exec cat"], rows: 6, cols: 20))
         try await waitForText("$ ")
         window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 200, height: 100), styleMask: [.borderless], backing: .buffered,
@@ -545,7 +562,8 @@ final class TerminalAccessibilityNotificationTests: XCTestCase {
     /// none of the old output; output after it is announced.
     func testN15AResizeAnnouncesNothingButLaterOutputIs() async throws {
         let script =
-            #"stty -echo -icanon; i=0; while [ $i -lt 40 ]; do printf 'line %02d some output text here\r\n' $i; i=$((i+1)); done; printf '$ '; exec cat"#
+            #"stty -echo -icanon; i=0; while [ $i -lt 40 ]; do "#
+                + #"printf 'line %02d some output text here\r\n' $i; i=$((i+1)); done; printf '$ '; exec cat"#
         let history = try app.spawn(.init(program: "/bin/sh", arguments: ["-c", script], rows: 24, cols: 80))
         try await waitUntil("the history is printed") { try history.accessibleText().string.hasSuffix("$ ") }
         accessibility.textProvider = { try history.accessibleText() }
@@ -747,7 +765,8 @@ final class TerminalAccessibilityFocusRaceTests: XCTestCase {
         app = try TesseraApp()
         session = try app.spawn(
             .init(
-                program: "/bin/sh", arguments: ["-c", #"stty -echo -icanon; printf 'ls\r\na.txt  b.txt\r\n$ '; exec cat"#],
+                program: "/bin/sh",
+                arguments: ["-c", #"stty -echo -icanon; printf 'ls\r\na.txt  b.txt\r\n$ '; exec cat"#],
                 rows: 24, cols: 20))
         view = TerminalSurfaceView(session: session)
         view.accessibility.monitor = FakeClientMonitor(attached: false)
@@ -971,6 +990,7 @@ final class TerminalAccessibilityAppTests: XCTestCase {
         XCTAssertTrue(firstWindow.firstResponder === left.view, "the left pane has the keyboard")
         try await Task.sleep(for: .milliseconds(100))
         let hasKey = NSApp.keyWindow != nil
+        print("D10 hasKey: \(hasKey)")
         if hasKey {
             XCTAssertTrue(NSApp.keyWindow === firstWindow, "the window brought to the front is key")
         }
@@ -1087,7 +1107,10 @@ final class TerminalAccessibilityAppTests: XCTestCase {
         XCTAssertNil(weakAccessibility, "accessibility")
         XCTAssertNil(weakSession, "session")
         let latency = ContinuousClock.now - closing
-        print("accessibility flood: \(recorder.posts.count) posts, footprint +\((footprintAfter - footprintBefore) >> 10) KiB in 3 s, freed \(latency) after close")
+        print(
+            "accessibility flood: \(recorder.posts.count) posts, "
+                + "footprint +\((footprintAfter - footprintBefore) >> 10) KiB in 3 s, "
+                + "freed \(latency) after close")
         XCTAssertLessThan(latency, .seconds(3), "closing is not held up by the flood")
         let quiet = recorder.posts.count
         try await Task.sleep(for: .milliseconds(300))

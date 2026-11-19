@@ -35,9 +35,10 @@ final class TerminalScrollerTests: XCTestCase {
     /// fade on whatever the machine's Reduce Motion (a CI runner may
     /// report it on).
     private func makeScroller(
-        _ position: TesseraSession.ScrollPosition = middle, style: NSScroller.Style = .overlay
+        _ position: TesseraSession.ScrollPosition = middle, style: NSScroller.Style = .overlay,
+        in provided: NSWindow? = nil
     ) -> (scroller: TerminalScroller, window: NSWindow) {
-        let window = NSWindow(
+        let window = provided ?? NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 480, height: Self.height), styleMask: [.titled],
             backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
@@ -450,6 +451,12 @@ final class TerminalScrollerTests: XCTestCase {
         let before = try XCTUnwrap(try render(scroller).knob(atX: start.x))
         let driver = KnobDragDriver(scroller: scroller, window: window, start: start, distance: 40)
         driver.render = { [unowned self] in try? self.render(scroller).knob(atX: start.x) }
+        let knobWidth: () -> CGFloat? = { [unowned self] in
+            guard let knob = try? self.render(scroller).knob(atY: scroller.rect(for: .knob).midY) else { return nil }
+            return knob.right - knob.left
+        }
+        let wideWidth = try XCTUnwrap(knobWidth())
+        driver.knobWidth = knobWidth
         driver.onScroll = { targets }
         // AppKit's tracking loop runs until the release the driver posts.
         let timer = Timer(
@@ -468,8 +475,74 @@ final class TerminalScrollerTests: XCTestCase {
         XCTAssertEqual(driver.targetsAfterDrag.last, .offset(expected), "the view goes to the knob's line")
         XCTAssertEqual(driver.afterOutput?.top, moved.top, "output during the drag does not move the knob")
         XCTAssertEqual(driver.afterOutput?.bottom, moved.bottom)
-        XCTAssertTrue(driver.wideAfterExit, "still wide with the pointer off the strip during the drag")
+        XCTAssertEqual(
+            try XCTUnwrap(driver.widthAfterExit), wideWidth, accuracy: 1,
+            "still wide with the pointer off the strip during the drag")
         XCTAssertFalse(scroller.isTracking)
+    }
+
+    // MARK: Layout
+
+    /// The overlay knob and slot layers (the ones above AppKit's own).
+    private func overlayLayers(_ scroller: TerminalScroller) throws -> [CALayer] {
+        try XCTUnwrap(scroller.layer).sublayers?.filter { $0.zPosition > 0 } ?? []
+    }
+
+    /// Too short for AppKit to give it a knob, the scroller shows neither
+    /// knob nor slot, even expanded; given its height back, both return.
+    func testAScrollerTooShortForAKnobShowsNeitherKnobNorSlot() throws {
+        let (scroller, window) = makeScroller()
+        defer { window.close() }
+        try enter(scroller)
+        let full = scroller.frame.size
+        XCTAssertFalse(try overlayLayers(scroller).isEmpty)
+        XCTAssertTrue(try overlayLayers(scroller).allSatisfy { !$0.isHidden }, "expanded: knob and slot")
+
+        scroller.setFrameSize(NSSize(width: full.width, height: 12))
+        print("SCROLLER short: parts \(scroller.usableParts.rawValue), knob \(scroller.rect(for: .knob))")
+        XCTAssertNotEqual(scroller.usableParts, .allScrollerParts, "AppKit gives it no knob")
+        XCTAssertTrue(try overlayLayers(scroller).allSatisfy(\.isHidden), "neither is shown")
+
+        scroller.setFrameSize(full)
+        XCTAssertEqual(scroller.usableParts, .allScrollerParts)
+        XCTAssertTrue(try overlayLayers(scroller).allSatisfy { !$0.isHidden }, "both are back")
+    }
+
+    /// Moved to a screen of another scale, the drawn knob goes where AppKit
+    /// now puts its own: AppKit rounds the knob's rect to the backing scale.
+    /// The change is called as AppKit calls it; the window reports the scale.
+    func testAChangeOfBackingScaleMovesTheKnobToAppKitsRect() throws {
+        let window = ScaledWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 480, height: Self.height), styleMask: [.titled],
+            backing: .buffered, defer: false)
+        let (scroller, _) = makeScroller(in: window)
+        defer { window.close() }
+        // A position whose knob rounds differently at the two scales.
+        var found: (position: TesseraSession.ScrollPosition, rect: NSRect)?
+        for offset in stride(from: UInt64(3000), to: 7000, by: 13) {
+            let position = TesseraSession.ScrollPosition(offset: offset, history: 10_000, rows: 24)
+            window.scale = 2
+            scroller.update(position)
+            let fine = scroller.rect(for: .knob)
+            window.scale = 1
+            scroller.update(position)
+            if scroller.rect(for: .knob) != fine {
+                found = (position, fine)
+                break
+            }
+        }
+        let (position, fine) = try XCTUnwrap(found, "AppKit rounds the knob to the backing scale")
+        // Laid out at 1x: an unchanged position would lay nothing out.
+        scroller.update(.init(offset: position.offset + 1, history: position.history, rows: position.rows))
+        scroller.update(position)
+        let knob = try XCTUnwrap(try overlayLayers(scroller).first { $0.zPosition == 2 })
+        XCTAssertNotEqual(knob.frame.minY, fine.minY - 1, "at 1x, not yet where 2x puts it")
+
+        window.scale = 2
+        scroller.viewDidChangeBackingProperties()
+
+        XCTAssertEqual(knob.frame.minY, fine.minY - 1, "the rim is 1 pt outside AppKit's knob")
+        XCTAssertEqual(knob.frame.height, fine.height + 2)
     }
 
     // MARK: Legacy style
@@ -632,7 +705,9 @@ private final class KnobDragDriver: NSObject {
     private(set) var afterOutput: (top: CGFloat, bottom: CGFloat)?
     private(set) var value: Double?
     private(set) var targetsAfterDrag: [TesseraSession.ScrollTarget] = []
-    private(set) var wideAfterExit = false
+    /// How wide the knob is drawn now, and was once the pointer had left.
+    var knobWidth: () -> CGFloat? = { nil }
+    private(set) var widthAfterExit: CGFloat?
     private var step = 0
 
     init(scroller: TerminalScroller, window: NSWindow, start: NSPoint, distance: CGFloat) {
@@ -681,7 +756,7 @@ private final class KnobDragDriver: NSObject {
             {
                 scroller.mouseExited(with: exit)
             }
-            wideAfterExit = render() != nil
+            widthAfterExit = knobWidth()
             post(.leftMouseUp, at: end)
         case 30, 60:
             // A second release in case AppKit missed the first.
@@ -692,4 +767,11 @@ private final class KnobDragDriver: NSObject {
             }
         }
     }
+}
+
+/// A window reporting the backing scale a test gives it; AppKit rounds what
+/// is in it to that scale.
+private final class ScaledWindow: NSWindow {
+    var scale: CGFloat = 1
+    override var backingScaleFactor: CGFloat { scale }
 }
