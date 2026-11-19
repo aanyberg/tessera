@@ -9,7 +9,8 @@ import XCTest
 /// Increase Contrast) to off, so no test depends on the machine it runs on
 /// (a CI runner may report Reduce Motion on, and a scroll bar would then
 /// never fade). A test that needs one on sets the app delegate's read
-/// itself and calls ``pin(_:)`` in its tearDown.
+/// itself and calls ``pin(_:)`` in its tearDown. It also holds the run to
+/// ``LiveWindows/bound``.
 @objc(TesseraTestsHostDisplaySettings)
 final class HostDisplaySettings: NSObject, XCTestObservation {
     override init() {
@@ -26,10 +27,22 @@ final class HostDisplaySettings: NSObject, XCTestObservation {
             TerminationSignalChild.runIfRequested()
             // Files of test suites that an earlier run's killed host left.
             TestDefaultsSuite.sweep()
+            LiveWindows.install()
             if let appDelegate = NSApp.delegate as? AppDelegate {
                 Self.pin(appDelegate)
             }
         }
+    }
+
+    func testCaseWillStart(_ testCase: XCTestCase) {
+        if let report = LiveWindows.takeReport() {
+            testCase.record(XCTIssue(type: .assertionFailure, compactDescription: report))
+        }
+    }
+
+    func testBundleDidFinish(_ testBundle: Bundle) {
+        let line = "live windows at the end of the run: \(LiveWindows.count), at most \(LiveWindows.peak)\n"
+        FileHandle.standardError.write(Data(line.utf8))
     }
 
     /// All three read as off, applied at once (the scroll bars' default

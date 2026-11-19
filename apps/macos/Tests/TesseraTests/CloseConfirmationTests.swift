@@ -1228,10 +1228,14 @@ enum TerminationSignalChild {
             sample.standardError = FileHandle.nullDevice
             if (try? sample.run()) != nil { sample.waitUntilExit() }
             let text = read("sample.txt").split(separator: "\n", omittingEmptySubsequences: false)
-            let graph = text.drop { !$0.contains("Call graph:") }.prefix(40)
+            // Every thread's stack: a stalled launch can sit deeper than the
+            // first screenful, or on another thread than the main one.
+            let graph = text.drop { !$0.contains("Call graph:") }
+                .prefix { !$0.contains("Total number in stack") }
+                .prefix(1000)
             let images = text.drop { !$0.contains("Binary Images:") }
                 .filter { $0.contains("XCTest") || $0.contains("Inject") || $0.contains("tsan") }
-            lines.append("main thread:\n\(graph.joined(separator: "\n"))")
+            lines.append("threads:\n\(graph.joined(separator: "\n"))")
             lines.append("XCTest images:\n\(images.joined(separator: "\n"))")
         }
         return lines.joined(separator: "\n")
@@ -1260,8 +1264,10 @@ enum TerminationSignalChild {
         }
     }
 
+    /// Atomic: the parent decodes the file as soon as it exists.
     private static func reportReady(_ jobPid: pid_t, in dir: URL) throws {
-        try JSONEncoder().encode(Ready(jobPid: jobPid)).write(to: dir.appendingPathComponent(readyFile))
+        try JSONEncoder().encode(Ready(jobPid: jobPid))
+            .write(to: dir.appendingPathComponent(readyFile), options: .atomic)
     }
 
     /// Reports ready once an application-modal window is up.
