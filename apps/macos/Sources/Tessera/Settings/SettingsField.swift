@@ -408,9 +408,16 @@ struct CommitTextField: View {
     }
 }
 
-/// The message of a failed edit, if there is one.
+/// The message of a failed edit, if there is one, or (`notSaved` false) a
+/// notice that says what happened itself.
 struct SettingsMessage: View {
     let text: String?
+    var notSaved = true
+
+    /// What VoiceOver reads for `text`.
+    static func spoken(_ text: String, notSaved: Bool) -> String {
+        notSaved ? "Not saved: \(text)" : text
+    }
 
     var body: some View {
         if let text {
@@ -418,7 +425,7 @@ struct SettingsMessage: View {
                 .font(.callout)
                 .foregroundStyle(.red)
                 .fixedSize(horizontal: false, vertical: true)
-                .accessibilityLabel("Not saved: \(text)")
+                .accessibilityLabel(Self.spoken(text, notSaved: notSaved))
         }
     }
 }

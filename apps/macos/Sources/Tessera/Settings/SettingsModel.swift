@@ -151,6 +151,10 @@ final class SettingsModel {
     /// as ``importThemeKey``), already sanitised.
     private(set) var messages: [String: String] = [:]
     private var throttles: [String: Throttle] = [:]
+    /// The values sliders and steppers wrote and no configuration has shown
+    /// yet, oldest first, at most ``maxUnappliedWrites`` per key: what tells
+    /// this window's own values from a hand edit during a press (#517).
+    @ObservationIgnored private var unappliedWrites: [String: [TesseraConfigValue]] = [:]
     /// Moves when a configuration is applied whose profiles are not the
     /// ones before it but for this window's own edits (a hand edit added,
     /// removed, reordered or changed one, whatever the names): the index a
@@ -172,6 +176,16 @@ final class SettingsModel {
     /// The one ``profileSettleTimeout`` timer, of the add or delete that
     /// locks the list now.
     @ObservationIgnored private var profileSettle: SettingsTimer?
+    /// Per key, the timer of ``reloadAfterRelease(_:after:)``: at most one, gone
+    /// when it fires or the key is pressed again.
+    @ObservationIgnored private var releaseSettles: [String: SettingsTimer] = [:]
+    /// The add or delete ``releaseProfiles()`` stopped waiting for, and the
+    /// notice it left: a configuration that shows it after all (a watch
+    /// slower than the settle time) takes the notice back (#344 m2).
+    @ObservationIgnored private var released: (change: ReleasedChange, notice: String)?
+    /// `plugins.enabled` when a toggle was refused at the cap: the refusal
+    /// stands until the list is another one (25.2 adversarial M1).
+    @ObservationIgnored var pluginsRefusedAt: [TesseraConfigValue]?
     /// Why ``renameProfile(_:to:)`` last refused a name, while
     /// ``commitDraft()`` runs (#344 adversarial M5).
     @ObservationIgnored private var nameRefusal: String?
@@ -188,6 +202,11 @@ final class SettingsModel {
     /// first, since the field goes before it could see the focus go.
     @ObservationIgnored private var draft: (owner: ObjectIdentifier, commit: @MainActor () -> Void)?
 
+    /// How many written values ``unappliedWrites`` keeps per key (S5): 3 s
+    /// of a drag at one write per ``coalescingInterval``. A value older
+    /// than that, applied during a press, counts as a hand edit: the
+    /// release then shows the file until the newer values apply.
+    static let maxUnappliedWrites = 32
     /// The key of the message the theme import shows.
     static let importThemeKey = "action:import_theme"
     /// The key of the message the profile list shows.
@@ -200,6 +219,13 @@ final class SettingsModel {
     static let pluginSettleInterval: Duration = .milliseconds(50)
     /// …at most this many times after each configuration applied (2 s).
     static let pluginSettleReads = 40
+
+    /// An add or delete of a profile no configuration showed in time.
+    private enum ReleasedChange {
+        case add(TesseraAddedProfile)
+        /// The key path of the delete, and the profiles it was queued against.
+        case delete(key: String, from: [TesseraConfigValue])
+    }
 
     /// A profile being added.
     private struct Addition {
@@ -227,6 +253,14 @@ final class SettingsModel {
         /// Pressed and not yet let go (``beginChange(_:)`` to
         /// ``endChange(_:)``).
         var dragging = false
+        /// This press made a step, or found one held back when it began:
+        /// only then has its release anything to write (#534).
+        var stepped = false
+        /// The key's applied value as last seen during the press.
+        var seenApplied: TesseraConfigValue?
+        /// A configuration applied during the press changed the key to a
+        /// value this window did not write, and no step came after it.
+        var overridden = false
     }
 
     init(source: any SettingsConfigSource, clock: any SettingsClock = SystemSettingsClock()) {
@@ -273,6 +307,7 @@ final class SettingsModel {
         }
         // After the configuration, so an apply in between reloads again.
         readPluginsAgain()
+        notePressedKeysApplied()
         let masks = pending
         let listed = snapshot["profiles"]?.array ?? []
         // Read once for every key that waits for the list (21.6a m5).
@@ -297,16 +332,71 @@ final class SettingsModel {
             movedFrom[key] = nil
         }
         endAdditionIfApplied(masking: masks)
+        withdrawReleaseNotice()
         if messages[Self.pluginsKey] == Self.pluginsFullRefusal,
-            (value(Self.pluginsKey)?.array?.count ?? 0) < Self.maxEnabledPlugins
+            value(Self.pluginsKey)?.array != pluginsRefusedAt
         {
-            // A hand edit made room: the refusal at the cap no longer holds.
+            // A hand edit changed the list: the refusal was about the old one.
             messages[Self.pluginsKey] = nil
+            pluginsRefusedAt = nil
         }
         if !profilesChanging {
             profileSettle?.cancel()
             profileSettle = nil
         }
+    }
+
+    /// What the configuration just read means for the keys pressed now: a
+    /// value this window wrote is taken off ``unappliedWrites`` with the
+    /// ones before it; any other new value is a hand edit, which the
+    /// release shows (#517), and a step held back until now, taken before
+    /// it, is not written over it.
+    private func notePressedKeysApplied() {
+        for key in Array(unappliedWrites.keys) where pending[key] == nil { unappliedWrites[key] = nil }
+        for (key, var throttle) in throttles where throttle.dragging {
+            let applied = snapshot[key]
+            guard !Self.sameApplied(applied, throttle.seenApplied) else { continue }
+            throttle.seenApplied = applied
+            if let index = unappliedWrites[key]?.firstIndex(where: { Self.sameApplied($0, applied) }) {
+                unappliedWrites[key]?.removeFirst(index + 1)
+            } else {
+                throttle.overridden = true
+                throttle.timer?.cancel()
+                throttle.timer = nil
+            }
+            throttles[key] = throttle
+        }
+    }
+
+    /// Whether a value written and a value read back are the same: the core
+    /// keeps some floats as `f32`, so 0.3 comes back as 0.30000001192….
+    private static func sameApplied(_ first: TesseraConfigValue?, _ second: TesseraConfigValue?) -> Bool {
+        if let first = first?.double, let second = second?.double { return Float(first) == Float(second) }
+        return first == second
+    }
+
+    /// How many values of `key` wait in ``unappliedWrites`` (for tests).
+    func unappliedWriteCount(_ key: String) -> Int {
+        unappliedWrites[key]?.count ?? 0
+    }
+
+    /// Takes back the notice of ``releaseProfiles()`` once the applied
+    /// configuration shows the add or delete after all. The rows after a
+    /// late add move on again, with their messages. A new add or delete
+    /// ends this: what the notice was about is no longer followed.
+    private func withdrawReleaseNotice() {
+        guard let released else { return }
+        switch released.change {
+        case .add(let added):
+            let listed = snapshot["profiles"]?.array ?? []
+            guard listed.indices.contains(added.index), listed[added.index]["name"]?.string == added.name
+            else { return }
+            shiftProfileMessages(from: added.index, by: 1)
+        case .delete(let key, let base):
+            guard deleteShown(key, .null, from: base) else { return }
+        }
+        self.released = nil
+        if messages[Self.profilesKey] == released.notice { messages[Self.profilesKey] = nil }
     }
 
     /// Ends the written add of a profile once the configuration lists it
@@ -370,7 +460,7 @@ final class SettingsModel {
             if read != plugins { plugins = read }
             if pluginsUnreadable { pluginsUnreadable = false }
         } catch {
-            pluginsUnreadable = true
+            if !pluginsUnreadable { pluginsUnreadable = true }
             Self.log.error("plugins not read: \(String(describing: error), privacy: .public)")
         }
     }
@@ -466,6 +556,9 @@ final class SettingsModel {
         guard !lockedProfileEdit(key, value) else { return }
         pending[key] = value
         var throttle = throttles[key] ?? Throttle()
+        // A step after a hand edit applied is the latest word.
+        throttle.overridden = false
+        throttle.stepped = true
         let now = clock.now
         if let last = throttle.lastWrite, now - last < Self.coalescingInterval {
             if throttle.timer == nil {
@@ -486,19 +579,57 @@ final class SettingsModel {
     /// (``endChange(_:)``), a configuration applied keeps the value it
     /// shows.
     func beginChange(_ key: String) {
-        throttles[key, default: Throttle()].dragging = true
+        releaseSettles.removeValue(forKey: key)?.cancel()
+        var throttle = throttles[key] ?? Throttle()
+        throttle.dragging = true
+        throttle.stepped = throttle.timer != nil
+        throttle.overridden = false
+        throttle.seenApplied = snapshot[key]
+        throttles[key] = throttle
     }
 
-    /// The slider or stepper at `key` was released: its final value is
-    /// written if it was not yet.
+    /// The slider or stepper at `key` was released: the final value of a
+    /// press that made a step is written if it was not yet. If a hand edit
+    /// applied during the press and no step came after it, nothing is
+    /// written and the reload the press held back runs: the edit shows, and
+    /// the next step starts from it (#517). It runs after this event: the
+    /// `NSSlider` of an app linked against the macOS 15 SDK sends one more
+    /// action on mouse-up, with the knob's value, and SwiftUI takes that
+    /// for a new edit if the binding has moved. Otherwise
+    /// ``settleAfterRelease(_:)`` follows.
     func endChange(_ key: String) {
         guard let throttle = throttles[key] else { return }
         throttle.timer?.cancel()
         throttles[key]?.timer = nil
-        if let value = pending[key], value != throttle.lastWritten {
+        if throttle.stepped, !throttle.overridden, let value = pending[key], value != throttle.lastWritten {
             writeThrottled(key, value)
         }
         throttles[key] = nil
+        if throttle.overridden {
+            reloadAfterRelease(key, after: .zero)
+        } else {
+            settleAfterRelease(key)
+        }
+    }
+
+    /// A configuration applied since the last write of `key`, during the
+    /// press, may be the last one: it can leave the key as it was or on an
+    /// earlier value of the press (another app saved over the step before
+    /// the watch read it), which looks like no hand edit. It can also be
+    /// followed by the press's own value, so it does not settle the key at
+    /// once: ``profileSettleTimeout`` later, more than the watch takes, the
+    /// reload does, and the window shows what is applied (#517).
+    private func settleAfterRelease(_ key: String) {
+        guard pending[key] != nil else { return }
+        if let queued = queuedAtGeneration[key], snapshot.generation <= queued { return }
+        reloadAfterRelease(key, after: profileSettleTimeout)
+    }
+
+    private func reloadAfterRelease(_ key: String, after delay: Duration) {
+        releaseSettles[key] = clock.schedule(after: delay) { [weak self] in
+            self?.releaseSettles[key] = nil
+            self?.reload()
+        }
     }
 
     private func flushThrottle(_ key: String) {
@@ -521,11 +652,16 @@ final class SettingsModel {
         }
         throttles[key, default: Throttle()].lastWrite = clock.now
         throttles[key, default: Throttle()].lastWritten = value
-        if value == snapshot[key], (inFlight[key] ?? 0) == 0 {
-            // Back where the file is: nothing to write.
+        if value == snapshot[key], (inFlight[key] ?? 0) == 0, unappliedWrites[key]?.isEmpty != false {
+            // Back where the file is: nothing to write. With a write not
+            // applied yet the file has moved on from the snapshot (#530).
             pending[key] = nil
             return
         }
+        var written = unappliedWrites[key] ?? []
+        if written.count == Self.maxUnappliedWrites { written.removeFirst() }
+        written.append(value)
+        unappliedWrites[key] = written
         enqueue(key, value)
     }
 
@@ -563,6 +699,7 @@ final class SettingsModel {
             // A new lock: an earlier one's timer must not end it.
             profileSettle?.cancel()
             profileSettle = nil
+            released = nil
         }
         for edit in edits {
             let written = edit.value ?? .null
@@ -705,8 +842,10 @@ final class SettingsModel {
         profileSettle = nil
         reload()
         var notice: String?
+        var change: ReleasedChange?
         if let addition, let added = addition.added, (inFlight[Self.profilesKey] ?? 0) == 0 {
             self.addition = nil
+            change = .add(added)
             // The rows after it are back where they were.
             shiftProfileMessages(from: added.index, by: -1)
             notice =
@@ -714,6 +853,7 @@ final class SettingsModel {
                 + "another app may have saved config.toml without it."
         }
         for (key, value) in pending where movesProfiles(key, value) && (inFlight[key] ?? 0) == 0 {
+            change = movedFrom[key].map { .delete(key: key, from: $0) }
             pending[key] = nil
             queuedAtGeneration[key] = nil
             movedFrom[key] = nil
@@ -724,6 +864,7 @@ final class SettingsModel {
         guard let notice else { return }
         Self.log.info("profile add or delete not shown by the applied configuration in time")
         messages[Self.profilesKey] = notice
+        released = change.map { ($0, notice) }
         // The list is not the one the controls were made for.
         profileListGeneration += 1
         draft = nil
@@ -1053,6 +1194,7 @@ final class SettingsModel {
         // A new lock: an earlier one's timer must not end it.
         profileSettle?.cancel()
         profileSettle = nil
+        released = nil
         addition = Addition(
             listed: snapshot["profiles"]?.array ?? [],
             keys: Dictionary(keys, uniquingKeysWith: { $1 }), masks: pending, added: nil)
