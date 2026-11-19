@@ -523,9 +523,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Whether `model` has an edit that a closed window keeps it for: an
     /// add or delete of a profile, or an edit of `[plugins] enabled`, not
-    /// yet applied.
+    /// yet applied, or an edit of a profile not yet written (one that
+    /// meets a hand edit is written again later by this model, so Settings
+    /// opened again must edit on with it, #549).
     private static func waitsForApply(_ model: SettingsModel) -> Bool {
-        model.profilesChanging || model.pluginsChanging
+        model.profilesChanging || model.pluginsChanging || model.profileEditsUnwritten
     }
 
     /// The closed Settings window's waiting model, which the app delegate

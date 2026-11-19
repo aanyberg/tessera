@@ -91,7 +91,9 @@ final class SystemSettingsClock: SettingsClock {
 /// nothing: the control shows the file's value again, and the core's
 /// message (sanitised, S3) next to it. An edit that meets an external edit
 /// of the file since the core read it (`Conflict`) is retried once, and the
-/// model reloads.
+/// model reloads. An edit of a profile's key is retried once the external
+/// edit applies, at the index of the profile it was made for, or dropped if
+/// that profile is gone (#549).
 @MainActor
 @Observable
 final class SettingsModel {
@@ -180,10 +182,26 @@ final class SettingsModel {
     /// Per key, the timer of ``reloadAfterRelease(_:after:)``: at most one, gone
     /// when it fires or the key is pressed again.
     @ObservationIgnored private var releaseSettles: [String: SettingsTimer] = [:]
+    /// Per key whose press was let go with a hand edit applied during it
+    /// and no step after it (``endChange(_:)``), a timer that ends with the
+    /// events of that release: until it fires, ``change(_:_:)`` writes
+    /// nothing (#550). The `NSSlider` of the macOS 15 SDK sends the knob's
+    /// value once more on mouse-up, in a press of its own, after the
+    /// release; that is no step, whatever the label shows (the dim
+    /// slider's knob sits on 35 % for a hand-typed 33 %), and a knob not
+    /// moved to the hand edit sends the value from before it.
+    @ObservationIgnored private var handEditReleases: [String: SettingsTimer] = [:]
     /// The add or delete ``releaseProfiles()`` stopped waiting for, and the
     /// notice it left: a configuration that shows it after all (a watch
     /// slower than the settle time) takes the notice back (#344 m2).
     @ObservationIgnored private var released: (change: ReleasedChange, notice: String)?
+    /// The edits of profiles that met an external edit of the file
+    /// (`Conflict`) and wait to be written again, in the order they began
+    /// to wait (``awaitProfileRetry(_:name:)``, #549): written again oldest
+    /// first, so a later edit's value is the one left.
+    @ObservationIgnored private var profileRetries: [Int: ProfileRetry] = [:]
+    /// The key of the next of ``profileRetries``.
+    @ObservationIgnored private var nextProfileRetry = 0
     /// `plugins.enabled` when a toggle was refused at the cap: the refusal
     /// stands until the list is another one (25.2 adversarial M1).
     @ObservationIgnored var pluginsRefusedAt: [TesseraConfigValue]?
@@ -227,6 +245,40 @@ final class SettingsModel {
         /// The key path of the delete, and the profiles it was queued against.
         case delete(key: String, from: [TesseraConfigValue])
     }
+
+    /// An edit of a profile that met an external edit of the file, with the
+    /// edits of its run after it (not run): written again once a
+    /// configuration applied after the conflict lists the profile it was
+    /// made for, at that profile's index.
+    private struct ProfileRetry {
+        var edits: [Edit]
+        /// The name of that profile, as listed when the edit was queued.
+        var name: String?
+        /// The generation applied when the conflict came back.
+        var generation: UInt64
+        var timer: SettingsTimer
+
+        /// Whether `edit`, made on the list `listed` (the one shown), sets
+        /// what one of these edits sets: the same key outside the
+        /// profiles, or the same key of the profile this waits for, by its
+        /// name, wherever the list has it now (#549).
+        @MainActor func isReplaced(by edit: Edit, listed: [TesseraConfigValue]) -> Bool {
+            let waitingAt = edits.first.flatMap { SettingsModel.profilePath($0.key)?.index }
+            return edits.contains { old in
+                guard let (at, rest) = SettingsModel.profilePath(old.key),
+                    let (index, editRest) = SettingsModel.profilePath(edit.key)
+                else { return old.key == edit.key }
+                guard rest == editRest else { return false }
+                guard let name, at == waitingAt else { return old.key == edit.key }
+                return listed.indices.contains(index) && listed[index]["name"]?.string == name
+            }
+        }
+    }
+
+    /// The notice of the profile list for a profile's value not written
+    /// again after a conflict: a hand edit removed or renamed the profile.
+    static let profileGoneNotice =
+        "A profile’s value was not saved: config.toml was changed by hand and that profile is no longer in it."
 
     /// A profile being added.
     private struct Addition {
@@ -320,6 +372,7 @@ final class SettingsModel {
         // After the configuration, so an apply in between reloads again.
         readPluginsAgain()
         notePressedKeysApplied()
+        retryProfileEdits()
         let masks = pending
         let listed = snapshot["profiles"]?.array ?? []
         // Read once for every key that waits for the list (21.6a m5).
@@ -606,7 +659,7 @@ final class SettingsModel {
     /// when it has passed (with the latest value then). Nothing while a
     /// profile's key is locked (``profilesChanging``).
     func change(_ key: String, _ value: TesseraConfigValue) {
-        guard !lockedProfileEdit(key, value) else { return }
+        guard !lockedProfileEdit(key, value), handEditReleases[key] == nil else { return }
         pending[key] = value
         var throttle = throttles[key] ?? Throttle()
         // A step after a hand edit applied is the latest word.
@@ -645,7 +698,9 @@ final class SettingsModel {
     /// press that made a step is written if it was not yet. If a hand edit
     /// applied during the press and no step came after it, nothing is
     /// written and the reload the press held back runs: the edit shows, and
-    /// the next step starts from it (#517). It runs after this event: the
+    /// the next step starts from it (#517); until this event's handling
+    /// ends, nothing is written (``handEditReleases``, #550). It runs after
+    /// this event: the
     /// `NSSlider` of an app linked against the macOS 15 SDK sends one more
     /// action on mouse-up, with the knob's value, and SwiftUI takes that
     /// for a new edit if the binding has moved. Otherwise
@@ -660,6 +715,10 @@ final class SettingsModel {
         throttles[key] = nil
         if throttle.overridden {
             reloadAfterRelease(key, after: .zero)
+            handEditReleases[key]?.cancel()
+            handEditReleases[key] = clock.schedule(after: .zero) { [weak self] in
+                self?.handEditReleases[key] = nil
+            }
         } else {
             settleAfterRelease(key)
         }
@@ -731,6 +790,22 @@ final class SettingsModel {
     private struct Edit: Sendable {
         var key: String
         var value: TesseraConfigValue?
+        var onConflict: OnConflict = .retry
+    }
+
+    /// What a `Conflict` (the file changed since the core read it) does to
+    /// an edit.
+    private enum OnConflict: Sendable, Equatable {
+        /// Written again at once on the write queue: the core reads the
+        /// file again, so the external edit stays.
+        case retry
+        /// A key of a profile, named by its index, which the external edit
+        /// may have moved: not written again on the queue but
+        /// ``awaitProfileRetry(_:name:)`` (#549), for the profile of this name
+        /// (as listed when the edit was queued).
+        case retryProfile(name: String?)
+        /// Shown: the edit was written again already.
+        case show
     }
 
     /// What became of one edit of a run: its result and whether it was
@@ -753,6 +828,25 @@ final class SettingsModel {
             profileSettle = nil
             released = nil
         }
+        let edits = edits.map { edit in
+            var edit = edit
+            if edit.onConflict == .retry, let (index, _) = Self.profilePath(edit.key) {
+                let listed = snapshot["profiles"]?.array ?? []
+                let name = listed.indices.contains(index) ? listed[index]["name"]?.string : nil
+                edit.onConflict = .retryProfile(name: name)
+            }
+            return edit
+        }
+        // An edit written again replaces none: an earlier one's value is
+        // not the latest word.
+        let listed = snapshot["profiles"]?.array ?? []
+        let superseded = profileRetries.filter { _, retry in
+            edits.contains { $0.onConflict != .show && retry.isReplaced(by: $0, listed: listed) }
+        }
+        // While one waits, the file holds a hand edit not applied yet: a
+        // profile's edit waits with it, to be placed by its name (#549).
+        var waitsWith: String?? = nil
+        if !profileRetries.isEmpty, case .retryProfile(let name)? = edits.first?.onConflict { waitsWith = name }
         for edit in edits {
             let written = edit.value ?? .null
             pending[edit.key] = written
@@ -761,7 +855,20 @@ final class SettingsModel {
             inFlight[edit.key, default: 0] += 1
             messages[edit.key] = nil
         }
+        // A later edit of a key waiting to be written again is the latest word.
+        for (key, retry) in superseded {
+            retry.timer.cancel()
+            profileRetries[key] = nil
+            for old in retry.edits { finish(old.key, nil) }
+        }
+        if let name = waitsWith {
+            awaitProfileRetry(edits, name: name)
+            return
+        }
         let writer = source.settingsWriter
+        // A profile's edit that meets a conflict is written again by this
+        // model, so it outlives a closed window until then (#549).
+        let keep = edits.contains { if case .retryProfile = $0.onConflict { true } else { false } } ? self : nil
         Self.writeQueue.async { [weak self] in
             var outcomes: [Outcome] = []
             for edit in edits {
@@ -771,7 +878,7 @@ final class SettingsModel {
                 }
                 var retried = false
                 var result = Self.perform(writer, edit.key, edit.value)
-                if case .failure(let error) = result, error.kind == .conflict {
+                if case .failure(let error) = result, error.kind == .conflict, edit.onConflict == .retry {
                     // The file changed since the core read it: the core reads
                     // it again on the retry, so the other edit stays.
                     retried = true
@@ -781,8 +888,18 @@ final class SettingsModel {
             }
             let done = outcomes
             Task { @MainActor [weak self] in
-                guard let self else { return }
-                for (edit, outcome) in zip(edits, done) {
+                guard let self = keep ?? self else { return }
+                for (at, (edit, outcome)) in zip(edits, done).enumerated() {
+                    if case .retryProfile(let name) = edit.onConflict, case .failure(let error)? = outcome?.result,
+                        error.kind == .conflict
+                    {
+                        // The edits after it were not run. One with a later
+                        // edit of its key queued is not the latest word.
+                        let waiting = edits[at...].filter { (self.inFlight[$0.key] ?? 0) <= 1 }
+                        for edit in edits[at...] where (self.inFlight[edit.key] ?? 0) > 1 { self.finish(edit.key, nil) }
+                        if !waiting.isEmpty { self.awaitProfileRetry(waiting, name: name) }
+                        return
+                    }
                     self.finish(edit.key, outcome, written: edit.value ?? .null)
                 }
             }
@@ -846,15 +963,12 @@ final class SettingsModel {
             }
         }
         if retried {
-            let base = movedFrom[key]
             reload()
-            if case .success = result, inFlight[key] == nil, let written,
-                !deleteShown(key, written, from: base)
-            {
+            if case .success = result, inFlight[key] == nil, let written {
                 // The external edit was applied before this one: show this
-                // one until a configuration after it applies. A delete the
-                // reload shows applied already is not waited for again
-                // (21.6a m6): its list would not change again.
+                // one until a configuration after it applies. (A profile's
+                // edit, a delete among them, is not retried here but by
+                // ``awaitProfileRetry(_:name:)``.)
                 pending[key] = written
                 queuedAt[key] = Queued(generation: snapshot.generation, loadError: snapshot.loadError)
                 movedFrom[key] = movesProfiles(key, written) ? snapshot["profiles"]?.array ?? [] : nil
@@ -864,6 +978,69 @@ final class SettingsModel {
             pending[key] != nil
         {
             settleProfiles()
+        }
+    }
+
+    /// `edits` (an edit of the profile named `name` that met an external
+    /// edit of the file, then the edits of its run not run) are not written
+    /// again at once:
+    /// the external edit may have removed or moved the profile, and the
+    /// key names it by its index. They stay queued and shown, the
+    /// configuration is read again, and once a configuration applied after
+    /// this one lists the profile (``profileSettleTimeout`` at most, for an
+    /// external edit the watch applied already or never applies) they are
+    /// written again at its index, or dropped if it is gone
+    /// (``retryProfileEdits(due:)``, #549).
+    private func awaitProfileRetry(_ edits: [Edit], name: String?) {
+        guard !edits.isEmpty else { return }
+        reload()
+        let id = nextProfileRetry
+        nextProfileRetry += 1
+        // Held until then, by a closed window's model too.
+        let timer = clock.schedule(after: profileSettleTimeout) { [self] in
+            guard self.profileRetries[id] != nil else { return }
+            self.reload()
+            self.retryProfileEdits(due: id)
+        }
+        profileRetries[id] = ProfileRetry(edits: edits, name: name, generation: snapshot.generation, timer: timer)
+    }
+
+    /// Writes again the edits of ``profileRetries`` that a configuration
+    /// applied since their conflict (or `due`, whose time is up) can place:
+    /// at the index of the one profile listed under the name the edit was
+    /// made for, each `.show`ing its next conflict. With no such profile,
+    /// they are dropped: a delete has nothing left to do, a value is not
+    /// saved and the list says so. Run while the list is locked by an add
+    /// or delete, they are not written either, with the list's notice.
+    private func retryProfileEdits(due: Int? = nil) {
+        for id in profileRetries.keys.sorted() {
+            guard let retry = profileRetries[id], id == due || snapshot.generation > retry.generation else { continue }
+            retry.timer.cancel()
+            profileRetries[id] = nil
+            guard let key = retry.edits.first?.key, let (index, _) = Self.profilePath(key) else { continue }
+            let listed = snapshot["profiles"]?.array ?? []
+            let places = listed.indices.filter { retry.name != nil && listed[$0]["name"]?.string == retry.name }
+            var again: [Edit] = []
+            if places.count == 1 {
+                again = retry.edits.map { edit in
+                    var edit = edit
+                    edit.onConflict = .show
+                    if let (at, rest) = Self.profilePath(edit.key), at == index {
+                        edit.key = "profiles[\(places[0])]\(rest)"
+                    }
+                    return edit
+                }
+                if again.contains(where: { lockedProfileEdit($0.key, $0.value ?? .null) }) {
+                    messages[Self.profilesKey] = Self.heldValueNotice
+                    again = []
+                }
+            } else if !movesProfiles(key, retry.edits.first?.value ?? .null) {
+                messages[Self.profilesKey] = Self.profileGoneNotice
+            }
+            // Queued again before the old keys finish, so a key written
+            // again where it was keeps its value shown.
+            if !again.isEmpty { enqueue(again) }
+            for edit in retry.edits { finish(edit.key, nil) }
         }
     }
 
@@ -1132,6 +1309,12 @@ final class SettingsModel {
     /// the list); a written one ends with the next configuration applied.
     var profilesChanging: Bool {
         addition != nil || pending.contains { movesProfiles($0.key, $0.value) }
+    }
+
+    /// Whether an edit of a profile's key is queued or running, or waits
+    /// to be written again (``awaitProfileRetry(_:name:)``, #549).
+    var profileEditsUnwritten: Bool {
+        inFlight.keys.contains { Self.profilePath($0) != nil }
     }
 
     /// Whether `value` (`.null` for a removal) at `key` deletes a profile:
