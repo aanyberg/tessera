@@ -41,8 +41,9 @@
 //! had that deadline (searched again, it would be the same run). Above the
 //! floor, a piece late the first time is always searched again, so one
 //! stall does not skip a row (#378). A segment a halved limit cuts inside its line can lose
-//! a match across the cut, so it counts as skipped too: either way the
-//! status says lines were skipped ([`SearchStatus::lines_skipped`]). A
+//! a match across the cut (a match touching such a cut is dropped, so a
+//! run is not counted in parts, #531), so it counts as skipped too: either
+//! way the status says lines were skipped ([`SearchStatus::lines_skipped`]). A
 //! later piece of a step stops at the budget and is searched first in the
 //! next step. A piece's matches reach the chunk's sink only once it has
 //! run to its end (or been skipped), so a piece searched again is never
@@ -153,8 +154,9 @@ pub struct SearchStatus {
     /// Some lines were too slow to search whole with this query: one row
     /// of at most [`MIN_PIECE_BYTES`] of text took over
     /// `max(4 x budget, `[`LINE_TIME_LIMIT`]`)` and was skipped, or a line was cut into pieces finer than the full
-    /// limit cuts (a match across such a cut is not found). Matches there
-    /// may be missing from the count. Clears once those lines are gone.
+    /// limit cuts (a match across or touching such a cut is not found, so
+    /// a run is not counted in parts, #531). Matches there may be missing
+    /// from the count. Clears once those lines are gone.
     pub lines_skipped: bool,
 }
 
@@ -2393,6 +2395,7 @@ mod tests {
                 // The most a step took over its deadline and longest run.
                 let mut longest_over = Duration::ZERO;
                 let mut steps = 0;
+                let mut pieces_run = 0;
                 let started = Instant::now();
                 let status = loop {
                     let step = Instant::now();
@@ -2400,6 +2403,7 @@ mod tests {
                     let took = step.elapsed();
                     steps += 1;
                     let pieces = search.take_pieces();
+                    pieces_run += pieces.len();
                     if budget.is_zero() {
                         assert!(
                             pieces.len() <= 1,
@@ -2461,9 +2465,12 @@ mod tests {
                 if pattern == NO_MATCH {
                     assert_eq!(status.matches, 0, "{name}: {status:?}");
                 } else if pattern != COSTLY_RUN {
+                    // A one-cell match touching a halved cut is dropped
+                    // (#531): at most two per cut, fewer than two per piece.
                     assert!(
-                        skips > 0 || status.matches == cells,
-                        "{name}, budget {budget:?}: {status:?}, {cells} cells"
+                        skips > 0 || status.matches + 2 * pieces_run >= cells,
+                        "{name}, budget {budget:?}: {status:?}, {cells} cells, \
+                         {pieces_run} pieces"
                     );
                 }
                 assert!(status.matches <= cells, "{name}: {status:?}, counted twice");
@@ -2530,15 +2537,15 @@ mod tests {
         let mut search = SearchState::default();
         search.start(r"\w*X\b|\w", REGEX).unwrap();
         let mut steps = 0;
+        let mut pieces = 0;
         let mut limits = vec![PieceLimit::FULL];
         let status = loop {
             let status = search.step(&shared, Duration::ZERO);
             steps += 1;
             assert!(steps < 1_000, "no end: {status:?}");
-            assert!(
-                search.take_pieces().len() <= 1,
-                "step {steps} ran two pieces"
-            );
+            let ran = search.take_pieces().len();
+            assert!(ran <= 1, "step {steps} ran two pieces");
+            pieces += ran;
             let limit = search.active.as_ref().unwrap().limit;
             if limits.last() != Some(&limit) {
                 limits.push(limit);
@@ -2560,7 +2567,12 @@ mod tests {
         );
         assert!(status.matches <= cells, "{status:?}: counted twice");
         let skips = search.active.as_ref().unwrap().skips;
-        assert!(skips > 0 || status.matches == cells, "{status:?}");
+        // A one-cell match touching a halved cut is dropped (#531): at
+        // most two per cut, so fewer than two per piece run.
+        assert!(
+            skips > 0 || (status.matches < cells && status.matches + 2 * pieces >= cells),
+            "{status:?}, {pieces} pieces"
+        );
         // The halved limit cut the line: the status says so.
         assert!(status.lines_skipped, "{status:?}");
         // A new query starts at the full size again.
@@ -3141,6 +3153,37 @@ mod tests {
         search.active.as_mut().unwrap().limit = PieceLimit::FULL;
         run(&mut search, shared);
         search
+    }
+
+    /// #531: a variable-length match across a cut finer than the full
+    /// limit is dropped, not counted (and copied) as one fragment per
+    /// piece. Each line holds `12`, a run of 600 digits that the floor's
+    /// one-row pieces cut 15 times, and `345`: on main the halved search
+    /// counted every row's part of the run.
+    #[test]
+    fn a_match_split_by_a_halved_cut_is_dropped_not_counted_in_parts() {
+        let mut term = Terminal::new(6, 40);
+        let line = format!("a 12 b {} c 345 d", "7".repeat(600));
+        term.advance(format!("{line}\r\n{line}").as_bytes());
+        let shared = Shared::new(term);
+        let mut whole = SearchState::default();
+        whole.start("[0-9]+", REGEX).unwrap();
+        let status = run(&mut whole, &shared);
+        assert_eq!((status.matches, status.lines_skipped), (6, false));
+        let whole_text = whole.matches_text(&shared).text;
+        let mut halved = SearchState::default();
+        halved.start("[0-9]+", REGEX).unwrap();
+        halved.active.as_mut().unwrap().limit = floor(40);
+        let status = run(&mut halved, &shared);
+        assert!(status.lines_skipped, "{status:?}");
+        assert!(status.matches <= 6, "{status:?}");
+        // The runs inside one piece stay; no part of the long run is
+        // reported or copied.
+        let text = halved.matches_text(&shared).text;
+        assert_eq!(text, "12\n345\n12\n345", "{status:?}");
+        for part in text.split('\n') {
+            assert!(whole_text.split('\n').any(|m| m == part), "{part:?}");
+        }
     }
 
     /// #368 (M10): the skipped mark is the skipped segment's end, so

@@ -204,7 +204,9 @@ impl Query {
     /// matches with three changes: an empty match is skipped; a match is
     /// widened to whole cells (a boundary inside a grapheme cluster takes
     /// the cluster's cell); and a match that, widened, starts before the
-    /// previous one ends is dropped.
+    /// previous one ends is dropped. In a piece [`scan_piece`] cut finer
+    /// than [`PieceLimit::FULL`], a match touching such a cut is dropped
+    /// too.
     pub fn find(
         &self,
         haystack: &Haystack,
@@ -276,6 +278,13 @@ impl Query {
             }
             let end = (last.row, last.col + last.width);
             previous_end = Some(end);
+            if (haystack.drop_at_start && m.start() == haystack.start)
+                || (haystack.drop_at_end && m.end() == haystack.end)
+            {
+                // A part of a match the cut split (#531): dropped, its
+                // cells still taken so no later match starts inside them.
+                continue;
+            }
             let flow = found(SegmentMatch {
                 start_row: first.row,
                 start_col: first.col,
@@ -364,6 +373,12 @@ pub struct Haystack {
     end: usize,
     /// True when text past [`MAX_HAYSTACK_BYTES`] was left out.
     capped: bool,
+    /// A match starting at `start` is dropped: the cut above is one the
+    /// full limit would not make ([`scan_piece`], #531).
+    drop_at_start: bool,
+    /// A match ending at `end` is dropped: the cut below is one the full
+    /// limit would not make ([`scan_piece`], #531).
+    drop_at_end: bool,
     /// Cells the last fill took in, spacers and padding included.
     cells: usize,
     /// Segments, kept for [`scan`] to reuse.
@@ -411,6 +426,8 @@ impl Haystack {
         self.text.clear();
         self.spans.clear();
         self.capped = false;
+        self.drop_at_start = false;
+        self.drop_at_end = false;
         if continues_above {
             self.text.push(CUT);
         }
@@ -724,6 +741,10 @@ pub struct Piece {
     from: (usize, usize),
     /// The piece starts behind a cut marker.
     above: bool,
+    /// A piece before this one in its segment was cut at a limit below
+    /// [`PieceLimit::FULL`], so the cut above this piece is one the full
+    /// limit would not make.
+    fine: bool,
 }
 
 impl Piece {
@@ -735,6 +756,7 @@ impl Piece {
             segment,
             from: (0, 0),
             above: segment.above,
+            fine: false,
         }
     }
 
@@ -776,6 +798,14 @@ pub struct PieceScan {
 /// `\w*X\b|\w` costs about a millisecond per match on 64 KiB of combining
 /// marks. A caller bounds it with the deadline and, when a piece times
 /// out, retries it at a [halved](PieceLimit::halved) limit or skips it.
+///
+/// A cut that a limit below [`PieceLimit::FULL`] makes, or any later cut of
+/// the same segment (they no longer fall where the full limit cuts), would
+/// split a variable-length match the full limit finds whole into parts on
+/// each side, each a match of its own (`[0-9]+` on a long run of digits).
+/// A match that starts right behind such a cut or ends right at it is
+/// therefore not handed to `found` (#531): it may be such a part. The
+/// caller reports such a segment as not searched whole.
 pub fn scan_piece(
     query: &Query,
     rows: &[Line],
@@ -789,6 +819,11 @@ pub fn scan_piece(
     let rows = &rows[segment.start..segment.end];
     let base = piece.first + segment.start as u64;
     let stopped = haystack.fill_from(rows, piece.from, limit, piece.above, segment.below);
+    // A cut the full limit would not make splits a match it would find
+    // whole into parts on either side: those are dropped (#531).
+    let below_fine = piece.fine || limit != PieceLimit::FULL;
+    haystack.drop_at_start = piece.fine;
+    haystack.drop_at_end = stopped.is_some() && below_fine;
     let flow = query.find_until(haystack, deadline, |m| {
         found(Match {
             start_line: base + u64::from(m.start_row),
@@ -802,6 +837,7 @@ pub fn scan_piece(
         next: stopped.map(|from| Piece {
             from,
             above: true,
+            fine: below_fine,
             ..piece
         }),
         timed_out: flow.is_none(),
@@ -1082,6 +1118,27 @@ mod tests {
             check_pieces(&rows, above, below, limit(bytes, cells));
         }
 
+        /// #531: piece by piece at a limit below the full one, every match
+        /// of a pattern whose matches are maximal runs is a match of the
+        /// whole segment: a run the cuts split is dropped, not reported in
+        /// parts.
+        #[test]
+        fn pieces_below_the_full_limit_report_no_part_of_a_match(
+            cols in 2u16..12,
+            text in "[0-9a ]{0,90}",
+            bytes in 1usize..24,
+            cells in 1usize..16,
+            word in any::<bool>(),
+        ) {
+            let rows = rows(cols, &text);
+            let pattern = if word { r"\w+" } else { "[0-9]+" };
+            let whole = piece_matches(&rows, pattern, PieceLimit::FULL);
+            let pieces = piece_matches(&rows, pattern, limit(bytes, cells));
+            for m in &pieces {
+                prop_assert!(whole.contains(m), "{m:?} not in {whole:?} ({text:?})");
+            }
+        }
+
         /// The run-length cell map gives every byte the cell the per-cell
         /// map gives it.
         #[test]
@@ -1115,6 +1172,57 @@ mod tests {
                 check(&rows, true, false);
             }
         }
+    }
+
+    /// The matches of `pattern` (a regex) in `rows`, taken as one segment
+    /// and searched piece by piece at `at`.
+    fn piece_matches(rows: &[Line], pattern: &str, at: PieceLimit) -> Vec<Match> {
+        let options = QueryOptions {
+            regex: true,
+            case_sensitive: true,
+        };
+        let query = Query::new(pattern, options).unwrap().unwrap();
+        let segment = Segment {
+            start: 0,
+            end: rows.len(),
+            above: false,
+            below: false,
+        };
+        let mut haystack = Haystack::new();
+        let mut found = Vec::new();
+        let mut piece = Piece::first(0, segment);
+        loop {
+            let scan = scan_piece(&query, rows, piece, at, None, &mut haystack, |m| {
+                found.push(m);
+                ControlFlow::Continue(())
+            });
+            let Some(next) = scan.next else {
+                return found;
+            };
+            piece = next;
+        }
+    }
+
+    /// #531: the full limit's own cuts drop nothing (they are the ones the
+    /// whole-line count is made of): `a+` on a segment of 66 Ki `a` finds
+    /// two matches, one up to the 64 KiB cut and one behind it; one piece at
+    /// half the limit drops the match touching its cut and the parts
+    /// behind it.
+    #[test]
+    fn the_full_limit_keeps_a_match_at_its_cut() {
+        let rows = long_line(2048, 33, "a", 1);
+        let whole = piece_matches(&rows, "a+", PieceLimit::FULL);
+        assert_eq!(whole.len(), 2, "{whole:?}");
+        let half = PieceLimit::FULL.halved(2048).unwrap();
+        let halved = piece_matches(&rows, "a+", half);
+        assert!(halved.is_empty(), "{halved:?}");
+        // The run ends in `XYZ`: `a+X` matches once, behind the last cut.
+        // That match starts at the cut, so it is dropped only when the cut
+        // is finer than the full limit's.
+        let whole = piece_matches(&rows, "a+X", PieceLimit::FULL);
+        assert_eq!(whole.len(), 1, "{whole:?}");
+        let halved = piece_matches(&rows, "a+X", half);
+        assert!(halved.is_empty(), "{halved:?}");
     }
 
     /// Halving goes down to one row and [`MIN_PIECE_BYTES`], each step at

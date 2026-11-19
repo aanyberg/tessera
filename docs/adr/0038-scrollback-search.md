@@ -1,7 +1,8 @@
 # ADR 0038: Scrollback search: stepped scan, caps, lock budget
 
 **Status:** accepted · 2026-11-06 · amended 2026-11-07 (#46b: per-piece step bound, find bar) · amended
-2026-11-08 (#331, #318: a ceiling per piece, lines skipped, stale truncation, reveal)
+2026-11-08 (#331, #318: a ceiling per piece, lines skipped, stale truncation, reveal) · amended
+2026-11-19 (#531: no parts of a match split by a halved cut)
 
 ## Context
 
@@ -109,9 +110,20 @@ a quarter of a dense literal search:
   lines are gone. "Line" here is one row, or 1 KiB of it. A row whose
   single regex run outlasts that deadline is skipped the same way.
 - Halved pieces cut a logical line inside where the full limit would not,
-  and a match across such a cut is not found. A segment cut at a halved
-  limit therefore counts as skipped too (`lines_skipped`), so the count is
-  never short without saying so.
+  and a match across such a cut is not found. A variable-length pattern
+  would instead match on each side of it (`[0-9]+` on a run of digits once
+  per piece), so a match that starts right behind such a cut or ends right
+  at it is dropped, as is one at every later cut of that segment, which no
+  longer falls where the full limit cuts (amended in #531: before, one run
+  counted, and copied, as one fragment per piece). A match the full limit
+  finds whole inside one halved piece is kept; one that merely touches the
+  cut is lost with the parts. A segment cut at a halved limit therefore
+  counts as skipped too (`lines_skipped`), so the count is never short
+  without saying so. It is a lower bound for patterns whose matches are
+  maximal runs (`[0-9]+`, `\w+`); a pattern whose text behind a dropped
+  part matches differently on its own (`x\d*|\d` behind a cut inside
+  `x12345`) can still report matches the whole line would not, with
+  `lines_skipped` set.
 - A later piece of the step gets the step's own deadline; one that runs
   out is not halved but runs first in the next step, at a first piece's
   deadline.
