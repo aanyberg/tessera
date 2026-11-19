@@ -201,12 +201,33 @@ struct Prepared {
     options: SpawnOptions,
 }
 
+/// How a case loads the script.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Route {
+    /// Through the injection (`Injection::for_bash`, `for_shell`).
+    Injected,
+    /// By hand: the shell starts with the case's arguments and nothing
+    /// injected, and a startup file sources the script (see [`BY_HAND`]).
+    ByHand,
+}
+
+/// What a `.bashrc` adds to load the bash script by hand, as the script's
+/// header tells users to.
+const BY_HAND: &str =
+    "export TESSERA_SHELL_INTEGRATION=enabled\n. \"$TESSERA_TEST_SCRIPTS/bash/tessera.bash\"\n";
+
+/// [`prepare_via`] through the injection.
+fn prepare(case: &Case<'_>) -> Prepared {
+    prepare_via(case, Route::Injected)
+}
+
 /// Materialises the scripts, writes the case's startup files and builds the
-/// spawn options: the case's program with the injection applied, then
+/// spawn options: the case's program with the injection applied (on
+/// [`Route::Injected`]), then
 /// `case.env` (which wins over the injection; `$SCRIPTS` in a value is the
 /// scripts directory). `$TESSERA_TEST_SCRIPTS` is
 /// the scripts directory, for startup files that source a script.
-fn prepare(case: &Case<'_>) -> Prepared {
+fn prepare_via(case: &Case<'_>, route: Route) -> Prepared {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().canonicalize().unwrap();
     // Like the real location, with a space in it.
@@ -256,9 +277,10 @@ fn prepare(case: &Case<'_>) -> Prepared {
     };
     // Tessera does not inject bash yet; its rules are kept in `for_bash`,
     // which these tests use so the bash script stays tested.
-    let injection = match case.shell {
-        Shell::Bash => Injection::for_bash(&scripts, launch, user_env),
-        _ => Injection::for_shell(case.shell, &scripts, launch, user_env),
+    let injection = match (route, case.shell) {
+        (Route::ByHand, _) => Injection::default(),
+        (Route::Injected, Shell::Bash) => Injection::for_bash(&scripts, launch, user_env),
+        (Route::Injected, _) => Injection::for_shell(case.shell, &scripts, launch, user_env),
     };
 
     let mut options = SpawnOptions::command(&case.program, "live")
@@ -355,15 +377,22 @@ fn run(case: &Case<'_>) -> Observed {
     run_steps(case, &steps)
 }
 
-/// Runs the case, typing each input once its wait is over.
+/// Runs the case through the injection, typing each input once its wait
+/// is over.
 fn run_steps(case: &Case<'_>, steps: &[(Wait, &str)]) -> Observed {
-    let prepared = prepare(case);
+    run_steps_via(case, steps, Route::Injected)
+}
+
+/// [`run_steps`] on `route`.
+fn run_steps_via(case: &Case<'_>, steps: &[(Wait, &str)], route: Route) -> Observed {
+    let prepared = prepare_via(case, route);
     assert!(
-        prepared
-            .options
-            .env
-            .iter()
-            .any(|(key, _)| key == "TESSERA_SHELL_INTEGRATION"),
+        route == Route::ByHand
+            || prepared
+                .options
+                .env
+                .iter()
+                .any(|(key, _)| key == "TESSERA_SHELL_INTEGRATION"),
         "nothing injected"
     );
     let (mut pty, events) = NativePty::spawn(&prepared.options).expect("spawn the shell");
@@ -2217,42 +2246,58 @@ fw_preexec() {
 PROMPT_COMMAND=fw_precmd
 trap 'fw_preexec "$_"' DEBUG
 "#;
+    // Also with the script sourced by hand after the framework's setup
+    // (its trap was hidden from the script then, #542).
+    let by_hand = format!("{bashrc}{BY_HAND}");
     for bash in bashes() {
-        for integrated in [false, true] {
+        for (how, route) in [
+            ("plain", None),
+            ("injected", Some(Route::Injected)),
+            ("by hand", Some(Route::ByHand)),
+        ] {
             let mut env = vec![];
-            if !integrated {
+            if route.is_none() {
                 env.push(("TESSERA_SHELL_INTEGRATION", "0"));
             }
-            let output = if integrated {
-                run_steps(
-                    &Case {
-                        shell: Shell::Bash,
-                        program: bash.clone(),
-                        args: Some(&["-i"]),
-                        files: &[(".bashrc", bashrc)],
-                        env: &env,
+            let case = Case {
+                shell: Shell::Bash,
+                program: bash.clone(),
+                args: Some(&["-i"]),
+                files: &[(
+                    ".bashrc",
+                    if route == Some(Route::ByHand) {
+                        &by_hand
+                    } else {
+                        bashrc
                     },
-                    &[
-                        (Wait::Prompts(1), "false\r"),
-                        (Wait::Prompts(2), "echo two\r"),
-                        (Wait::Prompts(3), "exit\r"),
-                    ],
-                )
-                .output
-            } else {
-                run_raw(
-                    &Case {
-                        shell: Shell::Bash,
-                        program: bash.clone(),
-                        args: Some(&["-i"]),
-                        files: &[(".bashrc", bashrc)],
-                        env: &env,
-                    },
-                    "false\recho two\rexit\r",
-                )
+                )],
+                env: &env,
+            };
+            let output = match route {
+                Some(route) => {
+                    let observed = run_steps_via(
+                        &case,
+                        &[
+                            (Wait::Prompts(1), "false\r"),
+                            (Wait::Prompts(2), "echo two\r"),
+                            (Wait::Prompts(3), "exit\r"),
+                        ],
+                        route,
+                    );
+                    let got = marks(observed.payloads.iter().map(Vec::as_slice));
+                    assert_eq!(
+                        got,
+                        marks_for(&[1, 0]),
+                        "{} {how}: {:?}",
+                        bash.display(),
+                        String::from_utf8_lossy(&observed.output)
+                    );
+                    observed.output
+                }
+                None => run_raw(&case, "false\recho two\rexit\r"),
             };
             let text = String::from_utf8_lossy(&output);
-            let what = format!("{} integrated={integrated}", bash.display());
+            let what = format!("{} {how}", bash.display());
             assert!(
                 text.contains("started-by=[false] status=[0]\r\n"),
                 "{what}: {text:?}"
@@ -2261,6 +2306,305 @@ trap 'fw_preexec "$_"' DEBUG
                 text.contains("started-by=[echo two] status=[1]\r\n"),
                 "{what}: {text:?}"
             );
+        }
+    }
+}
+
+/// Where a case's own DEBUG trap comes from.
+struct Placement {
+    what: &'static str,
+    route: Route,
+    bashrc: String,
+    /// Whether the trap is typed at the first prompt (before the inputs).
+    typed: bool,
+}
+
+/// A `.bashrc` that sets `trap` before or after the line that loads the
+/// script by hand, a `.bashrc` read through the injection that sets it, and
+/// the trap typed at the first prompt (on either route).
+fn trap_placements(trap: &str) -> [Placement; 5] {
+    let line = format!("{trap}\n");
+    [
+        Placement {
+            what: "by hand, set before",
+            route: Route::ByHand,
+            bashrc: format!("{line}{BY_HAND}"),
+            typed: false,
+        },
+        Placement {
+            what: "by hand, set after",
+            route: Route::ByHand,
+            bashrc: format!("{BY_HAND}{line}"),
+            typed: false,
+        },
+        Placement {
+            what: "by hand, set at a prompt",
+            route: Route::ByHand,
+            bashrc: BY_HAND.into(),
+            typed: true,
+        },
+        Placement {
+            what: "injected, set in .bashrc",
+            route: Route::Injected,
+            bashrc: line,
+            typed: false,
+        },
+        Placement {
+            what: "injected, set at a prompt",
+            route: Route::Injected,
+            bashrc: String::new(),
+            typed: true,
+        },
+    ]
+}
+
+/// Runs `bash` with `place`'s `.bashrc`, typing `inputs` one prompt at a
+/// time (after `trap` when the placement types it).
+fn run_placed(bash: &std::path::Path, place: &Placement, trap: &str, inputs: &[&str]) -> Observed {
+    let typed = format!("{trap}\r");
+    let steps: Vec<(Wait, &str)> = place
+        .typed
+        .then_some(typed.as_str())
+        .into_iter()
+        .chain(inputs.iter().copied())
+        .enumerate()
+        .map(|(i, input)| (Wait::Prompts(i + 1), input))
+        .collect();
+    run_steps_via(
+        &Case {
+            shell: Shell::Bash,
+            program: bash.to_path_buf(),
+            args: Some(&["-i"]),
+            files: &[(".bashrc", &place.bashrc)],
+            env: &[],
+        },
+        &steps,
+        place.route,
+    )
+}
+
+/// A user's own DEBUG trap keeps running for the user's commands wherever
+/// it was set: before or after the line in `.bashrc` that sources the
+/// script by hand (where `trap -p DEBUG` in the sourced file shows
+/// nothing, #542), through the injection, or later at a prompt. The marks
+/// stay as they are without it. An empty line first (it fires no trap, so
+/// ours is still there at the next prompt) changes nothing. The trap has
+/// quotes in it, which `trap -p` escapes.
+#[test]
+fn bash_users_debug_trap_keeps_running_wherever_it_was_set() {
+    // Adds `$BASH_COMMAND` joined with an empty string.
+    let trap = r#"trap 'seen+=("$BASH_COMMAND"'\'''\'')' DEBUG"#;
+    let probe = "echo \"trap=[$(trap -p DEBUG)]\"; \
+                 echo \"seen=$(printf '%s\\n' \"${seen[@]}\" | grep -c '^echo first$')\"\r";
+    for bash in bashes() {
+        for place in trap_placements(trap) {
+            let observed = run_placed(
+                &bash,
+                &place,
+                trap,
+                &["\r", "echo first\r", probe, "exit\r"],
+            );
+            let text = String::from_utf8_lossy(&observed.output);
+            let what = format!("{} {}", bash.display(), place.what);
+            assert!(
+                text.contains(&format!("trap=[{}]", trap.replace("trap '", "trap -- '"))),
+                "{what}: {text:?}"
+            );
+            assert!(
+                text.contains("seen=1\r\n"),
+                "{what}: the user's trap missed a command: {text:?}"
+            );
+            let got = marks(observed.payloads.iter().map(Vec::as_slice));
+            let mut want = Vec::new();
+            if place.typed {
+                want.extend(command_marks(true, Some(0)));
+            }
+            // The empty line: a bare D.
+            want.extend(command_marks(false, None));
+            want.extend(command_marks(true, Some(0)));
+            want.extend(command_marks(true, Some(0)));
+            want.extend([Mark::PromptStart, Mark::CommandStart, Mark::OutputStart]);
+            assert_eq!(got, want, "{what}: {text:?}");
+        }
+    }
+}
+
+/// A guard DEBUG trap (`extdebug`, a non-zero status skips the command)
+/// that refuses `rm` keeps refusing it wherever it was set, and every
+/// other command still runs (#542: hand-sourced, the guard was gone).
+#[test]
+fn bash_guard_debug_trap_keeps_guarding_wherever_it_was_set() {
+    let trap = r#"shopt -s extdebug; trap '[[ "$BASH_COMMAND" != rm\ * ]]' DEBUG"#;
+    let inputs = [
+        "touch kept\r",
+        "rm kept\r",
+        "[[ -e kept ]] && echo still-$((40+2))\r",
+        "exit\r",
+    ];
+    for bash in bashes() {
+        for place in trap_placements(trap) {
+            let observed = run_placed(&bash, &place, trap, &inputs);
+            let text = String::from_utf8_lossy(&observed.output);
+            let what = format!("{} {}", bash.display(), place.what);
+            assert!(text.contains("still-42\r\n"), "{what}: {text:?}");
+            let got = marks(observed.payloads.iter().map(Vec::as_slice));
+            // The refused `rm` ends with 0, as in a plain bash (the status of
+            // a skipped command).
+            let commands = inputs.len() - 1 + usize::from(place.typed);
+            assert_eq!(got, marks_for(&vec![0; commands]), "{what}: {text:?}");
+        }
+    }
+}
+
+/// What bash prints when the hooks feed it broken shell text.
+const SHELL_ERRORS: [&str; 4] = [
+    "unexpected EOF",
+    "syntax error",
+    "command not found",
+    "bad substitution",
+];
+
+/// A DEBUG trap that prints keeps running wherever it was set, also with
+/// `set -T` or extdebug (where it runs inside the hooks' read of the trap
+/// too), and the hooks never take what it printed for the trap (#542: 5.3
+/// read the trap in this shell, the user's trap printed into the read, and
+/// the script installed and ran the result). An empty line first (no
+/// command fires the trap) changes nothing.
+#[test]
+fn bash_printing_debug_trap_keeps_running_wherever_it_was_set() {
+    let base = r#"trap 'printf "[t:%s]" "${BASH_COMMAND%% *}"' DEBUG"#;
+    let shown = base.replace("trap '", "trap -- '");
+    let inputs = ["\r", "echo first\r", "trap -p DEBUG\r", "exit\r"];
+    for bash in bashes() {
+        for prefix in ["", "set -T; ", "shopt -s extdebug; "] {
+            let trap = format!("{prefix}{base}");
+            for place in trap_placements(&trap) {
+                let observed = run_placed(&bash, &place, &trap, &inputs);
+                let text = String::from_utf8_lossy(&observed.output);
+                let what = format!("{} {} {trap}", bash.display(), place.what);
+                for error in SHELL_ERRORS {
+                    assert!(!text.contains(error), "{what}: {text:?}");
+                }
+                assert!(
+                    text.contains(&format!("[t:trap]{shown}\r\n")),
+                    "{what}: the trap was not kept: {text:?}"
+                );
+                assert!(
+                    text.contains("[t:echo]first\r\n"),
+                    "{what}: the user's trap missed a command: {text:?}"
+                );
+                let got = marks(observed.payloads.iter().map(Vec::as_slice));
+                let mut want = Vec::new();
+                if place.typed {
+                    want.extend(command_marks(true, Some(0)));
+                }
+                // The empty line: a bare D.
+                want.extend(command_marks(false, None));
+                want.extend(marks_for(&[0, 0]));
+                assert_eq!(got, want, "{what}: {text:?}");
+            }
+        }
+    }
+}
+
+/// A DEBUG trap that prints the directory's name in a directory whose name
+/// is shell code with a stray quote: the hooks never run the name, print no
+/// errors and keep the user's trap, also with `set -T` (the trap runs inside
+/// the hooks' read) and when what it prints starts as `trap -p` output does.
+#[test]
+fn bash_debug_trap_printing_the_directory_runs_no_code_from_its_name() {
+    let title = r#"trap 'printf "\033]0;%s\007" "${PWD##*/}"' DEBUG"#;
+    let raw = r#"trap 'printf %s "${PWD##*/}"' DEBUG"#;
+    let cases = [
+        (
+            "x;touch PWNED;'",
+            "",
+            title,
+            "\u{1b}]0;x;touch PWNED;'\u{7}",
+        ),
+        (
+            "x;touch PWNED;'",
+            "set -T; ",
+            title,
+            "\u{1b}]0;x;touch PWNED;'\u{7}",
+        ),
+        (
+            "trap -- 'touch PWNED;'",
+            "set -T; ",
+            raw,
+            "trap -- 'touch PWNED;'",
+        ),
+    ];
+    let inputs = [
+        "echo first\r",
+        "trap -p DEBUG\r",
+        "[[ -e PWNED ]] || echo no-$((1+1))-pwned\r",
+        "exit\r",
+    ];
+    for bash in bashes() {
+        for (dir, prefix, base, printed) in cases {
+            let trap = format!("{prefix}{base}");
+            let shown = base.replace("trap '", "trap -- '");
+            let setup = format!("mkdir -p \"$HOME/{dir}\" && cd \"$HOME/{dir}\"\n");
+            for mut place in trap_placements(&trap) {
+                place.bashrc = format!("{setup}{}", place.bashrc);
+                let observed = run_placed(&bash, &place, &trap, &inputs);
+                let text = String::from_utf8_lossy(&observed.output);
+                let what = format!("{} {} [{dir}] {trap}", bash.display(), place.what);
+                for error in SHELL_ERRORS {
+                    assert!(!text.contains(error), "{what}: {text:?}");
+                }
+                assert!(
+                    text.contains("no-2-pwned\r\n"),
+                    "{what}: the name ran: {text:?}"
+                );
+                assert!(
+                    text.contains(&format!("{printed}{shown}\r\n")),
+                    "{what}: the trap was not kept: {text:?}"
+                );
+                assert!(
+                    text.contains(&format!("{printed}first\r\n")),
+                    "{what}: the user's trap missed a command: {text:?}"
+                );
+                let got = marks(observed.payloads.iter().map(Vec::as_slice));
+                let commands = inputs.len() - 1 + usize::from(place.typed);
+                assert_eq!(got, marks_for(&vec![0; commands]), "{what}: {text:?}");
+            }
+        }
+    }
+}
+
+/// A DEBUG trap whose status is not zero (a false `&&` list, as in a trap
+/// that acts on some commands only) runs for the user's commands without
+/// the hooks making it a failure (no ERR trap run for the status, no exit of
+/// a `set -e` shell), as in a plain bash (#542: the hooks ran it as a plain
+/// command, and ERR ran three times per command). A command failing inside
+/// the trap still runs ERR, as in a plain bash.
+#[test]
+fn bash_failing_debug_trap_status_is_no_hook_failure_and_keeps_a_set_e_shell() {
+    let trap =
+        r#"trap 'printf "[t:%s]" "${BASH_COMMAND%% *}"; [[ $BASH_COMMAND == ssh* ]] && :' DEBUG"#;
+    let inputs = ["echo first\r", "echo alive-$((1+1))\r", "exit\r"];
+    for bash in bashes() {
+        for setup in ["trap 'echo \"[ERR $?]\"' ERR\n", "set -e\n"] {
+            for mut place in trap_placements(trap) {
+                place.bashrc = format!("{setup}{}", place.bashrc);
+                let observed = run_placed(&bash, &place, trap, &inputs);
+                let text = String::from_utf8_lossy(&observed.output);
+                let what = format!("{} {} {setup:?}", bash.display(), place.what);
+                assert!(!text.contains("[ERR"), "{what}: {text:?}");
+                assert!(
+                    text.contains("alive-2\r\n"),
+                    "{what}: the shell exited: {text:?}"
+                );
+                assert!(
+                    text.contains("[t:echo]first\r\n"),
+                    "{what}: the user's trap missed a command: {text:?}"
+                );
+                let got = marks(observed.payloads.iter().map(Vec::as_slice));
+                let commands = inputs.len() - 1 + usize::from(place.typed);
+                assert_eq!(got, marks_for(&vec![0; commands]), "{what}: {text:?}");
+            }
         }
     }
 }

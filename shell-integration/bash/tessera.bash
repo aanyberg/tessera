@@ -31,8 +31,11 @@
 # with f as standard output): the C mark goes to copies of standard output
 # taken at the prompt, closed before the command runs.
 # The hooks run no ERR trap and do not exit a `set -e` shell, whatever IFS
-# holds. An existing DEBUG trap keeps running (after ours, and alone while a command
-# runs); with bash-preexec loaded, its hook lists are used instead. Once
+# holds. A DEBUG trap of the user's keeps running (after ours, and alone
+# while a command runs), whenever it was set: before or after this script
+# loaded, or at a prompt (it is read again at every prompt, a fork that
+# costs about 0.5 ms of CPU on bash 3.2 and 0.7 ms on 5.3). With
+# bash-preexec loaded, its hook lists are used instead. Once
 # installed, PROMPT_COMMAND is no longer exported (child shells have none of
 # our functions). An array PROMPT_COMMAND (bash 5.1+) is joined into one
 # string. Limits:
@@ -40,8 +43,13 @@
 #   prompt marks for one prompt (ours moves back to the end at the next);
 #   for an element the trap is not armed that time, so that command ends
 #   with a bare D and no C;
-# - a DEBUG trap set after this script loaded is replaced at the next
-#   prompt (by ours, chained to the trap found at load);
+# - a DEBUG trap set before this script loaded, in a login shell that loads
+#   it from PROMPT_COMMAND, is lost on bash 5.3 (bash hides it while it
+#   sources a file, and 5.3 keeps the trap the file set) and the first
+#   command has no C on 3.2 (which puts the hidden one back);
+# - with `set -T` or `shopt -s extdebug` a DEBUG trap that writes to
+#   descriptor 3 writes into the hooks' read of the trap, so it is not
+#   taken up (it stays as it was at the last prompt; a new one is dropped);
 # - a command line that only runs a subshell, `(cd x; make)`, does not fire
 #   the DEBUG trap: it ends with a bare D, no C (with `set -T` or `shopt -s
 #   extdebug` the subshell inherits the trap and sends the C itself, still
@@ -271,11 +279,51 @@ if [[ $- == *i* && -n "${TESSERA_SHELL_INTEGRATION-}" && "${TESSERA_SHELL_INTEGR
         builtin return "$status"
     }
 
-    # Next to last PROMPT_COMMAND entry: put the marks into PS1 (after any
-    # entry that rebuilds it). Keeps $? (for PS1) in _tessera_si_status.
-    # Third PROMPT_COMMAND entry, after the head installed the trap: give
-    # the user's entries the status of the user's command.
+    # Fourth PROMPT_COMMAND entry, after the head installed the trap: take
+    # the DEBUG trap the head found in its place (_tessera_si_found, in
+    # `trap -p` form) for the user's, unless it was ours (no command fired
+    # it since the last prompt: an empty line, Ctrl-C, a line that only
+    # runs a subshell), and give the user's entries the status of the
+    # user's command.
+    # Only exactly `trap -- '<text>' DEBUG` with no quote left in <text>
+    # once every `'\''` is gone is a trap (the head's read keeps what a
+    # trap prints out of it; anything printed before it would leave the
+    # opening quote bare). Anything else is never installed or run (it may
+    # hold a directory's name); the trap stays as it was.
     _tessera_si_pass() {
+        builtin local found="$_tessera_si_found"
+        case $found in
+            "") ;;
+            "trap -- '"*"' DEBUG")
+                found=${found#"trap -- '"}
+                found=${found%"' DEBUG"}
+                if [[ "${found//"'\\''"/}" == *"'"* ]]; then
+                    found=$_tessera_si_trap
+                else
+                    found=${found//"'\\''"/"'"}
+                fi
+                ;;
+            *) found=$_tessera_si_trap ;;
+        esac
+        if [[ "$found" != "$_tessera_si_trap" ]]; then
+            _tessera_si_prev_trap=$found
+            if [[ -n "$found" ]]; then
+                # It runs (for the user's command) with $? and $_ as they
+                # were when the trap started, as the first command of an
+                # `&&` list: a non-zero status it ends with (a false `&&`
+                # list in it) is not made a failure by the hooks (they run
+                # no ERR trap and do not exit a `set -e` shell) and is
+                # still the list's. A command failing inside the trap runs
+                # ERR as in a plain bash, and more often: the trap also
+                # runs during the prompt hooks.
+                # shellcheck disable=SC2016
+                _tessera_si_untrap='builtin trap -- "$_tessera_si_prev_trap" DEBUG
+_tessera_si_restore "${_tessera_si_saved[1]}" && _tessera_si_nop "${_tessera_si_saved[1]}"
+builtin eval "$_tessera_si_prev_trap" && _tessera_si_nop'
+            else
+                _tessera_si_untrap='builtin trap - DEBUG'
+            fi
+        fi
         builtin return "$_tessera_si_status"
     }
 
@@ -386,39 +434,41 @@ if [[ $- == *i* && -n "${TESSERA_SHELL_INTEGRATION-}" && "${TESSERA_SHELL_INTEGR
         # start at our tail instead of at the user's command. Unarmed, ours
         # only saves and restores $? and $_. While the command runs, ours
         # costs nothing.
-        _tessera_si_prev_trap=$(builtin trap -p DEBUG)
-        _tessera_si_prev_trap=${_tessera_si_prev_trap#"trap -- '"}
-        _tessera_si_prev_trap=${_tessera_si_prev_trap%"' DEBUG"}
-        _tessera_si_prev_trap=${_tessera_si_prev_trap//"'\\''"/"'"}
-        if [[ -n "$_tessera_si_prev_trap" ]]; then
-            # shellcheck disable=SC2016
-            _tessera_si_untrap='builtin trap -- "$_tessera_si_prev_trap" DEBUG'
-        else
-            _tessera_si_untrap='builtin trap - DEBUG'
-        fi
+        # The trap that was there is read by the head, at every prompt and
+        # at top level: bash hides the DEBUG trap from `trap -p` in a
+        # function and in a sourced file (this one, sourced from .bashrc),
+        # and the user may set one later (in .bashrc, or at a prompt).
+        # _tessera_si_untrap puts it back and runs it (see _tessera_si_pass).
+        _tessera_si_prev_trap=
+        _tessera_si_found=
+        _tessera_si_untrap='builtin trap - DEBUG'
         # The trap's own commands would change `$_` (the last argument of
         # the previous command) and, for the trap before ours, `$?`: it
-        # saves both first, restores them before that trap, and ends with
-        # _tessera_si_keep, whose argument `$_` becomes. Its status is 0
-        # unless the trap before ours decided otherwise: under `extdebug` a
-        # DEBUG trap returning non-zero skips the command (2: `return`).
+        # saves both first, restores them before that trap (in
+        # _tessera_si_untrap), and ends with _tessera_si_keep, whose
+        # argument `$_` becomes. Its status is 0 unless the trap before
+        # ours decided otherwise: under `extdebug` a DEBUG trap returning
+        # non-zero skips the command (2: `return`). That status is handed
+        # on through `&&` lists, as in the hooks (they make it no ERR
+        # trap and no exit under `set -e`).
         # The conditional commands are eval'd quoted strings (`eval ""` is
         # a no-op with status 0), not unquoted expansions: those would be
         # split with the user's IFS (`IFS=,` made `builtin eval ...` one
-        # word, "command not found").
+        # word, "command not found"). The text never changes
+        # (_tessera_si_pass compares the trap the head found with it).
         # shellcheck disable=SC2016
         _tessera_si_trap='_tessera_si_saved=("$?" "$_")
 builtin eval "${_tessera_si_armed:+_tessera_si_debug}"
-builtin eval "${_tessera_si_disarm:+$_tessera_si_untrap}"'
-        if [[ -n "$_tessera_si_prev_trap" ]]; then
-            # shellcheck disable=SC2016
-            _tessera_si_trap+='
-_tessera_si_restore "${_tessera_si_saved[1]}" && _tessera_si_nop "${_tessera_si_saved[1]}"
-builtin eval "${_tessera_si_disarm:+$_tessera_si_prev_trap}"'
-        fi
+builtin eval "${_tessera_si_disarm:+$_tessera_si_untrap}" && _tessera_si_nop
+_tessera_si_keep "${_tessera_si_saved[1]}" && _tessera_si_nop "${_tessera_si_saved[1]}"'
+        # The head reads the trap with a command substitution, a fork per
+        # prompt (about 0.5 ms of CPU on 3.2, 0.7 ms on 5.3). Not 5.3's `${ ...; }`: that runs in this
+        # shell, where the user's trap fires and prints into the read.
+        # Under `set -T` or extdebug the user's trap runs in the fork too,
+        # before `trap -p`: its standard output goes to /dev/null for that
+        # one hidden run, and only `trap -p` writes (through 3) to the read.
         # shellcheck disable=SC2016
-        _tessera_si_trap+='
-_tessera_si_keep "${_tessera_si_saved[1]}"'
+        _tessera_si_read_trap='_tessera_si_found=$( { builtin trap -p DEBUG >&3; } 3>&1 1>/dev/null )'
         # shellcheck disable=SC2016
         # The entries that hand on a non-zero status do it as the first
         # command of an `&&` list: a failing command there does not run an
@@ -427,7 +477,8 @@ _tessera_si_keep "${_tessera_si_saved[1]}"'
         # _tessera_si_nop, not `:`, ends the list: the trap takes any
         # command but ours for the user's (after _tessera_si_ret, `:` would
         # get the C).
-        _tessera_si_head=$'_tessera_si_precmd && _tessera_si_nop\nbuiltin trap -- "$_tessera_si_trap" DEBUG\n_tessera_si_pass && _tessera_si_nop\n'
+        _tessera_si_head=$'_tessera_si_precmd && _tessera_si_nop\n'$_tessera_si_read_trap$'\nbuiltin trap -- "$_tessera_si_trap" DEBUG\n_tessera_si_pass && _tessera_si_nop\n'
+        builtin unset _tessera_si_read_trap
         _tessera_si_tail=$'\n_tessera_si_prompt && _tessera_si_nop\n_tessera_si_ret && _tessera_si_nop'
         # Newline-separated: valid whatever the user's PROMPT_COMMAND ends
         # with (`;`, `&`, a newline or nothing).
@@ -442,9 +493,10 @@ _tessera_si_keep "${_tessera_si_saved[1]}"'
     builtin printf '\033]1337;ShellIntegrationVersion=1;shell=bash\007'
 
     # Loaded from PROMPT_COMMAND: this prompt's hooks have been skipped.
-    # Nothing may run at top level after the trap is armed. (bash 4 and
-    # later put a DEBUG trap set in a sourced file back on return when one
-    # was set before: then the first command has no C.)
+    # Nothing may run at top level after the trap is armed. (bash 3.2 puts
+    # a DEBUG trap that was set before the file was sourced back on return:
+    # then the first command has no C. 5.3 keeps ours, and the hidden one
+    # is lost: see the limits.)
     if [[ -n "${_tessera_si_late-}" ]]; then
         builtin unset _tessera_si_late
         _tessera_si_precmd && _tessera_si_nop
