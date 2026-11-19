@@ -620,6 +620,43 @@ final class TerminationSignalTests: XCTestCase {
     /// measured more than 20 s).
     private static let exitDeadline: Duration = .seconds(3)
 
+    /// #525: only a thread that spent the whole sample in TSan's fork
+    /// interceptor at an atfork handler counts as the #278 hang (stacks as
+    /// `sample` prints them, from the CI hang of run 44504840654).
+    func testOnlyAWholeSampleInTheForkInterceptorIsTheForkHang() {
+        let hung = [
+            "Call graph:",
+            "    696 Thread_139287   DispatchQueue_1: com.apple.main-thread  (serial)",
+            "    + 696 start  (in dyld) + 6076  [0x195ab2b98]",
+            "    +   696 AppDelegate.spawn(profile:)  (in Tessera) + 980  [0x1021c7598]  AppDelegate.swift:688",
+            "    +     696 wrap_fork  (in libclang_rt.tsan_osx_dynamic.dylib) + 128  [0x1042bd384]",
+            "    +       696 fork  (in libsystem_c.dylib) + 36  [0x195d06c40]",
+            "    +         696 libSystem_atfork_prepare  (in libSystem.B.dylib) + 44  [0x1a40c5184]",
+            "    +           696 _objc_atfork_prepare  (in libobjc.A.dylib) + 552  [0x195a75b3c]",
+            "    +             696 __ulock_wait2  (in libsystem_kernel.dylib) + 8  [0x195e1fa54]",
+            "    696 Thread_139316   DispatchQueue_2: com.apple.libdispatch-manager  (serial)",
+            "    + 696 start_wqthread  (in libsystem_pthread.dylib) + 8  [0x195e4eb74]",
+        ]
+        XCTAssertTrue(TerminationSignalChild.isForkHang(hung), "the CI hang")
+        // A fork that was only passing through during the sample.
+        let passing = hung.map { line in
+            line.contains("fork") || line.contains("ulock") ? line.replacingOccurrences(of: "696", with: "3") : line
+        }
+        XCTAssertFalse(TerminationSignalChild.isForkHang(passing), "a fork in progress")
+        // The fork interceptor without an atfork handler or TSan frame under it.
+        XCTAssertFalse(
+            TerminationSignalChild.isForkHang(hung.filter { !$0.contains("atfork") }), "no atfork handler")
+        // A main thread waiting in its run loop, with wrap_fork named only
+        // in the output the diagnosis also carries (never passed here).
+        let idle = [
+            "Call graph:",
+            "    696 Thread_139287   DispatchQueue_1: com.apple.main-thread  (serial)",
+            "    + 696 start  (in dyld) + 6076  [0x195ab2b98]",
+            "    +   696 mach_msg2_trap  (in libsystem_kernel.dylib) + 8  [0x195e10c34]",
+        ]
+        XCTAssertFalse(TerminationSignalChild.isForkHang(idle), "a plain wait")
+    }
+
     func testASignalEndsTheAppWithACloseSheetUp() async throws {
         for (signal, name) in [(SIGTERM, "SIGTERM"), (SIGINT, "SIGINT"), (SIGHUP, "SIGHUP")] {
             let result = try await run(.sheet, command: "sleep 100", signal: signal)
@@ -911,9 +948,50 @@ final class TerminationSignalTests: XCTestCase {
     ///
     /// Without a trigger, the child is expected to quit on its own once
     /// ready. `quitKeepsWindows` stands in for macOS's setting.
+    ///
+    /// A child whose session spawn hangs in Thread Sanitizer's fork hook
+    /// (#278, not fixed by design; the watchdog retries such a hang in the
+    /// test host, but this one is in the child, which never gets ready) is
+    /// started once more in a fresh directory: nothing was sent to it yet.
+    /// The hang is found by sampling a child still not ready after
+    /// ``forkHangProbe`` (that deadlock never resolves), so a retry costs
+    /// about 25 s and a test with one stays well within the default 120 s
+    /// allowance and the watchdog's 150 s. A second hang fails.
     private func run(
         _ mode: TerminationSignalChild.Mode, command: String, trigger: Trigger?, thenExpect expected: String? = nil,
         followedBy followUp: Int32? = nil, quitKeepsWindows: Bool? = nil
+    ) async throws -> Result {
+        func attempt() async throws -> Result {
+            try await runOnce(
+                mode, command: command, trigger: trigger, thenExpect: expected, followedBy: followUp,
+                quitKeepsWindows: quitKeepsWindows)
+        }
+        do {
+            return try await attempt()
+        } catch let hang as ChildForkHang {
+            print("TSan fork hang in the child (#278), retried once; the first try:\n\(hang)")
+            do {
+                return try await attempt()
+            } catch let again as ChildForkHang {
+                throw PollTimedOut(description: "the second try hung in TSan's fork hook too (#278): \(again)")
+            }
+        }
+    }
+
+    /// How long a loaded child may go without getting ready before it is
+    /// sampled for the #278 fork hang, and again after each such period
+    /// (a child gets ready in 11-16 s on CI).
+    private static let forkHangProbe: Duration = .seconds(20)
+
+    /// A child that never got ready because its main thread is stuck in
+    /// Thread Sanitizer's fork hook (#278).
+    private struct ChildForkHang: Error, CustomStringConvertible {
+        let description: String
+    }
+
+    private func runOnce(
+        _ mode: TerminationSignalChild.Mode, command: String, trigger: Trigger?, thenExpect expected: String?,
+        followedBy followUp: Int32?, quitKeepsWindows: Bool?
     ) async throws -> Result {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("tessera-441-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -939,6 +1017,8 @@ final class TerminationSignalTests: XCTestCase {
         let failure = dir.appendingPathComponent(TerminationSignalChild.errorFile)
         let stages = dir.appendingPathComponent(TerminationSignalChild.stagesFile)
         let launched = ContinuousClock.now
+        var nextProbe = Self.forkHangProbe
+        let inFork = { (graph: [String]?) in graph.map(TerminationSignalChild.isForkHang) ?? false }
         while !FileManager.default.fileExists(atPath: ready.path) {
             if let error = try? String(contentsOf: failure, encoding: .utf8) {
                 let diagnosis = TerminationSignalChild.diagnose(child, in: dir)
@@ -950,12 +1030,30 @@ final class TerminationSignalTests: XCTestCase {
             // runs as the plain app and would never get ready.
             let loaded = FileManager.default.fileExists(atPath: stages.path)
             let waited = ContinuousClock.now - launched
-            guard child.isRunning, waited < .seconds(60), loaded || waited < .seconds(20) else {
-                let what = !child.isRunning ? "exited" : loaded ? "never got ready" : "never loaded the test bundle"
-                let diagnosis = TerminationSignalChild.diagnose(child, in: dir)
+            let timedOut = !child.isRunning || waited >= .seconds(60) || (!loaded && waited >= .seconds(20))
+            var graph: [String]?
+            if !timedOut, loaded, waited >= nextProbe {
+                nextProbe += Self.forkHangProbe
+                graph = TerminationSignalChild.callGraph(of: child, in: dir)
+            }
+            let forkHang = loaded && child.isRunning && inFork(graph)
+            if timedOut || forkHang {
+                let what: String
+                if forkHang {
+                    what = "hung in TSan's fork hook"
+                } else if !child.isRunning {
+                    what = "exited"
+                } else {
+                    what = loaded ? "never got ready" : "never loaded the test bundle"
+                }
+                if child.isRunning, graph == nil { graph = TerminationSignalChild.callGraph(of: child, in: dir) }
+                let diagnosis = TerminationSignalChild.diagnose(child, in: dir, graph: graph)
+                let hung = forkHang || (loaded && child.isRunning && inFork(graph))
                 if child.isRunning { kill(child.processIdentifier, SIGKILL) }
                 child.waitUntilExit()
-                throw PollTimedOut(description: "the child \(what) after \(waited)\n\(diagnosis)")
+                let description = "the child \(what) after \(waited)\n\(diagnosis)"
+                if hung { throw ChildForkHang(description: description) }
+                throw PollTimedOut(description: description)
             }
             try await Task.sleep(for: .milliseconds(20))
         }
@@ -1205,8 +1303,9 @@ enum TerminationSignalChild {
 
     /// What the parent knows of a child that did not get ready: whether it
     /// runs or how it ended, the stages it reached, how it was launched,
-    /// its output and, while it runs, where its main thread is.
-    static func diagnose(_ child: Process, in dir: URL) -> String {
+    /// its output and, while it runs, where its threads are (from `graph`,
+    /// a ``callGraph(of:in:)`` already taken, or a new sample).
+    static func diagnose(_ child: Process, in dir: URL, graph: [String]? = nil) -> String {
         func read(_ name: String) -> String {
             (try? String(contentsOf: dir.appendingPathComponent(name), encoding: .utf8)) ?? "(none)"
         }
@@ -1219,26 +1318,62 @@ enum TerminationSignalChild {
             read(launchFile),
             "output (tail):\n\(read("output.log").suffix(2000))",
         ]
-        if child.isRunning {
-            let sample = Process()
-            sample.executableURL = URL(fileURLWithPath: "/usr/bin/sample")
-            let file = dir.appendingPathComponent("sample.txt")
-            sample.arguments = ["\(child.processIdentifier)", "1", "-mayDie", "-file", file.path]
-            sample.standardOutput = FileHandle.nullDevice
-            sample.standardError = FileHandle.nullDevice
-            if (try? sample.run()) != nil { sample.waitUntilExit() }
-            let text = read("sample.txt").split(separator: "\n", omittingEmptySubsequences: false)
-            // Every thread's stack: a stalled launch can sit deeper than the
-            // first screenful, or on another thread than the main one.
-            let graph = text.drop { !$0.contains("Call graph:") }
-                .prefix { !$0.contains("Total number in stack") }
-                .prefix(1000)
+        if let graph = graph ?? (child.isRunning ? callGraph(of: child, in: dir) : nil) {
+            let text = read(sampleFile).split(separator: "\n", omittingEmptySubsequences: false)
             let images = text.drop { !$0.contains("Binary Images:") }
                 .filter { $0.contains("XCTest") || $0.contains("Inject") || $0.contains("tsan") }
             lines.append("threads:\n\(graph.joined(separator: "\n"))")
             lines.append("XCTest images:\n\(images.joined(separator: "\n"))")
         }
         return lines.joined(separator: "\n")
+    }
+
+    private static let sampleFile = "sample.txt"
+
+    /// Samples the running `child` for a second (into ``sampleFile``) and
+    /// returns every thread's stack: a stalled launch can sit deeper than
+    /// the first screenful, or on another thread than the main one.
+    static func callGraph(of child: Process, in dir: URL) -> [String] {
+        let sample = Process()
+        sample.executableURL = URL(fileURLWithPath: "/usr/bin/sample")
+        let file = dir.appendingPathComponent(sampleFile)
+        try? FileManager.default.removeItem(at: file)
+        sample.arguments = ["\(child.processIdentifier)", "1", "-mayDie", "-file", file.path]
+        sample.standardOutput = FileHandle.nullDevice
+        sample.standardError = FileHandle.nullDevice
+        if (try? sample.run()) != nil { sample.waitUntilExit() }
+        let text = ((try? String(contentsOf: file, encoding: .utf8)) ?? "")
+            .split(separator: "\n", omittingEmptySubsequences: false)
+        return text.drop { !$0.contains("Call graph:") }
+            .prefix { !$0.contains("Total number in stack") }
+            .prefix(1000)
+            .map(String.init)
+    }
+
+    /// Whether a thread of `graph` (a ``callGraph(of:in:)``) spent the whole
+    /// sample inside Thread Sanitizer's fork interceptor, at an atfork
+    /// prepare handler or in the TSan runtime: the #278 deadlock. Only the
+    /// sample's stacks are read, never the child's output.
+    static func isForkHang(_ graph: [String]) -> Bool {
+        // A line is "<indent and tree marks><count> <frame>"; a thread's
+        // first line is "    <count> Thread_<id>...".
+        func count(_ line: String) -> Int? {
+            let trimmed = line.drop { " +!:|".contains($0) }
+            return Int(trimmed.prefix { $0.isNumber })
+        }
+        var threads: [[String]] = []
+        for line in graph.dropFirst() {
+            if line.drop(while: { $0 == " " }).drop(while: \.isNumber).hasPrefix(" Thread_") {
+                threads.append([line])
+            } else if !threads.isEmpty {
+                threads[threads.count - 1].append(line)
+            }
+        }
+        return threads.contains { thread in
+            guard let total = count(thread[0]) else { return false }
+            let stuck = thread.contains { $0.contains("wrap_fork") && count($0) == total }
+            return stuck && thread.contains { $0.contains("atfork_prepare") || $0.contains("__tsan::") }
+        }
     }
 
     /// Runs the child if this process is one; then never returns.
