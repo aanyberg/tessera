@@ -1697,6 +1697,70 @@ extension SettingsTests {
         XCTAssertTrue(try file().contains("not toml"), contents)
     }
 
+    /// #570, on the core, in the window the app opens (nothing posted):
+    /// another app saves its stale copy of config.toml (without the add,
+    /// and not loading) right behind an Add Profile, before the watch
+    /// read the add. The add ends with the failure and no notice by the
+    /// list, so the Profiles pane shows the load error, as the other panes
+    /// do: the add does not go silently. The repair (still without the
+    /// add) takes the error away.
+    func testTheProfilesPaneShowsTheLoadErrorAnAddEndedWith() async throws {
+        let model = try openSettings(config: Self.threeProfilesTOML)
+        let window = try XCTUnwrap(appDelegate.settingsWindowController?.window)
+        try Self.pressToolbarItem("Profiles", in: window)
+        window.layoutIfNeeded()
+        let url = try configFile
+        let stale = Self.threeProfilesTOML + "\nnot toml\n"
+        XCTAssertTrue(model.addProfile())
+        SettingsModel.writeQueue.async { try? stale.write(to: url, atomically: true, encoding: .utf8) }
+        try await waitUntil("the load error") { model.loadError != nil }
+        let error = try XCTUnwrap(model.loadError)
+        XCTAssertTrue(error.contains("not toml"), error)
+        XCTAssertFalse(model.profilesChanging, "the add ended with the failure")
+        XCTAssertNil(model.message(SettingsModel.profilesKey), "no notice by the list")
+        try await waitUntil("the Profiles pane shows the load error") {
+            Self.shownTexts(in: window.contentView).contains(error)
+        }
+        XCTAssertFalse(try file().contains("New Profile"), contents)
+
+        try Self.threeProfilesTOML.write(to: url, atomically: true, encoding: .utf8)
+        try await waitUntil("the repair applies") { model.loadError == nil }
+        try await waitUntil("the pane no longer shows the error") {
+            !Self.shownTexts(in: window.contentView).contains { $0.hasPrefix("config.toml could not be loaded") }
+        }
+        XCTAssertEqual(model.profiles.map(\.name), ["one", "two", "three"])
+    }
+
+    /// #570 on stand-ins: the Profiles pane shows the model's load error,
+    /// sanitised (S3: the model's text, not the core's), above the list,
+    /// and not once the file loads again.
+    func testTheProfilesPaneShowsTheSanitisedLoadError() async throws {
+        let (model, source, _) = try fakeModel(Self.threeProfiles)
+        let window = profilesPane(model)
+        defer {
+            window.contentView = nil
+            window.close()
+        }
+        try await waitUntil("the list shows the profiles") {
+            Self.views(NSTableView.self, in: window.contentView).first?.numberOfRows == 3
+        }
+        XCTAssertFalse(Self.shownTexts(in: window.contentView).contains { $0.contains("could not be loaded") })
+        source.snapshot.loadError = "line 3\u{202E}\u{1B}]0;x\u{7}: not toml"
+        model.reload()
+        let error = try XCTUnwrap(model.loadError)
+        XCTAssertEqual(error, SettingsModel.loadErrorMessage("line 3\u{202E}\u{1B}]0;x\u{7}: not toml"))
+        try await waitUntil("the pane shows the load error") { Self.shownTexts(in: window.contentView).contains(error) }
+        let shown = Self.shownTexts(in: window.contentView)
+        XCTAssertFalse(
+            shown.contains { $0.unicodeScalars.contains { $0 == "\u{202E}" || $0 == "\u{1B}" || $0 == "\u{7}" } },
+            "\(shown)")
+        source.snapshot.loadError = nil
+        model.reload()
+        try await waitUntil("the error goes") {
+            !Self.shownTexts(in: window.contentView).contains { $0.contains("could not be loaded") }
+        }
+    }
+
     /// A syntax error's excerpt of the file shows as lines, each sanitised
     /// (S3), not as one line with `\n` in it.
     func testASyntaxErrorShowsAsLines() async throws {

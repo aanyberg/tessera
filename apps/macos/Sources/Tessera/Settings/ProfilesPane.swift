@@ -31,6 +31,43 @@ struct ProfilesPane: View {
         let profiles = model.profiles
         // An add or delete moves the indices edits name: wait for it.
         let changing = model.profilesChanging
+        VStack(alignment: .leading, spacing: 0) {
+            if let error = model.loadError {
+                // As the other panes do: also why an add or delete this
+                // pane made went with the failure, which leaves no notice
+                // by the list (#547, #570). Selectable, as the status line
+                // is: it quotes the file.
+                SettingsMessage(text: error, notSaved: false)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding([.horizontal, .top], 20)
+            }
+            profilesAndDetail(profiles, changing: changing)
+        }
+        .frame(width: 680)
+        .fixedSize(horizontal: false, vertical: true)
+        // The profile an Add or Duplicate wrote, once written: also when
+        // this pane shows a model a closed window left waiting (#312 m5).
+        .onChange(of: model.selectionRequest, initial: true) {
+            if let index = model.takeSelectionRequest() { selection = index }
+        }
+        .confirmationDialog(
+            "Delete the profile “\(confirmingDelete?.title ?? "")”?",
+            isPresented: Binding(get: { confirmingDelete != nil }, set: { if !$0 { confirmingDelete = nil } })
+        ) {
+            Button("Delete", role: .destructive) {
+                if let profile = confirmingDelete, model.deleteProfile(profile.index) {
+                    selection = nil
+                }
+                confirmingDelete = nil
+            }
+        } message: {
+            Text("Its entry is removed from config.toml.")
+        }
+    }
+
+    /// The list with its buttons and status, and the selected profile.
+    private func profilesAndDetail(_ profiles: [SettingsModel.Profile], changing: Bool) -> some View {
         HStack(alignment: .top, spacing: 0) {
             VStack(alignment: .leading, spacing: 0) {
                 // A click on another profile first writes the text typed
@@ -103,26 +140,6 @@ struct ProfilesPane: View {
                     .frame(maxWidth: .infinity, minHeight: 300)
                     .padding(20)
             }
-        }
-        .frame(width: 680)
-        .fixedSize(horizontal: false, vertical: true)
-        // The profile an Add or Duplicate wrote, once written: also when
-        // this pane shows a model a closed window left waiting (#312 m5).
-        .onChange(of: model.selectionRequest, initial: true) {
-            if let index = model.takeSelectionRequest() { selection = index }
-        }
-        .confirmationDialog(
-            "Delete the profile “\(confirmingDelete?.title ?? "")”?",
-            isPresented: Binding(get: { confirmingDelete != nil }, set: { if !$0 { confirmingDelete = nil } })
-        ) {
-            Button("Delete", role: .destructive) {
-                if let profile = confirmingDelete, model.deleteProfile(profile.index) {
-                    selection = nil
-                }
-                confirmingDelete = nil
-            }
-        } message: {
-            Text("Its entry is removed from config.toml.")
         }
     }
 

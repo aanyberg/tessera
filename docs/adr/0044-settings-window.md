@@ -59,9 +59,11 @@ was queued (a later `generation`) and no edit of that key is queued; then
 the file's value shows. A `config.toml` that stops loading after the edit
 (a broken hand edit read before or instead of the save) applies nothing:
 the core calls `on_config_invalid` once per new failure, the window reads
-the snapshot's `load_error` again, shows it (sanitised, S3) and drops the
+the snapshot's `load_error` again, shows it (sanitised, S3) above every
+pane's controls, the Profiles pane's too (#570), and drops the
 edit, an add or a delete of a profile from `pending`, so the control shows
-the configuration in effect (#547). An edit queued while the file already
+the configuration in effect (#547). An add or delete dropped so leaves no
+notice by the list: the load error says why it went. An edit queued while the file already
 failed with that error (a repair) waits for its configuration as before. The core does not apply its own write: the
 configuration watch applies the saved file like a hand edit (ADR 0040), so
 the window, the open tabs and a hand edit all go through one apply path.
@@ -136,7 +138,8 @@ the importer refuses writes nothing and shows the importer's message.
   to about 1 s) before the next profile edit, at most 2 s after the write
   (the #344 Profiles amendment): a watch that never applies it, or another
   app that saved config.toml without it, unlocks the pane then, with a
-  notice by the list.
+  notice by the list (or, while config.toml does not load, the load error
+  above the pane, #570).
 - `on_config_applied` reloads the model once per applied configuration, not
   per edit; nothing in the window runs per byte of terminal output.
 - Keys the panes do not show are untouched by the window and reachable
