@@ -68,6 +68,9 @@ test that needs a client attached sets a detached fake first.
 
 A test with a wall-clock bar (a latency, a lock hold, a ratio of two costs) joins the `timing` test group in
 `.config/nextest.toml`, so nextest runs it alone and a loaded machine cannot fail it by running two of them at once.
+Other work on the machine still preempts the test, so a bar on the cost of code measures the thread's CPU time
+(`CLOCK_THREAD_CPUTIME_ID` through `nix::time`, see `thread_cpu_time` in the test helpers of `tessera-term` and
+`tessera-app-core`) or counts work, and compares costs taken side by side, since the cores differ in speed (#520, #521).
 Add an override with a `filter` that names the package, the binary and the test, and a one-line comment that says what
 the bar is and which issue set it. The groups today cover the config reload, shaping, close and writer bounds, the
 DECSCUSR flood, the theme-edit bound, the search caps (including `the_kept_copy_and_its_spares_stay_within_the_cap`,

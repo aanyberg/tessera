@@ -450,7 +450,10 @@ fn the_child_leads_its_own_session_on_the_pty_as_controlling_terminal() {
     // one, so `sh -c 'exec 3</dev/tty'` passes even when the spawn gave none
     // and zsh or fish would run without job control (no Ctrl-C). `sleep`
     // opens nothing, so whatever terminal it has came from the spawn; `ps`
-    // reads the terminal and its foreground group from the kernel.
+    // reads the terminal's foreground group from the kernel, and a process
+    // with no controlling terminal reports 0 there, so `tpgid == pid` proves
+    // both. The `tty` name column is not read: its lookup reported `??` for
+    // a child whose tpgid was right (#525).
     let options = SpawnOptions::command("/bin/sleep", "test-session").args(["30"]);
     let (pty, _events) = NativePty::spawn(&options).unwrap();
     let pid = child_pid(&pty);
@@ -462,19 +465,14 @@ fn the_child_leads_its_own_session_on_the_pty_as_controlling_terminal() {
         "a new session, not ours"
     );
     let ps = std::process::Command::new("ps")
-        .args(["-o", "tpgid=,tty=", "-p", &pid.to_string()])
+        .args(["-o", "tpgid=", "-p", &pid.to_string()])
         .output()
         .unwrap();
     let ps = String::from_utf8_lossy(&ps.stdout);
-    let fields: Vec<&str> = ps.split_whitespace().collect();
     assert_eq!(
-        fields.first().copied(),
-        Some(pid.to_string().as_str()),
-        "the child's group is the terminal's foreground group: {ps:?}"
-    );
-    assert!(
-        fields.get(1).is_some_and(|tty| !tty.starts_with('?')),
-        "the child has a controlling terminal: {ps:?}"
+        ps.trim(),
+        pid.to_string(),
+        "the child has a controlling terminal whose foreground group is its own"
     );
 }
 

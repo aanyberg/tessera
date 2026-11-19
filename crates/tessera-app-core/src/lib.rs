@@ -2664,6 +2664,15 @@ impl App {
     }
 }
 
+/// The CPU time the calling thread has used so far, for the timing bars a
+/// loaded machine must not fail: time spent preempted does not count.
+#[cfg(test)]
+pub(crate) fn thread_cpu_time() -> std::time::Duration {
+    nix::time::clock_gettime(nix::time::ClockId::CLOCK_THREAD_CPUTIME_ID)
+        .expect("the thread CPU clock")
+        .into()
+}
+
 /// The PTY of [`App::spawn_test_session`].
 #[cfg(any(test, feature = "test-hooks"))]
 mod test_pty {

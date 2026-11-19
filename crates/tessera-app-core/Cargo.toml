@@ -32,6 +32,8 @@ tracing.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+# The calling thread's CPU clock, for the timing bars that a loaded machine must not fail.
+nix = { workspace = true, features = ["time"] }
 # Enables `test-hooks` (`App::spawn_test_session`) for the integration tests.
 tessera-app-core = { path = ".", features = ["test-hooks"] }
 # URL detection and selection properties.

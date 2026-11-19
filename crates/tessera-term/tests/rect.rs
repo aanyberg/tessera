@@ -24,6 +24,8 @@ mod common;
 #[allow(dead_code)] // Shared with tests/csi.rs and tests/vttest.rs.
 mod spec;
 
+use std::time::Duration;
+
 use common::{Chunking, Script, Step, decode, pen_text};
 use tessera_grid::{Cell, DamageRows, Point, Style};
 use tessera_term::Terminal;
@@ -615,16 +617,47 @@ fn a_flood_requests_nothing() {
     assert_eq!(term.take_requests().len(), 0);
 }
 
-fn best_of_three(rows: u16, cols: u16, flood: &[u8]) -> std::time::Duration {
-    (0..3)
+/// ED 2, the baseline of the cost bars below.
+const ERASE: &[u8] = b"\x1b[2J";
+
+/// The least CPU time of `runs` runs of `ops`, each on a new `rows`x`cols`
+/// terminal fed `setup` (not measured).
+fn cpu_cost(rows: u16, cols: u16, setup: &[u8], ops: &[u8], runs: usize) -> Duration {
+    (0..runs)
         .map(|_| {
-            let mut term = feed(rows, cols, b"abc");
-            let start = std::time::Instant::now();
-            term.advance(flood);
-            start.elapsed()
+            let mut term = feed(rows, cols, setup);
+            let start = common::thread_cpu_time();
+            term.advance(ops);
+            common::thread_cpu_time().saturating_sub(start)
         })
         .min()
-        .expect("three runs")
+        .expect("a run")
+}
+
+/// What `ops` costs as a multiple of `base`, each on a new `rows`x`cols`
+/// terminal fed `setup` and given as the bytes and how many runs to take the
+/// best of: the lowest of three rounds, each comparing CPU times taken side
+/// by side.
+///
+/// CPU time leaves out the time the thread is preempted, and the side by
+/// side rounds the difference between a machine's fast and slow cores, so
+/// load does not move the ratio: on the wall clock these bars failed at
+/// load 30-90 (#521). A cost per cell that is too high reads high in every
+/// round.
+fn cost_ratio(
+    rows: u16,
+    cols: u16,
+    setup: &[u8],
+    base: (&[u8], usize),
+    ops: (&[u8], usize),
+) -> f64 {
+    (0..3)
+        .map(|_| {
+            let base = cpu_cost(rows, cols, setup, base.0, base.1);
+            let cost = cpu_cost(rows, cols, setup, ops.0, ops.1);
+            cost.as_secs_f64() / base.as_secs_f64().max(f64::MIN_POSITIVE)
+        })
+        .fold(f64::INFINITY, f64::min)
 }
 
 /// The full-screen DECCRA and DECFRA on the largest grid (2048 columns x
@@ -634,32 +667,30 @@ const LARGEST_OPS: [(&str, &[u8]); 2] = [
     ("DECFRA", b"\x1b[88;1;1;1024;2048$x"),
 ];
 
-/// B02 (release only, where timing means something): 100 000 full-screen
+/// B02 (release only, where cost means something): 100 000 full-screen
 /// DECCRA on 24x80, and 256 full-screen DECCRA and DECFRA on the largest
-/// grid, cost a constant per cell: each stays within a small factor of
-/// as many full-screen ED 2, best of three. (A 1 MiB flood of either is
-/// about 45 000 full-screen operations, minutes of work, as 1 MiB of ED 2
-/// is: `b02_one_mib_floods_on_the_largest_grid` measures it on request.)
+/// grid, cost a constant per cell: each stays within four times as many
+/// full-screen ED 2 ([`cost_ratio`]). (A 1 MiB flood of either is about
+/// 45 000 full-screen operations, minutes of work, as 1 MiB of ED 2 is:
+/// `b02_one_mib_floods_on_the_largest_grid` measures it on request.)
 #[test]
-#[cfg_attr(debug_assertions, ignore = "timing: release only")]
+#[cfg_attr(debug_assertions, ignore = "cost bar: release only")]
 fn b02_floods_cost_a_constant_per_cell() {
-    use std::time::Duration;
-    let n = 100_000;
-    let copy = best_of_three(24, 80, &b"\x1b[1;1;24;80;1;2;1;1$v".repeat(n));
-    let erase = best_of_three(24, 80, &b"\x1b[2J".repeat(n));
-    eprintln!("100k DECCRA 24x80: {copy:?}, 100k ED 2: {erase:?}");
-    assert!(
-        copy < erase * 4 + Duration::from_millis(50),
-        "{copy:?} vs {erase:?}"
-    );
-    for (name, op) in LARGEST_OPS {
-        let took = best_of_three(1024, 2048, &op.repeat(256));
-        let base = best_of_three(1024, 2048, &b"\x1b[2J".repeat(256));
-        eprintln!("256 {name} on 2048x1024: {took:?}, 256 ED 2: {base:?}");
-        assert!(
-            took < base * 4 + Duration::from_millis(50),
-            "{name} {took:?} vs {base:?}"
+    let floods: [(&str, u16, u16, &[u8], usize); 3] = [
+        ("DECCRA 24x80", 24, 80, b"\x1b[1;1;24;80;1;2;1;1$v", 100_000),
+        ("DECCRA 2048x1024", 1024, 2048, LARGEST_OPS[0].1, 256),
+        ("DECFRA 2048x1024", 1024, 2048, LARGEST_OPS[1].1, 256),
+    ];
+    for (name, rows, cols, op, n) in floods {
+        let ratio = cost_ratio(
+            rows,
+            cols,
+            b"abc",
+            (&ERASE.repeat(n), 1),
+            (&op.repeat(n), 1),
         );
+        eprintln!("{n} {name}: {ratio:.2} times as many ED 2");
+        assert!(ratio < 4.0, "{name}: {ratio:.2} times ED 2");
     }
 }
 
@@ -677,52 +708,34 @@ fn filled_largest(kind: &str) -> Vec<u8> {
     }
 }
 
-/// The shortest of `runs` runs of `ops` on a new 1024x2048 terminal fed
-/// `setup` (not timed).
-fn timed_on(runs: usize, setup: &[u8], ops: &[u8]) -> std::time::Duration {
-    (0..runs)
-        .map(|_| {
-            let mut term = feed(1024, 2048, setup);
-            let start = std::time::Instant::now();
-            term.advance(ops);
-            start.elapsed()
-        })
-        .min()
-        .expect("a run")
-}
-
 /// B02 with clusters and links (#251 round 1, B1): a DECCRA that copies
 /// the left half of every row one column to the right (onto itself would
 /// be the exact self copy, a no-op since #269), on a screen of clusters or
 /// of linked cells, so each destination row keeps entries left and right
-/// of the copy,
-/// costs a constant per cell, like ED 2 on the same screen, one at a time
-/// and as a flood of 256 (the screen stays full, so each costs the same):
-/// within 10 times ED 2 (measured: 3 times over clusters, 6 over links,
-/// whose copies count references; inserting each entry on its own was 19
-/// and 40 times). The one-at-a-time bar for links is 20 times, not 10: the
-/// tightest run was 52 ms against a 58 ms limit at a load of 31 (#430), so a
-/// loaded machine failed a correct build; a per-entry insert is 40 times.
+/// of the copy, costs a constant per cell, like ED 2 on the same screen,
+/// one at a time and as a flood (the screen stays full, so each costs the
+/// same): within 12 times ED 2 over clusters and 20 times over links, whose
+/// copies count references ([`cost_ratio`]; measured 3.6 and 6.2, and
+/// inserting each entry on its own was 19 and 40 times). The flood is 64
+/// copies, run three times, where one run of 256 took 15 s of the machine's
+/// time at load 35 (#521).
 #[test]
-#[cfg_attr(debug_assertions, ignore = "timing: release only")]
+#[cfg_attr(debug_assertions, ignore = "cost bar: release only")]
 fn b02_partial_copies_over_clusters_and_links_cost_a_constant_per_cell() {
-    use std::time::Duration;
+    const FLOOD: u32 = 64;
     let copy = b"\x1b[1;1;1024;1024;1;1;2;1$v";
     for kind in ["clusters", "links"] {
-        // Links are the slower kind and flaked at 10 times under load (see above).
-        let one_factor = if kind == "links" { 20 } else { 10 };
+        let bar = if kind == "links" { 20.0 } else { 12.0 };
         let setup = filled_largest(kind);
-        let erase = timed_on(3, &setup, b"\x1b[2J");
-        let one = timed_on(3, &setup, copy);
-        let flood = timed_on(1, &setup, &copy.repeat(256));
-        eprintln!("{kind}: DECCRA of the left half {one:?}, x256 {flood:?}; ED 2 {erase:?}");
+        let base = (ERASE, 3);
+        let one = cost_ratio(1024, 2048, &setup, base, (copy, 3));
+        let flood = cost_ratio(1024, 2048, &setup, base, (&copy.repeat(FLOOD as usize), 1))
+            / f64::from(FLOOD);
+        eprintln!("{kind}: one DECCRA of the left half {one:.1} x ED 2, in a flood {flood:.1}");
+        assert!(one < bar, "{kind}: one copy costs {one:.1} x ED 2");
         assert!(
-            one < erase * one_factor + Duration::from_millis(5),
-            "{kind}: {one:?} vs ED 2 {erase:?}"
-        );
-        assert!(
-            flood < erase * (10 * 256) + Duration::from_millis(50),
-            "{kind}: x256 {flood:?} vs ED 2 {erase:?}"
+            flood < bar,
+            "{kind}: a flooded copy costs {flood:.1} x ED 2"
         );
     }
 }

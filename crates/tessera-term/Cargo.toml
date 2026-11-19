@@ -19,6 +19,8 @@ base64.workspace = true
 [dev-dependencies]
 insta.workspace = true
 proptest.workspace = true
+# The calling thread's CPU clock, for the cost bars that a loaded machine must not fail.
+nix = { workspace = true, features = ["time"] }
 
 [lints]
 workspace = true

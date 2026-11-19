@@ -42,7 +42,7 @@
 #[allow(dead_code)] // Shared harness: not every helper is used here.
 mod common;
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use common::{Chunking, decode, render_screen};
 use tessera_grid::Point;
@@ -523,14 +523,15 @@ fn oversized_parameters_saturate_in_the_parser() {
 /// A flood of DECSCUSR and DECSET 12 queues nothing and keeps the cost
 /// per sequence flat: 4N units take about four times as long as N.
 ///
-/// The bar is the ratio of the two sizes, each the best of three runs
-/// taken in turn, so a loaded machine that slows both alike cannot fail
-/// it. Linear cost reads ~4; the bar is 6. Quadratic cost reads 16 once
-/// it dominates: a handler that keeps every style it was sent, newest
-/// first (`Vec::insert(0, _)`), reads 12-14 at these sizes in a debug build
-/// and fails every attempt. A run that a stall hits only on the large
-/// side can still read high, so up to five attempts are made and every
-/// ratio is printed.
+/// The bar is the ratio of the two sizes in the thread's CPU time, each the
+/// best of three runs taken in turn: time spent preempted does not count,
+/// so a loaded machine cannot fail it (#525; on the wall clock it failed
+/// once at load 60-86). Linear cost reads ~4; the bar is 6. Quadratic cost
+/// reads 16 once it dominates: a handler that keeps every style it was
+/// sent, newest first (`Vec::insert(0, _)`), reads 12-14 at these sizes in
+/// a debug build and fails every attempt. A large run that lands on a
+/// slower core than the small one can still read high, so up to five
+/// attempts are made and every ratio is printed.
 #[test]
 fn a_flood_of_cursor_styles_requests_nothing_and_stays_linear() {
     const UNITS: usize = 10_000;
@@ -539,9 +540,9 @@ fn a_flood_of_cursor_styles_requests_nothing_and_stays_linear() {
     let unit = b"\x1b[5 q\x1b[?12l\x1b[0 q\x1b[3 q";
     let time = |bytes: &[u8]| {
         let mut term = Terminal::new(3, 10);
-        let start = Instant::now();
+        let start = common::thread_cpu_time();
         term.advance(bytes);
-        let took = start.elapsed();
+        let took = common::thread_cpu_time().saturating_sub(start);
         assert!(term.take_requests().is_empty(), "{}: requests", bytes.len());
         assert_eq!(term.cursor_style().shape, CursorShape::Underline);
         took
