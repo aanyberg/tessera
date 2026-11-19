@@ -132,10 +132,11 @@ final class SettingsModel {
     /// Values set but not yet seen in ``snapshot``, by key path; `.null`
     /// for a removed key.
     private var pending: [String: TesseraConfigValue] = [:]
-    /// The snapshot generation when each key's latest edit was queued: the
-    /// pending value goes once a later configuration has been applied and
+    /// The snapshot generation and load error when each key's latest edit
+    /// was queued: the pending value goes once a later configuration has
+    /// been applied, or `config.toml` has stopped loading since (#547), and
     /// nothing is queued for the key.
-    private var queuedAtGeneration: [String: UInt64] = [:]
+    private var queuedAt: [String: Queued] = [:]
     /// The applied `[[profiles]]` when an add or delete of a profile was
     /// queued, by its key path: its pending value goes only once the
     /// listed profiles are no longer these (#344 m-b), not with a
@@ -243,6 +244,16 @@ final class SettingsModel {
         /// Where the core put it and what it named it, once written: shown
         /// there until the watch has applied the file.
         var added: TesseraAddedProfile?
+        /// Why `config.toml` did not load when it was queued (or written
+        /// again), if it did not: another failure after it ends it (#547).
+        var loadError: String?
+    }
+
+    /// What ``snapshot`` said when an edit was queued.
+    private struct Queued {
+        var generation: UInt64
+        /// The core's ``TesseraConfigSnapshot/loadError`` then.
+        var loadError: String?
     }
 
     /// One slider's or stepper's coalescing state.
@@ -289,7 +300,7 @@ final class SettingsModel {
             let entries = profileEntries
             snapshot = try source.configSnapshot()
             readKeymap(source)
-            loadError = nil
+            loadError = snapshot.loadError.map(Self.loadErrorMessage)
             if profileEntries != entries {
                 profileListGeneration += 1
                 // The draft's field names an index that may now be another
@@ -319,17 +330,18 @@ final class SettingsModel {
         // keyboard) has no release, so it waits only for its timer.
         for key in Array(pending.keys)
         where (inFlight[key] ?? 0) == 0 && throttles[key]?.timer == nil && throttles[key]?.dragging != true {
-            if let queued = queuedAtGeneration[key], snapshot.generation <= queued { continue }
+            if awaitsApply(key) { continue }
             // An add or delete waits for the list to change (it, or a hand
             // edit too), not for any later configuration (#344 m-b). Both
-            // lists leave out the same keys, this window's pending ones.
-            if let base = movedFrom[key] {
+            // lists leave out the same keys, this window's pending ones. A
+            // file that stopped loading changes no list (#547).
+            if let base = movedFrom[key], !stoppedLoading(since: key) {
                 let current = listedEntries ?? Self.entries(listed, masking: masks)
                 listedEntries = current
                 if Self.entries(base, masking: masks) == current { continue }
             }
             pending[key] = nil
-            queuedAtGeneration[key] = nil
+            queuedAt[key] = nil
             movedFrom[key] = nil
         }
         endAdditionIfApplied(masking: masks)
@@ -345,6 +357,36 @@ final class SettingsModel {
             profileSettle?.cancel()
             profileSettle = nil
         }
+    }
+
+    /// Whether `key`'s latest edit waits for a configuration applied after
+    /// it was queued: none has been, and `config.toml` has not stopped
+    /// loading since. A file that does not load applies nothing, so the
+    /// edit cannot show before the file is fixed, and a fixed file applies
+    /// a configuration (#547).
+    private func awaitsApply(_ key: String) -> Bool {
+        guard let queued = queuedAt[key], snapshot.generation <= queued.generation else { return false }
+        return !stoppedLoading(since: key)
+    }
+
+    /// Whether `config.toml` does not load now with another error than
+    /// when `key`'s latest edit was queued: one that came after it. (The
+    /// same error again after a configuration applied in between is not
+    /// told apart; nor is the same broken text written back by another
+    /// app before the watch read a repair, which then waits for the next
+    /// configuration applied.)
+    private func stoppedLoading(since key: String) -> Bool {
+        guard let error = snapshot.loadError else { return false }
+        return error != queuedAt[key]?.loadError
+    }
+
+    /// What the window shows while `config.toml` does not load: the core's
+    /// `error` as lines (``messageLines(_:)``, sanitised, S3).
+    static func loadErrorMessage(_ error: String) -> String {
+        let reason = messageLines(error)
+        let text =
+            "config.toml could not be loaded, so the configuration in effect is the last one that loaded, or the defaults"
+        return reason.isEmpty ? text + "." : text + ":\n" + reason
     }
 
     /// What the configuration just read means for the keys pressed now: a
@@ -405,9 +447,19 @@ final class SettingsModel {
     /// has), or once the listed profiles are no longer the ones it was
     /// queued against (a hand edit of the file was applied with it, or
     /// before it), `masks` (this window's pending keys) and the keys
-    /// pending when it was queued left out of both.
+    /// pending when it was queued left out of both. A file that stopped
+    /// loading since applies nothing, so the add cannot show before it is
+    /// fixed: it ends too, and the list is the applied one again (#547).
     private func endAdditionIfApplied(masking masks: [String: TesseraConfigValue]) {
         guard let addition, let added = addition.added else { return }
+        if let error = snapshot.loadError, error != addition.loadError {
+            self.addition = nil
+            // The rows after it are back where they were.
+            shiftProfileMessages(from: added.index, by: -1)
+            profileListGeneration += 1
+            draft = nil
+            return
+        }
         let listed = snapshot["profiles"]?.array ?? []
         let shown = listed.indices.contains(added.index) && listed[added.index]["name"]?.string == added.name
         let all = masks.merging(addition.masks) { current, _ in current }
@@ -621,8 +673,7 @@ final class SettingsModel {
     /// once: ``profileSettleTimeout`` later, more than the watch takes, the
     /// reload does, and the window shows what is applied (#517).
     private func settleAfterRelease(_ key: String) {
-        guard pending[key] != nil else { return }
-        if let queued = queuedAtGeneration[key], snapshot.generation <= queued { return }
+        guard pending[key] != nil, !awaitsApply(key) else { return }
         reloadAfterRelease(key, after: profileSettleTimeout)
     }
 
@@ -646,7 +697,7 @@ final class SettingsModel {
             // written, and the list says so (#344 adversarial M6). The
             // control shows what was written of the drag, if anything
             // waits to apply, else the file's value.
-            pending[key] = queuedAtGeneration[key] != nil ? throttles[key]?.lastWritten : nil
+            pending[key] = queuedAt[key] != nil ? throttles[key]?.lastWritten : nil
             cancelThrottle(key)
             messages[Self.profilesKey] = Self.heldValueNotice
             return
@@ -705,7 +756,7 @@ final class SettingsModel {
         for edit in edits {
             let written = edit.value ?? .null
             pending[edit.key] = written
-            queuedAtGeneration[edit.key] = snapshot.generation
+            queuedAt[edit.key] = Queued(generation: snapshot.generation, loadError: snapshot.loadError)
             movedFrom[edit.key] = movesProfiles(edit.key, written) ? snapshot["profiles"]?.array ?? [] : nil
             inFlight[edit.key, default: 0] += 1
             messages[edit.key] = nil
@@ -773,7 +824,7 @@ final class SettingsModel {
             // Not written; the failed edit's message says why.
             if inFlight[key] == nil {
                 pending[key] = nil
-                queuedAtGeneration[key] = nil
+                queuedAt[key] = nil
                 movedFrom[key] = nil
                 cancelThrottle(key)
             }
@@ -789,7 +840,7 @@ final class SettingsModel {
             }
             if inFlight[key] == nil {
                 pending[key] = nil
-                queuedAtGeneration[key] = nil
+                queuedAt[key] = nil
                 movedFrom[key] = nil
                 cancelThrottle(key)
             }
@@ -805,7 +856,7 @@ final class SettingsModel {
                 // reload shows applied already is not waited for again
                 // (21.6a m6): its list would not change again.
                 pending[key] = written
-                queuedAtGeneration[key] = snapshot.generation
+                queuedAt[key] = Queued(generation: snapshot.generation, loadError: snapshot.loadError)
                 movedFrom[key] = movesProfiles(key, written) ? snapshot["profiles"]?.array ?? [] : nil
             }
         }
@@ -856,7 +907,7 @@ final class SettingsModel {
         for (key, value) in pending where movesProfiles(key, value) && (inFlight[key] ?? 0) == 0 {
             change = movedFrom[key].map { .delete(key: key, from: $0) }
             pending[key] = nil
-            queuedAtGeneration[key] = nil
+            queuedAt[key] = nil
             movedFrom[key] = nil
             notice =
                 "The profile deleted is still in the configuration applied: another app may have saved "
@@ -864,8 +915,11 @@ final class SettingsModel {
         }
         guard let notice else { return }
         Self.log.info("profile add or delete not shown by the applied configuration in time")
-        messages[Self.profilesKey] = notice
-        released = change.map { ($0, notice) }
+        // While config.toml does not load, the load error says why (#547).
+        if snapshot.loadError == nil {
+            messages[Self.profilesKey] = notice
+            released = change.map { ($0, notice) }
+        }
         // The list is not the one the controls were made for.
         profileListGeneration += 1
         draft = nil
@@ -1215,7 +1269,8 @@ final class SettingsModel {
         released = nil
         addition = Addition(
             listed: snapshot["profiles"]?.array ?? [],
-            keys: Dictionary(keys, uniquingKeysWith: { $1 }), masks: pending, added: nil)
+            keys: Dictionary(keys, uniquingKeysWith: { $1 }), masks: pending, added: nil,
+            loadError: snapshot.loadError)
         let writer = source.settingsWriter
         Self.writeQueue.async { [weak self] in
             var retried = false
@@ -1265,6 +1320,7 @@ final class SettingsModel {
                 // (wait for a list after that one), or both were.
                 reload()
                 addition.listed = snapshot["profiles"]?.array ?? []
+                addition.loadError = snapshot.loadError
             }
             addition.added = added
             self.addition = addition

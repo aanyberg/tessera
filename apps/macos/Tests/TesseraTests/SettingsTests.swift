@@ -1534,6 +1534,169 @@ extension SettingsTests {
         }
     }
 
+    /// #547: a save followed by a `config.toml` that does not load (a
+    /// broken hand edit before the watch read the save) applies nothing,
+    /// so the generation stays; the save settles all the same: the control
+    /// shows the configuration in effect, and the window the load error,
+    /// sanitised (S3). A save made while the file already did not load
+    /// (one that repairs it) waits for its configuration as before, and
+    /// another failure after it settles it too.
+    func testASaveFollowedByAFileThatDoesNotLoadSettlesAndShowsTheError() async throws {
+        let (model, source, writer) = try fakeModel(Self.fakeConfig)
+        model.set("appearance.opacity", .float(0.5))
+        try await waitUntil("the edit ran") { !model.isWriting }
+        XCTAssertEqual(writer.calls.count, 1)
+        model.reload()
+        XCTAssertTrue(model.isPending("appearance.opacity"), "waits for the configuration")
+        let error = #"TOML parse error at line 3, column 1\n  |\n3 | not toml\u{202E}\n  | ^\nkey with no value"#
+        source.snapshot = TesseraConfigSnapshot(
+            generation: 0, config: try Self.json(Self.fakeConfig), loadError: error.replacingOccurrences(
+                of: #"\u{202E}"#, with: "\u{202E}\u{1B}]0;x\u{7}"))
+        model.reload()
+        XCTAssertFalse(model.isPending("appearance.opacity"), "settled by the failure")
+        XCTAssertEqual(model.value("appearance.opacity"), .float(0.85), "the configuration in effect")
+        let shown = try XCTUnwrap(model.loadError)
+        XCTAssertTrue(shown.hasPrefix("config.toml could not be loaded"), shown)
+        XCTAssertTrue(shown.contains("\n3 | not toml]0;x\n"), shown)
+        for line in shown.split(separator: "\n") {
+            XCTAssertEqual(String(line), SettingsModel.sanitisedMessage(String(line)), shown)
+        }
+
+        // A save while the file does not load: the same error does not
+        // settle it, a configuration applied does (and clears the error).
+        model.set("appearance.opacity", .float(0.4))
+        try await waitUntil("the second edit ran") { !model.isWriting }
+        model.reload()
+        XCTAssertTrue(model.isPending("appearance.opacity"), "the failure it was saved under")
+        XCTAssertEqual(model.value("appearance.opacity"), .float(0.4))
+        source.snapshot = TesseraConfigSnapshot(
+            generation: 1, config: try Self.json(Self.fakeConfig.replacingOccurrences(of: "0.85", with: "0.4")))
+        model.reload()
+        XCTAssertFalse(model.isPending("appearance.opacity"))
+        XCTAssertEqual(model.value("appearance.opacity"), .float(0.4))
+        XCTAssertNil(model.loadError, "the file loads again")
+
+        // Saved under one failure, settled by another.
+        source.snapshot.loadError = "first"
+        model.reload()
+        model.set("appearance.opacity", .float(0.3))
+        try await waitUntil("the third edit ran") { !model.isWriting }
+        model.reload()
+        XCTAssertTrue(model.isPending("appearance.opacity"))
+        source.snapshot.loadError = "second"
+        model.reload()
+        XCTAssertFalse(model.isPending("appearance.opacity"), "another failure settles it")
+        XCTAssertEqual(model.loadError, SettingsModel.loadErrorMessage("second"))
+    }
+
+    /// #547 on the core: the file breaks right after the save is written
+    /// (on the write queue, before the watch's debounce ends), so the watch
+    /// reads only the broken file. The core announces it, the app delegate
+    /// has the window read it (nothing posted by the test), and the save
+    /// settles with the error shown; fixing the file clears it.
+    func testOnTheCoreASaveFollowedByABrokenFileSettlesAndShowsTheError() async throws {
+        let model = try openSettings(config: "[appearance]\nopacity = 0.85\n")
+        let generation = model.snapshot.generation
+        let url = try configFile
+        model.set("appearance.opacity", .float(0.5))
+        SettingsModel.writeQueue.async {
+            try? "[appearance]\nopacity = 0.5\nnot toml\n".write(to: url, atomically: true, encoding: .utf8)
+        }
+        try await waitUntil("the load error shows") { model.loadError != nil }
+        XCTAssertEqual(model.snapshot.generation, generation, "the watch applied nothing")
+        XCTAssertFalse(model.isPending("appearance.opacity"), "the save settled")
+        XCTAssertTrue(Self.same(model.value("appearance.opacity"), .float(0.85)), "the configuration in effect")
+        let shown = try XCTUnwrap(model.loadError)
+        XCTAssertTrue(shown.contains("not toml"), shown)
+        XCTAssertFalse(shown.contains(#"\n"#), shown)
+        try "[appearance]\nopacity = 0.5\n".write(to: configFile, atomically: true, encoding: .utf8)
+        try await waitUntil("the fixed file applies") { model.loadError == nil }
+        XCTAssertTrue(Self.same(model.value("appearance.opacity"), .float(0.5)))
+    }
+
+    /// #547: a closed window's model waiting for its delete goes once the
+    /// file stops loading (the delete cannot apply), not at the wait limit.
+    func testAClosedWindowsWaitingModelGoesWhenTheFileStopsLoading() async throws {
+        appDelegate.settingsWaitLimit = .seconds(60)
+        try autoreleasepool { _ = try openSettings(config: Self.threeProfilesTOML) }
+        let url = try configFile
+        let broken = Self.threeProfilesTOML + "\nnot toml\n"
+        let closed = try await opened { controller in
+            // No add or delete notice on the settle timer meanwhile.
+            controller.model.profileSettleTimeout = .seconds(60)
+            XCTAssertTrue(controller.model.deleteProfile(1))
+            SettingsModel.writeQueue.async { try? broken.write(to: url, atomically: true, encoding: .utf8) }
+            controller.close()
+        }
+        try await waitUntil("the controller is freed") { closed.controller == nil }
+        try await waitUntil("the model is freed once the file stops loading") { closed.model == nil }
+        XCTAssertTrue(try file().contains("not toml"), contents)
+    }
+
+    /// #547: an Add Profile followed by a file that does not load ends
+    /// with the failure: the list unlocks at once and is the applied one
+    /// again (the rows after the add with their messages), with the load
+    /// error and no "another app" notice, then or at the settle time.
+    func testAnAddFollowedByAFileThatDoesNotLoadSettlesWithNoNotice() async throws {
+        let clock = ManualClock()
+        let writer = FakeWriter()
+        let refusal = "`profiles[2].command`: this profile is defined in a file in profiles/, not in config.toml"
+        writer.respond = { call, _ in
+            call.key == "profiles[2].command" ? TesseraConfigEditError(.invalidArgument, message: refusal) : nil
+        }
+        let (model, source, _) = try fakeModel(Self.entriesAndFiles, writer: writer, clock: clock)
+        let names = ["one", "two", "extra", "zeta"]
+        model.set("profiles[2].command", .string("/bin/sh"))
+        try await waitUntil("refused") { !model.isWriting }
+        XCTAssertTrue(model.addProfile())
+        try await waitUntil("written") { !model.isWriting }
+        XCTAssertEqual(model.profiles.map(\.name), ["one", "two", "New Profile", "extra", "zeta"])
+        XCTAssertEqual(model.message("profiles[3].command"), refusal)
+        XCTAssertTrue(model.profilesChanging)
+        let generation = model.profileListGeneration
+
+        source.snapshot.loadError = "broken"
+        model.reload()
+        XCTAssertEqual(model.loadError, SettingsModel.loadErrorMessage("broken"))
+        XCTAssertFalse(model.profilesChanging, "settled by the failure")
+        XCTAssertEqual(model.profiles.map(\.name), names, "the list applied")
+        XCTAssertEqual(model.message("profiles[2].command"), refusal, "back with extra")
+        XCTAssertNil(model.message("profiles[3].command"))
+        XCTAssertEqual(model.profileListGeneration, generation + 1, "the controls start again")
+        XCTAssertTrue(model.canAddProfile)
+        clock.advance(by: .seconds(3))
+        XCTAssertNil(model.message(SettingsModel.profilesKey), "no notice")
+
+        // An add queued while the file already does not load (the fake
+        // writes it) ends at the settle time, with no notice either.
+        XCTAssertTrue(model.addProfile())
+        try await waitUntil("written again") { !model.isWriting }
+        model.reload()
+        XCTAssertTrue(model.profilesChanging, "the failure it was queued under")
+        clock.advance(by: .seconds(3))
+        XCTAssertFalse(model.profilesChanging, "unlocked at the settle time")
+        XCTAssertNil(model.message(SettingsModel.profilesKey), "the load error says why")
+        XCTAssertEqual(model.profiles.map(\.name), names)
+    }
+
+    /// #547: a closed window's model waiting for its add goes once the
+    /// file stops loading, not at the wait limit.
+    func testAClosedWindowsWaitingAddGoesWhenTheFileStopsLoading() async throws {
+        appDelegate.settingsWaitLimit = .seconds(60)
+        try autoreleasepool { _ = try openSettings(config: Self.threeProfilesTOML) }
+        let url = try configFile
+        let broken = Self.threeProfilesTOML + "\nnot toml\n"
+        let closed = try await opened { controller in
+            controller.model.profileSettleTimeout = .seconds(60)
+            XCTAssertTrue(controller.model.addProfile())
+            SettingsModel.writeQueue.async { try? broken.write(to: url, atomically: true, encoding: .utf8) }
+            controller.close()
+        }
+        try await waitUntil("the controller is freed") { closed.controller == nil }
+        try await waitUntil("the model is freed once the file stops loading") { closed.model == nil }
+        XCTAssertTrue(try file().contains("not toml"), contents)
+    }
+
     /// A syntax error's excerpt of the file shows as lines, each sanitised
     /// (S3), not as one line with `\n` in it.
     func testASyntaxErrorShowsAsLines() async throws {

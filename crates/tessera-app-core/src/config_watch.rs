@@ -12,7 +12,10 @@
 //!   it only when it differs from the theme in use, so editing a theme file
 //!   that is not in use changes nothing on screen.
 //! - [`ConfigEvent::Invalid`]: the last good configuration stays (the
-//!   store logged the error, once).
+//!   store logged the error, once), and the observer hears
+//!   [`SessionObserver::on_config_invalid`] (#547): a host waiting for an
+//!   edit it saved to apply stops waiting and shows the error
+//!   ([`App::config_generation_and_load_error`]).
 //! - [`ConfigEvent::Unchanged`]: the watcher read the files again and
 //!   found the configuration in effect. Nothing is restyled, but the
 //!   configuration generation moves and the observer hears
@@ -32,6 +35,7 @@
 //!
 //! [`SessionObserver::on_appearance_changed`]: crate::SessionObserver::on_appearance_changed
 //! [`SessionObserver::on_config_applied`]: crate::SessionObserver::on_config_applied
+//! [`SessionObserver::on_config_invalid`]: crate::SessionObserver::on_config_invalid
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -117,6 +121,11 @@ pub(crate) struct Applied {
     /// that does not load: the next lookup that finds it again logs
     /// nothing (#489 21.0b m4).
     pub(crate) kept_broken: Option<String>,
+    /// Why `config.toml` does not load, while it does not
+    /// ([`tessera_config::ConfigStore::last_error`] as the watch last
+    /// handled it): the configuration in effect is the last good one
+    /// (#547). Kept by every apply; only the store's next load changes it.
+    pub(crate) load_error: Option<String>,
 }
 
 /// The profile themes resolved under one recorded configuration, shared by
@@ -389,6 +398,7 @@ impl Live {
                 display,
                 profile_themes: Arc::clone(&themes),
                 kept_broken: applied.kept_broken.take(),
+                load_error: applied.load_error.take(),
             };
             (generation, display, radius_changed, themes)
         };
@@ -685,7 +695,62 @@ impl Live {
 
     /// Handles one watcher event. Returns whether the observer heard
     /// [`SessionObserver::on_config_applied`](crate::SessionObserver::on_config_applied).
+    ///
+    /// The store's load error is recorded first, whatever the event (a
+    /// folded `Changed` or `ThemesChanged` may cover an `Invalid`), so the
+    /// observer's `on_config_applied` reads it current; a new one is
+    /// announced after the event is handled
+    /// ([`SessionObserver::on_config_invalid`], #547).
+    ///
+    /// [`SessionObserver::on_config_invalid`]: crate::SessionObserver::on_config_invalid
     fn handle(&self, store: &ConfigStore, event: ConfigEvent) -> bool {
+        let failed = self.note_load_error(store);
+        let announced = self.handle_event(store, event);
+        if failed {
+            self.config_invalid();
+        }
+        announced
+    }
+
+    /// Records the store's load error ([`Applied::load_error`]); returns
+    /// whether it is a new one (a failure the observer has not heard of).
+    fn note_load_error(&self, store: &ConfigStore) -> bool {
+        let error = store.last_error().map(|error| error.to_string());
+        let mut applied = lock(&self.applied);
+        let news = error.is_some() && error != applied.load_error;
+        applied.load_error = error;
+        news
+    }
+
+    /// Tells the observer `config.toml` changed and does not load.
+    fn config_invalid(&self) {
+        let observers = self
+            .observers
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(observer) = observers.as_ref()
+            && std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                observer.on_config_invalid();
+            }))
+            .is_err()
+        {
+            tracing::error!("session observer panicked in on_config_invalid");
+        }
+    }
+
+    /// [`Live::config_and_generation`] with [`Applied::load_error`], all
+    /// read under the one lock.
+    pub(crate) fn config_generation_and_load_error(&self) -> (Arc<Config>, u64, Option<String>) {
+        let applied = lock(&self.applied);
+        (
+            Arc::clone(&applied.config),
+            self.bindings.generation(),
+            applied.load_error.clone(),
+        )
+    }
+
+    /// [`Live::handle`] for the event itself.
+    fn handle_event(&self, store: &ConfigStore, event: ConfigEvent) -> bool {
         match event {
             ConfigEvent::Changed(changed) => {
                 // The store logged the warnings it had not logged before
@@ -746,11 +811,15 @@ impl Live {
     /// otherwise the theme, which may have changed on disk since the `App`
     /// resolved it.
     fn reconcile(&self, store: &ConfigStore) {
+        let failed = self.note_load_error(store);
         let config = store.config();
         if *config == *self.config() {
             self.apply_theme_if_changed(store);
         } else {
             self.apply_changed(store, &config);
+        }
+        if failed {
+            self.config_invalid();
         }
     }
 
@@ -2329,6 +2398,106 @@ mod tests {
             cursor_style_of(&app, id)
         );
         assert_eq!(app.config().appearance.font_size, 14.0);
+    }
+
+    /// #547: a `config.toml` that stops loading is announced
+    /// (`on_config_invalid`) and its error read with the configuration
+    /// and generation, which stay; the file loading again clears the error
+    /// with the configuration it applies, and the same failure after that
+    /// is announced again.
+    #[test]
+    fn a_config_that_stops_loading_is_announced_and_its_error_read() {
+        #[derive(Default)]
+        struct Heard {
+            invalid: Mutex<usize>,
+            applied: Mutex<Vec<(u64, Option<String>)>>,
+        }
+        struct Recorder(Arc<Heard>, Arc<Mutex<Option<Arc<App>>>>);
+        impl SessionObserver for Recorder {
+            fn on_session_event(&self, _: SessionId, _: SessionEvent) {}
+            fn on_config_applied(&self, generation: u64) {
+                // The error the host reads in this call is current.
+                let error = lock(&self.1)
+                    .as_ref()
+                    .and_then(|app| app.config_generation_and_load_error().2);
+                lock(&self.0.applied).push((generation, error));
+            }
+            fn on_config_invalid(&self) {
+                *lock(&self.0.invalid) += 1;
+            }
+        }
+        let base = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::new(base.path().join("Tessera"));
+        std::fs::create_dir_all(paths.root()).unwrap();
+        std::fs::write(paths.config_file(), "[terminal]\nscrollback_lines = 1000\n").unwrap();
+        let app = Arc::new(App::with_config_dir(paths.clone(), WatchOptions::default()));
+        let heard = Arc::new(Heard::default());
+        let slot = Arc::new(Mutex::new(Some(Arc::clone(&app))));
+        app.set_observer(Some(Box::new(Recorder(
+            Arc::clone(&heard),
+            Arc::clone(&slot),
+        ))));
+        let (_, generation, error) = app.config_generation_and_load_error();
+        assert_eq!(error, None);
+        std::fs::write(paths.config_file(), "[terminal]\nscrollback_lines = 2000\n").unwrap();
+        assert!(eventually(Duration::from_secs(30), || app
+            .config()
+            .terminal
+            .scrollback_lines
+            == 2000));
+        assert!(eventually(Duration::from_secs(30), || app
+            .config_generation()
+            > generation));
+        let saved = app.config_generation();
+        std::fs::write(
+            paths.config_file(),
+            "[terminal]\nscrollback_lines = 3000\nnot toml\n",
+        )
+        .unwrap();
+        assert!(
+            eventually(Duration::from_secs(30), || *lock(&heard.invalid) == 1),
+            "on_config_invalid"
+        );
+        let (config, generation, error) = app.config_generation_and_load_error();
+        assert_eq!(
+            config.terminal.scrollback_lines, 2000,
+            "the last good configuration stays"
+        );
+        assert_eq!(generation, saved, "nothing was applied");
+        assert!(
+            error.is_some(),
+            "the load error is read with the configuration"
+        );
+        let failed = lock(&heard.applied).len();
+        std::fs::write(paths.config_file(), "[terminal]\nscrollback_lines = 3000\n").unwrap();
+        assert!(eventually(Duration::from_secs(30), || app
+            .config()
+            .terminal
+            .scrollback_lines
+            == 3000));
+        assert!(eventually(Duration::from_secs(30), || lock(&heard.applied)
+            .len()
+            > failed));
+        assert_eq!(app.config_generation_and_load_error().2, None);
+        assert!(
+            lock(&heard.applied)[failed..]
+                .iter()
+                .all(|(_, error)| error.is_none()),
+            "the configuration that loads again is applied with the error cleared: {:?}",
+            lock(&heard.applied)
+        );
+        std::fs::write(
+            paths.config_file(),
+            "[terminal]\nscrollback_lines = 3000\nnot toml\n",
+        )
+        .unwrap();
+        assert!(
+            eventually(Duration::from_secs(30), || *lock(&heard.invalid) == 2),
+            "the same failure after a good load is announced again"
+        );
+        // The observer holds the `App`: let it go before the `App` drops.
+        lock(&slot).take();
+        app.set_observer(None);
     }
 
     /// #43 (R3): an edit that only reorders `[keys]` changes the chord a

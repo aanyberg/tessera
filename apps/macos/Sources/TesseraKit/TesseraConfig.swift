@@ -249,10 +249,17 @@ public struct TesseraConfigSnapshot: Sendable, Equatable {
     /// Every key `config.toml` documents, under the same names
     /// (`general`, `appearance`, `terminal`, `profiles`, `plugins`, `keys`).
     public var config: TesseraConfigValue
+    /// Why `config.toml` does not load, while it does not (as the core
+    /// words it, quoting the file escaped; sanitise it before showing it,
+    /// S3): ``config`` is then the last good configuration, and an edit
+    /// saved since is not in it (#547).
+    /// ``TesseraAppDelegate/configurationDidNotLoad()`` reports a new one.
+    public var loadError: String?
 
-    public init(generation: UInt64, config: TesseraConfigValue) {
+    public init(generation: UInt64, config: TesseraConfigValue, loadError: String? = nil) {
         self.generation = generation
         self.config = config
+        self.loadError = loadError
     }
 
     /// The value at `path` (``TesseraConfigValue/subscript(_:)``).
@@ -526,7 +533,8 @@ extension TesseraApp {
         guard let generation = document["generation"]?.integer, generation >= 0, let config = document["config"] else {
             throw TesseraCoreError.invalidArgument
         }
-        return TesseraConfigSnapshot(generation: UInt64(generation), config: config)
+        return TesseraConfigSnapshot(
+            generation: UInt64(generation), config: config, loadError: document["load_error"]?.string)
     }
 
     /// The themes `appearance.theme` can name: the bundled ones, then the

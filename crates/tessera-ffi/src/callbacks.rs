@@ -43,8 +43,8 @@ use tessera_app_core::{Remote, SessionEvent, SessionId, SessionObserver};
 /// # ABI
 ///
 /// Fields are only ever added at the end (`on_appearance_changed`,
-/// `on_session_clipboard`, `on_config_applied` and `on_session_remote`
-/// were). A host compiled against an older header
+/// `on_session_clipboard`, `on_config_applied`, `on_session_remote` and
+/// `on_config_invalid` were). A host compiled against an older header
 /// passes a shorter table, which this core would read past: rebuild the
 /// host against the header that ships with the core it links. Initialise the table with designated
 /// initialisers (C) or every field (Swift), so a new field is `NULL`.
@@ -147,6 +147,16 @@ pub struct Callbacks {
             len: usize,
         ),
     >,
+    /// `config.toml` changed and does not load (#547): the last good
+    /// configuration stays in effect, so `on_config_applied` is not
+    /// called. The host reads `"load_error"` from `tessera_config_json`
+    /// again (a settings window shows it, and stops waiting for an edit it
+    /// saved to apply). Called once per failure with an error other than
+    /// the one last reported, and when the file was already broken as the
+    /// configuration watch started; the next configuration applied, once
+    /// the file loads, clears `"load_error"`. Configuration watch's thread,
+    /// under the rules of `on_config_applied`.
+    pub on_config_invalid: Option<unsafe extern "C" fn(user_data: *mut c_void)>,
 }
 
 /// Most bytes of the host `on_session_remote` passes: the longest DNS name
@@ -262,6 +272,13 @@ impl SessionObserver for CallbackObserver {
             unsafe { callback(self.0.user_data, generation) };
         }
     }
+
+    fn on_config_invalid(&self) {
+        if let Some(callback) = self.0.on_config_invalid {
+            // SAFETY: host contract on `Callbacks`.
+            unsafe { callback(self.0.user_data) };
+        }
+    }
 }
 
 /// Converts `text` to a C string, dropping interior NULs.
@@ -277,18 +294,53 @@ fn c_string_lossy(text: String) -> CString {
 mod tests {
     use super::*;
 
-    /// The table's C layout: nine pointers, `on_session_remote` last,
-    /// right after `on_config_applied` (fields are only appended, S7).
+    /// The table's C layout: ten pointers, `on_config_invalid` last,
+    /// right after `on_session_remote` (fields are only appended, S7).
     #[test]
-    fn the_session_remote_callback_is_appended_last() {
+    fn the_config_invalid_callback_is_appended_last() {
         use std::mem::{offset_of, size_of};
 
         let pointer = size_of::<*const c_void>();
-        assert_eq!(size_of::<Callbacks>(), 9 * pointer);
+        assert_eq!(size_of::<Callbacks>(), 10 * pointer);
         assert_eq!(offset_of!(Callbacks, on_appearance_changed), 5 * pointer);
         assert_eq!(offset_of!(Callbacks, on_session_clipboard), 6 * pointer);
         assert_eq!(offset_of!(Callbacks, on_config_applied), 7 * pointer);
         assert_eq!(offset_of!(Callbacks, on_session_remote), 8 * pointer);
+        assert_eq!(offset_of!(Callbacks, on_config_invalid), 9 * pointer);
+    }
+
+    static INVALID_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    unsafe extern "C" fn record_invalid(_user_data: *mut c_void) {
+        INVALID_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// #547: the observer's `on_config_invalid` reaches the table's.
+    #[test]
+    fn a_config_that_does_not_load_reaches_the_callback() {
+        let observer = CallbackObserver::new(Callbacks {
+            on_config_invalid: Some(record_invalid),
+            ..empty()
+        });
+        observer.on_config_invalid();
+        assert_eq!(INVALID_CALLS.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // A table without it ignores the failure.
+        CallbackObserver::new(empty()).on_config_invalid();
+    }
+
+    fn empty() -> Callbacks {
+        Callbacks {
+            user_data: std::ptr::null_mut(),
+            on_session_output: None,
+            on_session_title: None,
+            on_session_bell: None,
+            on_session_exit: None,
+            on_appearance_changed: None,
+            on_session_clipboard: None,
+            on_config_applied: None,
+            on_session_remote: None,
+            on_config_invalid: None,
+        }
     }
 
     /// What one `on_session_remote` call passed: kind, host bytes (`None`
@@ -322,6 +374,7 @@ mod tests {
             on_session_clipboard: None,
             on_config_applied: None,
             on_session_remote: Some(record_remote),
+            on_config_invalid: None,
         });
         let id = SessionId::from_raw(1);
         observer.on_session_event(id, SessionEvent::Remote(Remote::Host("far.example".into())));

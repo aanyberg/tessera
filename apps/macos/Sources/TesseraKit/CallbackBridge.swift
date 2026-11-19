@@ -33,7 +33,8 @@ internal import TesseraCore
 /// `on_appearance_changed` (from the core's configuration watch thread) is
 /// coalesced the same way, app-wide: at most one delivery is queued, and it
 /// reports the latest `opaque`. `on_config_applied` (same thread) likewise
-/// reports the latest generation.
+/// reports the latest generation, and `on_config_invalid` (same thread) is a
+/// flag.
 @MainActor
 final class CallbackBridge {
     weak var delegate: (any TesseraAppDelegate)?
@@ -65,6 +66,11 @@ final class CallbackBridge {
     private nonisolated let pendingConfiguration = Mutex<UInt64?>(nil)
     /// Configuration deliveries scheduled so far (tests: a burst schedules one).
     nonisolated let scheduledConfigurationDeliveries = Mutex<Int>(0)
+    /// Whether `on_config_invalid` was received and not yet delivered;
+    /// `true` exactly while a delivery is queued.
+    private nonisolated let pendingInvalid = Mutex<Bool>(false)
+    /// Load-failure deliveries scheduled so far (tests: a burst schedules one).
+    nonisolated let scheduledInvalidDeliveries = Mutex<Int>(0)
     /// The registry's command names, by id (``TesseraKeymap/Command/command``),
     /// read once at start: the registry never changes while the core runs.
     var commandNames: [String] = []
@@ -133,6 +139,9 @@ final class CallbackBridge {
                 // during this call.
                 let remote = CallbackBridge.remote(kind: kind, host: host, len: len)
                 CallbackBridge.from(userData)?.receive(for: id) { $0.remote = remote }
+            },
+            on_config_invalid: { userData in
+                CallbackBridge.from(userData)?.receiveInvalid()
             }
         )
     }
@@ -209,7 +218,28 @@ final class CallbackBridge {
         }
     }
 
+    private nonisolated func receiveInvalid() {
+        let schedule = pendingInvalid.withLock { pending in
+            defer { pending = true }
+            return !pending
+        }
+        guard schedule else { return }
+        scheduledInvalidDeliveries.withLock { $0 += 1 }
+        Task { @MainActor in
+            self.deliverInvalid()
+        }
+    }
+
     // MARK: Main actor
+
+    private func deliverInvalid() {
+        guard pendingInvalid.withLock({ pending in
+            defer { pending = false }
+            return pending
+        }) else { return }
+        guard !isShutDown, let delegate else { return }
+        delegate.configurationDidNotLoad()
+    }
 
     private func deliverConfiguration() {
         guard let generation = pendingConfiguration.withLock({ pending in

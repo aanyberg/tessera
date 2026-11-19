@@ -338,6 +338,7 @@ impl App {
             display: DisplayOptions::default(),
             profile_themes,
             kept_broken: None,
+            load_error: None,
         }));
         let plugins = Arc::new(plugins::PluginHost::new(factories, Arc::clone(&applied)));
         // The configuration the `App` starts with enables its plugins; no
@@ -418,6 +419,18 @@ impl App {
     /// after the other can give while configurations apply (#348).
     pub fn config_and_generation(&self) -> (Arc<Config>, u64) {
         self.live().config_and_generation()
+    }
+
+    /// [`App::config_and_generation`] with why `config.toml` does not load,
+    /// while it does not (`None` once it loads again): the configuration in
+    /// effect is then the last good one. Read under one lock. The watch
+    /// records the error before it applies anything, so an
+    /// [`SessionObserver::on_config_applied`] reads it current, and
+    /// announces a new one with [`SessionObserver::on_config_invalid`]
+    /// (#547). The text is the store's ([`tessera_config::Error`]),
+    /// escaped where it quotes the file (S8).
+    pub fn config_generation_and_load_error(&self) -> (Arc<Config>, u64, Option<String>) {
+        self.live().config_generation_and_load_error()
     }
 
     /// How many configurations were applied since the `App` was created

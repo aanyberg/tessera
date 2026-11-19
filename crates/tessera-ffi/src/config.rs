@@ -350,11 +350,16 @@ unsafe fn edit_export(
 /// {"generation": 3,
 ///  "config": {"general": {...}, "appearance": {"theme": "Nord",
 ///             "opacity": 1.0, ...}, "terminal": {...}, "keys": {...},
-///             "profiles": [...], ...}}
+///             "profiles": [...], ...},
+///  "load_error": null}
 /// ```
 ///
 /// `generation` is `on_config_applied`'s count for this configuration (0
-/// for the one the app started with); `config` has every key the
+/// for the one the app started with); `load_error` is `null`, or while
+/// `config.toml` does not load, why (a message for the user, escaped where
+/// it quotes the file, S8; sanitise it for display, S3): `config` is then
+/// the last good configuration, and an edit saved since is not in it
+/// (`on_config_invalid`, #547). All three are read together. `config` has every key the
 /// configuration file documents, under the same names. Each profile also
 /// has `"source"`: `"config"` for a `[[profiles]]` entry of `config.toml`,
 /// `"profiles/<stem>.toml"` for one read from that file, which the
@@ -393,10 +398,11 @@ pub unsafe extern "C" fn tessera_config_json(
         };
         // Read together (#348): read one after the other, an apply in
         // between gave a configuration with another apply's generation.
-        let (config, generation) = app.core.config_and_generation();
+        let (config, generation, load_error) = app.core.config_generation_and_load_error();
         let json = serde_json::json!({
             "generation": generation,
             "config": config_value(&config),
+            "load_error": load_error,
         })
         .to_string();
         // SAFETY: `len` and `buf` per the contract.

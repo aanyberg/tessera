@@ -79,6 +79,14 @@ final class Recorder: TesseraAppDelegate {
         XCTAssertTrue(Thread.isMainThread, "delegate called off the main thread")
         configurations.append(generation)
     }
+
+    /// How many `configurationDidNotLoad()` calls came.
+    private(set) var loadFailures = 0
+
+    func configurationDidNotLoad() {
+        XCTAssertTrue(Thread.isMainThread, "delegate called off the main thread")
+        loadFailures += 1
+    }
 }
 
 @MainActor

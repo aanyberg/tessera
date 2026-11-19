@@ -48,6 +48,13 @@ public protocol TesseraAppDelegate: AnyObject {
     /// with the latest. Not sent after ``TesseraApp/shutdown()``. The
     /// default does nothing.
     func configurationDidApply(generation: UInt64)
+    /// `config.toml` changed and does not load (#547): the last good
+    /// configuration stays in effect and nothing was applied. Read
+    /// ``TesseraApp/configSnapshot()`` again for its
+    /// ``TesseraConfigSnapshot/loadError``, and stop waiting for an edit
+    /// saved to apply. Several between two deliveries are reported once.
+    /// Not sent after ``TesseraApp/shutdown()``. The default does nothing.
+    func configurationDidNotLoad()
     /// Where the session's shell runs changed (#205): the core decided it from
     /// the shell's working-directory reports (OSC 7) and, with none naming a
     /// host, from `ssh` in the foreground. Reported only on a change; a new
@@ -58,6 +65,7 @@ public protocol TesseraAppDelegate: AnyObject {
 
 extension TesseraAppDelegate {
     public func configurationDidApply(generation: UInt64) {}
+    public func configurationDidNotLoad() {}
     public func session(_ session: TesseraSession, didChangeRemote remote: TesseraRemote) {}
 }
 

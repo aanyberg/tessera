@@ -750,6 +750,13 @@ impl SessionObserver for Tee {
             inner.on_config_applied(generation);
         }
     }
+
+    /// Nothing changed for the plugins: the configuration in effect stays.
+    fn on_config_invalid(&self) {
+        if let Some(inner) = &self.inner {
+            inner.on_config_invalid();
+        }
+    }
 }
 
 /// A plugin's storage, in memory only (ADR 0047).

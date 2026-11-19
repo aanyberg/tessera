@@ -720,6 +720,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.settingsWindowController?.model.reload()
             self?.reloadWaitingSettingsModel()
         }
+        router.onConfigurationInvalid = { [weak self] in
+            // Nothing else changed: the configuration in effect stays.
+            self?.settingsWindowController?.model.reload()
+            self?.reloadWaitingSettingsModel()
+        }
         // Before the caller opens the window the core was started for.
         readAppAppearance()
         applyKeymap()
