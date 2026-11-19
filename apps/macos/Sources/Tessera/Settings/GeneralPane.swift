@@ -42,7 +42,7 @@ struct SettingsForm<Content: View>: View {
         Form {
             if let error = model.loadError {
                 Section {
-                    SettingsMessage(text: error)
+                    SettingsMessage(text: error, notSaved: false)
                 }
             }
             content

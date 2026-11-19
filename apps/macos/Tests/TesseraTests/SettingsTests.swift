@@ -16,7 +16,11 @@ import TesseraKit
 @MainActor
 final class SettingsTests: XCTestCase {
     private var appDelegate: AppDelegate!
-    private var dir: URL?
+    private var dir: URL? {
+        willSet { if let dir, dir != newValue { earlierDirs.append(dir) } }
+    }
+    /// The directories of earlier attempts of a test that tries again.
+    private var earlierDirs: [URL] = []
     private var previous: String?
     private var replacedCore = false
     /// The stand-in sources of the test's models, which hold them weakly.
@@ -40,7 +44,7 @@ final class SettingsTests: XCTestCase {
         AppDelegate.applyAppAppearance(.dark)
         if let bar = NSApp.mainMenu { MainMenu.setProfiles([], in: bar) }
         if let previous { setenv("TESSERA_CONFIG_DIR", previous, 1) } else { unsetenv("TESSERA_CONFIG_DIR") }
-        if let dir { try? FileManager.default.removeItem(at: dir) }
+        removeTemporaryDirectories()
         sources = []
         appDelegate.opener = WorkspaceOpener()
         appDelegate.configFileCreator = nil
@@ -50,6 +54,12 @@ final class SettingsTests: XCTestCase {
     }
 
     // MARK: Helpers
+
+    /// Removes the test's configuration directories, every attempt's.
+    private func removeTemporaryDirectories() {
+        for url in earlierDirs + (dir.map { [$0] } ?? []) { try? FileManager.default.removeItem(at: url) }
+        earlierDirs = []
+    }
 
     /// Waits up to 10 s for `condition`.
     private func waitUntil(_ what: String, _ condition: () -> Bool) async throws {
@@ -2675,6 +2685,886 @@ extension SettingsTests {
         _ = try incrementor().accessibilityPerformIncrement()
         try await waitUntil("the next step written") { writer.calls.count == 2 && !model.isWriting }
         XCTAssertEqual(writer.calls.last, .init(key: key, value: .float(21)), "from the hand edit's 20")
+    }
+
+    // MARK: A configuration applied during a press (#517)
+
+    /// The real stepper of the font size, in a window of its own, on `model`.
+    private func hostedFontSizeStepper(
+        _ context: SettingsFieldContext
+    ) async throws -> (KeyControlledWindow, NSStepper) {
+        let field = try XCTUnwrap(AppearancePane.fields.first { $0.key == "appearance.font_size" })
+        let window = KeyControlledWindow(contentRect: NSRect(x: 0, y: 0, width: 500, height: 200))
+        window.isKeyForTest = true
+        window.contentView = NSHostingView(
+            rootView: SettingsFieldRow(field: field, context: context).padding())
+        window.layoutIfNeeded()
+        func find(_ view: NSView) -> NSStepper? {
+            (view as? NSStepper) ?? view.subviews.lazy.compactMap(find).first
+        }
+        var stepper: NSStepper?
+        try await waitUntil("the stepper is shown") {
+            window.layoutIfNeeded()
+            stepper = window.contentView.flatMap(find)
+            return stepper != nil
+        }
+        return (window, try XCTUnwrap(stepper))
+    }
+
+    /// A press of `stepper`'s up arrow, as AppKit's mouse tracking makes it
+    /// on the control: the cell is told the press started and ended
+    /// (SwiftUI's cell reports both to `onEditingChanged`), and each step
+    /// is the new value with the control's action. The tracking loop itself
+    /// ends at once in a test: no mouse button is down.
+    private struct StepperPress {
+        let stepper: NSStepper
+        let cell: NSCell
+        let point: NSPoint
+
+        @MainActor
+        func step() {
+            stepper.doubleValue += stepper.increment
+            stepper.sendAction(stepper.action, to: stepper.target)
+        }
+
+        @MainActor
+        func release() {
+            cell.stopTracking(last: point, current: point, in: stepper, mouseIsUp: true)
+        }
+    }
+
+    /// Presses the up arrow, and takes the step a press starts with.
+    private func pressUpArrow(of stepper: NSStepper) throws -> StepperPress {
+        let cell = try XCTUnwrap(stepper.cell)
+        let point = NSPoint(x: stepper.bounds.midX, y: stepper.bounds.midY - stepper.bounds.height / 4)
+        XCTAssertTrue(cell.startTracking(at: point, in: stepper), "the cell tracks the press")
+        let press = StepperPress(stepper: stepper, cell: cell, point: point)
+        press.step()
+        return press
+    }
+
+    private func applyFontSize(_ size: String, generation: UInt64, _ model: SettingsModel, _ source: FakeSource) throws {
+        let text = Self.fakeConfig.replacingOccurrences(of: #""font_size": 13.0"#, with: #""font_size": \#(size)"#)
+        source.snapshot = TesseraConfigSnapshot(generation: generation, config: try Self.json(text))
+        model.reload()
+    }
+
+    /// #517: the real stepper, held with the mouse. A hand edit of the
+    /// key applied during the press shows once it is let go, and the next
+    /// step goes from it instead of writing over it.
+    func testAHandEditDuringAHeldStepperShowsAfterTheReleaseAndTheNextStepKeepsIt() async throws {
+        let clock = ManualClock()
+        let (model, source, writer) = try fakeModel(Self.fakeConfig, clock: clock)
+        let key = "appearance.font_size"
+        let (window, stepper) = try await hostedFontSizeStepper(.init(model: model, path: key))
+        defer {
+            window.contentView = nil
+            window.close()
+        }
+        let press = try pressUpArrow(of: stepper)
+        try await waitUntil("the step written") { writer.calls.count == 1 && !model.isWriting }
+        XCTAssertEqual(writer.calls, [.init(key: key, value: .float(14))])
+        try applyFontSize("14.0", generation: 1, model, source)
+        try applyFontSize("20.0", generation: 2, model, source)
+        XCTAssertEqual(model.value(key), .float(14), "held: the control keeps the value it shows")
+
+        press.release()
+        clock.advance(by: .zero)
+        XCTAssertEqual(model.value(key), .float(20), "the hand edit shows after the release")
+        XCTAssertFalse(model.isPending(key))
+        XCTAssertEqual(writer.calls.count, 1, "the release writes nothing")
+
+        window.layoutIfNeeded()
+        try pressUpArrow(of: stepper).release()
+        try await waitUntil("the next step written") { writer.calls.count == 2 && !model.isWriting }
+        XCTAssertEqual(writer.calls.last, .init(key: key, value: .float(21)), "from the hand edit's 20")
+    }
+
+    /// #517: what the press itself wrote is not a hand edit. An earlier
+    /// value of the press applied, read back as the core's `f32`, leaves
+    /// the last value showing after the release, until it applies too.
+    func testAnEarlierValueOfThePressAppliedDoesNotReplaceTheLastAfterTheRelease() async throws {
+        let clock = ManualClock()
+        let (model, source, writer) = try fakeModel(Self.fakeConfig, clock: clock)
+        let key = "appearance.opacity"
+        let field = try XCTUnwrap(AppearancePane.fields.first { $0.key == key })
+        let editingChanged = field.editingChanged(.init(model: model, path: key))
+        editingChanged(true)
+        model.change(key, .float(0.3))
+        try await waitUntil("the first value written") { writer.calls.count == 1 && !model.isWriting }
+        clock.advance(by: SettingsModel.coalescingInterval)
+        model.change(key, .float(0.6))
+        try await waitUntil("the second written") { writer.calls.count == 2 && !model.isWriting }
+        let widened = Self.fakeConfig.replacingOccurrences(of: "0.85", with: "\(Double(Float(0.3)))")
+        source.snapshot = TesseraConfigSnapshot(generation: 1, config: try Self.json(widened))
+        model.reload()
+        editingChanged(false)
+        XCTAssertEqual(model.value(key), .float(0.6), "not the earlier value the press wrote")
+        XCTAssertTrue(model.isPending(key))
+        let last = Self.fakeConfig.replacingOccurrences(of: "0.85", with: "\(Double(Float(0.6)))")
+        source.snapshot = TesseraConfigSnapshot(generation: 2, config: try Self.json(last))
+        model.reload()
+        XCTAssertFalse(model.isPending(key), "its own value applied")
+        XCTAssertEqual(writer.calls.count, 2)
+    }
+
+    /// #517: a configuration applied that changes another key says nothing
+    /// about this one: the value written and not yet applied stays.
+    func testAnotherKeyAppliedDuringAPressLeavesTheValueShown() async throws {
+        let (model, source, writer) = try fakeModel(Self.fakeConfig, clock: ManualClock())
+        let key = "appearance.font_size"
+        model.beginChange(key)
+        model.change(key, .float(14))
+        try await waitUntil("written") { writer.calls.count == 1 && !model.isWriting }
+        let other = Self.fakeConfig.replacingOccurrences(of: "Tessera Dark", with: "Nord")
+        source.snapshot = TesseraConfigSnapshot(generation: 1, config: try Self.json(other))
+        model.reload()
+        model.endChange(key)
+        XCTAssertEqual(model.value(key), .float(14))
+        XCTAssertTrue(model.isPending(key))
+    }
+
+    /// #517: a step held back by the coalescing when the hand edit applies
+    /// was taken before it: it is not written over the edit, by its timer
+    /// or at the release.
+    func testAHeldBackStepIsNotWrittenOverAHandEditAppliedAfterIt() async throws {
+        let clock = ManualClock()
+        let (model, source, writer) = try fakeModel(Self.fakeConfig, clock: clock)
+        let key = "appearance.font_size"
+        model.beginChange(key)
+        model.change(key, .float(14))
+        try await waitUntil("written") { writer.calls.count == 1 && !model.isWriting }
+        model.change(key, .float(15))
+        try applyFontSize("20.0", generation: 1, model, source)
+        clock.advance(by: SettingsModel.coalescingInterval * 2)
+        model.endChange(key)
+        clock.advance(by: .zero)
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(writer.calls, [.init(key: key, value: .float(14))], "15 is not written")
+        XCTAssertEqual(model.value(key), .float(20))
+        XCTAssertFalse(model.isPending(key))
+    }
+
+    /// #517: a step taken after the hand edit applied (the press goes on)
+    /// is the person's latest word: written, and shown after the release.
+    func testAStepAfterTheHandEditInTheSamePressIsWritten() async throws {
+        let clock = ManualClock()
+        let (model, source, writer) = try fakeModel(Self.fakeConfig, clock: clock)
+        let key = "appearance.font_size"
+        model.beginChange(key)
+        model.change(key, .float(14))
+        try await waitUntil("written") { writer.calls.count == 1 && !model.isWriting }
+        try applyFontSize("20.0", generation: 1, model, source)
+        // Within the coalescing interval: the release writes it.
+        model.change(key, .float(15))
+        model.endChange(key)
+        try await waitUntil("the step written") { writer.calls.count == 2 && !model.isWriting }
+        XCTAssertEqual(writer.calls.last, .init(key: key, value: .float(15)))
+        XCTAssertEqual(model.value(key), .float(15))
+        XCTAssertTrue(model.isPending(key), "until it applies")
+    }
+
+    /// #517: the values a press remembers go once they are settled, so a
+    /// later hand edit back to one of them is still a hand edit.
+    func testAHandEditBackToAnEarlierPressesValueShowsAfterTheRelease() async throws {
+        let clock = ManualClock()
+        let (model, source, writer) = try fakeModel(Self.fakeConfig, clock: clock)
+        let key = "appearance.font_size"
+        model.beginChange(key)
+        model.change(key, .float(14))
+        try await waitUntil("written") { writer.calls.count == 1 && !model.isWriting }
+        model.endChange(key)
+        try applyFontSize("14.0", generation: 1, model, source)
+        XCTAssertFalse(model.isPending(key))
+        try applyFontSize("18.0", generation: 2, model, source)
+
+        clock.advance(by: .seconds(1))
+        model.beginChange(key)
+        model.change(key, .float(19))
+        try await waitUntil("written") { writer.calls.count == 2 && !model.isWriting }
+        // The step reached the file and the edit went over it before the
+        // watch looked: one configuration, the edit's.
+        try applyFontSize("14.0", generation: 3, model, source)
+        model.endChange(key)
+        clock.advance(by: .zero)
+        XCTAssertEqual(model.value(key), .float(14), "the hand edit, though the first press wrote 14 too")
+        XCTAssertFalse(model.isPending(key))
+    }
+
+    /// #517: a value of this press that has applied is settled too: a hand
+    /// edit back to it, in the same press, is still a hand edit.
+    func testAHandEditBackToAValueThePressAlreadySawAppliedShows() async throws {
+        let clock = ManualClock()
+        let (model, source, writer) = try fakeModel(Self.fakeConfig, clock: clock)
+        let key = "appearance.font_size"
+        model.beginChange(key)
+        model.change(key, .float(14))
+        try await waitUntil("written") { writer.calls.count == 1 && !model.isWriting }
+        clock.advance(by: SettingsModel.coalescingInterval)
+        model.change(key, .float(15))
+        try await waitUntil("written") { writer.calls.count == 2 && !model.isWriting }
+        // The watch saw both writes at once: 15 settles 14 as well.
+        try applyFontSize("15.0", generation: 1, model, source)
+        try applyFontSize("14.0", generation: 2, model, source)
+        model.endChange(key)
+        clock.advance(by: .zero)
+        XCTAssertEqual(model.value(key), .float(14))
+        XCTAssertFalse(model.isPending(key))
+    }
+
+    /// #517, S5: the values remembered per key are capped however long a
+    /// press lasts with no configuration applied.
+    func testTheValuesAPressRemembersAreBounded() async throws {
+        let clock = ManualClock()
+        let (model, _, writer) = try fakeModel(Self.fakeConfig, clock: clock)
+        let key = "appearance.font_size"
+        model.beginChange(key)
+        let steps = SettingsModel.maxUnappliedWrites * 3
+        for step in 0..<steps {
+            model.change(key, .float(Double(14 + step)))
+            clock.advance(by: SettingsModel.coalescingInterval)
+        }
+        try await waitUntil("written") { writer.calls.count == steps && !model.isWriting }
+        XCTAssertEqual(model.unappliedWriteCount(key), SettingsModel.maxUnappliedWrites)
+        model.endChange(key)
+    }
+
+    /// #517 on the core: `config.toml` edited by hand during a press, seen
+    /// through the watch. After the release the window shows the file's
+    /// value, and the next step keeps the rest of what the edit changed.
+    func testAHandEditOfTheFileDuringAPressShowsAfterTheReleaseOnTheCore() async throws {
+        let model = try openSettings(config: "[appearance]\nfont_size = 13.0\nopacity = 0.5\n")
+        let key = "appearance.font_size"
+        try await waitUntil("the file's value") { model.value(key) == .float(13) }
+        model.beginChange(key)
+        model.change(key, .float(14))
+        try await waitUntil("the step applied") { model.snapshot[key] == .float(14) && !model.isWriting }
+        let generation = model.snapshot.generation
+        try "[appearance]\nfont_size = 20.0\nopacity = 0.25\n".write(to: configFile, atomically: true, encoding: .utf8)
+        try await waitUntil("the hand edit applied") { model.snapshot.generation > generation }
+        XCTAssertEqual(model.value(key), .float(14), "held: the control keeps the value it shows")
+        model.endChange(key)
+        try await waitUntil("shown after the release") { model.value(key) == .float(20) }
+        model.change(key, .float(21))
+        try await waitUntil("the next step applied") { model.snapshot[key] == .float(21) }
+        XCTAssertTrue(try lines().contains { $0.hasPrefix("font_size") && $0.contains("21") }, contents)
+        XCTAssertTrue(try lines().contains { $0.hasPrefix("opacity") && $0.contains("0.25") }, contents)
+    }
+
+    /// #517 B1: a configuration applied during a press with the key where
+    /// it was (another app saved its copy over the step). Nothing about the
+    /// key looks new, so the press sees no hand edit: once the watch has had
+    /// its time after the release, the window shows what is applied.
+    func testAnApplyLeavingThePressedKeyAsItWasShowsAfterTheSettleTime() async throws {
+        let clock = ManualClock()
+        let (model, source, writer) = try fakeModel(Self.fakeConfig, clock: clock)
+        let key = "appearance.font_size"
+        model.beginChange(key)
+        model.change(key, .float(14))
+        try await waitUntil("written") { writer.calls.count == 1 && !model.isWriting }
+        try applyFontSize("13.0", generation: 1, model, source)
+        model.endChange(key)
+        XCTAssertEqual(model.value(key), .float(14), "the step may still be on its way")
+        clock.advance(by: model.profileSettleTimeout)
+        XCTAssertEqual(model.value(key), .float(13))
+        XCTAssertFalse(model.isPending(key))
+        XCTAssertEqual(writer.calls.count, 1, "nothing written over it")
+    }
+
+    /// #517 B1: the file ends on an earlier value of the press.
+    func testAFileEndingOnAnEarlierValueOfThePressShowsAfterTheSettleTime() async throws {
+        let clock = ManualClock()
+        let (model, source, writer) = try fakeModel(Self.fakeConfig, clock: clock)
+        let key = "appearance.font_size"
+        model.beginChange(key)
+        model.change(key, .float(14))
+        try await waitUntil("written") { writer.calls.count == 1 && !model.isWriting }
+        clock.advance(by: SettingsModel.coalescingInterval)
+        model.change(key, .float(15))
+        try await waitUntil("written") { writer.calls.count == 2 && !model.isWriting }
+        try applyFontSize("14.0", generation: 1, model, source)
+        model.endChange(key)
+        XCTAssertEqual(model.value(key), .float(15), "14 may be the press's own")
+        clock.advance(by: model.profileSettleTimeout)
+        XCTAssertEqual(model.value(key), .float(14))
+        XCTAssertFalse(model.isPending(key))
+    }
+
+    /// #517 B1: a hand edit removes a profile, and the row under the press
+    /// is another one with no value of its own, before and after.
+    func testARowThatMovedUnderAPressShowsItsOwnValueAfterTheSettleTime() async throws {
+        let clock = ManualClock()
+        let (model, source, writer) = try fakeModel(Self.threeProfiles, clock: clock)
+        let key = "profiles[1].appearance.font_size"
+        model.beginChange(key)
+        model.change(key, .float(14))
+        try await waitUntil("written") { writer.calls.count == 1 && !model.isWriting }
+        let removed = Self.threeProfiles.replacingOccurrences(of: #"{"name": "one"}, "#, with: "")
+        XCTAssertNotEqual(removed, Self.threeProfiles)
+        source.snapshot = TesseraConfigSnapshot(generation: 1, config: try Self.json(removed))
+        model.reload()
+        model.endChange(key)
+        clock.advance(by: model.profileSettleTimeout)
+        XCTAssertEqual(model.profiles.map(\.name), ["two", "three"])
+        XCTAssertNil(model.value(key), "“three” has no size of its own")
+        XCTAssertFalse(model.isPending(key))
+    }
+
+    /// #517 B1: a new press cancels the reload the last release set up.
+    func testANewPressCancelsTheSettleOfTheLastRelease() async throws {
+        let clock = ManualClock()
+        let (model, source, writer) = try fakeModel(Self.fakeConfig, clock: clock)
+        let key = "appearance.font_size"
+        model.beginChange(key)
+        model.change(key, .float(14))
+        try await waitUntil("written") { writer.calls.count == 1 && !model.isWriting }
+        try applyFontSize("13.0", generation: 1, model, source)
+        model.endChange(key)
+        model.beginChange(key)
+        source.snapshot = TesseraConfigSnapshot(generation: 2, config: try Self.json(Self.fakeConfig))
+        clock.advance(by: model.profileSettleTimeout)
+        XCTAssertEqual(model.snapshot.generation, 1, "not read again")
+    }
+
+    /// #517 B1: with nothing applied since the last write the value goes on
+    /// waiting for the watch, however long it takes.
+    func testAReleaseWaitsForTheWatchWhenNothingAppliedSinceTheWrite() async throws {
+        let clock = ManualClock()
+        let (model, source, writer) = try fakeModel(Self.fakeConfig, clock: clock)
+        let key = "appearance.font_size"
+        model.beginChange(key)
+        model.change(key, .float(14))
+        try await waitUntil("written") { writer.calls.count == 1 && !model.isWriting }
+        model.endChange(key)
+        let applied = Self.fakeConfig.replacingOccurrences(of: #""font_size": 13.0"#, with: #""font_size": 14.0"#)
+        source.snapshot = TesseraConfigSnapshot(generation: 1, config: try Self.json(applied))
+        clock.advance(by: .seconds(30))
+        XCTAssertEqual(model.snapshot.generation, 0, "no reload was set up")
+        XCTAssertEqual(model.value(key), .float(14))
+        XCTAssertTrue(model.isPending(key))
+        model.reload()
+        XCTAssertFalse(model.isPending(key))
+    }
+
+    /// #517 B1 on the core: another app saves its copy, with the value from
+    /// before the step, before the watch has read the step.
+    func testAStaleSaveDuringAPressShowsAfterTheReleaseOnTheCore() async throws {
+        let model = try openSettings(config: "[appearance]\nfont_size = 13.0\nopacity = 0.5\n")
+        let key = "appearance.font_size"
+        try await waitUntil("the file's value") { model.value(key) == .float(13) }
+        model.beginChange(key)
+        model.change(key, .float(14))
+        try await waitUntil("written") { !model.isWriting && self.contents.contains("14") }
+        try "[appearance]\nfont_size = 13.0\nopacity = 0.25\n".write(to: configFile, atomically: true, encoding: .utf8)
+        try await waitUntil("applied") { Self.same(model.snapshot["appearance.opacity"], .float(0.25)) }
+        model.endChange(key)
+        try await waitUntil("the file's value after the release") {
+            model.value(key) == .float(13) && !model.isPending(key)
+        }
+        XCTAssertTrue(try lines().contains { $0.hasPrefix("font_size") && $0.contains("13") }, contents)
+    }
+
+    /// #517 B1 on the core: the same with a profile removed under the press.
+    func testARemovedProfileUnderAPressShowsAfterTheReleaseOnTheCore() async throws {
+        let three = "[[profiles]]\nname = \"one\"\n\n[[profiles]]\nname = \"two\"\n\n[[profiles]]\nname = \"three\"\n"
+        let model = try openSettings(config: three)
+        let key = "profiles[1].appearance.font_size"
+        try await waitUntil("the profiles") { model.profiles.count == 3 }
+        model.beginChange(key)
+        model.change(key, .float(14))
+        try await waitUntil("written") { !model.isWriting && self.contents.contains("14") }
+        let removed = "[[profiles]]\nname = \"two\"\n\n[[profiles]]\nname = \"three\"\n"
+        try removed.write(to: configFile, atomically: true, encoding: .utf8)
+        try await waitUntil("applied") { model.profiles.count == 2 }
+        model.endChange(key)
+        try await waitUntil("the row's own value after the release") {
+            model.value(key) == nil && !model.isPending(key)
+        }
+        XCTAssertFalse(contents.contains("font_size"), contents)
+    }
+
+    /// #517: an own value applied, then a hand edit back to the value at the
+    /// press: new against what the press saw last, so it shows.
+    func testAHandEditBackToThePressStartAfterAnOwnValueShows() async throws {
+        let clock = ManualClock()
+        let (model, source, writer) = try fakeModel(Self.fakeConfig, clock: clock)
+        let key = "appearance.font_size"
+        model.beginChange(key)
+        model.change(key, .float(14))
+        try await waitUntil("written") { writer.calls.count == 1 && !model.isWriting }
+        try applyFontSize("14.0", generation: 1, model, source)
+        try applyFontSize("13.0", generation: 2, model, source)
+        model.endChange(key)
+        clock.advance(by: .zero)
+        XCTAssertEqual(model.value(key), .float(13))
+        XCTAssertFalse(model.isPending(key))
+    }
+
+    /// The reload a hand edit held back waits for the end of the release
+    /// event: until then the binding still equals the knob, and the final
+    /// action of an `NSSlider` is no edit.
+    func testTheHeldBackReloadRunsAfterTheReleaseEvent() async throws {
+        let clock = ManualClock()
+        let (model, source, writer) = try fakeModel(Self.fakeConfig, clock: clock)
+        let key = "appearance.font_size"
+        model.beginChange(key)
+        model.change(key, .float(14))
+        try await waitUntil("written") { writer.calls.count == 1 && !model.isWriting }
+        try applyFontSize("20.0", generation: 1, model, source)
+        model.endChange(key)
+        XCTAssertEqual(model.value(key), .float(14), "still the knob's value during the release")
+        clock.advance(by: .zero)
+        XCTAssertEqual(model.value(key), .float(20))
+        XCTAssertFalse(model.isPending(key))
+        XCTAssertEqual(writer.calls.count, 1)
+    }
+
+    /// #534: stepped up and back inside the watch's debounce, 13 is pending
+    /// with 14 and 13 unapplied. A press without a step during which a hand
+    /// edit to exactly 14 applies has nothing to write: the edit looks like
+    /// the press's own value, and it stays.
+    func testAPressWithoutAStepWritesNothingOverAHandEditEqualToAnUnappliedWrite() async throws {
+        let clock = ManualClock()
+        let (model, source, writer) = try fakeModel(Self.fakeConfig, clock: clock)
+        let key = "appearance.font_size"
+        model.beginChange(key)
+        model.change(key, .float(14))
+        try await waitUntil("14 written") { writer.calls.count == 1 && !model.isWriting }
+        clock.advance(by: SettingsModel.coalescingInterval)
+        model.change(key, .float(13))
+        try await waitUntil("13 written") { writer.calls.count == 2 && !model.isWriting }
+        model.endChange(key)
+        XCTAssertTrue(model.isPending(key))
+
+        model.beginChange(key)
+        try applyFontSize("14.0", generation: 1, model, source)
+        model.endChange(key)
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(writer.calls.count, 2, "the release of a press without a step writes nothing")
+        clock.advance(by: model.profileSettleTimeout)
+        XCTAssertEqual(model.value(key), .float(14))
+        XCTAssertFalse(model.isPending(key))
+    }
+
+    /// #534: a press without a step on a row whose profile moved away,
+    /// inside the settle time of the last release, writes nothing to the
+    /// profile that now has that index.
+    func testAPressWithoutAStepOnARowThatMovedWritesNothing() async throws {
+        let clock = ManualClock()
+        let (model, source, writer) = try fakeModel(Self.threeProfiles, clock: clock)
+        let key = "profiles[1].appearance.font_size"
+        model.beginChange(key)
+        model.change(key, .float(14))
+        try await waitUntil("written") { writer.calls.count == 1 && !model.isWriting }
+        let removed = Self.threeProfiles.replacingOccurrences(of: #"{"name": "one"}, "#, with: "")
+        XCTAssertNotEqual(removed, Self.threeProfiles)
+        source.snapshot = TesseraConfigSnapshot(generation: 1, config: try Self.json(removed))
+        model.reload()
+        model.endChange(key)
+
+        model.beginChange(key)
+        model.endChange(key)
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(writer.calls.count, 1, "nothing goes to the profile now at that index")
+        clock.advance(by: model.profileSettleTimeout)
+        XCTAssertNil(model.value(key), "“three” has no size of its own")
+        XCTAssertFalse(model.isPending(key))
+    }
+
+    /// A step still held back when a press begins is the press's to write:
+    /// its release cancels the timer that would have.
+    func testAStepHeldBackWhenAPressBeginsIsWrittenByItsRelease() async throws {
+        let clock = ManualClock()
+        let (model, _, writer) = try fakeModel(Self.fakeConfig, clock: clock)
+        let key = "appearance.font_size"
+        model.change(key, .float(14))
+        try await waitUntil("14 written") { writer.calls.count == 1 && !model.isWriting }
+        model.change(key, .float(15))
+        model.beginChange(key)
+        model.endChange(key)
+        try await waitUntil("15 written") { writer.calls.count == 2 && !model.isWriting }
+        XCTAssertEqual(writer.calls.last, .init(key: key, value: .float(15)))
+    }
+
+    /// The real opacity slider where it is an `NSSlider`: in an app linked
+    /// against the macOS 15 SDK, which is what CI and releases build. An
+    /// app linked against a later SDK gets SwiftUI's own slider, and the
+    /// test is skipped.
+    private func hostedOpacitySlider(
+        _ context: SettingsFieldContext
+    ) async throws -> (KeyControlledWindow, NSSlider) {
+        let field = try XCTUnwrap(AppearancePane.fields.first { $0.key == "appearance.opacity" })
+        let window = KeyControlledWindow(contentRect: NSRect(x: 0, y: 0, width: 500, height: 200))
+        window.isKeyForTest = true
+        window.contentView = NSHostingView(
+            rootView: SettingsFieldRow(field: field, context: context).padding())
+        window.orderFrontRegardless()
+        func find(_ view: NSView) -> NSSlider? {
+            (view as? NSSlider) ?? view.subviews.lazy.compactMap(find).first
+        }
+        for _ in 0..<50 {
+            window.layoutIfNeeded()
+            if let slider = window.contentView.flatMap(find) { return (window, slider) }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        window.contentView = nil
+        window.close()
+        throw XCTSkip("Slider is not an NSSlider when linked against this SDK")
+    }
+
+    /// Presses `slider`'s knob with real events, runs `whileHeld`, and lets
+    /// go. With no mouse button really down the press returns at once and
+    /// the control takes the drags and the release as they are dispatched,
+    /// which is done here so that the release has happened on return. If
+    /// AppKit's tracking loop runs instead, it takes them from the queue
+    /// while the script runs on the main queue it keeps serving.
+    private func pressKnob(
+        of slider: NSSlider, in window: NSWindow,
+        whileHeld: @escaping @MainActor (_ drag: (CGFloat) -> Void) async throws -> Void
+    ) async throws {
+        let cell = try XCTUnwrap(slider.cell as? NSSliderCell)
+        let knob = cell.knobRect(flipped: slider.isFlipped)
+        let start = slider.convert(NSPoint(x: knob.midX, y: knob.midY), to: nil)
+        var location = start
+        var pressReturned = false
+        func event(_ type: NSEvent.EventType) -> NSEvent? {
+            NSEvent.mouseEvent(
+                with: type, location: location, modifierFlags: [],
+                timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+                context: nil, eventNumber: 0, clickCount: 1, pressure: 1)
+        }
+        func deliver(_ type: NSEvent.EventType) {
+            guard let posted = event(type) else { return XCTFail("no \(type) event") }
+            NSApp.postEvent(posted, atStart: false)
+            guard pressReturned else { return }
+            while let next = NSApp.nextEvent(
+                matching: [.leftMouseDragged, .leftMouseUp], until: .distantPast, inMode: .default, dequeue: true)
+            {
+                NSApp.sendEvent(next)
+            }
+        }
+        let down = try XCTUnwrap(event(.leftMouseDown))
+        let script = Task { @MainActor in
+            defer { deliver(.leftMouseUp) }
+            try await whileHeld { offset in
+                location = NSPoint(x: start.x + offset, y: start.y)
+                deliver(.leftMouseDragged)
+            }
+        }
+        window.sendEvent(down)
+        pressReturned = true
+        try await script.value
+    }
+
+    private func applyOpacity(
+        _ opacity: String, generation: UInt64, _ model: SettingsModel, _ source: FakeSource
+    ) throws {
+        let text = Self.fakeConfig.replacingOccurrences(of: #""opacity": 0.85"#, with: #""opacity": \#(opacity)"#)
+        source.snapshot = TesseraConfigSnapshot(generation: generation, config: try Self.json(text))
+        model.reload()
+    }
+
+    /// The adversarial case of #517, on the `NSSlider` CI and releases get:
+    /// the knob is dragged and held, a hand edit applies, and the slider is
+    /// let go without moving. Its final mouse-up action must not start a
+    /// write of the stale knob value over the edit.
+    func testAHandEditDuringAHeldNSSliderSurvivesTheRelease() async throws {
+        let clock = ManualClock()
+        let (model, source, writer) = try fakeModel(Self.fakeConfig, clock: clock)
+        let key = "appearance.opacity"
+        let (window, slider) = try await hostedOpacitySlider(.init(model: model, path: key))
+        defer {
+            window.contentView = nil
+            window.close()
+        }
+        var written = 0
+        try await pressKnob(of: slider, in: window) { drag in
+            drag(-40)
+            try await self.waitUntil("the drag written") { !writer.calls.isEmpty && !model.isWriting }
+            written = writer.calls.count
+            try self.applyOpacity("0.3", generation: 1, model, source)
+        }
+        XCTAssertGreaterThan(written, 0)
+        clock.advance(by: .zero)
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(writer.calls.count, written, "the release writes nothing: \(writer.calls)")
+        XCTAssertEqual(model.value(key), .float(0.3), "the hand edit shows")
+        XCTAssertFalse(model.isPending(key))
+        clock.advance(by: model.profileSettleTimeout)
+        XCTAssertEqual(writer.calls.count, written)
+        XCTAssertEqual(model.value(key), .float(0.3))
+    }
+
+    /// The same slider without a hand edit: the last value of the drag,
+    /// held back by the coalescing, is written by the release.
+    func testADraggedNSSliderWritesItsLastValueOnRelease() async throws {
+        let clock = ManualClock()
+        let (model, _, writer) = try fakeModel(Self.fakeConfig, clock: clock)
+        let key = "appearance.opacity"
+        let (window, slider) = try await hostedOpacitySlider(.init(model: model, path: key))
+        defer {
+            window.contentView = nil
+            window.close()
+        }
+        var held: TesseraConfigValue?
+        try await pressKnob(of: slider, in: window) { drag in
+            drag(-40)
+            try await self.waitUntil("the drag written") { !writer.calls.isEmpty && !model.isWriting }
+            let first = model.value(key)
+            drag(-80)
+            try await self.waitUntil("the knob moved on") { model.value(key) != first }
+            held = model.value(key)
+            XCTAssertEqual(writer.calls.count, 1, "the second value waits for the coalescing")
+        }
+        try await waitUntil("the last value written") { writer.calls.count == 2 && !model.isWriting }
+        XCTAssertEqual(writer.calls.last?.value, held)
+        XCTAssertEqual(model.value(key), held)
+    }
+
+    /// #517: an own value applied and a step held back: another key applying
+    /// is no hand edit of this one, so the release writes the step.
+    func testAHeldStepIsWrittenWhenAnotherKeyAppliesAfterAnOwnValue() async throws {
+        let (model, source, writer) = try fakeModel(Self.fakeConfig, clock: ManualClock())
+        let key = "appearance.font_size"
+        model.beginChange(key)
+        model.change(key, .float(14))
+        try await waitUntil("written") { writer.calls.count == 1 && !model.isWriting }
+        try applyFontSize("14.0", generation: 1, model, source)
+        model.change(key, .float(15))
+        XCTAssertEqual(writer.calls.count, 1, "held back")
+        let other = Self.fakeConfig
+            .replacingOccurrences(of: #""font_size": 13.0"#, with: #""font_size": 14.0"#)
+            .replacingOccurrences(of: "Tessera Dark", with: "Nord")
+        source.snapshot = TesseraConfigSnapshot(generation: 2, config: try Self.json(other))
+        model.reload()
+        model.endChange(key)
+        try await waitUntil("written") { writer.calls.count == 2 && !model.isWriting }
+        XCTAssertEqual(model.value(key), .float(15))
+    }
+
+    /// 24.12 m2: once the notice is taken back, a further apply moves nothing.
+    func testAFurtherApplyAfterTheNoticeWasTakenBackMovesNothing() async throws {
+        let (model, source, _, refusal) = try await modelWithAReleasedAdd()
+        let applied = Self.withNewProfile(Self.entriesAndFiles)
+        source.snapshot = TesseraConfigSnapshot(generation: 1, config: try Self.json(applied))
+        model.reload()
+        XCTAssertEqual(model.message("profiles[3].command"), refusal)
+        source.snapshot = TesseraConfigSnapshot(generation: 2, config: try Self.json(applied))
+        model.reload()
+        XCTAssertEqual(model.message("profiles[3].command"), refusal)
+        XCTAssertNil(model.message("profiles[4].command"))
+    }
+
+    /// #530 on the core: a slider dragged away and back in one press, its
+    /// first value written and not applied yet. The file has moved on, so
+    /// the way back is written too.
+    func testASliderDraggedAwayAndBackEndsOnTheLastValueOnTheCore() async throws {
+        let model = try openSettings(config: "[appearance]\nopacity = 0.5\n")
+        let key = "appearance.opacity"
+        try await waitUntil("the file's value") { Self.same(model.value(key), .float(0.5)) }
+        model.beginChange(key)
+        model.change(key, .float(0.6))
+        try await waitUntil("written") { !model.isWriting && self.contents.contains("0.6") }
+        model.change(key, .float(0.5))
+        model.endChange(key)
+        try await waitUntil("the last value, shown and in the file") {
+            Self.same(model.value(key), .float(0.5)) && !self.contents.contains("0.6")
+        }
+        XCTAssertTrue(try lines().contains { $0.hasPrefix("opacity") && $0.contains("0.5") }, contents)
+    }
+
+    /// #530 on the core: the same with a stepper, up and down again.
+    func testAStepperSteppedUpAndDownEndsOnTheLastValueOnTheCore() async throws {
+        let model = try openSettings(config: "[appearance]\nfont_size = 13.0\n")
+        let key = "appearance.font_size"
+        try await waitUntil("the file's value") { model.value(key) == .float(13) }
+        model.beginChange(key)
+        model.change(key, .float(14))
+        try await waitUntil("written") { !model.isWriting && self.contents.contains("14") }
+        model.change(key, .float(13))
+        model.endChange(key)
+        try await waitUntil("the last value, shown and in the file") {
+            model.value(key) == .float(13) && !self.contents.contains("14")
+        }
+        XCTAssertTrue(try lines().contains { $0.hasPrefix("font_size") && $0.contains("13") }, contents)
+    }
+
+    /// #530 on the core: two clicks of a stepper, each its own press.
+    func testTwoStepperClicksUpAndDownEndOnTheLastValueOnTheCore() async throws {
+        let model = try openSettings(config: "[appearance]\nfont_size = 13.0\n")
+        let key = "appearance.font_size"
+        try await waitUntil("the file's value") { model.value(key) == .float(13) }
+        model.beginChange(key)
+        model.change(key, .float(14))
+        model.endChange(key)
+        try await waitUntil("written") { !model.isWriting && self.contents.contains("14") }
+        model.beginChange(key)
+        model.change(key, .float(13))
+        model.endChange(key)
+        try await waitUntil("the last value, shown and in the file") {
+            model.value(key) == .float(13) && !self.contents.contains("14")
+        }
+        XCTAssertTrue(try lines().contains { $0.hasPrefix("font_size") && $0.contains("13") }, contents)
+    }
+
+    /// 24.4: a test that opens Settings again leaves no directory behind.
+    func testEveryAttemptsConfigurationDirectoryIsRemoved() throws {
+        try openSettings(config: "")
+        let first = try XCTUnwrap(dir)
+        try XCTUnwrap(appDelegate.settingsWindowController).close()
+        try openSettings(config: "")
+        let second = try XCTUnwrap(dir)
+        XCTAssertNotEqual(first, second)
+        try appDelegate.replaceCore(start: false)
+        removeTemporaryDirectories()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: first.path), "the earlier attempt's")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: second.path))
+    }
+
+    /// 24.12 m2: a watch slower than the settle time. The add applies after
+    /// the list gave up on it: the notice goes, and the rows after it and
+    /// their messages move on again. Another change of the list before
+    /// that leaves the notice.
+    func testAnAddAppliedAfterTheSettleTimeTakesBackTheNotice() async throws {
+        let (model, source, notice, refusal) = try await modelWithAReleasedAdd()
+        let renamed = Self.entriesAndFiles.replacingOccurrences(of: #""name": "one""#, with: #""name": "uno""#)
+        source.snapshot = TesseraConfigSnapshot(generation: 1, config: try Self.json(renamed))
+        model.reload()
+        XCTAssertEqual(model.message(SettingsModel.profilesKey), notice, "the add is still not shown")
+
+        source.snapshot = TesseraConfigSnapshot(generation: 2, config: try Self.json(Self.withNewProfile(renamed)))
+        model.reload()
+        XCTAssertNil(model.message(SettingsModel.profilesKey), "applied after all")
+        XCTAssertEqual(model.profiles.map(\.name), ["uno", "two", "New Profile", "extra", "zeta"])
+        XCTAssertNil(model.message("profiles[2].command"))
+        XCTAssertEqual(model.message("profiles[3].command"), refusal, "moved on with extra")
+    }
+
+    /// 24.12 m2: a new add after the notice is followed on its own: when it
+    /// applies, the rows after it move once, not again for the old one.
+    func testANewAddAfterAReleasedOneMovesTheMessagesOnce() async throws {
+        let (model, source, _, refusal) = try await modelWithAReleasedAdd()
+        XCTAssertTrue(model.addProfile())
+        try await waitUntil("written") { !model.isWriting }
+        XCTAssertEqual(model.message("profiles[3].command"), refusal, "moved by the new add")
+        let applied = Self.withNewProfile(Self.entriesAndFiles)
+        source.snapshot = TesseraConfigSnapshot(generation: 1, config: try Self.json(applied))
+        model.reload()
+        XCTAssertFalse(model.profilesChanging)
+        XCTAssertEqual(model.message("profiles[3].command"), refusal)
+        XCTAssertNil(model.message("profiles[4].command"), "not moved twice")
+    }
+
+    /// 24.12 m2: so does a delete. A list that later has a profile of the
+    /// old add's name at its place moves no message.
+    func testADeleteAfterAReleasedAddMovesNoMessageForIt() async throws {
+        let (model, source, _, refusal) = try await modelWithAReleasedAdd(refusedRow: 3)
+        XCTAssertTrue(model.deleteProfile(1))
+        try await waitUntil("written") { !model.isWriting }
+        let applied = Self.entriesAndFiles
+            .replacingOccurrences(of: #""name": "two""#, with: #""name": "other""#)
+            .replacingOccurrences(of: #""name": "extra""#, with: #""name": "New Profile""#)
+        source.snapshot = TesseraConfigSnapshot(generation: 1, config: try Self.json(applied))
+        model.reload()
+        XCTAssertFalse(model.profilesChanging)
+        XCTAssertEqual(model.profiles.map(\.name), ["one", "other", "New Profile", "zeta"])
+        XCTAssertEqual(model.message("profiles[3].command"), refusal, "zeta is still at 3")
+        XCTAssertNil(model.message("profiles[4].command"))
+    }
+
+    /// `entriesAndFiles`-shaped `config` with the added profile in place.
+    private static func withNewProfile(_ config: String) -> String {
+        config.replacingOccurrences(
+            of: #"{"name": "extra""#, with: #"{"name": "New Profile", "source": "config"}, {"name": "extra""#)
+    }
+
+    /// A refused edit of a row after the add, then an add no configuration
+    /// showed within the settle time: returns its notice and the refusal.
+    private func modelWithAReleasedAdd(
+        refusedRow row: Int = 2
+    ) async throws -> (SettingsModel, FakeSource, String, String) {
+        let clock = ManualClock()
+        let writer = FakeWriter()
+        let key = "profiles[\(row)].command"
+        let refusal = "`\(key)`: this profile is defined in a file in profiles/, not in config.toml"
+        writer.respond = { call, _ in
+            call.key == key ? TesseraConfigEditError(.invalidArgument, message: refusal) : nil
+        }
+        let (model, source, _) = try fakeModel(Self.entriesAndFiles, writer: writer, clock: clock)
+        model.set(key, .string("/bin/sh"))
+        try await waitUntil("refused") { !model.isWriting }
+        XCTAssertTrue(model.addProfile())
+        try await waitUntil("written") { !model.isWriting }
+        clock.advance(by: model.profileSettleTimeout)
+        let notice = try XCTUnwrap(model.message(SettingsModel.profilesKey))
+        XCTAssertTrue(notice.contains("was written"), notice)
+        XCTAssertEqual(model.message(key), refusal, "back with its row")
+        return (model, source, notice, refusal)
+    }
+
+    /// 24.12 m2: the same for a delete the watch applies late.
+    func testADeleteAppliedAfterTheSettleTimeTakesBackTheNotice() async throws {
+        let clock = ManualClock()
+        let (model, source, _) = try fakeModel(Self.threeProfiles, clock: clock)
+        XCTAssertTrue(model.deleteProfile(2))
+        try await waitUntil("written") { !model.isWriting }
+        clock.advance(by: model.profileSettleTimeout)
+        XCTAssertNotNil(model.message(SettingsModel.profilesKey))
+        let deleted = Self.threeProfiles.replacingOccurrences(of: #", {"name": "three"}"#, with: "")
+        XCTAssertNotEqual(deleted, Self.threeProfiles)
+        source.snapshot = TesseraConfigSnapshot(generation: 1, config: try Self.json(deleted))
+        model.reload()
+        XCTAssertNil(model.message(SettingsModel.profilesKey), "applied after all")
+    }
+
+    /// 24.12 m6: only a failed edit is read as "Not saved"; a notice says
+    /// what happened itself.
+    func testOnlyAFailedEditIsSpokenAsNotSaved() {
+        XCTAssertEqual(SettingsMessage.spoken("too big", notSaved: true), "Not saved: too big")
+        XCTAssertEqual(SettingsMessage.spoken(SettingsModel.heldValueNotice, notSaved: false), SettingsModel.heldValueNotice)
+        XCTAssertTrue(SettingsMessage(text: "x").notSaved, "an edit's message by default")
+    }
+
+    /// 24.12 c2 minor, on the real control: a profile inheriting its font
+    /// size steps from the inherited value.
+    func testTheRealStepperOfAnInheritingProfileStepsFromTheInheritedSize() async throws {
+        let (model, _, writer) = try fakeModel(Self.fakeConfig, clock: ManualClock())
+        let key = "appearance.font_size"
+        let path = "profiles[0].\(key)"
+        let context = SettingsFieldContext(model: model, path: path, fallback: key, profile: 0)
+        let (window, stepper) = try await hostedFontSizeStepper(context)
+        defer {
+            window.contentView = nil
+            window.close()
+        }
+        try pressUpArrow(of: stepper).release()
+        try await waitUntil("the step written") { writer.calls.count == 1 && !model.isWriting }
+        XCTAssertEqual(writer.calls, [.init(key: path, value: .float(14))], "13 + 1, not the bottom of the range")
+    }
+
+    /// 24.12 c2 minor, on the core: a profile with no font size of its own
+    /// shows the one it inherits, whether `[appearance]` sets it or the
+    /// default applies, and its first step goes on from that value, not
+    /// from the bottom of the range.
+    func testAProfilesFirstStepGoesOnFromTheInheritedFontSize() async throws {
+        let profile = "[[profiles]]\nname = \"one\"\ncommand = \"/bin/cat\"\n"
+        for config in ["[appearance]\nfont_size = 17.0\n\n" + profile, profile] {
+            let model = try openSettings(config: config)
+            let key = "appearance.font_size"
+            let path = "profiles[0].\(key)"
+            let field = try XCTUnwrap(ProfilesPane.appearanceFields.first { $0.key == key })
+            let context = SettingsFieldContext(model: model, path: path, fallback: key, profile: 0)
+            let inherited = try XCTUnwrap(model.value(key)?.double, "the size in effect")
+            XCTAssertGreaterThan(inherited, 5, config)
+            XCTAssertTrue(model.inherits(0, key), config)
+            XCTAssertEqual(field.doubleBinding(context).wrappedValue, inherited, config)
+            model.setInherits(0, key, false)
+            let binding = field.doubleBinding(context)
+            XCTAssertEqual(binding.wrappedValue, inherited, config)
+            binding.wrappedValue += 1
+            try await waitUntil("the step applied") { Self.same(model.snapshot[path], .float(inherited + 1)) }
+            try XCTUnwrap(appDelegate.settingsWindowController).close()
+        }
     }
 
     /// 21.6a adversarial M6: a profile's slider value held back by the

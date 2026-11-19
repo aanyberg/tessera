@@ -1024,7 +1024,7 @@ struct KeysPane: View {
         let changing = keys.isChanging
         VStack(alignment: .leading, spacing: 12) {
             if let error = model.loadError {
-                SettingsMessage(text: error)
+                SettingsMessage(text: error, notSaved: false)
             }
             TextField("Search", text: $query, prompt: Text("Search commands and shortcuts"))
                 .textFieldStyle(.roundedBorder)

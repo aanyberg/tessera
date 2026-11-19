@@ -414,6 +414,41 @@ final class PluginsPaneTests: XCTestCase {
         XCTAssertEqual(writer.calls, [])
     }
 
+    /// 25.2 adversarial M1: at the cap, a hand edit that swaps ids keeps 64
+    /// listed, and the refusal, about the list before it, goes.
+    func testAHandEditOfAFullListTakesBackTheRefusal() throws {
+        let full = (0..<SettingsModel.maxEnabledPlugins).map { "x.\($0)" }
+        let plugin = Self.plugin("dev.a")
+        let (model, source, writer, _) = try fakeModel(enabled: full, plugins: [plugin])
+        let toggle = PluginsPane.enabledBinding(model, "dev.a")
+        toggle.wrappedValue = true
+        XCTAssertEqual(model.message(SettingsModel.pluginsKey), SettingsModel.pluginsFullRefusal)
+        try Self.apply(source, model, generation: 1, enabled: full, plugins: [plugin])
+        XCTAssertEqual(model.message(SettingsModel.pluginsKey), SettingsModel.pluginsFullRefusal, "the same list")
+        let swapped = Array(full.dropLast()) + ["dev.a"]
+        try Self.apply(source, model, generation: 2, enabled: swapped, plugins: [plugin])
+        XCTAssertEqual(model.value(SettingsModel.pluginsKey)?.array?.count, SettingsModel.maxEnabledPlugins)
+        XCTAssertNil(model.message(SettingsModel.pluginsKey), "another list, as full")
+        XCTAssertEqual(writer.calls, [])
+    }
+
+    /// 25.2: reads that keep failing do not set ``pluginsUnreadable`` again
+    /// (Swift 6.1's `@Observable` notifies on equal values).
+    func testFailedReadsAfterTheFirstDoNotRedraw() throws {
+        let (model, source, _, _) = try fakeModel(enabled: [], plugins: [])
+        source.pluginList = nil
+        model.readPluginsAgain()
+        XCTAssertTrue(model.pluginsUnreadable)
+        let changes = ChangeCount()
+        withObservationTracking {
+            _ = model.pluginsUnreadable
+        } onChange: {
+            changes.value += 1
+        }
+        model.readPluginsAgain()
+        XCTAssertEqual(changes.value, 0)
+    }
+
     /// The plugins read again while one settles and read the same are not
     /// set again, nor is whether they could be read: the pane, which reads
     /// both, is not redrawn for them (#489 48b m2).

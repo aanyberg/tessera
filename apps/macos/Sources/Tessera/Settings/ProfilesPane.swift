@@ -88,7 +88,8 @@ struct ProfilesPane: View {
                         .fixedSize(horizontal: false, vertical: true)
                         .padding(.top, 6)
                 }
-                SettingsMessage(text: model.message(SettingsModel.profilesKey))
+                // Mostly notices that say what happened themselves.
+                SettingsMessage(text: model.message(SettingsModel.profilesKey), notSaved: false)
                     .padding(.top, 6)
             }
             .frame(width: 180)

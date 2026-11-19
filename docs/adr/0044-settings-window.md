@@ -521,7 +521,13 @@ amendment's "The profile list's lock", and "The cap is the core's" in the
   profile's controls start again, as after a hand edit. If the watch
   applies the other app's file before the window's own write lands, no
   configuration showed the add, and the notice is the only sign (the
-  file on disk is the other app's).
+  file on disk is the other app's). A watch slower than the 2 s is the
+  other way to get here: when a later configuration shows the add or
+  delete after all, the notice goes and the rows after a late add move on
+  again with their messages (#517 round). Until then, after a delete is
+  released, a control acts on the index the list shows: if the delete did
+  reach the file, that index is the next profile there. The risk is
+  accepted in the window as it is for an edit from another app.
 - **Profiles of `profiles/` are read-only.** Selected, one shows "Defined
   in profiles/<file>.toml. Edit that file to change this profile." above
   its controls (the core's `source`, sanitised for control, bidi and line
@@ -561,7 +567,8 @@ amendment's "The profile list's lock", and "The cap is the core's" in the
   reload shows applied unlocks at once, and a configuration applied
   while a slider or stepper is pressed keeps the value it shows (a step
   by VoiceOver or the keyboard has no press: it shows the configuration
-  applied after it, as before).
+  applied after it, as before). The #517 amendment says what the release
+  does.
 
 ## Amendment: the Plugins pane's cap, ids and close, and the Keys pane's keys (#489, 2026-11-18)
 
@@ -611,3 +618,48 @@ amendment.
 - **Entry values.** A `[keys]` entry value of a shape this version does not
   know (a number, list, other object, or none) reads as not a string; one
   entry never fails the key map.
+
+## Amendment: a configuration applied during a press (#517, 2026-11-18)
+
+This completes "a configuration applied while a slider or stepper is
+pressed keeps the value it shows" in the #344 amendment: a value set stops
+waiting once a later configuration applies, and for a held control that
+rule now runs at the release.
+
+- **The settle rule and held presses.** A pressed control keeps its value
+  through every configuration applied. The model tells its own values from
+  a hand edit by what it wrote: the values written and not yet seen applied
+  (at most `SettingsModel.maxUnappliedWrites`, 32, per key), compared as the
+  core stores them (`f32`). A new applied value that is one of them is the
+  press's own, and an earlier one does not replace the last at the release.
+  Any other new value of the key is a hand edit: at the release the model
+  reloads, the control shows the edit, and the next step starts from it.
+- **What looks like no edit.** A configuration applied during the press
+  can leave the key as it was, or on an earlier value of the press: another
+  app saved over the step before the watch read it, or a profile row moved.
+  That cannot be told from the press's own values on their way, so if one
+  applied since the last write, the model reloads
+  `profileSettleTimeout` (2 s) after the release, unless the key is pressed
+  again, and the control shows what is applied. A watch slower than that
+  shows the earlier value until the last one applies.
+- **Which value wins.** A step held back by the coalescing when the edit
+  applies was taken before it and is dropped. A step taken after it, in the
+  same press, is written over it: the last act wins, as for two edits in
+  the file. A change of another key says nothing about this one.
+- **The release (#534).** A release writes only if its press made a step,
+  or found one held back by the coalescing when it began. A press that only
+  held the control writes nothing, whatever applied meanwhile. The reload
+  after a hand edit runs on the next turn of the main queue, after the
+  release event: in an app linked against the macOS 15 SDK, which is what CI
+  and releases build, `Slider` is an `NSSlider`, whose mouse-up sends one
+  more action with the knob's value. SwiftUI takes that for a new edit if
+  the binding has already moved, and it would write the old value over the
+  hand edit.
+- **Limits.** After more than 32 unseen writes (the watch 3 s behind), an
+  older value applied counts as a hand edit: the control shows it from the
+  release until the newer values apply. In a press that made a step, a hand
+  edit equal to one of its unseen writes still reads as the press's own: a
+  last step not yet written goes over it, and if the last step was written
+  the control shows the edit after `profileSettleTimeout`. A step taken
+  after a profile row moved under the press goes to the profile now at that
+  index.

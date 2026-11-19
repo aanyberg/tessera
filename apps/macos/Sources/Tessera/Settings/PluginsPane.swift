@@ -82,6 +82,7 @@ extension SettingsModel {
             guard !isPluginEnabled(id) else { return }
             guard listed.count < Self.maxEnabledPlugins else {
                 show(Self.pluginsFullRefusal, for: Self.pluginsKey)
+                pluginsRefusedAt = listed
                 return
             }
             set(Self.pluginsKey, .array(listed + [entry]))
@@ -148,7 +149,7 @@ struct PluginsPane: View {
         SettingsForm(model: model) {
             if model.pluginsUnreadable {
                 Section {
-                    SettingsMessage(text: "The plugins could not be read.")
+                    SettingsMessage(text: "The plugins could not be read.", notSaved: false)
                 }
             } else if model.plugins.isEmpty {
                 Section {
