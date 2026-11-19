@@ -3212,21 +3212,59 @@ extension SettingsTests {
         throw XCTSkip("Slider is not an NSSlider when linked against this SDK")
     }
 
-    /// Presses `slider`'s knob with real events, runs `whileHeld`, and lets
-    /// go. With no mouse button really down the press returns at once and
-    /// the control takes the drags and the release as they are dispatched,
-    /// which is done here so that the release has happened on return. If
-    /// AppKit's tracking loop runs instead, it takes them from the queue
-    /// while the script runs on the main queue it keeps serving.
+    /// Forwards a control's action to the target SwiftUI gave it, and
+    /// counts it: an action sent means AppKit tracked the synthetic press.
+    @MainActor
+    private final class ActionCounter: NSObject {
+        let target: AnyObject?
+        let action: Selector?
+        var count = 0
+
+        init(_ control: NSControl) {
+            target = control.target
+            action = control.action
+            super.init()
+            control.target = self
+            control.action = #selector(forward(_:))
+        }
+
+        @objc func forward(_ sender: Any?) {
+            count += 1
+            NSApp.sendAction(action ?? #selector(forward(_:)), to: target, from: sender)
+        }
+    }
+
+    /// Presses `slider`'s knob with real events, drags it 40 points left,
+    /// runs `whileHeld`, and lets go. With no mouse button really down the
+    /// press returns at once and the control takes the drags and the
+    /// release as they are dispatched, which is done here so that the
+    /// release has happened on return. If AppKit's tracking loop runs
+    /// instead, it takes them from the queue while the script runs on the
+    /// main queue it keeps serving.
+    ///
+    /// Where the first drag reaches nothing (no action from the slider, and
+    /// `touched` false: the model saw no change), the test is skipped with
+    /// what was seen: AppKit did not track the synthetic events, so the
+    /// product was not exercised. Once the drag is delivered, every check
+    /// of the test applies.
     private func pressKnob(
-        of slider: NSSlider, in window: NSWindow,
+        of slider: NSSlider, in window: NSWindow, touched: @escaping @MainActor () -> Bool,
         whileHeld: @escaping @MainActor (_ drag: (CGFloat) -> Void) async throws -> Void
     ) async throws {
         let cell = try XCTUnwrap(slider.cell as? NSSliderCell)
         let knob = cell.knobRect(flipped: slider.isFlipped)
         let start = slider.convert(NSPoint(x: knob.midX, y: knob.midY), to: nil)
+        let hit = window.contentView?.hitTest(window.contentView?.convert(start, from: nil) ?? start)
+        let actions = ActionCounter(slider)
+        defer {
+            if slider.target === actions {
+                slider.target = actions.target
+                slider.action = actions.action
+            }
+        }
         var location = start
         var pressReturned = false
+        var pressReturnedBeforeTheDrag = false
         func event(_ type: NSEvent.EventType) -> NSEvent? {
             NSEvent.mouseEvent(
                 with: type, location: location, modifierFlags: [],
@@ -3243,17 +3281,35 @@ extension SettingsTests {
                 NSApp.sendEvent(next)
             }
         }
+        func drag(_ offset: CGFloat) {
+            location = NSPoint(x: start.x + offset, y: start.y)
+            deliver(.leftMouseDragged)
+        }
         let down = try XCTUnwrap(event(.leftMouseDown))
-        let script = Task { @MainActor in
+        let script = Task { @MainActor () throws -> Bool in
             defer { deliver(.leftMouseUp) }
-            try await whileHeld { offset in
-                location = NSPoint(x: start.x + offset, y: start.y)
-                deliver(.leftMouseDragged)
+            pressReturnedBeforeTheDrag = pressReturned
+            drag(-40)
+            let deadline = ContinuousClock.now + .seconds(2)
+            while actions.count == 0 && !touched() && ContinuousClock.now < deadline {
+                try await Task.sleep(for: .milliseconds(10))
             }
+            guard actions.count > 0 || touched() else { return false }
+            try await whileHeld(drag)
+            return true
         }
         window.sendEvent(down)
         pressReturned = true
-        try await script.value
+        guard try await script.value else {
+            let system = ProcessInfo.processInfo.operatingSystemVersionString
+            throw XCTSkip(
+                """
+                the synthetic drag did not reach the NSSlider on macOS \(system): no action, no change; \
+                press returned before the drag: \(pressReturnedBeforeTheDrag), \
+                hit at the knob: \(hit.map { String(describing: type(of: $0)) } ?? "nothing"), \
+                slider bounds \(slider.bounds), knob \(knob)
+                """)
+        }
     }
 
     private func applyOpacity(
@@ -3278,8 +3334,8 @@ extension SettingsTests {
             window.close()
         }
         var written = 0
-        try await pressKnob(of: slider, in: window) { drag in
-            drag(-40)
+        let touched: @MainActor () -> Bool = { !writer.calls.isEmpty || model.isPending(key) }
+        try await pressKnob(of: slider, in: window, touched: touched) { _ in
             try await self.waitUntil("the drag written") { !writer.calls.isEmpty && !model.isWriting }
             written = writer.calls.count
             try self.applyOpacity("0.3", generation: 1, model, source)
@@ -3307,8 +3363,8 @@ extension SettingsTests {
             window.close()
         }
         var held: TesseraConfigValue?
-        try await pressKnob(of: slider, in: window) { drag in
-            drag(-40)
+        let touched: @MainActor () -> Bool = { !writer.calls.isEmpty || model.isPending(key) }
+        try await pressKnob(of: slider, in: window, touched: touched) { drag in
             try await self.waitUntil("the drag written") { !writer.calls.isEmpty && !model.isWriting }
             let first = model.value(key)
             drag(-80)
