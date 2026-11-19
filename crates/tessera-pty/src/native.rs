@@ -101,6 +101,37 @@ const WRITE_SLICE: usize = 1024;
 /// milliseconds. Linux only signals end-of-file once the last descriptor on
 /// the slave side closes, so there a lingering grandchild delays
 /// [`PtyEvent::Exited`] until it too lets go of the terminal.
+///
+/// # Output written just before exit
+///
+/// On macOS the parent keeps one descriptor on the slave side open until
+/// the reader reaches end-of-file or the session is closed. Without it,
+/// the child's own exit closes the last slave descriptor, and the kernel's
+/// last close waits only about 0.6 s for the master to drain the
+/// terminal's output queue, then discards what is left: a child that
+/// printed and exited while the reader thread was not scheduled (many
+/// sessions in one busy process) lost its last output (#562). With the
+/// parent's descriptor open, the child's close is not the last one, and
+/// the session leader's exit drains the queue to the master without a time
+/// limit before it revokes the terminal, which still ends the stream as
+/// described above. The reader drains the master even once the events are
+/// no longer received, so only a consumer that keeps the events but stops
+/// reading them holds up an exiting child, as it already holds up a child
+/// that writes.
+///
+/// That exit also waits, without a time limit and immune to `SIGKILL`,
+/// while the terminal's output is stopped (`Ctrl-S` with `IXON`, or
+/// `tcflow(TCOOFF)`) with output queued, until output restarts (any key
+/// with `IXANY`, or `Ctrl-Q`). [`Pty::hangup`], [`Pty::kill`] and dropping
+/// the handle therefore release the parent's descriptor before they
+/// signal: that close is then the last one, the kernel discards the queued
+/// output at once (the last close of a non-blocking description does not
+/// wait for the drain), and the exit completes and the child is reaped.
+/// The parent's descriptor is a description of its own, the slave reopened
+/// by name with `O_NONBLOCK` before the fork, so the child's descriptors
+/// stay blocking and the release never blocks the caller. A leader whose
+/// session is not closed keeps waiting until output restarts, as a child
+/// writing to the stopped terminal does.
 pub struct NativePty {
     master: Box<dyn MasterPty + Send>,
     queue: Arc<WriteQueue>,
@@ -108,6 +139,39 @@ pub struct NativePty {
     size: PtySize,
     phase: Arc<Mutex<Phase>>,
     threads: IoThreads,
+    held_slave: Arc<HeldSlave>,
+}
+
+/// The parent's own descriptor on the slave side, held on macOS until the
+/// reader reaches end-of-file or the session is closed (see "Output written
+/// just before exit" on [`NativePty`]); empty elsewhere.
+#[derive(Debug, Default)]
+struct HeldSlave(Mutex<Option<File>>);
+
+impl HeldSlave {
+    /// Opens a fresh, non-blocking description of `master`'s slave by name.
+    /// Called before the child is forked: once the session leader has
+    /// exited and revoked the terminal, a new open would make the slave
+    /// open again and hold off the master's end-of-file.
+    fn open(master: &dyn MasterPty) -> Result<Self, PtyError> {
+        let name = master
+            .tty_name()
+            .ok_or_else(|| PtyError::Open("pty slave has no name".to_owned()))?;
+        let slave = File::options()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOCTTY | libc::O_NONBLOCK)
+            .open(&name)
+            .map_err(|err| PtyError::Open(format!("reopening {}: {err}", name.display())))?;
+        Ok(Self(Mutex::new(Some(slave))))
+    }
+
+    /// Closes the descriptor if it is still held. Never blocks: the
+    /// description is non-blocking, so a last close discards undrained
+    /// output instead of waiting for the master to take it.
+    fn release(&self) {
+        drop(self.0.lock().unwrap_or_else(PoisonError::into_inner).take());
+    }
 }
 
 /// Liveness of one [`NativePty`]'s reader and writer threads.
@@ -206,6 +270,17 @@ impl NativePty {
         })?;
         let pair = redrive_open(|| native_pty_system().openpty(options.size.into()))
             .map_err(|err| PtyError::Open(err.to_string()))?;
+        // On Linux the parent must not keep the slave open: the master
+        // would never see end-of-file after the child exits. On macOS it
+        // holds a description of its own until end-of-file or the close, so
+        // the child's exit never makes the last close, which would drop
+        // undrained output after 0.6 s (see "Output written just before
+        // exit" above).
+        let held_slave = Arc::new(if cfg!(target_os = "macos") {
+            HeldSlave::open(pair.master.as_ref())?
+        } else {
+            HeldSlave::default()
+        });
 
         let program = describe_program(&options.program);
         let spawn_error = |reason: String| PtyError::Spawn {
@@ -230,8 +305,7 @@ impl NativePty {
                 return Err(spawn_error("unexpected child handle type".to_owned()));
             }
         };
-        // The parent must not keep the slave open: the master would never
-        // see end-of-file after the child exits.
+        // The child's own copy: `held_slave` is the parent's.
         drop(pair.slave);
 
         // From here on, an early return drops `child`, which kills and
@@ -248,6 +322,7 @@ impl NativePty {
 
         let reader_phase = Arc::clone(&phase);
         let reader_queue = Arc::clone(&queue);
+        let reader_slave = Arc::clone(&held_slave);
         // A thread that cannot be created drops its closure, and with it
         // the guard, so the child is killed and reaped then too.
         let reader_thread = spawn_thread(
@@ -256,6 +331,7 @@ impl NativePty {
             move || {
                 pump_output(
                     reader,
+                    &reader_slave,
                     child.into_inner(),
                     &event_tx,
                     &reader_phase,
@@ -276,6 +352,7 @@ impl NativePty {
             // runs and nothing was queued); it keeps the order every other
             // closing path uses (close, then signal).
             queue.close();
+            held_slave.release();
             if let Err(err) = signal_child(&phase, pid, Signal::SIGKILL) {
                 tracing::warn!(pid, %err, "killing a half-spawned child failed");
             }
@@ -292,6 +369,7 @@ impl NativePty {
                 size: options.size,
                 phase,
                 threads,
+                held_slave,
             },
             event_rx,
         ))
@@ -902,15 +980,21 @@ impl Pty for NativePty {
     /// A writer blocked in `write(2)` is not woken by closing its duplicate
     /// of the master: on macOS that `close(2)` hangs the closing thread
     /// instead of failing the write, so no design can rely on it.
+    ///
+    /// On macOS it also releases the parent's slave descriptor before the
+    /// signal, so a session leader stuck exiting on stopped output ends
+    /// (see "Output written just before exit" on [`NativePty`]).
     fn hangup(&mut self) -> io::Result<()> {
         self.queue.close();
+        self.held_slave.release();
         self.signal_if_running(Signal::SIGHUP)
     }
 
-    /// Closes the write queue as [`Pty::hangup`] does, then sends
-    /// `SIGKILL`.
+    /// Closes the write queue and releases the parent's slave descriptor as
+    /// [`Pty::hangup`] does, then sends `SIGKILL`.
     fn kill(&mut self) -> io::Result<()> {
         self.queue.close();
+        self.held_slave.release();
         self.signal_if_running(Signal::SIGKILL)
     }
 
@@ -940,7 +1024,8 @@ impl Pty for NativePty {
 impl Drop for NativePty {
     fn drop(&mut self) {
         // Same order as `hangup`: drop pending input and stop the writer,
-        // then signal a child that is still running. With 1 KiB slices the
+        // release the parent's slave descriptor, then signal a child that
+        // is still running. With 1 KiB slices the
         // reverse order is not observable from outside (the writer would
         // stop microseconds later either way), but closing first means no
         // slice is started after the child was told to go, and it keeps
@@ -949,6 +1034,7 @@ impl Drop for NativePty {
         // the child's input. The reader thread keeps its own handle on the
         // master and reaps the child once it goes away.
         self.queue.close();
+        self.held_slave.release();
         if let Err(err) = self.signal_if_running(Signal::SIGHUP) {
             tracing::debug!(pid = self.pid, %err, "hangup on drop failed");
         }
@@ -1041,9 +1127,11 @@ fn check_size(size: PtySize) -> Result<(), PtyError> {
     Ok(())
 }
 
-/// Reader thread body: forwards output until end-of-file, then reaps.
+/// Reader thread body: forwards output until end-of-file, releases the
+/// parent's slave descriptor (held only on macOS), then reaps.
 fn pump_output(
     mut reader: Box<dyn Read + Send>,
+    held_slave: &HeldSlave,
     mut child: Child,
     events: &SyncSender<PtyEvent>,
     phase: &Mutex<Phase>,
@@ -1073,6 +1161,7 @@ fn pump_output(
             }
         }
     }
+    held_slave.release();
 
     // Announce the reap under the lock so no signal can target the pid
     // between `wait` returning and the status being recorded.
