@@ -359,3 +359,16 @@ the watch has applied each one.
   value, `"name"` too (serde_json's object; the C side has no duplicate
   check), and the keys are set in byte order of their paths. The key path
   cap is checked on the full path after `profiles[N].`.
+
+## Amendment: a new profile's name and `replace` (#489, #526, 2026-11-18)
+
+- **Names.** `unused_profile_name` and `add_profile_with` avoid each
+  `[[profiles]]` name as written and as the loader reads it, as well as the
+  names of `profiles/`. Beside `name = "A\u0000"`, which loads as
+  `"A\u{FFFD}"`, adding `A\u{FFFD}` gives `A\u{FFFD} 2` instead of a
+  duplicate-name refusal. A file the loader fails on has only its written
+  names.
+- **`replace` and unknown keys.** A `replace` that makes a failing file
+  load is refused when the loaded file has any warning, an unknown key
+  elsewhere included, because the failing file had no warnings to keep.
+  A test pins this; it is the existing rule, not a new one.

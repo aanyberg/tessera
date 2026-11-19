@@ -185,10 +185,12 @@ impl NativePty {
     /// returns `Ok` and a child that ends at once, because `portable-pty`
     /// closes the pipe through which the standard library would report the
     /// error: the child aborts and [`PtyEvent::Exited`] carries
-    /// `Signaled(SIGABRT)`. On macOS these are a fat binary without a
-    /// slice for this machine or a damaged Mach-O file (`EBADARCH`,
-    /// `EBADMACHO`), `ENOMEM`, and a file replaced between the check and
-    /// the `exec`. `ETXTBSY` never occurs on macOS (a binary open for
+    /// `Signaled(SIGABRT)`. On macOS these are a FIFO or device with an
+    /// execute bit named as the program (`EACCES`; it is never opened, so
+    /// the spawn cannot block on it), a fat binary without a slice for this
+    /// machine or a damaged Mach-O file (`EBADARCH`, `EBADMACHO`), `ENOMEM`,
+    /// and a file replaced between the check and the `exec`. `ETXTBSY`
+    /// never occurs on macOS (a binary open for
     /// writing execs and is then killed, `Signaled(SIGKILL)`, as is a
     /// binary that code signing rejects); on Linux it would abort like the
     /// others.
@@ -338,8 +340,9 @@ impl NativePty {
 /// `EPERM` count as success: macOS answers `EPERM` when no member could be
 /// signalled, which is what a group whose only member is the child's
 /// zombie gives (the reader thread may not have reaped it yet), and either
-/// way no process we may signal is left in the group. A pid of 0 or 1 is refused before any signal: `killpg(0)` would
-/// signal this process's own group, and 1 is `launchd` or `init`.
+/// way no process we may signal is left in the group. A pid of 0 or 1 is
+/// refused before any signal: `killpg(0)` would signal this process's own
+/// group, and 1 is `launchd` or `init`.
 fn signal_child(phase: &Mutex<Phase>, pid: u32, signal: Signal) -> io::Result<()> {
     let phase = phase.lock().unwrap_or_else(PoisonError::into_inner);
     if *phase != Phase::Running {
@@ -527,13 +530,19 @@ const SHEBANG_HEADER_BYTES: usize = 512;
 /// Without this such a spawn would look successful: `portable-pty` closes
 /// the pipe the standard library reports `exec` errors through, so the
 /// child aborts after the fork (`SIGABRT`) instead of the spawn failing.
-/// Every other kind of file is left to `exec`. A file with no `#!` line
-/// (`ENOEXEC`) is not refused, because `execvp(3)` runs it with `/bin/sh`.
+/// Every other kind of file is left to `exec`, a FIFO or device named as
+/// the program included: it fails there with `EACCES`, after the fork. A
+/// file with no `#!` line (`ENOEXEC`) is not refused, because `execvp(3)`
+/// runs it with `/bin/sh`.
 ///
 /// The program checked is the one `portable-pty` will run (see
 /// [`resolve_program`]); one it cannot resolve is left to `portable-pty`,
 /// which refuses it with its own reason. Best effort: the file can change
 /// between this check and the `exec`.
+///
+/// The `#!` rules are XNU's ([`shebang_interpreter`], `IMG_SHSIZE`) and run
+/// unchanged on Linux, which is a development target only: its kernel's
+/// own rules differ, and this check does not follow them.
 fn check_interpreter(command: &CommandBuilder) -> Result<(), String> {
     let Some(program) = resolve_program(command) else {
         return Ok(());
@@ -1535,6 +1544,72 @@ mod tests {
         assert_eq!(&header[..5], b"#!/x\n");
         assert!(header[5..].iter().all(|&byte| byte == 0));
         assert!(read_header(&dir).iter().all(|&byte| byte == 0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A directory of its own for one test, removed by the caller.
+    fn scratch_dir(test: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("tessera-pty-{test}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The boundary in plain numbers, through the file read and the parse
+    /// together: a line ending on the 512th byte is a `#!` line and one
+    /// ending on the 513th is not, so a header of 511 or 513 bytes fails
+    /// here (the other tests size theirs from the constant).
+    #[test]
+    fn a_shebang_line_must_end_within_the_first_512_bytes() {
+        let dir = scratch_dir("boundary");
+        let path = dir.join("script");
+        let parsed_with_line_end_at = |at: usize| {
+            let mut bytes = b"#!/bin/sh".to_vec();
+            bytes.resize(at, b' ');
+            bytes.push(b'\n');
+            bytes.resize(4096, b'x');
+            std::fs::write(&path, &bytes).unwrap();
+            shebang_interpreter(&read_header(&path)).map(<[u8]>::to_vec)
+        };
+        assert_eq!(
+            parsed_with_line_end_at(511),
+            Some(b"/bin/sh".to_vec()),
+            "the 512th byte is in the header"
+        );
+        assert_eq!(
+            parsed_with_line_end_at(512),
+            None,
+            "the 513th byte is not in the header"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An interpreter `stat` fails on for a reason other than a missing
+    /// file (a path through a regular file, a symbolic link loop) is
+    /// refused with that error as the system words it.
+    #[test]
+    fn an_interpreter_that_cannot_be_reached_is_refused_with_its_error() {
+        let dir = scratch_dir("unreachable");
+        let plain = dir.join("plain");
+        std::fs::write(&plain, "").unwrap();
+        let looped = dir.join("loop");
+        std::os::unix::fs::symlink(&looped, &looped).unwrap();
+        let script = dir.join("script");
+        for (interpreter, errno) in [
+            (plain.join("below"), nix::libc::ENOTDIR),
+            (looped, nix::libc::ELOOP),
+        ] {
+            let shown = interpreter.to_str().unwrap();
+            std::fs::write(&script, format!("#!{shown}\n")).unwrap();
+            let command = build_command(&SpawnOptions::command(&script, "1"));
+            assert_eq!(
+                check_interpreter(&command),
+                Err(format!(
+                    "its #! interpreter {shown:?} cannot be reached ({})",
+                    io::Error::from_raw_os_error(errno)
+                ))
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -308,6 +308,8 @@ fn check_for(pattern: &str) -> RuleCheck {
 enum RuleError {
     TooLong(usize),
     Invalid,
+    /// Valid, but larger compiled than [`SMART_RULE_SIZE_LIMIT`].
+    TooBig,
     MatchesEmpty,
 }
 
@@ -323,6 +325,10 @@ impl fmt::Display for RuleError {
             Self::Invalid => {
                 f.write_str("the pattern ignored: not a valid regular expression, or too complex")
             }
+            Self::TooBig => f.write_str(
+                "the pattern ignored: too large once compiled, usually from counted repetition \
+                 of a Unicode class; use ASCII classes or (?-u)",
+            ),
             Self::MatchesEmpty => f.write_str("the pattern ignored: it matches the empty string"),
         }
     }
@@ -342,7 +348,10 @@ fn compile(rule: &SmartRule) -> Result<CompiledRule, RuleError> {
         .dfa_size_limit(SMART_RULE_SIZE_LIMIT)
         .nest_limit(SMART_RULE_NEST_LIMIT)
         .build()
-        .map_err(|_| RuleError::Invalid)?;
+        .map_err(|error| match error {
+            regex::Error::CompiledTooBig(_) => RuleError::TooBig,
+            _ => RuleError::Invalid,
+        })?;
     if regex.is_match("") {
         return Err(RuleError::MatchesEmpty);
     }
@@ -682,6 +691,40 @@ mod tests {
         let loaded = Config::from_toml_lenient(&rules_toml(&[mid.into(), "ok".into()])).unwrap();
         assert_eq!(loaded.warnings.len(), 1, "{:?}", loaded.warnings);
         assert_eq!(loaded.config.selection.compiled_rules().len(), 1);
+    }
+
+    /// #433: a pattern over the size limit is told apart from an invalid
+    /// one, and the warning says what to change. Neither quotes the
+    /// pattern (S8).
+    #[test]
+    fn a_pattern_over_the_size_limit_gets_its_own_advice() {
+        let warning_of = |pattern: &str| {
+            let loaded = Config::from_toml_lenient(&rules_toml(&[pattern.into()])).unwrap();
+            let [Warning::OutOfRange { detail, .. }] = &loaded.warnings[..] else {
+                panic!("{pattern}: {:?}", loaded.warnings);
+            };
+            detail.clone()
+        };
+        for pattern in [r"\w{50}", r"[\p{L}\p{N}]{200}x"] {
+            let detail = warning_of(pattern);
+            assert!(detail.contains("counted repetition"), "{detail}");
+            assert!(detail.contains("Unicode"), "{detail}");
+            assert!(detail.contains("ASCII classes"), "{detail}");
+            assert!(detail.contains("(?-u)"), "{detail}");
+            assert!(!detail.contains(pattern), "{detail}");
+        }
+        // What the advice says works: the same repetition without Unicode.
+        for pattern in [r"(?-u)\w{50}", r"[a-z0-9_]{50}"] {
+            let loaded = Config::from_toml_lenient(&rules_toml(&[pattern.into()])).unwrap();
+            assert_eq!(loaded.warnings, [], "{pattern}");
+        }
+        let pattern = "(unclosed";
+        let detail = warning_of(pattern);
+        assert_eq!(
+            detail,
+            "the pattern ignored: not a valid regular expression, or too complex"
+        );
+        assert!(!detail.contains(pattern), "{detail}");
     }
 
     /// Every built-in rule compiles within half the bound, so a user's copy

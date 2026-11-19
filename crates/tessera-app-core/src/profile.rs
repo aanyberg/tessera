@@ -27,15 +27,17 @@ pub(crate) fn apply(mut options: SpawnOptions, resolved: &ResolvedProfile) -> Sp
 }
 
 /// The `errno` behind a [`tessera_pty::PtyError::Spawn`] reason, when it
-/// names one: `(os error N)` as `std::io::Error` writes it, or one of the
-/// messages `portable-pty` gives for a program it cannot find or run.
-/// `None` for any other reason; the reason itself (it may hold paths and
-/// `PATH`) is never shown or logged (docs/security.md S8).
+/// names one: for `tessera-pty`'s refusal of a `#!` script, the problem it
+/// states ([`interpreter_errno`]); otherwise `(os error N)` as
+/// `std::io::Error` writes it, or one of the messages `portable-pty` gives
+/// for a program it cannot find or run. `None` for any other reason; the
+/// reason itself (it may hold paths and `PATH`) is never shown or logged
+/// (docs/security.md S8).
 pub(crate) fn spawn_errno(reason: &str) -> Option<i32> {
-    if let Some((_, rest)) = reason.rsplit_once("(os error ")
-        && let Some((digits, _)) = rest.split_once(')')
-        && let Ok(errno) = digits.parse::<i32>()
-    {
+    if let Some(detail) = reason.strip_prefix("its #! ") {
+        return interpreter_errno(detail);
+    }
+    if let Some(errno) = os_error(reason) {
         return Some(errno);
     }
     if reason.contains("is a directory") {
@@ -57,13 +59,51 @@ pub(crate) fn spawn_errno(reason: &str) -> Option<i32> {
     }
 }
 
-/// The `errno` values [`spawn_errno`] maps `portable-pty`'s own messages
-/// to (the same on every Unix Tessera builds for), and the one a refused
+/// The `errno` of a `#!` refusal, `detail` being its text after `its #! `.
+/// Only what follows the interpreter is read: the name comes from the
+/// script and is quoted with `Debug`, which escapes every `"` in it, so the
+/// last `" ` is the end of the quotes and the name cannot choose the
+/// `errno`. A script with CRLF line endings is `ENOEXEC` whatever became of
+/// its `/bin/sh\r`: the file is what is wrong, and "No such file or
+/// directory" would send the user looking for `/bin/sh`.
+fn interpreter_errno(detail: &str) -> Option<i32> {
+    let problem = detail
+        .rsplit_once("\" ")
+        .map_or(detail, |(_, problem)| problem);
+    if problem.contains("CRLF line endings") {
+        Some(errno::ENOEXEC)
+    } else if problem.starts_with("cannot be reached") {
+        os_error(problem)
+    } else if problem.starts_with("is not a regular file")
+        || problem.starts_with("is not executable")
+    {
+        Some(errno::EACCES)
+    } else if problem.starts_with("does not exist")
+        || problem.starts_with("line names no interpreter")
+    {
+        Some(errno::ENOENT)
+    } else {
+        None
+    }
+}
+
+/// The `N` of the last `(os error N)` in `text`.
+fn os_error(text: &str) -> Option<i32> {
+    let (_, rest) = text.rsplit_once("(os error ")?;
+    let (digits, _) = rest.split_once(')')?;
+    digits.parse().ok()
+}
+
+/// The `errno` values [`spawn_errno`] maps `portable-pty`'s and
+/// `tessera-pty`'s own messages to (the same on every Unix Tessera builds
+/// for), and the one a refused
 /// [`tessera_pty::PtyError::ArgumentsTooLong`] stands for.
 pub(crate) mod errno {
     /// `Argument list too long`.
     pub(crate) const E2BIG: i32 = 7;
     pub(super) const ENOENT: i32 = 2;
+    /// `Exec format error`.
+    pub(super) const ENOEXEC: i32 = 8;
     pub(super) const EACCES: i32 = 13;
     pub(super) const EISDIR: i32 = 21;
 }
@@ -227,6 +267,124 @@ mod tests {
         );
         assert_eq!(spawn_errno("nul byte found in provided data"), None);
         assert_eq!(spawn_errno("(os error x)"), None);
+    }
+
+    /// Every reason `check_interpreter` gives, as `format!` builds it there.
+    #[test]
+    fn a_shebang_refusal_gives_the_errno_of_its_problem() {
+        let crlf = " (the script has CRLF line endings; save it with LF endings)";
+        let reached = "cannot be reached (Not a directory (os error 20))";
+        for (problem, errno) in [
+            ("does not exist (ENOENT)".to_owned(), Some(errno::ENOENT)),
+            (
+                "is not a regular file (EACCES)".to_owned(),
+                Some(errno::EACCES),
+            ),
+            ("is not executable (EACCES)".to_owned(), Some(errno::EACCES)),
+            (reached.to_owned(), Some(20)),
+            ("cannot be reached (Too many levels)".to_owned(), None),
+            (
+                format!("does not exist (ENOENT){crlf}"),
+                Some(errno::ENOEXEC),
+            ),
+            (
+                format!("is not executable (EACCES){crlf}"),
+                Some(errno::ENOEXEC),
+            ),
+            (format!("{reached}{crlf}"), Some(errno::ENOEXEC)),
+            ("something new".to_owned(), None),
+        ] {
+            let reason = format!("its #! interpreter {:?} {problem}", "/bin/sh");
+            assert_eq!(spawn_errno(&reason), errno, "{reason}");
+        }
+        assert_eq!(
+            spawn_errno("its #! line names no interpreter (ENOENT)"),
+            Some(errno::ENOENT)
+        );
+    }
+
+    /// An interpreter path is the script's text: whatever it holds, the
+    /// `errno` is the one a plain path with the same failure gets.
+    #[test]
+    fn an_interpreter_path_cannot_choose_the_errno() {
+        let hostile = [
+            "/x/(os error 13)",
+            "/x (os error 1)",
+            "/x/is a directory",
+            "/x/does not exist",
+            "/x/not executable",
+            "/x/No viable candidates",
+            "/x/CRLF line endings",
+            "/x\" is not executable (EACCES)",
+            "/x\" does not exist (ENOENT)",
+            "/x\" cannot be reached (os error 1)",
+            "\" ",
+            "/x\" ",
+        ];
+        for problem in [
+            "does not exist (ENOENT)",
+            "is not a regular file (EACCES)",
+            "is not executable (EACCES)",
+            "cannot be reached (Not a directory (os error 20))",
+            "does not exist (ENOENT) (the script has CRLF line endings; save it with LF endings)",
+        ] {
+            let plain = spawn_errno(&format!("its #! interpreter {:?} {problem}", "/bin/sh"));
+            assert!(plain.is_some(), "{problem}");
+            for path in hostile {
+                let reason = format!("its #! interpreter {path:?} {problem}");
+                assert_eq!(spawn_errno(&reason), plain, "{reason}");
+            }
+        }
+    }
+
+    /// The reasons as `tessera-pty` really words them: a change of wording
+    /// there fails here, not silently in the notice. Each is refused before
+    /// the fork, so nothing runs.
+    #[test]
+    fn every_real_shebang_refusal_maps_to_its_errno() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path().canonicalize().unwrap();
+        let plain = dir.join("plain");
+        std::fs::write(&plain, "").unwrap();
+        let looped = dir.join("loop");
+        std::os::unix::fs::symlink(&looped, &looped).unwrap();
+        let loop_errno = std::fs::metadata(&looped).unwrap_err().raw_os_error();
+        let below_file = std::fs::metadata(plain.join("x"))
+            .unwrap_err()
+            .raw_os_error();
+        let path = |path: &Path| path.to_str().unwrap().to_owned();
+        let script = dir.join("script");
+        for (line, errno) in [
+            (
+                format!("#!{}\n", path(&dir.join("missing"))),
+                Some(errno::ENOENT),
+            ),
+            (format!("#!{}\n", path(&dir)), Some(errno::EACCES)),
+            (format!("#!{}\n", path(&plain)), Some(errno::EACCES)),
+            (format!("#!{}/x\n", path(&plain)), below_file),
+            (format!("#!{}\n", path(&looped)), loop_errno),
+            ("#!\0/x\n".to_owned(), Some(errno::ENOENT)),
+            ("#!/bin/sh\r\necho hi\r\n".to_owned(), Some(errno::ENOEXEC)),
+        ] {
+            std::fs::write(&script, &line).unwrap();
+            let Err(tessera_pty::PtyError::Spawn { reason, .. }) =
+                tessera_pty::NativePty::spawn(&SpawnOptions::command(&script, "1"))
+            else {
+                panic!("{line:?} was not refused");
+            };
+            assert_eq!(spawn_errno(&reason), errno, "{line:?}: {reason}");
+        }
+    }
+
+    /// A CRLF script's notice names the format, not a missing file.
+    #[test]
+    fn the_notice_for_a_crlf_script_says_exec_format_error() {
+        let reason = "its #! interpreter \"/bin/sh\\r\" does not exist (ENOENT) \
+                      (the script has CRLF line endings; save it with LF endings)";
+        let notice = String::from_utf8(fallback_notice("dev", spawn_errno(reason))).unwrap();
+        assert!(notice.contains("(Exec format error)"), "{notice}");
+        assert!(!notice.contains("No such file or directory"), "{notice}");
+        assert!(!notice.contains("/bin/sh"), "{notice}");
     }
 
     #[test]

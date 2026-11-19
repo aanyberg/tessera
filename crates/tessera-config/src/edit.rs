@@ -778,10 +778,11 @@ impl ConfigEditor {
 
     /// The first of `base`, `base 2`, `base 3`, … that no profile of the
     /// configuration the app would read now is named: the `[[profiles]]`
-    /// entries of the document (with the edits so far) and the profiles of
-    /// the files in `profiles/` (#312). Names compare byte for byte, as
-    /// the loader's duplicate-name check does. At most one more try than
-    /// there are profiles.
+    /// entries of the document (with the edits so far), each as written
+    /// and as the loader reads it (`"A\0"` loads as `"A\u{FFFD}"`), and the
+    /// profiles of the files in `profiles/` (#312). Names compare byte for
+    /// byte, as the loader's duplicate-name check does. At most one more
+    /// try than there are names.
     #[must_use]
     pub fn unused_profile_name(&self, base: &str) -> String {
         self.unused_name(base, &self.load_profile_files())
@@ -795,17 +796,22 @@ impl ConfigEditor {
     /// [`ConfigEditor::unused_profile_name`] with `files` read by the
     /// caller.
     fn unused_name(&self, base: &str, files: &crate::profile_files::ProfileFiles) -> String {
-        // The names as written: one the loader cuts or changes only makes
-        // the added name a duplicate, which the check refuses (#312 m6).
-        let entries = match self.plain.get("profiles") {
-            Some(toml::Value::Array(profiles)) => profiles.as_slice(),
-            _ => &[],
-        };
-        let taken: std::collections::HashSet<&str> = entries
+        // The loader's names are the ones a new name must differ from; a
+        // file it fails on has none, and the names as written still count.
+        let written = self
+            .plain
+            .get("profiles")
+            .and_then(toml::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|p| p.get("name").and_then(toml::Value::as_str));
+        let loaded = self
+            .config
             .iter()
-            .filter_map(|p| p.get("name").and_then(toml::Value::as_str))
-            .chain(files.names())
-            .collect();
+            .flat_map(|config| &config.profiles)
+            .map(|p| p.name.as_str());
+        let taken: std::collections::HashSet<&str> =
+            written.chain(loaded).chain(files.names()).collect();
         let mut name = base.to_owned();
         let mut number = 2usize;
         while taken.contains(name.as_str()) {

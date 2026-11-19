@@ -371,9 +371,10 @@ or `#` within those bytes, the interpreter at a blank or NUL). The refusal
 is `PtyError::Spawn` naming the interpreter and `ENOENT` or `EACCES`; no
 new error variant. An interpreter that is itself a script is not
 inspected (it is an `ENOEXEC` that runs). Still reported only by the
-child's death: `EBADARCH` and `EBADMACHO` (fat or Mach-O files that do not
-load), `ENOMEM`, and a file changed between the check and the `exec`
-(`Signaled(SIGABRT)`); a binary that code signing rejects, or one open for
+child's death: a FIFO or device with an execute bit named as the program
+(`EACCES`; it is never opened, so the spawn cannot block on it), `EBADARCH`
+and `EBADMACHO` (fat or Mach-O files that do not load), `ENOMEM`, and a file
+changed between the check and the `exec` (`Signaled(SIGABRT)`); a binary that code signing rejects, or one open for
 writing, execs and is then killed (`Signaled(SIGKILL)`). `ETXTBSY` does not
 occur on macOS. A fork/exec wrapper or a `portable-pty` patch that keeps
 the error pipe was out of scope. The cases and what exec does with each

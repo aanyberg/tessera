@@ -6,9 +6,10 @@
 //! and propagates window-size changes. This is the only crate besides
 //! `tessera-ffi` that is allowed to contain `unsafe`, because it talks to the
 //! OS; the implementation stays on `portable-pty`'s safe surface except for
-//! one duplication of the master descriptor and the macOS process-name
-//! lookups of [`Pty::foreground_process`] (`proc_name`, `proc_pidinfo`),
-//! each documented at its `SAFETY:` comment.
+//! one duplication of the master descriptor, the `access(2)` check of the
+//! program and of a `#!` script's interpreter before a spawn, and the macOS
+//! process-name lookups of [`Pty::foreground_process`] (`proc_name`,
+//! `proc_pidinfo`), each documented at its `SAFETY:` comment.
 //!
 //! The crate is Unix-only: it relies on `fork`/`exec` semantics, POSIX
 //! signals and `wait(2)` statuses, and refuses to compile elsewhere.
@@ -210,7 +211,8 @@ pub enum PtyError {
     /// is missing, not a regular file or not executable (a script saved
     /// with CRLF line endings names `/bin/sh\r`), or an argument or
     /// variable holds a NUL byte. All of these are found before the fork.
-    /// An `exec` that fails after the fork for any other reason is not
+    /// An `exec` that fails after the fork for any other reason, such as
+    /// a FIFO or device with an execute bit named as the program, is not
     /// reported here: the spawn succeeds and the child ends at once (see
     /// [`NativePty::spawn`]).
     #[error("failed to spawn {program}: {reason}")]

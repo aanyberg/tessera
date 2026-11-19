@@ -321,3 +321,11 @@ work is done, not any result, so no test can kill them:
   budget and both comparisons stop at the same match.
 
 The `index > 0` exemption is gone.
+
+## Amendment: the warning for a pattern over the size limit (#433, 2026-11-18)
+
+A rule whose pattern compiles past `SMART_RULE_SIZE_LIMIT`
+(`regex::Error::CompiledTooBig`) has its own warning: it says the pattern is
+too large once compiled, usually from counted repetition of a Unicode class,
+and suggests ASCII classes or `(?-u)`. Any other compile failure keeps the
+existing warning. Neither quotes the pattern (S8).

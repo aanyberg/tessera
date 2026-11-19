@@ -749,6 +749,7 @@ pub enum KeyEntry {
 /// A `[keys]` entry the notation refused, as much of it as a settings view
 /// shows: never the raw text, which may be as long as the file.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RefusedKey {
     /// The table key as written, escaped and capped as warnings are.
     pub key: String,
