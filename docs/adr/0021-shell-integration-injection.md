@@ -313,3 +313,39 @@ counting as a failed command. bash 3.2 resets `PIPESTATUS` in any `DEBUG`
 trap, ours included (4 and later restore it): restoring it would take a
 pipeline of forked subshells before every command, so it is a documented
 limit of the script.
+
+## Amendment: bash keeps the user's DEBUG trap however the script is loaded (#542, 2026-11-19)
+
+bash hides the `DEBUG` trap from `trap -p` inside a function and inside a
+sourced file (3.2 and 5.3 alike), so the script sourced from `.bashrc` by
+hand saw no trap at load and dropped the user's at the first prompt. The
+`PROMPT_COMMAND` entries that install ours therefore read the trap in its
+place at every prompt, at top level, and take it for the user's unless it is
+ours (no command fired it since the last prompt). That also keeps a trap set
+after the script loaded or typed at a prompt, which was a documented limit
+above: the fork per prompt the Decision rejected is now accepted (a command
+substitution: about 0.5 ms of CPU per prompt on bash 3.2 and 0.7 ms on 5.3,
+measured against main). The read is a command substitution on every bash, not
+5.3's `${ ...; }`: that runs in the shell itself, where the user's trap
+fires and prints into the read (a title trap printing the directory's name
+had that name installed and run as the trap). With `set -T` or `extdebug`
+the user's trap fires inside the fork as well, so the fork sends its
+standard output to `/dev/null` and only `trap -p` writes to the read
+(through descriptor 3). As a second guard only text that is exactly
+`trap -- '<text>' DEBUG`, with no quote left in `<text>` once every `'\''`
+is removed, is taken for a trap; anything else leaves the trap as it was.
+So under `set -T` or `extdebug` a trap that writes to descriptor 3 (into the
+read) is not taken up (documented in the script). The hooks run the user's
+trap as the first command of an `&&` list, so a non-zero status it ends with
+(a false `&&` list, in a trap that acts on some commands only) is not made a
+failure by the hooks' own plumbing (which ran `ERR` three times per command
+and exited a `set -e` shell), and still reaches bash (under `extdebug` it
+skips the command). A command that fails inside the user's trap still runs
+`ERR`, as in a plain bash, and more often: the trap also runs during the
+prompt hooks (a bare `false` in it gave 15 `ERR` lines on bash 3.2 for two
+commands against 9 in a plain bash).
+The user's trap now also runs for the read, once more per prompt. Loaded from
+`PROMPT_COMMAND` (the login route) the script still cannot see a trap a
+startup file set: bash 5.3 keeps the trap the file sets, so the user's is
+lost, and 3.2 puts it back, so the first command has no `C` (documented in
+the script).
