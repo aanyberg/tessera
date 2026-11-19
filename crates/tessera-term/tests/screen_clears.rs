@@ -81,25 +81,28 @@ fn b03_ed_0_at_home_counts() {
     row(b"\x1b[H\x1b[0J", 1);
 }
 
-/// #86: ED 0 at home on a top row that continues the newest history line
-/// is a shell redrawing a line that began above the screen, not a clear.
+/// ED 0 at home on a top row that continues the newest history line may be
+/// a shell redrawing a line that began above the screen (#86): the screen
+/// stays continuous with its history. It blanks every row all the same, so
+/// it counts, with the top row's line id (#516).
 #[test]
-fn b04_ed_0_at_home_on_a_row_continuing_the_history_does_not_count() {
+fn b04_ed_0_at_home_on_a_row_continuing_the_history_counts_and_keeps_the_history() {
     let mut term = Terminal::new(24, 80);
     // 25 rows of one logical line: the first scrolls off, wrapped.
     term.advance("y".repeat(25 * 80).as_bytes());
     assert!(term.grid().scrollback_line(0).unwrap().wrapped);
     term.advance(b"\x1b[H\x1b[J");
+    let grid = term.grid();
     assert!(
-        term.grid()
-            .line(1)
-            .unwrap()
-            .cells
-            .iter()
-            .all(|c| c.ch == ' '),
+        grid.line(1).unwrap().cells.iter().all(|c| c.ch == ' '),
         "the rows below were erased"
     );
-    expect_clears(&mut term, 0, 0, None);
+    assert!(
+        grid.scrollback_line(0).unwrap().wrapped,
+        "the history line still continues on the top row"
+    );
+    assert!(grid.scrolled_since_clear(), "the screen is still scrolled");
+    expect_clears(&mut term, 0, 1, Some(1));
 }
 
 #[test]

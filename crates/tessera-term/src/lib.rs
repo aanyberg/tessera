@@ -637,9 +637,10 @@ impl Terminal {
     /// How many times the primary screen was erased whole since the
     /// terminal was created ([`Grid::screen_clears`]): ED 2 and DECSED 2,
     /// ED 0 from the home position (the `clear` of screen, tmux, vt100 and
-    /// linux terminfo; not on a top row that continues the history),
-    /// DECCOLM and RIS. Never ED 0 elsewhere (a shell redrawing its
-    /// prompt), ED 1, ED 3, EL or anything on the alternate screen.
+    /// linux terminfo; also on a top row that continues the history, whose
+    /// rows it blanks all the same), DECCOLM and RIS. Never ED 0 elsewhere
+    /// (a shell redrawing its prompt), ED 1, ED 3, EL or anything on the
+    /// alternate screen.
     ///
     /// Unlike [`Terminal::line_epoch`], which no erase bumps (an in-place
     /// erase moves no line), it tells a reader that the screen's rows lost

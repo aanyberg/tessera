@@ -532,12 +532,12 @@ impl Grid {
     /// [`Grid::scrollback_pushed`] show (ADR 0039, #377).
     ///
     /// Bumped once per erase of the whole primary screen: ED 2
-    /// ([`EraseDisplay::All`], protected cells kept or not) and ED 0
-    /// ([`EraseDisplay::Below`]) from the home position unless the top row
-    /// continues the newest history line, exactly the erases that clear
-    /// [`Grid::scrolled_since_clear`], and [`Grid::reset`] (RIS), also
-    /// while the alternate screen is active (it drops the stashed primary
-    /// rows). Never bumped by ED 0 elsewhere, ED 1, ED 3,
+    /// ([`EraseDisplay::All`], protected cells kept or not), ED 0
+    /// ([`EraseDisplay::Below`]) from the home position, also on a top row
+    /// that continues the newest history line (it blanks the rows although
+    /// [`Grid::scrolled_since_clear`] stays; #516), and [`Grid::reset`]
+    /// (RIS), also while the alternate screen is active (it drops the
+    /// stashed primary rows). Never bumped by ED 0 elsewhere, ED 1, ED 3,
     /// [`Grid::clear_scrollback`], erasing a line, a resize or anything on
     /// the alternate screen.
     #[must_use]
@@ -2246,12 +2246,12 @@ impl Grid {
     /// marks and wrap flag; the cursor's line, when only partially erased,
     /// behaves like [`Grid::erase_in_line`]. On the primary screen, an
     /// erase of the whole screen ([`EraseDisplay::All`], or
-    /// [`EraseDisplay::Below`] from the home position when the top row
-    /// does not continue the newest scrollback line) also clears
-    /// [`Grid::scrolled_since_clear`], counts in [`Grid::screen_clears`]
-    /// and ends the newest scrollback line (clears its wrap flag), whose
-    /// continuation on the top row it erased; [`EraseDisplay::Scrollback`]
-    /// is [`Grid::clear_scrollback`].
+    /// [`EraseDisplay::Below`] from the home position) counts in
+    /// [`Grid::screen_clears`]; unless it is [`EraseDisplay::Below`] on a
+    /// top row that continues the newest scrollback line, it also clears
+    /// [`Grid::scrolled_since_clear`] and ends that line (clears its wrap
+    /// flag), whose continuation on the top row it erased;
+    /// [`EraseDisplay::Scrollback`] is [`Grid::clear_scrollback`].
     pub fn erase_in_display(&mut self, mode: EraseDisplay) {
         self.erase_display(mode, false);
     }
@@ -2277,18 +2277,19 @@ impl Grid {
     fn erase_display(&mut self, mode: EraseDisplay, selective: bool) -> bool {
         self.pending_wrap = false;
         let row = usize::from(self.cursor.row);
+        // From home ED 0 erases the whole screen, as vt100's `clear` does.
         let whole_screen = match mode {
             EraseDisplay::All => true,
-            // From home it erases the whole screen, as vt100's `clear`
-            // does, unless the top row continues the newest history line:
-            // then a shell is redrawing a line that started above the
-            // screen (zsh after a narrow made its prompt taller than the
-            // window), not clearing (#86).
-            EraseDisplay::Below => {
-                self.cursor == Point::default() && !self.top_row_continues_history()
-            }
+            EraseDisplay::Below => self.cursor == Point::default(),
             EraseDisplay::Above | EraseDisplay::Scrollback => false,
         };
+        // On a top row that continues the newest history line it may be a
+        // shell redrawing a line that started above the screen (zsh after
+        // a narrow made its prompt taller than the window; #86): the screen
+        // stays continuous with its history. Its rows are blank all the
+        // same, so it still counts as a clear (#516).
+        let continues_history =
+            matches!(mode, EraseDisplay::Below) && whole_screen && self.top_row_continues_history();
         let pen = self.pen;
         let clear = |lines: &mut [Line]| {
             let mut kept = false;
@@ -2331,9 +2332,11 @@ impl Grid {
             }
         };
         if whole_screen && !self.is_alt_screen() {
-            self.scrolled_since_clear = false;
             self.note_screen_clear();
-            self.end_newest_history_line();
+            if !continues_history {
+                self.scrolled_since_clear = false;
+                self.end_newest_history_line();
+            }
         }
         kept
     }

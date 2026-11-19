@@ -1144,6 +1144,7 @@ pub(crate) fn last_output(session: &Session) -> Option<OutputRange> {
     };
     let refused = session.read_terminal(|term, _| {
         let grid = term.grid();
+        // Only saves the look: the scan below gives up on these too.
         if term.line_epoch() != epoch || grid.is_alt_screen() {
             return true;
         }
@@ -1738,6 +1739,58 @@ mod tests {
         assert_eq!(log.last_output_line(1), Some((4, false)), "above the clear");
         log.screen_cleared(4, 1);
         assert_eq!(log.last_output_line(1), Some((ERASED, true)));
+    }
+
+    /// A `C` drawn above the pending prompt retires the records it drew
+    /// over: the newest finished one's `C` line counts as blanked, though
+    /// neither a clear nor a resize touched it (#334).
+    #[test]
+    fn a_record_drawn_over_reports_its_output_line_blanked() {
+        use Mark::*;
+        let (log, _, _) = log_of(&[
+            (PromptStart, 3, 0),
+            (OutputStart, 4, 0),
+            (d(Some(0)), 6, 0),
+            (PromptStart, 6, 0),
+            (OutputStart, 4, 0),
+        ]);
+        assert_eq!(log.last_output_line(0), Some((4, true)));
+    }
+
+    /// A clear reported in an older epoch than the one a `C` was carried
+    /// into says nothing about that line: its ids are another numbering's
+    /// (#334).
+    #[test]
+    fn a_clear_of_an_older_epoch_leaves_a_carried_output_line() {
+        use Mark::*;
+        let (mut log, _, _) =
+            log_of(&[(PromptStart, 3, 0), (OutputStart, 4, 0), (d(Some(0)), 6, 0)]);
+        for record in &mut log.records {
+            record.anchor = 8;
+            record.anchor_epoch = 1;
+        }
+        log.screen_cleared(5, 0);
+        assert_eq!(log.last_output_line(1), Some((8, false)));
+    }
+
+    /// A `C` after a clear may have come before it only if the clear
+    /// reached its line: one above the clear's top, or under a clear of
+    /// another epoch, is not [`Record::cleared`]; one at the top is (#334).
+    #[test]
+    fn only_a_c_the_clear_reached_counts_as_cleared() {
+        use Mark::*;
+        for (top, clear_epoch, cleared) in [(5, 0, false), (0, 1, false), (4, 0, true)] {
+            let (mut log, _, _) = log_of(&[(PromptStart, 3, 0)]);
+            log.screen_cleared(top, clear_epoch);
+            let t = Instant::now();
+            log.apply(&OutputStart, 4, 0, t, |_| {});
+            log.apply(&d(Some(0)), 6, 0, t, |_| {});
+            assert_eq!(
+                log.last_output_line(0),
+                Some((4, cleared)),
+                "clear at {top} of epoch {clear_epoch}"
+            );
+        }
     }
 
     /// A terminal behind a mutex that counts the lines each lock hold
