@@ -41,8 +41,9 @@
 //! had that deadline (searched again, it would be the same run). Above the
 //! floor, a piece late the first time is always searched again, so one
 //! stall does not skip a row (#378). A segment a halved limit cuts inside its line can lose
-//! a match across the cut (a match touching such a cut is dropped, so a
-//! run is not counted in parts, #531), so it counts as skipped too: either
+//! a match across the cut (a regex match touching such a cut is dropped,
+//! so a run is not counted in parts, #531; a literal match is whole and
+//! kept, #569), so it counts as skipped too: either
 //! way the status says lines were skipped ([`SearchStatus::lines_skipped`]). A
 //! later piece of a step stops at the budget and is searched first in the
 //! next step. A piece's matches reach the chunk's sink only once it has
@@ -154,8 +155,8 @@ pub struct SearchStatus {
     /// Some lines were too slow to search whole with this query: one row
     /// of at most [`MIN_PIECE_BYTES`] of text took over
     /// `max(4 x budget, `[`LINE_TIME_LIMIT`]`)` and was skipped, or a line was cut into pieces finer than the full
-    /// limit cuts (a match across or touching such a cut is not found, so
-    /// a run is not counted in parts, #531). Matches there may be missing
+    /// limit cuts (a match across such a cut is not found, nor a regex match
+    /// touching it, so a run is not counted in parts, #531). Matches there may be missing
     /// from the count. Clears once those lines are gone.
     pub lines_skipped: bool,
 }
@@ -2689,6 +2690,45 @@ mod tests {
         // pieces follow its next half, not one more halving (#378, m1).
         let again = again.expect("4000 bytes are above the floor");
         assert_eq!(search.active.as_ref().unwrap().limit, again);
+    }
+
+    /// #569: one stall that makes the first piece of a literal search
+    /// late halves the limit for every later piece, so the line is cut
+    /// where the full limit does not cut it; a literal match touching
+    /// such a cut is whole all the same and is counted, so the stalled
+    /// search finds every single-cell `X` the full limit finds, as under
+    /// load in `tests/search.rs::every_match_is_found_across_piece_cuts`.
+    #[test]
+    fn a_stall_before_a_literal_search_loses_no_match_at_its_cuts() {
+        let zalgo = zalgo();
+        let cols = 2048_u16;
+        let mut term = Terminal::new(10, cols);
+        let mut input = String::new();
+        let mut xs = 0;
+        for n in 0..usize::from(cols) * 8 {
+            if n % 3 == 0 {
+                input.push('X');
+                xs += 1;
+            } else {
+                input.push_str(&zalgo);
+            }
+        }
+        term.advance(input.as_bytes());
+        let shared = Shared::new(term);
+        let mut search = SearchState::default();
+        search.start("X", LITERAL).unwrap();
+        // The stall: the first piece is late and searched again at half.
+        assert_eq!(search.unit(&shared, late(Duration::ZERO)), Some(Ran::Stop));
+        let limit = search.active.as_ref().unwrap().limit;
+        assert_eq!(limit, PieceLimit::FULL.halved(cols).unwrap());
+        let mut units = 0;
+        while search.unit(&shared, on_time()).is_some() {
+            units += 1;
+            assert!(units < 10_000, "never done");
+        }
+        let status = search.status();
+        assert_eq!(status.matches, xs, "{units} units at {limit:?}, {status:?}");
+        assert_eq!(search.active.as_ref().unwrap().skips, 0, "{status:?}");
     }
 
     /// A clock whose step started a minute ago: every piece is late.

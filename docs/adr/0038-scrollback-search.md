@@ -2,7 +2,8 @@
 
 **Status:** accepted · 2026-11-06 · amended 2026-11-07 (#46b: per-piece step bound, find bar) · amended
 2026-11-08 (#331, #318: a ceiling per piece, lines skipped, stale truncation, reveal) · amended
-2026-11-19 (#531: no parts of a match split by a halved cut)
+2026-11-19 (#531: no parts of a match split by a halved cut) · amended 2026-11-19 (#569: a literal match at
+a halved cut is kept)
 
 ## Context
 
@@ -117,7 +118,11 @@ a quarter of a dense literal search:
   longer falls where the full limit cuts (amended in #531: before, one run
   counted, and copied, as one fragment per piece). A match the full limit
   finds whole inside one halved piece is kept; one that merely touches the
-  cut is lost with the parts. A segment cut at a halved limit therefore
+  cut is lost with the parts. A literal (not regex) query drops nothing at
+  a cut: its match is the query's whole text, never a part (amended in
+  #569: one stall of a first piece halves the limit for the rest of the
+  search, and dropping every literal match beside a cut then lost matches
+  of a plain Find while a program printed). A segment cut at a halved limit therefore
   counts as skipped too (`lines_skipped`), so the count is never short
   without saying so. It is a lower bound for patterns whose matches are
   maximal runs (`[0-9]+`, `\w+`); a pattern whose text behind a dropped
