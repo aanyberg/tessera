@@ -323,22 +323,36 @@ impl NativePty {
         let reader_phase = Arc::clone(&phase);
         let reader_queue = Arc::clone(&queue);
         let reader_slave = Arc::clone(&held_slave);
-        // A thread that cannot be created drops its closure, and with it
-        // the guard, so the child is killed and reaped then too.
+        // The child goes to the reader only once its thread exists, so a
+        // failed start leaves the guard here (#566; see `hand_over_child`).
+        let (child_tx, child_rx) = mpsc::sync_channel::<ChildGuard>(1);
         let reader_thread = spawn_thread(
             format!("pty-reader-{pid}"),
             fault::Step::ReaderThread,
             move || {
-                pump_output(
-                    reader,
-                    &reader_slave,
-                    child.into_inner(),
-                    &event_tx,
-                    &reader_phase,
-                    &reader_queue,
-                );
+                if let Ok(child) = child_rx.recv() {
+                    pump_output(
+                        reader,
+                        &reader_slave,
+                        child.into_inner(),
+                        &event_tx,
+                        &reader_phase,
+                        &reader_queue,
+                    );
+                }
             },
-        )?;
+        );
+        let reader_thread = match hand_over_child(reader_thread, &child_tx, child) {
+            Ok(handle) => handle,
+            Err((err, child)) => {
+                // Close every reference to the terminal, the parent's slave
+                // included, before the guard reaps.
+                drop((writer, master));
+                held_slave.release();
+                drop(child);
+                return Err(err.into());
+            }
+        };
         let writer_queue = Arc::clone(&queue);
         let writer_thread = spawn_thread(
             format!("pty-writer-{pid}"),
@@ -401,6 +415,25 @@ impl NativePty {
     /// being recycled underneath us.
     fn signal_if_running(&self, signal: Signal) -> io::Result<()> {
         signal_child(&self.phase, self.pid, signal)
+    }
+}
+
+/// Sends `child` to a reader thread that started; a thread that did not
+/// start, or that ended before it got the child, gives the guard back with
+/// the error so the caller can close the master before the guard reaps: a
+/// child that already printed cannot finish exiting (its terminal waits for
+/// the output to be read) while the master is open and nobody reads it.
+fn hand_over_child(
+    reader_thread: io::Result<JoinHandle<()>>,
+    child_tx: &mpsc::SyncSender<ChildGuard>,
+    child: ChildGuard,
+) -> Result<JoinHandle<()>, (io::Error, ChildGuard)> {
+    match reader_thread {
+        Ok(handle) => child_tx.send(child).map(|()| handle).map_err(|err| {
+            let reason = "the pty reader thread ended before it got the child";
+            (io::Error::other(reason), err.0)
+        }),
+        Err(err) => Err((err, child)),
     }
 }
 
@@ -886,10 +919,24 @@ mod fault {
         static FORKED: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
     }
 
+    #[cfg(test)]
+    thread_local! {
+        static BEFORE_FAILURE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
     /// Makes the next spawn on this thread fail at `step`.
     #[cfg(test)]
     pub(super) fn fail_at(step: Step) {
         FAIL_AT.with(|cell| cell.set(Some(step)));
+    }
+
+    /// Like [`fail_at`], but runs `before` just before the failure fires,
+    /// so a test can let the child get somewhere first.
+    #[cfg(test)]
+    pub(super) fn fail_at_after(step: Step, before: impl FnOnce() + 'static) {
+        BEFORE_FAILURE.with(|cell| *cell.borrow_mut() = Some(Box::new(before)));
+        fail_at(step);
     }
 
     /// The pid of the last child a spawn on this thread forked, so a test
@@ -917,6 +964,9 @@ mod fault {
         #[cfg(test)]
         if FAIL_AT.with(std::cell::Cell::get) == Some(step) {
             FAIL_AT.with(|cell| cell.set(None));
+            if let Some(before) = BEFORE_FAILURE.with(|cell| cell.borrow_mut().take()) {
+                before();
+            }
             return Err(io::Error::other(format!("injected failure at {step:?}")));
         }
         let _ = step;
@@ -1538,6 +1588,57 @@ mod tests {
     #[test]
     fn a_writer_thread_that_cannot_start_kills_and_reaps_the_child() {
         assert_failure_at_cleans_up(fault::Step::WriterThread);
+    }
+
+    /// #566: a child that printed before its reader thread failed to start
+    /// cannot finish exiting while the master is open and nobody reads it
+    /// (on macOS the session leader's exit waits for its output to drain),
+    /// so the spawn must close the master before it reaps the child.
+    #[test]
+    fn a_reader_thread_that_cannot_start_after_output_fails_the_spawn() {
+        let marker = std::env::temp_dir().join(format!(
+            "tessera-pty-566-{}-{:?}",
+            std::process::id(),
+            thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&marker);
+        let alone = std::env::var_os("NEXTEST").is_some();
+        let fds = open_fds();
+        let script = format!("printf printed; : > '{}'; sleep 30", marker.display());
+        let options = SpawnOptions::command("/bin/sh", "fault").args(["-c", &script]);
+        let (done_tx, done_rx) = mpsc::channel();
+        let wait_for = marker.clone();
+        // The spawn runs on its own thread so a hang fails this test in
+        // bounded time instead of hanging it.
+        thread::spawn(move || {
+            let _ = fault::take_forked();
+            fault::fail_at_after(fault::Step::ReaderThread, move || {
+                // The child writes the marker after its output, so the
+                // output is queued on the terminal once the marker exists.
+                let started = std::time::Instant::now();
+                while !wait_for.exists() && started.elapsed() < std::time::Duration::from_secs(10) {
+                    thread::sleep(std::time::Duration::from_millis(10));
+                }
+            });
+            let result = NativePty::spawn(&options).map(|_| ());
+            let _ = done_tx.send((result, fault::take_forked()));
+        });
+        let outcome = done_rx.recv_timeout(std::time::Duration::from_secs(20));
+        let printed = marker.exists();
+        let _ = std::fs::remove_file(&marker);
+        let (result, pid) = outcome.expect("the spawn did not return after its reader failed");
+        assert!(printed, "the child never got to print before the failure");
+        match result {
+            Err(PtyError::Io(err)) => assert!(err.to_string().contains("injected"), "{err}"),
+            Err(other) => panic!("unexpected error: {other}"),
+            Ok(()) => panic!("the injected failure did not fire"),
+        }
+        let pid = pid.expect("the failure came after the fork");
+        assert!(reaped(pid), "the spawn returned before reaping child {pid}");
+        // The parent's held slave (#562) is released on this path too.
+        if alone {
+            assert_eq!(open_fds(), fds, "the failed spawn leaked a descriptor");
+        }
     }
 
     fn bytes(options: &SpawnOptions) -> usize {
