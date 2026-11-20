@@ -4464,6 +4464,21 @@ extension SettingsTests {
         }
     }
 
+    /// Skips a test whose press dragged `actions`' slider without moving it
+    /// (no action 0.05 or more from the value at the press): the press then
+    /// writes nothing, and the product was not exercised. The CI runner,
+    /// macOS 15, does this, as ``pressKnob`` records; a drag that moved the
+    /// knob runs every check of the test.
+    private func skipUnlessTheDragMoved(_ actions: ActionCounter) throws {
+        guard !actions.moved(0.05) else { return }
+        let system = ProcessInfo.processInfo.operatingSystemVersionString
+        throw XCTSkip(
+            """
+            the synthetic drag did not move the NSSlider on macOS \(system): \
+            actions with the values \(actions.values) from \(actions.pressedAt)
+            """)
+    }
+
     /// Cancels the press `slider` is tracking as AppKit does when it cancels
     /// the active mouse gesture recognizers (a window moved by the window
     /// server, #564): the slider's `NSControlGestureRecognizer`, begun, is
@@ -4822,6 +4837,7 @@ extension SettingsTests {
         }
         slider.target = first.target
         slider.action = first.action
+        try skipUnlessTheDragMoved(first)
         try await waitUntil("press 1 written") { !writer.calls.isEmpty && !model.isWriting }
         let written = try XCTUnwrap(writer.calls.last?.value?.double)
         let second = ActionCounter(slider)
@@ -4873,6 +4889,7 @@ extension SettingsTests {
         }
         slider.target = first.target
         slider.action = first.action
+        try skipUnlessTheDragMoved(first)
         try await waitUntil("press 1 written") { !writer.calls.isEmpty && !model.isWriting }
         let second = ActionCounter(slider)
         defer {
