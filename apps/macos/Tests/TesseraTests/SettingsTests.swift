@@ -2799,10 +2799,12 @@ extension SettingsTests {
         XCTAssertEqual(model.snapshot.generation, 1)
     }
 
-    /// 21.6a m6: a delete retried after a conflict, which the reload shows
-    /// applied already (the external edit was of another key), unlocks the
-    /// list at once: no later configuration would change the list again.
-    func testARetriedDeleteAlreadyAppliedUnlocksAtOnce() async throws {
+    /// 21.6a m6, #549: a delete that meets a conflict whose external edit
+    /// (of another key) the watch applied before the conflict came back:
+    /// no later configuration comes, so it is written again at the same
+    /// index once the settle time has passed, and unlocks the list when
+    /// it applies.
+    func testARetriedDeleteWhoseExternalEditAppliedAlreadyIsWrittenAfterTheSettleTime() async throws {
         let clock = ManualClock()
         let writer = FakeWriter()
         let (model, source, _) = try fakeModel(Self.threeProfiles, writer: writer, clock: clock)
@@ -2820,13 +2822,436 @@ extension SettingsTests {
             applied.value = TesseraConfigSnapshot(generation: 2, config: both)
             return nil
         }
+        let reads = source.pluginReads
         XCTAssertTrue(model.deleteProfile(1))
-        try await waitUntil("written") { !model.isWriting }
-        XCTAssertFalse(model.profilesChanging, "m6: the reload shows the delete")
+        try await waitUntil("the conflict came back") { source.pluginReads > reads }
+        XCTAssertEqual(model.value("appearance.theme"), .string("Nord"), "the external edit shows")
+        XCTAssertEqual(writer.calls.count, 1)
+        XCTAssertTrue(model.profilesChanging)
+        clock.advance(by: model.profileSettleTimeout)
+        try await waitUntil("written again") { !model.isWriting }
+        XCTAssertEqual(writer.calls, [.init(key: "profiles[1]", value: nil), .init(key: "profiles[1]", value: nil)])
+        model.reload()
+        XCTAssertFalse(model.profilesChanging, "the delete applied")
         XCTAssertEqual(model.profiles.map(\.name), ["one", "three"])
-        XCTAssertEqual(model.value("appearance.theme"), .string("Nord"))
         clock.advance(by: .seconds(3))
         XCTAssertNil(model.message(SettingsModel.profilesKey), "no settle notice either")
+    }
+
+    /// The configuration of ``threeProfiles`` with "one" removed by hand
+    /// (and the default profile moved to "two").
+    private static let firstProfileRemoved = """
+        {"general": {"default_profile": "two"}, "appearance": {"theme": "Tessera Dark"},
+         "profiles": [{"name": "two", "command": "/bin/cat"}, {"name": "three"}]}
+        """
+
+    /// Sets the writer to refuse its next call as a conflict
+    /// (an editor saved the file in between; the watch has not applied it
+    /// yet), runs `edit` and waits until the conflict came back (the model
+    /// read the configuration again).
+    private func conflictOnFirstAttempt(
+        _ model: SettingsModel, _ source: FakeSource, _ writer: FakeWriter, _ edit: () -> Void
+    ) async throws {
+        let first = Locked(true)
+        writer.respond = { _, _ in
+            guard first.value else { return nil }
+            first.value = false
+            return TesseraConfigEditError(.conflict, message: "config.toml changed on disk")
+        }
+        let reads = source.pluginReads
+        edit()
+        try await waitUntil("the conflict came back") { source.pluginReads > reads }
+        // A reload before the hand edit applies (another write finishing)
+        // must not retry by the old list.
+        model.reload()
+        XCTAssertEqual(writer.calls.count, 1, "not written again before the hand edit applies")
+        XCTAssertTrue(model.isWriting)
+    }
+
+    /// #549: a profile's edit that meets a hand edit (`Conflict`) which
+    /// removed an earlier profile is written again, once the hand edit
+    /// applies, at the index its profile has now, not at the one it had.
+    func testAProfileEditRetriedAfterAHandEditRemovedAnEarlierProfileGoesToItsProfile() async throws {
+        let (model, source, writer) = try fakeModel(Self.threeProfiles, clock: ManualClock())
+        try await conflictOnFirstAttempt(model, source, writer) {
+            model.set("profiles[1].command", .string("/bin/sh"))
+        }
+        XCTAssertEqual(model.value("profiles[1].command"), .string("/bin/sh"), "shown while it waits")
+        source.snapshot = TesseraConfigSnapshot(generation: 1, config: try Self.json(Self.firstProfileRemoved))
+        model.reload()
+        try await waitUntil("written again") { !model.isWriting }
+        XCTAssertEqual(
+            writer.calls,
+            [.init(key: "profiles[1].command", value: .string("/bin/sh")),
+             .init(key: "profiles[0].command", value: .string("/bin/sh"))],
+            "written to “two”, now the first, not to “three”")
+        XCTAssertEqual(model.profiles.map(\.name), ["two", "three"])
+        XCTAssertEqual(model.value("profiles[0].command"), .string("/bin/sh"), "shown on “two”")
+        XCTAssertNil(model.value("profiles[1].command"), "“three” keeps its own (none)")
+        XCTAssertNil(model.message(SettingsModel.profilesKey))
+    }
+
+    /// #549: a delete that meets a hand edit which removed an earlier
+    /// profile deletes its own profile, now one earlier.
+    func testADeleteRetriedAfterAHandEditRemovedAnEarlierProfileDeletesItsProfile() async throws {
+        let (model, source, writer) = try fakeModel(Self.threeProfiles, clock: ManualClock())
+        try await conflictOnFirstAttempt(model, source, writer) {
+            XCTAssertTrue(model.deleteProfile(2))
+        }
+        source.snapshot = TesseraConfigSnapshot(generation: 1, config: try Self.json(Self.firstProfileRemoved))
+        model.reload()
+        try await waitUntil("written again") { !model.isWriting }
+        XCTAssertEqual(writer.calls, [.init(key: "profiles[2]", value: nil), .init(key: "profiles[1]", value: nil)])
+        XCTAssertTrue(model.profilesChanging, "the delete of “three” waits to apply")
+    }
+
+    /// #549: a profile's edit (and a rename, with the default profile it
+    /// moves) that meets a hand edit which removed that profile is
+    /// dropped, and the list says the value was not saved; a delete of it
+    /// has nothing left to do.
+    func testAProfileEditRetriedAfterAHandEditRemovedItsProfileIsDropped() async throws {
+        let twoRemoved = """
+            {"general": {"default_profile": "one"}, "appearance": {"theme": "Tessera Dark"},
+             "profiles": [{"name": "one"}, {"name": "three"}]}
+            """
+        for edit in ["command", "rename", "delete"] {
+            let (model, source, writer) = try fakeModel(Self.threeProfiles, clock: ManualClock())
+            try await conflictOnFirstAttempt(model, source, writer) {
+                switch edit {
+                case "command": model.set("profiles[1].command", .string("/bin/sh"))
+                case "rename": model.renameProfile(1, to: "Deux")
+                default: XCTAssertTrue(model.deleteProfile(1))
+                }
+            }
+            source.snapshot = TesseraConfigSnapshot(generation: 1, config: try Self.json(twoRemoved))
+            model.reload()
+            try await waitUntil("dropped") { !model.isWriting }
+            XCTAssertEqual(writer.calls.count, 1, "\(edit): not written again: \(writer.calls)")
+            XCTAssertFalse(model.profilesChanging, edit)
+            XCTAssertEqual(model.profiles.map(\.name), ["one", "three"], edit)
+            XCTAssertNil(model.value("profiles[1].command"), "\(edit): “three” keeps its own")
+            XCTAssertFalse(model.isPending("profiles[1].command"), edit)
+            XCTAssertEqual(
+                model.message(SettingsModel.profilesKey), edit == "delete" ? nil : SettingsModel.profileGoneNotice,
+                edit)
+        }
+    }
+
+    /// #549: a rename that meets a hand edit which removed an earlier
+    /// profile renames its profile at its new index, and moves the default
+    /// profile with it, as the run it was queued in.
+    func testARenameRetriedAfterAHandEditRemovedAnEarlierProfileKeepsItsRun() async throws {
+        let config = Self.threeProfiles.replacingOccurrences(
+            of: #""default_profile": "one""#, with: #""default_profile": "three""#)
+        let removed = Self.firstProfileRemoved.replacingOccurrences(
+            of: #""default_profile": "two""#, with: #""default_profile": "three""#)
+        let (model, source, writer) = try fakeModel(config, clock: ManualClock())
+        try await conflictOnFirstAttempt(model, source, writer) {
+            model.renameProfile(2, to: "Trois")
+        }
+        source.snapshot = TesseraConfigSnapshot(generation: 1, config: try Self.json(removed))
+        model.reload()
+        try await waitUntil("written again") { !model.isWriting }
+        XCTAssertEqual(
+            writer.calls,
+            [.init(key: "profiles[2].name", value: .string("Trois")),
+             .init(key: "profiles[1].name", value: .string("Trois")),
+             .init(key: "general.default_profile", value: .string("Trois"))])
+    }
+
+    /// #549: an edit of the key while one waits to be written again
+    /// replaces it, and waits with it: only the later value is written, to
+    /// the profile it was made for once the hand edit applies.
+    func testALaterEditReplacesAProfileEditWaitingToBeRetried() async throws {
+        let (model, source, writer) = try fakeModel(Self.threeProfiles, clock: ManualClock())
+        try await conflictOnFirstAttempt(model, source, writer) {
+            model.set("profiles[1].command", .string("/bin/sh"))
+        }
+        model.set("profiles[1].command", .string("/bin/zsh"))
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(writer.calls.count, 1, "not written by the old list while the hand edit waits")
+        XCTAssertEqual(model.value("profiles[1].command"), .string("/bin/zsh"), "shown while it waits")
+        source.snapshot = TesseraConfigSnapshot(generation: 1, config: try Self.json(Self.firstProfileRemoved))
+        model.reload()
+        try await waitUntil("written") { !model.isWriting }
+        XCTAssertEqual(
+            writer.calls,
+            [.init(key: "profiles[1].command", value: .string("/bin/sh")),
+             .init(key: "profiles[0].command", value: .string("/bin/zsh"))],
+            "written to “two”, now the first, not to “three”")
+        XCTAssertEqual(model.value("profiles[0].command"), .string("/bin/zsh"))
+    }
+
+    /// #549 round 1 (P1): an edit of a profile's key already queued behind
+    /// one that meets a conflict is the latest word: the earlier value is
+    /// not written again over it once the hand edit applies.
+    func testALaterQueuedEditIsNotOverwrittenByARetriedEarlierOne() async throws {
+        let (model, source, writer) = try fakeModel(Self.threeProfiles, clock: ManualClock())
+        let first = Locked(true)
+        writer.respond = { _, _ in
+            guard first.value else { return nil }
+            first.value = false
+            return TesseraConfigEditError(.conflict, message: "config.toml changed on disk")
+        }
+        model.set("profiles[1].command", .string("/bin/sh"))
+        model.set("profiles[1].command", .string("/bin/zsh"))
+        try await waitUntil("both ran") { writer.calls.count == 2 && !model.isWriting }
+        // The file as the watch applies it: the hand edit and the later value.
+        let handEdited = Self.threeProfiles.replacingOccurrences(of: "Tessera Dark", with: "Nord")
+            .replacingOccurrences(of: "/bin/cat", with: "/bin/zsh")
+        source.snapshot = TesseraConfigSnapshot(generation: 1, config: try Self.json(handEdited))
+        model.reload()
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(
+            writer.calls,
+            [.init(key: "profiles[1].command", value: .string("/bin/sh")),
+             .init(key: "profiles[1].command", value: .string("/bin/zsh"))],
+            "the earlier value is not written again over the later one")
+        XCTAssertEqual(model.value("profiles[1].command"), .string("/bin/zsh"))
+        XCTAssertFalse(model.isWriting)
+    }
+
+    /// #549 round 1 (P6): a profile's edit that meets a conflict as its
+    /// window closes (a draft committed on close) is still written again,
+    /// as an edit outside the profiles is, and the model goes after it.
+    func testAProfileEditThatMeetsAConflictAsTheWindowClosesIsStillWritten() async throws {
+        let writer = FakeWriter()
+        let clock = ManualClock()
+        var model: SettingsModel? = try fakeModel(Self.threeProfiles, writer: writer, clock: clock).0
+        let first = Locked(true)
+        writer.respond = { _, _ in
+            guard first.value else { return nil }
+            first.value = false
+            return TesseraConfigEditError(.conflict, message: "config.toml changed on disk")
+        }
+        model?.set("profiles[1].command", .string("/bin/sh"))
+        weak var gone = model
+        model = nil
+        try await waitUntil("first attempt") { writer.calls.count >= 1 }
+        try await Task.sleep(for: .milliseconds(300))
+        clock.advance(by: .seconds(3))
+        try await waitUntil("written again") { writer.calls.count == 2 }
+        XCTAssertEqual(writer.calls.last, .init(key: "profiles[1].command", value: .string("/bin/sh")))
+        try await waitUntil("the model goes once written") { gone == nil }
+    }
+
+    /// #549 adversarial B-A: Settings closed while a profile's edit meets a
+    /// hand edit (`Conflict`), before the conflict comes back or once its
+    /// retry waits, keeps its model, so Settings opened again edits on with
+    /// it: a later edit of the field replaces the waiting one, and the
+    /// closed window's older value is never written over it. Opened and
+    /// closed as the app does, nothing posted, on a stand-in model the app
+    /// takes as its waiting one, on a manual clock.
+    func testSettingsOpenedAgainWhileAProfileEditWaitsEditsOnWithItsModel() async throws {
+        try openSettings(config: Self.threeProfilesTOML)
+        try XCTUnwrap(appDelegate.settingsWindowController).close()
+        XCTAssertNil(appDelegate.waitingSettingsModel)
+        let handEdited = Self.threeProfiles.replacingOccurrences(of: "Tessera Dark", with: "Nord")
+        for closedFirst in [true, false] {
+            let what = closedFirst ? "closed before the conflict came back" : "closed while the retry waits"
+            let (model, source, writer) = try fakeModel(Self.threeProfiles, clock: ManualClock())
+            let clock = try XCTUnwrap(model.clock as? ManualClock)
+            appDelegate.waitingSettingsModel = model
+            MainMenu.run(command: "settings")
+            XCTAssertTrue(appDelegate.settingsWindowController?.model === model, what)
+            let first = Locked(true)
+            writer.respond = { _, _ in
+                guard first.value else { return nil }
+                first.value = false
+                return TesseraConfigEditError(.conflict, message: "config.toml changed on disk")
+            }
+            let reads = source.pluginReads
+            model.set("profiles[1].command", .string("/bin/sh"))
+            // The write runs off the main actor: its conflict comes back
+            // after this close.
+            if closedFirst { try XCTUnwrap(appDelegate.settingsWindowController).close() }
+            try await waitUntil("the conflict came back") { source.pluginReads > reads && writer.calls.count == 1 }
+            try await Task.sleep(for: .milliseconds(100))
+            if !closedFirst { try XCTUnwrap(appDelegate.settingsWindowController).close() }
+            XCTAssertNil(appDelegate.settingsWindowController, what)
+            XCTAssertTrue(appDelegate.waitingSettingsModel === model, "\(what): kept while its edit waits")
+            MainMenu.run(command: "settings")
+            XCTAssertTrue(appDelegate.settingsWindowController?.model === model, "\(what): edited on with it")
+            model.set("profiles[1].command", .string("/bin/zsh"))
+            // The watch applies the hand edit (of the theme).
+            source.snapshot = TesseraConfigSnapshot(generation: 1, config: try Self.json(handEdited))
+            model.reload()
+            try await waitUntil("written") { !model.isWriting }
+            // Past every settle time and wait limit.
+            clock.advance(by: .seconds(5))
+            try await Task.sleep(for: .milliseconds(200))
+            XCTAssertEqual(
+                writer.calls,
+                [.init(key: "profiles[1].command", value: .string("/bin/sh")),
+                 .init(key: "profiles[1].command", value: .string("/bin/zsh"))],
+                "\(what): the older value is not written over the later one")
+            XCTAssertEqual(model.value("profiles[1].command"), .string("/bin/zsh"), what)
+            try XCTUnwrap(appDelegate.settingsWindowController).close()
+            XCTAssertNil(appDelegate.waitingSettingsModel, "\(what): nothing left to wait for")
+        }
+    }
+
+    /// The configuration of profiles named `names`, with no other keys.
+    private static func namedProfiles(_ names: [String]) -> String {
+        let list = names.map { #"{"name": "\#($0)"}"# }.joined(separator: ", ")
+        return #"{"general": {"default_profile": "q0"}, "appearance": {"theme": "Tessera Dark"}, "profiles": [\#(list)]}"#
+    }
+
+    /// #549 adversarial B-D: the watch applies a hand edit that removed the
+    /// first profile before the conflict comes back, so a profile's edit
+    /// waits (the settle time) while the window shows the moved list. A
+    /// later edit of that profile, at its new index, replaces it, whatever
+    /// configuration applies while both wait (facet 1); an edit of the
+    /// profile now at its old index is another profile's and is written
+    /// to it, with the waiting edit to its own (facet 2). Every list
+    /// length and index up to 7 profiles (each run once: a waiting retry
+    /// once followed the order of a `Dictionary`).
+    func testAWaitingRetryAfterAnAppliedHandEditKeepsALaterAndANeighboursEdit() async throws {
+        var report: [String] = []
+        var runs = 0
+        for count in 3...7 {
+            for index in 1..<count {
+                for facet in [1, 2] where facet == 1 || index + 1 < count {
+                    runs += 1
+                    let names = (0..<count).map { "q\($0)" }
+                    let (model, source, writer) = try fakeModel(Self.namedProfiles(names), clock: ManualClock())
+                    let clock = try XCTUnwrap(model.clock as? ManualClock)
+                    let applied = source.applied
+                    let removed = try Self.json(Self.namedProfiles(Array(names.dropFirst())))
+                    let first = Locked(true)
+                    writer.respond = { _, _ in
+                        guard first.value else { return nil }
+                        first.value = false
+                        // The watch applied the hand edit before the conflict came back.
+                        applied.value = TesseraConfigSnapshot(generation: 1, config: removed)
+                        return TesseraConfigEditError(.conflict, message: "config.toml changed on disk")
+                    }
+                    let reads = source.pluginReads
+                    model.set("profiles[\(index)].command", .string("/bin/old"))
+                    try await waitUntil("the conflict came back") { source.pluginReads > reads }
+                    XCTAssertEqual(model.profiles.map(\.name), Array(names.dropFirst()), "the hand edit shows")
+                    if facet == 1 {
+                        model.set("profiles[\(index - 1)].command", .string("/bin/new"))
+                        try await Task.sleep(for: .milliseconds(30))
+                        // Any configuration applying meanwhile (another key's write).
+                        source.snapshot = TesseraConfigSnapshot(generation: 2, config: removed)
+                        model.reload()
+                    } else {
+                        model.set("profiles[\(index)].command", .string("/bin/other"))
+                    }
+                    try await Task.sleep(for: .milliseconds(50))
+                    clock.advance(by: .seconds(3))
+                    try await waitUntil("written") { !model.isWriting }
+                    try await Task.sleep(for: .milliseconds(30))
+                    clock.advance(by: .seconds(3))
+                    let calls = writer.calls.dropFirst()
+                    let listed = calls.map { "\($0.key)=\($0.value?.string ?? "nil")" }
+                    let name = "\(count) profiles, index \(index), facet \(facet)"
+                    if facet == 1 {
+                        let last = calls.last { $0.key == "profiles[\(index - 1)].command" }
+                        if last?.value != .string("/bin/new")
+                            || calls.contains(where: { $0.key != "profiles[\(index - 1)].command" })
+                        {
+                            report.append("\(name): \(listed)")
+                        }
+                    } else {
+                        let own = calls.contains { $0 == .init(key: "profiles[\(index - 1)].command", value: .string("/bin/old")) }
+                        let other = calls.contains { $0 == .init(key: "profiles[\(index)].command", value: .string("/bin/other")) }
+                        if !own || !other {
+                            report.append(
+                                "\(name): \(listed) notice: \(model.message(SettingsModel.profilesKey) ?? "none")")
+                        }
+                    }
+                }
+            }
+        }
+        XCTAssertEqual(report.count, 0, "\(report.count) of \(runs):\n" + report.joined(separator: "\n"))
+    }
+
+    /// #549 adversarial B-D, the two failing seeds of its fuzz: one hand
+    /// edit per round lands during a profile's edit (a `Conflict`: an
+    /// earlier profile removed, two swapped, one inserted, or another key),
+    /// more edits follow while the retry waits, and the hand edit applies,
+    /// sometimes before the conflict comes back; then every profile still
+    /// listed holds the last value set for it, by its name, and no other
+    /// was written. Six rounds a seed, each bounded by the settle times on
+    /// a manual clock.
+    func testProfileEditsAroundHandEditsLeaveEachProfilesLastValue() async throws {
+        for seed: UInt64 in [13_064_056_694_810_536_062, 10_372_713_005_361_028_285] {
+            var random = SplitMix(seed)
+            let file = HandEditedProfiles((0..<4).map { .init(name: "p\($0)", command: "/bin/orig\($0)") })
+            let writer = FakeWriter()
+            let clock = ManualClock()
+            let source = FakeSource(writer: writer)
+            source.snapshot = TesseraConfigSnapshot(generation: 0, config: try Self.json(file.json()))
+            sources.append(source)
+            let model = SettingsModel(source: source, clock: clock)
+            writer.respond = { call, _ in file.respond(call) }
+            func apply() throws {
+                source.snapshot = TesseraConfigSnapshot(
+                    generation: source.snapshot.generation + 1, config: try Self.json(file.json()))
+                model.reload()
+            }
+            var intents: [String: String] = [:]
+            var counter = 0
+            var notes: [String] = []
+            func userEdit(twice: Bool) async throws {
+                let listed = model.snapshot["profiles"]?.array ?? []
+                guard !listed.isEmpty else { return }
+                let index = Int(random.next() % UInt64(listed.count))
+                let name = listed[index]["name"]?.string ?? "?"
+                if random.next() % 4 == 0 {
+                    counter += 1
+                    model.set("appearance.theme", .string("T\(counter)"))
+                }
+                for _ in 0..<(twice ? 2 : 1) {
+                    counter += 1
+                    let value = "/bin/v\(counter)"
+                    let calls = writer.calls.count
+                    model.set("profiles[\(index)].command", .string(value))
+                    intents[name] = value
+                    notes.append("set \(name) (index \(index)) = \(value)")
+                    if !twice {
+                        let deadline = ContinuousClock.now + .milliseconds(150)
+                        while writer.calls.count == calls, ContinuousClock.now < deadline {
+                            try await Task.sleep(for: .milliseconds(5))
+                        }
+                        try await Task.sleep(for: .milliseconds(25))
+                    }
+                }
+                if twice { try await Task.sleep(for: .milliseconds(80)) }
+            }
+            for round in 0..<6 {
+                let kind = Int(random.next() % 4)
+                let quick = random.next() % 3 == 0
+                file.quickApply = quick ? source.applied : nil
+                let before = Int(random.next() % 3)
+                for edit in 0..<(before + 1) {
+                    if edit == before { file.arm(kind) }
+                    try await userEdit(twice: edit == before && kind == 3 && random.next() % 2 == 0)
+                }
+                for _ in 0..<Int(random.next() % 4) { try await userEdit(twice: false) }
+                file.disarm()
+                file.quickApply = nil
+                if !quick || random.next() % 2 == 0 { try apply() }
+                try await Task.sleep(for: .milliseconds(60))
+                try apply()
+                clock.advance(by: .seconds(3))
+                let deadline = ContinuousClock.now + .seconds(3)
+                while model.isWriting, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(10)) }
+                try apply()
+                clock.advance(by: .seconds(3))
+                try await Task.sleep(for: .milliseconds(30))
+                if model.isWriting { notes.append("round \(round): still writing") }
+                if let message = model.message(SettingsModel.profilesKey) { notes.append("notice: \(message)") }
+            }
+            for profile in file.profiles {
+                let original = profile.name.hasPrefix("p") ? "/bin/orig\(profile.name.dropFirst())" : nil
+                XCTAssertEqual(
+                    profile.command, intents[profile.name] ?? original,
+                    "seed \(seed), \(profile.name):\n  " + (notes + file.log).joined(separator: "\n  "))
+            }
+        }
     }
 
     /// #344 round 1: a configuration applied while a slider is dragged (an
@@ -3459,6 +3884,91 @@ extension SettingsTests {
         XCTAssertEqual(writer.calls, [], "the release writes nothing")
         XCTAssertEqual(model.value(field.key), .float(0.12300000339746475))
         XCTAssertFalse(model.isPending(field.key))
+    }
+
+    /// The configuration of ``fakeConfig`` with `dim_inactive_panes` at `dim`.
+    private func dimConfig(_ dim: String) -> String {
+        Self.fakeConfig.replacingOccurrences(
+            of: #""opacity": 0.85"#, with: #""opacity": 0.85, "dim_inactive_panes": \#(dim)"#)
+    }
+
+    /// #550 (the #534 adversarial X1): on the dim slider (1 % label, 5 %
+    /// step) a hand edit off the step (0.33) applies while the knob is held
+    /// without moving; the `NSSlider` mouse-up action after the release
+    /// sends the knob's step (0.35). It writes nothing: the hand edit stays.
+    func testADimHandEditDuringANoMoveHoldIsNotOverwrittenOnRelease() async throws {
+        let field = try XCTUnwrap(AppearancePane.fields.first { $0.key == "appearance.dim_inactive_panes" })
+        let clock = ManualClock()
+        let (model, source, writer) = try fakeModel(dimConfig("0.6000000238418579"), clock: clock)
+        let context = SettingsFieldContext(model: model, path: field.key)
+        field.editingChanged(context)(true)
+        field.doubleBinding(context).wrappedValue = 0.6  // the press's own knob action
+        source.snapshot = TesseraConfigSnapshot(generation: 1, config: try Self.json(dimConfig("0.33000001311302185")))
+        model.reload()
+        XCTAssertEqual(model.value(field.key), .float(0.33000001311302185), "the hand edit shows")
+        field.editingChanged(context)(false)
+        field.doubleBinding(context).wrappedValue = 0.35  // NSSlider mouse-up, knob re-synced to the step
+        clock.advance(by: .zero)
+        try await Task.sleep(for: .milliseconds(80))
+        clock.advance(by: model.profileSettleTimeout)
+        try await Task.sleep(for: .milliseconds(80))
+        XCTAssertEqual(writer.calls, [], "the hand edit 0.33 is overwritten: \(writer.calls)")
+        XCTAssertEqual(model.value(field.key), .float(0.33000001311302185))
+        XCTAssertFalse(model.isPending(field.key))
+    }
+
+    /// #550 on every slider: after a no-move hold with a hand edit applied
+    /// during it, the mouse-up action writes nothing, whether it comes on
+    /// its own or in a press of its own (as the macOS 15 SDK's `NSSlider`
+    /// wraps it), and whether it carries the step nearest the hand edit or
+    /// the knob's value from before it (a knob not moved to the edit). Once
+    /// the release's events are handled, a step writes again.
+    func testAMouseUpAfterAHandEditDuringANoMoveHoldWritesNothingOnEverySlider() async throws {
+        let dim = try XCTUnwrap(AppearancePane.fields.first { $0.key == "appearance.dim_inactive_panes" })
+        let sliders = AppearancePane.fields.filter { if case .slider = $0.control { true } else { false } }
+        XCTAssertEqual(sliders.map(\.key), ["appearance.opacity", dim.key], "every slider is covered")
+        let cases: [(SettingsField, start: String, held: Double, edit: String, shown: Double, knobs: [Double])] = [
+            (try opacityField, "0.8500000238418579", 0.85, "0.12300000339746475", 0.123, [0.12, 0.85]),
+            (dim, "0.6000000238418579", 0.6, "0.33000001311302185", 0.33, [0.35, 0.6]),
+        ]
+        for (field, start, held, edit, shown, knobs) in cases {
+            for knob in knobs {
+                for ownPress in [false, true] {
+                    let name = "\(field.key) knob \(knob)\(ownPress ? " in its own press" : "")"
+                    let clock = ManualClock()
+                    let config = { (value: String) in
+                        Self.fakeConfig.replacingOccurrences(
+                            of: #""opacity": 0.85"#,
+                            with: field.key == dim.key
+                                ? #""opacity": 0.85, "dim_inactive_panes": \#(value)"# : #""opacity": \#(value)"#)
+                    }
+                    let (model, source, writer) = try fakeModel(config(start), clock: clock)
+                    let context = SettingsFieldContext(model: model, path: field.key)
+                    field.editingChanged(context)(true)
+                    field.doubleBinding(context).wrappedValue = held
+                    source.snapshot = TesseraConfigSnapshot(generation: 1, config: try Self.json(config(edit)))
+                    model.reload()
+                    XCTAssertEqual(model.value(field.key)?.double ?? 0, shown, accuracy: 0.0001, name)
+                    field.editingChanged(context)(false)
+                    if ownPress { field.editingChanged(context)(true) }
+                    field.doubleBinding(context).wrappedValue = knob
+                    if ownPress { field.editingChanged(context)(false) }
+                    clock.advance(by: .zero)
+                    try await Task.sleep(for: .milliseconds(50))
+                    clock.advance(by: model.profileSettleTimeout)
+                    try await Task.sleep(for: .milliseconds(50))
+                    XCTAssertEqual(writer.calls, [], name)
+                    XCTAssertEqual(model.value(field.key)?.double ?? 0, shown, accuracy: 0.0001, name)
+                    XCTAssertFalse(model.isPending(field.key), name)
+
+                    field.editingChanged(context)(true)
+                    field.doubleBinding(context).wrappedValue = 0.5
+                    field.editingChanged(context)(false)
+                    try await waitUntil("\(name): a later step written") { writer.calls.count == 1 && !model.isWriting }
+                    XCTAssertEqual(writer.calls, [.init(key: field.key, value: .float(0.5))], name)
+                }
+            }
+        }
     }
 
     /// A slider moved off a value off the step and back writes the step
@@ -4509,5 +5019,116 @@ private final class RecordingOpenPanel: SettingsOpenPanel {
         let handler = handler
         self.handler = nil
         handler?(response)
+    }
+}
+
+/// A stand-in `config.toml` of profiles for ``FakeWriter/respond``: edited
+/// as the core edits it (a profile by its index, in the file as it is at
+/// the call), with a hand edit armed to land during the next call of a
+/// profile's key, which then reports `Conflict` (#549).
+final class HandEditedProfiles: @unchecked Sendable {
+    struct Profile {
+        var name: String
+        var command: String?
+    }
+
+    private let lock = NSLock()
+    private var listed: [Profile]
+    private var armed: Int?
+    private var inserted = 0
+    private var entries: [String] = []
+    /// The configuration in effect, applied at once with the hand edit
+    /// when set (the watch was quicker than the conflict).
+    var quickApply: Locked<TesseraConfigSnapshot>?
+
+    init(_ profiles: [Profile]) {
+        listed = profiles
+    }
+
+    var profiles: [Profile] { lock.withLock { listed } }
+    /// What happened to the file, in order.
+    var log: [String] { lock.withLock { entries } }
+
+    /// Lands a hand edit during the next call of a profile's key: 0
+    /// removes the first profile, 1 swaps the first two, 2 inserts one
+    /// first, 3 edits another key.
+    func arm(_ kind: Int) { lock.withLock { armed = kind } }
+    func disarm() { lock.withLock { armed = nil } }
+
+    /// The file as the core's JSON.
+    func json() -> String {
+        lock.withLock { Self.json(listed) }
+    }
+
+    private static func json(_ profiles: [Profile]) -> String {
+        let list = profiles.map { profile -> [String: Any] in
+            var entry: [String: Any] = ["name": profile.name]
+            if let command = profile.command { entry["command"] = command }
+            return entry
+        }
+        let all: [String: Any] = [
+            "general": ["default_profile": "p0"], "appearance": ["theme": "Tessera Dark"], "profiles": list,
+        ]
+        return String(decoding: try! JSONSerialization.data(withJSONObject: all), as: UTF8.self)
+    }
+
+    private func handEdit(_ kind: Int) {
+        switch kind {
+        case 0 where listed.count > 2:
+            entries.append("hand edit: remove \(listed[0].name)")
+            listed.removeFirst()
+        case 1 where listed.count > 1:
+            entries.append("hand edit: swap \(listed[0].name) and \(listed[1].name)")
+            listed.swapAt(0, 1)
+        case 2:
+            inserted += 1
+            entries.append("hand edit: insert h\(inserted)")
+            listed.insert(Profile(name: "h\(inserted)", command: nil), at: 0)
+        default:
+            entries.append("hand edit: another key")
+        }
+    }
+
+    /// The writer's answer to `call`.
+    func respond(_ call: FakeWriter.Call) -> TesseraConfigEditError? {
+        lock.withLock {
+            let profile = call.key.hasPrefix("profiles[")
+            if let kind = armed, profile {
+                armed = nil
+                handEdit(kind)
+                entries.append("conflict: \(call.key) = \(call.value?.string ?? "nil")")
+                if let quickApply, let config = try? TesseraConfigValue.parse(json: Data(Self.json(listed).utf8)) {
+                    quickApply.value = TesseraConfigSnapshot(generation: quickApply.value.generation + 1, config: config)
+                }
+                return TesseraConfigEditError(.conflict, message: "config.toml changed on disk")
+            }
+            entries.append("written: \(call.key) = \(call.value?.string ?? "nil")")
+            guard profile, let close = call.key.firstIndex(of: "]"),
+                let index = Int(call.key[call.key.index(call.key.startIndex, offsetBy: 9)..<close])
+            else { return nil }
+            guard listed.indices.contains(index) else {
+                entries.append("  past the end")
+                return nil
+            }
+            if call.key[close...] == "].command" { listed[index].command = call.value?.string }
+            return nil
+        }
+    }
+}
+
+/// SplitMix64: a seeded generator, so a seed replays the same edits.
+struct SplitMix {
+    private var state: UInt64
+
+    init(_ seed: UInt64) {
+        state = seed
+    }
+
+    mutating func next() -> UInt64 {
+        state &+= 0x9E37_79B9_7F4A_7C15
+        var mixed = state
+        mixed = (mixed ^ (mixed >> 30)) &* 0xBF58_476D_1CE4_E5B9
+        mixed = (mixed ^ (mixed >> 27)) &* 0x94D0_49BB_1331_11EB
+        return mixed ^ (mixed >> 31)
     }
 }

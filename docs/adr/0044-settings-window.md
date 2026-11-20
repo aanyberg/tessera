@@ -83,7 +83,9 @@ removed, at most 400 characters). Only the error kind is logged (S8).
 once more at once (each set re-reads the file, so the other edit is kept and
 this one goes on top of it) and the model reloads; a second conflict shows
 its message. The value the user set stays shown until a configuration
-after the retry applies.
+after the retry applies. (A profile's key waits for the external edit to
+apply before it is run again, at the index of its profile: the #549
+amendment.)
 
 **Numbers keep their type.** Float keys are written as JSON numbers with a
 fraction (`15.0`), since the loader refuses an integer for a float key.
@@ -710,3 +712,52 @@ This completes the #517 amendment's "The release".
   that read from a slow watch (the #517 B1 rule waits for the watch however
   long it takes), so the fix is the core's: report a read that changed
   nothing.
+
+## Amendment: the mouse-up after a hand edit during a hold (#550, 2026-11-19)
+
+The #534 rule compares a value as the label shows it, so on the dim slider
+(1 % label, 5 % step) the knob's step nearest a hand-typed `0.33` (`35 %`)
+gets past it. When a hand edit applied during a press that made no step
+after it (the #517 "overridden" release), the `NSSlider` of the macOS 15
+SDK still sends the knob's value on mouse-up, after the release and in a
+press of its own; that wrote `0.35` over the hand edit. Now such a release
+holds every change of its key until its events are handled (a timer of no
+delay, which a new press does not cancel): the mouse-up writes nothing on
+any slider, whether it carries the step nearest the hand edit or the
+knob's value from before it, and the next press writes as any. A press with
+no hand edit keeps the #534 rule: a no-move click on a hand-typed `0.33`
+still writes `0.35`.
+
+## Amendment: a profile's edit that meets a hand edit (#549, 2026-11-19)
+
+A profile's key names the profile by its index (`profiles[1].command`).
+When a hand edit of the file meets the edit (`Conflict`) and removes or
+moves an earlier profile, running the edit again at once would write the
+profile now at that index. So a profile's edit (a value, a rename, a
+delete) is not run again on the write queue. It stays shown and in flight,
+the model reads the configuration again, and once a configuration applied
+after the conflict came back lists the profile under the name it had when
+the edit was queued, the edit runs again at that profile's index, with the
+edits of its run after it (a rename's `general.default_profile`). With no
+apply within the settle time (`profileSettleTimeout`: the watch applied the
+hand edit before the conflict came back, or the hand edit changed nothing
+it applies), it is placed by the configuration applied then. If no profile
+or more than one has that name, the edit is dropped: a delete has nothing
+left to do, and for a value the list says it was not saved. A second
+conflict is shown, as for any edit. An edit of the same key already
+queued behind the one that met the conflict is the latest word, so the
+earlier one is dropped. While one waits, a new profile's edit waits with it
+and is placed the same way; one of the same key replaces it, a key of a
+profile meaning the same field of the same profile, by its name in the
+list shown (an apply that moved the list since gives it another index).
+Waiting edits are written again oldest first, so a later one's value is
+the one left. The model waits even when its window is closed, and while
+a profile's edit is unwritten (queued, running or waiting) the closed
+window keeps it (2 s after the close at most, as for an add or delete),
+so Settings opened again edits on with it rather than beside it.
+
+Not covered: the core reports `Conflict` only when the file changes during
+the edit call itself. Any profile's edit made after a hand save and before
+the watch applies it (the watch's debounce and its event latency) meets no
+conflict, so it still goes by index. Closing that needs the core to take
+the profile's identity with the edit.
