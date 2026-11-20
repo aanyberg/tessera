@@ -265,7 +265,9 @@ Agents use these instead of rebuilding the setup in every run:
   timing tests (load does not explain it). `just quality-gate-test` checks, with a fake `cargo`, the watchdog (nextest
   and the ffi C step), that retry and that the hooks are inert without `TESSERA_GATE_SELFTEST=1`, through test hooks the
   gate honours only under `TESSERA_GATE_SELFTEST=1` (listed in the script's header). When the macOS job's test step
-  fails, times out or is cancelled, it uploads `apps/macos/build/app-test*.log` as the `app-test-logs` artifact (#121).
+  fails, times out or is cancelled, it uploads `apps/macos/build/app-test*.log` as the `app-test-logs` artifact (#121)
+  and the result bundles `apps/macos/DerivedData/Logs/Test/*.xcresult` as `app-test-xcresult` (7 days), so a crash with
+  no frames leaves a record.
   In CI the Rust job, which also runs the ffi C tests, has `timeout-minutes: 20` and always runs. The macOS app job has
   37 (a normal `just app-test` is 12-14 minutes); it runs in parallel with the Rust job, no longer waits for it, and is
   skipped for changes that cannot affect the app (**CI skips the macOS app job**), with a 30-minute limit on `just
@@ -519,7 +521,9 @@ issue or in a message, and the wave goes on with the work that does not depend o
    seven of them (up to three open PRs). When no task-list tool exists, the lead keeps a status table in its messages.
    The brief index has a `merged: #<PR>` column the lead fills in at each merge, and before spawning an implementer the
    lead runs `gh pr list --search "<issue>" --state merged` (wave 21 retro P11: two merged tasks were implemented again
-   after six context compactions had lost the merged state).
+   after six context compactions had lost the merged state). A brief that has the implementer run a load generator
+   (a CPU burner, a stress loop) caps it: time-boxed, and killed in a `trap` on exit (wave 25.1 left 10 CPU burners
+   running for 2 h 14 m).
 3. **Implement.** The lead spawns one implementer subagent per issue; it works in its own worktree
    (`../tessera-worktrees/wave-<n>/task-<issue>`, branch `task/<issue>-<slug>`) as `rust-implementer`,
    `swift-implementer` or `release-engineer` by area, with the spec fixture as its first test. Before reporting it

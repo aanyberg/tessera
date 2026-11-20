@@ -1,7 +1,8 @@
 #!/usr/bin/env zsh
 # Mechanical verification of a task branch before integration: the facts a reviewer should not spend reasoning on.
-# Usage: scripts/verify-branch.sh <worktree> [--base <ref>] [--pre-integration] [--allow <path>]... [--session <url>] [--coauthor <line>]
-#                                            [--load <crate>:<lib|bins|bin/<name>|tests|test-binary>]... [--no-load]
+# Usage: scripts/verify-branch.sh <worktree> [--base <ref>] [--pre-integration] [--allow <path>]... [--session <url>]
+#                                            [--coauthor <line>] [--no-load]
+#                                            [--load <crate>:<lib|bins|bin/<name>|tests|test-binary>]...
 #                                            [--parallel <1-8>] [--list-targets] [--closes <n[,n...]>] [--body <file>]
 #        scripts/verify-branch.sh --help
 #
@@ -220,8 +221,8 @@ if (( rc == 0 )); then pass "gate"; else fail "gate (exit $rc): $logs/gate.log";
 # clean
 if [[ -z "$(git status --porcelain)" ]]; then pass "clean"; else fail "clean:"; git status --porcelain; fi
 
-# app-test: a change to the app needs the app's own tests on this head (the gate runs none of them; #446). `just app-test`
-# records "<sha> clean" in apps/macos/build/app-test-pass after both suites pass.
+# app-test: a change to the app needs the app's own tests on this head (the gate runs none of them; #446).
+# `just app-test` records "<sha> clean" in apps/macos/build/app-test-pass after both suites pass.
 app_changes=( ${changed:#*.md} )
 app_changes=( ${(M)app_changes:#apps/macos/*} )
 if (( ${#app_changes} )); then

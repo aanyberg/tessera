@@ -123,3 +123,13 @@ jobs:
           path: apps/macos/build/app-test*.log
           if-no-files-found: warn
           retention-days: 14
+      # A crash with no frames (a TSan SEGV) leaves no line in those logs; the result bundles xcodebuild writes
+      # under the derived data path (`just app-test` passes apps/macos/DerivedData) keep the record.
+      - name: Upload app test result bundles
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-test-xcresult
+          path: apps/macos/DerivedData/Logs/Test/*.xcresult
+          if-no-files-found: ignore
+          retention-days: 7
