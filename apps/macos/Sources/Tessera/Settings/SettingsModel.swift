@@ -191,6 +191,19 @@ final class SettingsModel {
     /// slider's knob sits on 35 % for a hand-typed 33 %), and a knob not
     /// moved to the hand edit sends the value from before it.
     @ObservationIgnored private var handEditReleases: [String: SettingsTimer] = [:]
+    /// What the window showed when the current mouse or slider press first
+    /// reloaded or made a step: the configuration then and the values set
+    /// and not yet applied over it, with the press it was kept in
+    /// (``valueBeforeHandEdit(_:)``, #564).
+    @ObservationIgnored private var heldEdit:
+        (before: TesseraConfigSnapshot, pending: [String: TesseraConfigValue], press: UInt32?)?
+    /// The left mouse button's press now (the window server's count of
+    /// left mouse downs), nil while it is up. Tests set it: synthetic
+    /// events never reach the window server.
+    @ObservationIgnored var leftMousePress: @MainActor () -> UInt32? = {
+        guard NSEvent.pressedMouseButtons & 1 != 0 else { return nil }
+        return CGEventSource.counterForEventType(.combinedSessionState, eventType: .leftMouseDown)
+    }
     /// The add or delete ``releaseProfiles()`` stopped waiting for, and the
     /// notice it left: a configuration that shows it after all (a watch
     /// slower than the settle time) takes the notice back (#344 m2).
@@ -350,7 +363,9 @@ final class SettingsModel {
         }
         do {
             let entries = profileEntries
+            let before = snapshot
             snapshot = try source.configSnapshot()
+            keepHeldEdit(before)
             readKeymap(source)
             loadError = snapshot.loadError.map(Self.loadErrorMessage)
             if profileEntries != entries {
@@ -660,6 +675,7 @@ final class SettingsModel {
     /// profile's key is locked (``profilesChanging``).
     func change(_ key: String, _ value: TesseraConfigValue) {
         guard !lockedProfileEdit(key, value), handEditReleases[key] == nil else { return }
+        keepShown(snapshot)
         pending[key] = value
         var throttle = throttles[key] ?? Throttle()
         // A step after a hand edit applied is the latest word.
@@ -694,6 +710,45 @@ final class SettingsModel {
         throttles[key] = throttle
     }
 
+    /// The value `key` showed (applied, or set and not yet applied) at the
+    /// current press's first reload or step, if that differs from what is
+    /// applied now, while
+    /// the key has made no step since a hand edit: the press is the mouse
+    /// button held down
+    /// (``leftMousePress``) or a slider or stepper begun. A slider pressed
+    /// there sending it again is no step: an `NSSlider` (macOS 15 SDK)
+    /// whose press AppKit cancels sends the value under the point it was
+    /// pressed at, and SwiftUI begins the press for the model only then
+    /// (#564).
+    func valueBeforeHandEdit(_ key: String) -> TesseraConfigValue? {
+        // A step before the hand edit stays pending through it (the edit
+        // marks the press overridden); a step after it clears that.
+        let noStepSince =
+            throttles[key].map { $0.overridden || (!$0.stepped && pending[key] == nil) } ?? (pending[key] == nil)
+        guard let held = heldEdit, held.press == leftMousePress(), noStepSince else { return nil }
+        let before = held.pending[key].map { $0 == .null ? nil : $0 } ?? held.before[key]
+        return Self.sameApplied(before, snapshot[key]) ? nil : before
+    }
+
+    /// Keeps what the window showed, `before` and the values pending over
+    /// it, at the first reload of a press (``valueBeforeHandEdit(_:)``);
+    /// forgets it once no press holds.
+    private func keepHeldEdit(_ before: TesseraConfigSnapshot) {
+        guard leftMousePress() != nil || throttles.values.contains(where: \.dragging) else {
+            heldEdit = nil
+            return
+        }
+        keepShown(before)
+    }
+
+    /// Keeps what the window shows over `before` for a press that has
+    /// kept nothing yet: its own write applying later is no hand edit.
+    private func keepShown(_ before: TesseraConfigSnapshot) {
+        let press = leftMousePress()
+        guard press != nil || throttles.values.contains(where: \.dragging) else { return }
+        if heldEdit == nil || heldEdit?.press != press { heldEdit = (before, pending, press) }
+    }
+
     /// The slider or stepper at `key` was released: the final value of a
     /// press that made a step is written if it was not yet. If a hand edit
     /// applied during the press and no step came after it, nothing is
@@ -706,6 +761,7 @@ final class SettingsModel {
     /// for a new edit if the binding has moved. Otherwise
     /// ``settleAfterRelease(_:)`` follows.
     func endChange(_ key: String) {
+        heldEdit = nil
         guard let throttle = throttles[key] else { return }
         throttle.timer?.cancel()
         throttles[key]?.timer = nil

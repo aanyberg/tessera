@@ -761,3 +761,42 @@ the edit call itself. Any profile's edit made after a hand save and before
 the watch applies it (the watch's debounce and its event latency) meets no
 conflict, so it still goes by index. Closing that needs the core to take
 the profile's identity with the edit.
+
+## Amendment: a held slider that sends the value from before a hand edit (#564, 2026-11-19)
+
+A press that has made no step shows a hand edit applied during it, and
+SwiftUI moves the knob to it. When AppKit cancels the press while it is
+held (it cancels the active mouse gesture recognizers when the window
+server moves the window, for one), the `NSSlider` of the macOS 15 SDK ends
+its tracking at the point it was pressed and sends the value under it:
+the value from before the edit, inside the press, where the #517 rule took
+it for a step after the edit and wrote it over the hand edit. The press
+need not have begun for the model by then: SwiftUI begins a no-move
+press only with the cancel, and does not pass on the press's own action
+(the knob's value is unchanged), so neither marks it. The mouse button
+does: a configuration the model reads while the left button is down
+(`NSEvent.pressedMouseButtons`), or while a slider or stepper is begun,
+keeps what the window showed: the configuration it replaces and the
+values set over it and not yet applied, with the window server's count
+of left mouse downs at that moment. A press that steps before any reload
+keeps it at its first step. The shown value, not only the applied one,
+matters twice when a press follows a release quickly: the knob of a
+press that begins before the previous press's write applies sits on that
+unapplied value, which a cancel re-sends; and that write applying during
+the new press is the press's own value arriving, not a hand edit, so a
+step back from it is written. While the same press holds, a key that
+has made no step since and holds none back reports the value it showed
+before the press's first reload or step if that differs from what is
+applied now (`valueBeforeHandEdit`), and a slider's
+binding drops a value the label shows as that one: it is the press
+point sent again, not a step, so the hand edit stays and the release
+shows it, also where the press made a step before the hand edit (the
+edit marks the press overridden). Any other value is a step and is
+written, and a key with a step after the hand edit gets no kept value,
+so a move back to the press point is written too. The
+kept configuration goes at a release (`endChange`), at a reload with no
+press held, and with the next press (another count), so a click on the
+old value in a later press is written. Synthetic events in hosted tests
+never reach the window server, so the tests set the press
+(`leftMousePress`). Steppers do not get the rule: a stepper's step from
+a hand edit can land on the value from before it, and is a real step.

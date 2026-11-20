@@ -127,6 +127,8 @@ final class SettingsTests: XCTestCase {
         source.snapshot = TesseraConfigSnapshot(generation: 0, config: try Self.json(config))
         sources.append(source)
         let model = SettingsModel(source: source, clock: clock)
+        // Real presses in the session must not count as a held mouse.
+        model.leftMousePress = { nil }
         return (model, source, writer)
     }
 
@@ -4408,6 +4410,543 @@ extension SettingsTests {
         try await waitUntil("the last value written") { writer.calls.count == 2 && !model.isWriting }
         XCTAssertEqual(writer.calls.last?.value, held)
         XCTAssertEqual(model.value(key), held)
+    }
+
+    /// Presses `slider`'s knob with real events and holds it without
+    /// moving while `whileHeld` runs, then lets go. As in ``pressKnob``,
+    /// the release has happened on return. Where the press does not reach
+    /// the slider (no action from it), the test is skipped with what was
+    /// seen.
+    private func holdKnob(
+        of slider: NSSlider, in window: NSWindow, _ actions: ActionCounter,
+        whileHeld: @escaping @MainActor (_ drag: (CGFloat) -> Void) async throws -> Void
+    ) async throws {
+        let cell = try XCTUnwrap(slider.cell as? NSSliderCell)
+        let knob = cell.knobRect(flipped: slider.isFlipped)
+        let start = slider.convert(NSPoint(x: knob.midX, y: knob.midY), to: nil)
+        var location = start
+        var pressReturned = false
+        func event(_ type: NSEvent.EventType) -> NSEvent? {
+            NSEvent.mouseEvent(
+                with: type, location: location, modifierFlags: [],
+                timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+                context: nil, eventNumber: 0, clickCount: 1, pressure: 1)
+        }
+        func deliver(_ type: NSEvent.EventType) {
+            guard let posted = event(type) else { return XCTFail("no \(type) event") }
+            NSApp.postEvent(posted, atStart: false)
+            guard pressReturned else { return }
+            while let next = NSApp.nextEvent(
+                matching: [.leftMouseDragged, .leftMouseUp], until: .distantPast, inMode: .default, dequeue: true)
+            {
+                NSApp.sendEvent(next)
+            }
+        }
+        let down = try XCTUnwrap(event(.leftMouseDown))
+        let script = Task { @MainActor () throws -> Bool in
+            defer { deliver(.leftMouseUp) }
+            let deadline = ContinuousClock.now + .seconds(2)
+            while actions.values.isEmpty && ContinuousClock.now < deadline {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            guard !actions.values.isEmpty else { return false }
+            try await whileHeld { offset in
+                location = NSPoint(x: start.x + offset, y: start.y)
+                deliver(.leftMouseDragged)
+            }
+            return true
+        }
+        window.sendEvent(down)
+        pressReturned = true
+        guard try await script.value else {
+            let system = ProcessInfo.processInfo.operatingSystemVersionString
+            throw XCTSkip("the synthetic press did not reach the NSSlider on macOS \(system): no action")
+        }
+    }
+
+    /// Skips a test whose press dragged `actions`' slider without moving it
+    /// (no action 0.05 or more from the value at the press): the press then
+    /// writes nothing, and the product was not exercised. The CI runner,
+    /// macOS 15, does this, as ``pressKnob`` records; a drag that moved the
+    /// knob runs every check of the test.
+    private func skipUnlessTheDragMoved(_ actions: ActionCounter) throws {
+        guard !actions.moved(0.05) else { return }
+        let system = ProcessInfo.processInfo.operatingSystemVersionString
+        throw XCTSkip(
+            """
+            the synthetic drag did not move the NSSlider on macOS \(system): \
+            actions with the values \(actions.values) from \(actions.pressedAt)
+            """)
+    }
+
+    /// Cancels the press `slider` is tracking as AppKit does when it cancels
+    /// the active mouse gesture recognizers (a window moved by the window
+    /// server, #564): the slider's `NSControlGestureRecognizer`, begun, is
+    /// disabled and enabled again. Nil where the press is tracked without
+    /// one (the classic tracking loop), with the recognizers seen.
+    private func cancelTracking(of slider: NSSlider) -> String? {
+        let recognizers = slider.gestureRecognizers
+        guard
+            let tracking = recognizers.first(where: {
+                String(describing: type(of: $0)) == "NSControlGestureRecognizer"
+                    && [.began, .changed].contains($0.state)
+            })
+        else {
+            return recognizers.map { "\(type(of: $0)) state \($0.state.rawValue)" }.joined(separator: ", ")
+        }
+        tracking.isEnabled = false
+        tracking.isEnabled = true
+        return nil
+    }
+
+    /// #564: a hand edit applies while the `NSSlider` CI and releases get is
+    /// held without moving, and the hold is cancelled (as AppKit does when
+    /// the window server moves the window). The slider then sends the value
+    /// under the pointer, the one from before the edit, inside the press;
+    /// that is no step and is not written over the hand edit.
+    func testACancelledNSSliderHoldAfterAHandEditKeepsTheEdit() async throws {
+        let clock = ManualClock()
+        let (model, source, writer) = try fakeModel(Self.fakeConfig, clock: clock)
+        let key = "appearance.opacity"
+        let (window, slider) = try await hostedOpacitySlider(.init(model: model, path: key))
+        defer {
+            window.contentView = nil
+            window.close()
+        }
+        let actions = ActionCounter(slider)
+        defer {
+            slider.target = actions.target
+            slider.action = actions.action
+        }
+        var resent: [Double] = []
+        var diagnosis = ""
+        try await holdKnob(of: slider, in: window, actions) { _ in
+            // The window server counts no synthetic press: it is held.
+            model.leftMousePress = { 1 }
+            try self.applyOpacity("0.3", generation: 1, model, source)
+            XCTAssertEqual(model.value(key), .float(0.3), "the hand edit shows")
+            try await self.waitUntil("the hand edit on the knob") { abs(slider.doubleValue - 0.3) < 0.005 }
+            let before = actions.values.count
+            diagnosis = "before the cancel: actions \(actions.values), writes \(writer.calls), "
+                + "value before the edit kept \(String(describing: model.valueBeforeHandEdit(key)))"
+            if let seen = self.cancelTracking(of: slider) {
+                throw XCTSkip("the press is tracked without a gesture recognizer: \(seen)")
+            }
+            resent = Array(actions.values[before...])
+        }
+        guard resent.contains(where: { abs($0 - 0.85) < 0.005 }) else {
+            throw XCTSkip("the cancelled press re-sent no value from before the edit: \(resent)")
+        }
+        clock.advance(by: .zero)
+        try await Task.sleep(for: .milliseconds(50))
+        clock.advance(by: model.profileSettleTimeout)
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(writer.calls, [], "the re-sent 0.85 is written over the hand edit; \(diagnosis)")
+        XCTAssertEqual(model.value(key), .float(0.3))
+        XCTAssertFalse(model.isPending(key))
+    }
+
+    /// #564 (critic B1): the hold made a step before the hand edit applied,
+    /// then is cancelled. The slider sends the value under the press point,
+    /// which is no step after the edit and is not written over it.
+    func testACancelledNSSliderHoldAfterAStepAndAHandEditKeepsTheEdit() async throws {
+        let clock = ManualClock()
+        let (model, source, writer) = try fakeModel(Self.fakeConfig, clock: clock)
+        let key = "appearance.opacity"
+        let (window, slider) = try await hostedOpacitySlider(.init(model: model, path: key))
+        defer {
+            window.contentView = nil
+            window.close()
+        }
+        let actions = ActionCounter(slider)
+        defer {
+            slider.target = actions.target
+            slider.action = actions.action
+        }
+        var resent: [Double] = []
+        try await holdKnob(of: slider, in: window, actions) { drag in
+            model.leftMousePress = { 1 }
+            drag(-40)
+            let deadline = ContinuousClock.now + .seconds(2)
+            while !actions.moved(0.05) && ContinuousClock.now < deadline {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            guard actions.moved(0.05) else {
+                throw XCTSkip("the synthetic drag did not move the NSSlider: \(actions.values)")
+            }
+            try await self.waitUntil("the step written") { writer.calls.count == 1 && !model.isWriting }
+            try self.applyOpacity("0.3", generation: 1, model, source)
+            // The step stays pending through the hand edit: the knob stays on it.
+            try await Task.sleep(for: .milliseconds(50))
+            let before = actions.values.count
+            if let seen = self.cancelTracking(of: slider) {
+                throw XCTSkip("the press is tracked without a gesture recognizer: \(seen)")
+            }
+            resent = Array(actions.values[before...])
+        }
+        guard resent.contains(where: { abs($0 - 0.85) < 0.005 }) else {
+            throw XCTSkip("the cancelled press re-sent no value from before the edit: \(resent)")
+        }
+        clock.advance(by: .zero)
+        try await Task.sleep(for: .milliseconds(50))
+        clock.advance(by: model.profileSettleTimeout)
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(writer.calls.count, 1, "the re-sent 0.85 is written over the hand edit: \(writer.calls)")
+        XCTAssertFalse(writer.calls.contains { abs(($0.value?.double ?? 0) - 0.85) < 0.005 }, "\(writer.calls)")
+        XCTAssertEqual(model.value(key), .float(0.3))
+    }
+
+    /// #564: a real move of the knob after a hand edit applied during the
+    /// hold is a step, and is written.
+    func testAMoveAfterAHandEditDuringAnNSSliderHoldIsWritten() async throws {
+        let clock = ManualClock()
+        let (model, source, writer) = try fakeModel(Self.fakeConfig, clock: clock)
+        let key = "appearance.opacity"
+        let (window, slider) = try await hostedOpacitySlider(.init(model: model, path: key))
+        defer {
+            window.contentView = nil
+            window.close()
+        }
+        let actions = ActionCounter(slider)
+        defer {
+            slider.target = actions.target
+            slider.action = actions.action
+        }
+        try await holdKnob(of: slider, in: window, actions) { drag in
+            model.leftMousePress = { 1 }
+            try self.applyOpacity("0.3", generation: 1, model, source)
+            try await self.waitUntil("the hand edit on the knob") { abs(slider.doubleValue - 0.3) < 0.005 }
+            drag(-40)
+            let deadline = ContinuousClock.now + .seconds(2)
+            while writer.calls.isEmpty && !actions.moved(0.05) && ContinuousClock.now < deadline {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            guard actions.moved(0.05) else {
+                throw XCTSkip("the synthetic drag did not move the NSSlider: \(actions.values)")
+            }
+        }
+        try await waitUntil("the move written") { !writer.calls.isEmpty && !model.isWriting }
+        let moved = try XCTUnwrap(writer.calls.last?.value?.double)
+        XCTAssertGreaterThan(abs(moved - 0.85), 0.005, "the value from before the edit: \(writer.calls)")
+        XCTAssertGreaterThan(abs(moved - 0.3), 0.005, "the hand edit: \(writer.calls)")
+        XCTAssertEqual(model.value(key)?.double ?? 0, moved, accuracy: 0.0001)
+    }
+
+    /// #564 on every slider and SDK: after a hand edit applied during a
+    /// hold with no step, the slider sending the value from before the
+    /// edit again (a cancelled `NSSlider` press sends the value under the
+    /// pointer) writes nothing, also where that is the step nearest a value
+    /// off the step (0.123 by hand); a move to another value is written,
+    /// and so is a move back to the value from before the edit after it.
+    func testAValueFromBeforeAHandEditResentDuringTheHoldWritesNothingOnEverySlider() async throws {
+        let dim = try XCTUnwrap(AppearancePane.fields.first { $0.key == "appearance.dim_inactive_panes" })
+        let cases: [(SettingsField, start: String, knob: Double, edit: String, shown: Double, moved: Double)] = [
+            (try opacityField, "0.8500000238418579", 0.85, "0.30000001192092896", 0.3, 0.6),
+            (try opacityField, "0.12300000339746475", 0.12, "0.5", 0.5, 0.7),
+            (dim, "0.6000000238418579", 0.6, "0.33000001311302185", 0.33, 0.2),
+        ]
+        for (field, start, knob, edit, shown, moved) in cases {
+            let name = "\(field.key) from \(start)"
+            let config = { (value: String) in
+                Self.fakeConfig.replacingOccurrences(
+                    of: #""opacity": 0.85"#,
+                    with: field.key == dim.key
+                        ? #""opacity": 0.85, "dim_inactive_panes": \#(value)"# : #""opacity": \#(value)"#)
+            }
+            let (model, source, writer) = try fakeModel(config(start), clock: ManualClock())
+            let context = SettingsFieldContext(model: model, path: field.key)
+            let binding = field.doubleBinding(context)
+            field.editingChanged(context)(true)
+            binding.wrappedValue = knob  // the press's own action
+            source.snapshot = TesseraConfigSnapshot(generation: 1, config: try Self.json(config(edit)))
+            model.reload()
+            XCTAssertEqual(model.value(field.key)?.double ?? 0, shown, accuracy: 0.0001, name)
+            binding.wrappedValue = knob  // re-sent: the press cancelled
+            try await Task.sleep(for: .milliseconds(50))
+            XCTAssertEqual(writer.calls, [], "\(name): the value from before the edit is written over it")
+            XCTAssertEqual(model.value(field.key)?.double ?? 0, shown, accuracy: 0.0001, name)
+            binding.wrappedValue = moved
+            try await waitUntil("\(name): the move written") { writer.calls.count == 1 && !model.isWriting }
+            binding.wrappedValue = knob
+            field.editingChanged(context)(false)
+            try await waitUntil("\(name): the way back written") { writer.calls.count == 2 && !model.isWriting }
+            XCTAssertEqual(
+                writer.calls, [.init(key: field.key, value: .float(moved)), .init(key: field.key, value: .float(knob))],
+                name)
+        }
+    }
+
+    /// #564 where the press has not begun for the model (SwiftUI begins a
+    /// no-move `NSSlider` press only with its cancel): a hand edit that
+    /// applies while the mouse button is held keeps the value from before
+    /// it for that press, so the slider sending it again writes nothing.
+    /// In a later press, or with the button up, the same value is a click
+    /// on the slider and is written; a stepper's step there always is.
+    func testAValueFromBeforeAHandEditInTheMousePressAloneWritesNothing() async throws {
+        let stepper = try XCTUnwrap(AppearancePane.fields.first { $0.key == "appearance.font_size" })
+        for (field, start, edit, before) in [
+            (try opacityField, "0.85", "0.30000001192092896", 0.85),
+            (stepper, "13.0", "15.0", 13.0),
+        ] {
+            let name = field.key
+            let config = { (value: String) in
+                Self.fakeConfig
+                    .replacingOccurrences(of: #""opacity": 0.85"#, with: #""opacity": \#(name == stepper.key ? "0.85" : value)"#)
+                    .replacingOccurrences(of: #""font_size": 13.0"#, with: #""font_size": \#(name == stepper.key ? value : "13.0")"#)
+            }
+            let (model, source, writer) = try fakeModel(config(start), clock: ManualClock())
+            let context = SettingsFieldContext(model: model, path: field.key)
+            let binding = field.doubleBinding(context)
+            model.leftMousePress = { 7 }
+            source.snapshot = TesseraConfigSnapshot(generation: 1, config: try Self.json(config(edit)))
+            model.reload()
+            XCTAssertNotEqual(model.value(field.key)?.double ?? 0, before, accuracy: 0.0001, "\(name): the hand edit shows")
+            field.editingChanged(context)(true)
+            binding.wrappedValue = before  // the press point, sent with the cancel
+            try await Task.sleep(for: .milliseconds(50))
+            if name == stepper.key {
+                try await waitUntil("\(name): the step written") { writer.calls.count == 1 && !model.isWriting }
+                continue
+            }
+            XCTAssertEqual(writer.calls, [], "\(name): the value from before the edit is written over it")
+            model.leftMousePress = { 8 }  // let go and pressed again, no release seen
+            binding.wrappedValue = before  // a click there in the next press
+            try await waitUntil("\(name): the next press written") { writer.calls.count == 1 && !model.isWriting }
+            XCTAssertEqual(writer.calls.last?.value?.double ?? 0, before, accuracy: 0.0001, name)
+            field.editingChanged(context)(false)
+        }
+    }
+
+    /// #564 (critic B1) on every slider: a step, then a hand edit, during
+    /// one press; the slider sending the press point again writes nothing,
+    /// while a step after the hand edit is written.
+    func testAPressPointResentAfterAStepAndAHandEditWritesNothingOnEverySlider() async throws {
+        let dim = try XCTUnwrap(AppearancePane.fields.first { $0.key == "appearance.dim_inactive_panes" })
+        let cases: [(SettingsField, start: String, knob: Double, step: Double, edit: String, moved: Double)] = [
+            (try opacityField, "0.8500000238418579", 0.85, 0.75, "0.30000001192092896", 0.6),
+            (dim, "0.6000000238418579", 0.6, 0.5, "0.33000001311302185", 0.2),
+        ]
+        for (field, start, knob, step, edit, moved) in cases {
+            let name = field.key
+            let config = { (value: String) in
+                Self.fakeConfig.replacingOccurrences(
+                    of: #""opacity": 0.85"#,
+                    with: field.key == dim.key
+                        ? #""opacity": 0.85, "dim_inactive_panes": \#(value)"# : #""opacity": \#(value)"#)
+            }
+            let clock = ManualClock()
+            let (model, source, writer) = try fakeModel(config(start), clock: clock)
+            model.leftMousePress = { 3 }
+            let context = SettingsFieldContext(model: model, path: field.key)
+            let binding = field.doubleBinding(context)
+            field.editingChanged(context)(true)
+            binding.wrappedValue = step
+            try await waitUntil("\(name): the step written") { writer.calls.count == 1 && !model.isWriting }
+            source.snapshot = TesseraConfigSnapshot(generation: 1, config: try Self.json(config(edit)))
+            model.reload()
+            binding.wrappedValue = knob  // re-sent: the press cancelled
+            try await Task.sleep(for: .milliseconds(50))
+            XCTAssertEqual(writer.calls.count, 1, "\(name): the press point is written over the hand edit: \(writer.calls)")
+            binding.wrappedValue = moved
+            clock.advance(by: .seconds(1))
+            try await waitUntil("\(name): the move written") { writer.calls.count == 2 && !model.isWriting }
+            binding.wrappedValue = knob
+            field.editingChanged(context)(false)
+            clock.advance(by: .seconds(1))
+            try await waitUntil("\(name): the way back written") { writer.calls.count == 3 && !model.isWriting }
+            XCTAssertEqual(writer.calls.last?.value?.double ?? 0, knob, accuracy: 0.0001, name)
+        }
+    }
+
+    /// The left mouse press a test reports to the model
+    /// (``SettingsModel/leftMousePress``), changed while a press runs.
+    @MainActor private final class MousePress {
+        var now: UInt32?
+        init(_ now: UInt32? = nil) { self.now = now }
+    }
+
+    /// #564: press 1 steps and lets go, press 2 is down when press 1's own
+    /// write applies and steps back to where press 1 began. The own write
+    /// applying is no hand edit, so the step back is written, on both
+    /// sliders and whether press 2 begins before the apply or at its step.
+    func testAStepBackInAQuickRepressAfterTheFirstPressAppliesIsWrittenOnEverySlider() async throws {
+        let dim = try XCTUnwrap(AppearancePane.fields.first { $0.key == "appearance.dim_inactive_panes" })
+        let cases: [(SettingsField, start: String, step: Double, applied: String, back: Double, beginFirst: Bool)] = [
+            (dim, "0.6000000238418579", 0.55, "0.550000011920929", 0.6, false),
+            (dim, "0.6000000238418579", 0.55, "0.550000011920929", 0.6, true),
+            (try opacityField, "0.8500000238418579", 0.84, "0.8399999737739563", 0.85, false),
+        ]
+        for (field, start, step, applied, back, beginFirst) in cases {
+            let name = "\(field.key) begin first \(beginFirst)"
+            let config = { (value: String) in
+                Self.fakeConfig.replacingOccurrences(
+                    of: #""opacity": 0.85"#,
+                    with: field.key == dim.key
+                        ? #""opacity": 0.85, "dim_inactive_panes": \#(value)"# : #""opacity": \#(value)"#)
+            }
+            let clock = ManualClock()
+            let (model, source, writer) = try fakeModel(config(start), clock: clock)
+            let press = MousePress(1)
+            model.leftMousePress = { press.now }
+            let context = SettingsFieldContext(model: model, path: field.key)
+            let binding = field.doubleBinding(context)
+            field.editingChanged(context)(true)
+            binding.wrappedValue = step
+            try await waitUntil("\(name): press 1 written") { writer.calls.count == 1 && !model.isWriting }
+            press.now = nil
+            field.editingChanged(context)(false)
+            clock.advance(by: .zero)
+            press.now = 2
+            if beginFirst { field.editingChanged(context)(true) }
+            source.snapshot = TesseraConfigSnapshot(generation: 1, config: try Self.json(config(applied)))
+            model.reload()
+            if !beginFirst { field.editingChanged(context)(true) }
+            binding.wrappedValue = back
+            try await Task.sleep(for: .milliseconds(50))
+            press.now = nil
+            field.editingChanged(context)(false)
+            clock.advance(by: .seconds(1))
+            try await Task.sleep(for: .milliseconds(100))
+            clock.advance(by: model.profileSettleTimeout)
+            try await Task.sleep(for: .milliseconds(100))
+            XCTAssertEqual(writer.calls.count, 2, "\(name): the step back is not written: \(writer.calls)")
+            XCTAssertEqual(writer.calls.last?.value?.double ?? 0, back, accuracy: 0.0001, name)
+        }
+    }
+
+    /// #564: the same on the `NSSlider` CI and releases get: a drag, let go,
+    /// a second press that is down when the first one's write applies and
+    /// drags back. The second press's move is written.
+    func testAMoveBackInAQuickNSSliderRepressAfterTheFirstPressAppliesIsWritten() async throws {
+        let clock = ManualClock()
+        let (model, source, writer) = try fakeModel(Self.fakeConfig, clock: clock)
+        let key = "appearance.opacity"
+        let (window, slider) = try await hostedOpacitySlider(.init(model: model, path: key))
+        defer {
+            window.contentView = nil
+            window.close()
+        }
+        let press = MousePress()
+        model.leftMousePress = { press.now }
+        let first = ActionCounter(slider)
+        try await holdKnob(of: slider, in: window, first) { drag in
+            press.now = 1
+            drag(-40)
+            try await Task.sleep(for: .milliseconds(50))
+            press.now = nil
+        }
+        slider.target = first.target
+        slider.action = first.action
+        try skipUnlessTheDragMoved(first)
+        try await waitUntil("press 1 written") { !writer.calls.isEmpty && !model.isWriting }
+        let written = try XCTUnwrap(writer.calls.last?.value?.double)
+        let second = ActionCounter(slider)
+        defer {
+            slider.target = second.target
+            slider.action = second.action
+        }
+        try await holdKnob(of: slider, in: window, second) { drag in
+            press.now = 2
+            try self.applyOpacity(String(Double(Float(written))), generation: 1, model, source)
+            try await Task.sleep(for: .milliseconds(50))
+            drag(40)
+            try await Task.sleep(for: .milliseconds(50))
+            press.now = nil  // the button is up when the mouse-up is handled
+        }
+        clock.advance(by: .seconds(1))
+        try await Task.sleep(for: .milliseconds(100))
+        clock.advance(by: model.profileSettleTimeout)
+        try await Task.sleep(for: .milliseconds(100))
+        let moved = try XCTUnwrap(second.values.last)
+        XCTAssertNotEqual(moved, written, accuracy: 0.005, "press 2 did not move: \(second.values)")
+        XCTAssertEqual(
+            writer.calls.last?.value?.double ?? 0, moved, accuracy: 0.005,
+            "press 2's move is not written: \(writer.calls), actions \(second.values)")
+    }
+
+    /// #564: press 1 drags and lets go, press 2 is down before press 1's
+    /// write applies, a hand edit applies and press 2 is cancelled. The
+    /// slider re-sends the value press 2 began on, press 1's step the
+    /// window showed but the file never had; that is no step and is not
+    /// written over the hand edit.
+    func testACancelledQuickNSSliderRepressAfterAHandEditKeepsTheEdit() async throws {
+        let clock = ManualClock()
+        let (model, source, writer) = try fakeModel(Self.fakeConfig, clock: clock)
+        let key = "appearance.opacity"
+        let (window, slider) = try await hostedOpacitySlider(.init(model: model, path: key))
+        defer {
+            window.contentView = nil
+            window.close()
+        }
+        let press = MousePress()
+        model.leftMousePress = { press.now }
+        let first = ActionCounter(slider)
+        try await holdKnob(of: slider, in: window, first) { drag in
+            press.now = 1
+            drag(-40)
+            try await Task.sleep(for: .milliseconds(50))
+            press.now = nil
+        }
+        slider.target = first.target
+        slider.action = first.action
+        try skipUnlessTheDragMoved(first)
+        try await waitUntil("press 1 written") { !writer.calls.isEmpty && !model.isWriting }
+        let second = ActionCounter(slider)
+        defer {
+            slider.target = second.target
+            slider.action = second.action
+        }
+        var resent: [Double] = []
+        try await holdKnob(of: slider, in: window, second) { _ in
+            press.now = 2
+            try self.applyOpacity("0.30000001192092896", generation: 1, model, source)
+            try await Task.sleep(for: .milliseconds(80))
+            let before = second.values.count
+            if let seen = self.cancelTracking(of: slider) {
+                throw XCTSkip("the press is tracked without a gesture recognizer: \(seen)")
+            }
+            resent = Array(second.values[before...])
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        press.now = nil
+        clock.advance(by: .seconds(1))
+        try await Task.sleep(for: .milliseconds(100))
+        clock.advance(by: model.profileSettleTimeout)
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(
+            model.value(key)?.double ?? 0, 0.3, accuracy: 0.0001,
+            "the hand edit is overwritten: re-sent \(resent), writes \(writer.calls)")
+        XCTAssertEqual(writer.calls.count, 1, "re-sent \(resent): \(writer.calls)")
+    }
+
+    /// #564: the binding twin of the cancelled quick re-press, for any
+    /// slider: press 2 begins on press 1's unapplied step, a hand edit
+    /// applies, and the step is re-sent inside press 2. Nothing is written.
+    func testAValueResentInAQuickRepressAfterAHandEditWritesNothing() async throws {
+        let field = try opacityField
+        let clock = ManualClock()
+        let (model, source, writer) = try fakeModel(Self.fakeConfig, clock: clock)
+        let context = SettingsFieldContext(model: model, path: field.key)
+        let binding = field.doubleBinding(context)
+        let press = MousePress(1)
+        model.leftMousePress = { press.now }
+        field.editingChanged(context)(true)
+        binding.wrappedValue = 0.74
+        try await waitUntil("press 1 written") { writer.calls.count == 1 && !model.isWriting }
+        press.now = nil
+        field.editingChanged(context)(false)
+        press.now = 2
+        try applyOpacity("0.30000001192092896", generation: 1, model, source)
+        field.editingChanged(context)(true)
+        binding.wrappedValue = 0.74  // re-sent with the cancel: the value press 2 began on
+        field.editingChanged(context)(false)
+        press.now = nil
+        clock.advance(by: .seconds(1))
+        try await Task.sleep(for: .milliseconds(100))
+        clock.advance(by: model.profileSettleTimeout)
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(writer.calls.count, 1, "the re-sent step is written over the hand edit: \(writer.calls)")
+        XCTAssertEqual(model.value(field.key)?.double ?? 0, 0.3, accuracy: 0.0001)
     }
 
     /// #517: an own value applied and a step held back: another key applying
