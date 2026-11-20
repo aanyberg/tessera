@@ -485,6 +485,48 @@ fn continuous_writes_are_applied_within_max_wait() {
     }
 }
 
+/// The next `Changed` on `watcher`, skipping the `Unchanged` reports that
+/// may come before it (#578).
+///
+/// Every watcher of a store is subscribed before its `watch` returns, and
+/// the one re-read whose `apply` puts an edit in place broadcasts its
+/// `Changed` to all of them, so no watcher misses it. It can arrive late:
+/// the applying watcher releases the store between applying and
+/// broadcasting, and another watcher's re-read in that gap finds the edit
+/// applied and broadcasts `Unchanged` first. Such an `Unchanged` is sent
+/// after the edit is in place, so a consumer that reads
+/// `ConfigStore::config` on it already sees the edit. A re-read of a file
+/// caught half-written (truncated, not yet filled) also finds nothing new.
+fn next_changed(
+    watcher: &Watcher,
+    backend: WatchBackend,
+    name: &str,
+) -> tessera_config::ConfigChanged {
+    let deadline = Instant::now() + EVENTUALLY;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match watcher.recv_timeout(left) {
+            Ok(ConfigEvent::Unchanged) => {}
+            Ok(event) => return expect_changed(event, backend),
+            Err(e) => panic!("{backend:?}: {name} watcher saw no Changed: {e}"),
+        }
+    }
+}
+
+/// Waits until `watcher` is quiet and fails on anything but `Unchanged`:
+/// the change it reported is not reported again.
+fn expect_only_unchanged(watcher: &Watcher, backend: WatchBackend, name: &str) {
+    while let Ok(event) = watcher.recv_timeout(Duration::from_millis(300)) {
+        assert!(
+            matches!(event, ConfigEvent::Unchanged),
+            "{backend:?}: {name} watcher reported the change twice: {event:?}"
+        );
+    }
+}
+
+/// Each watcher of a store sees an edit's `Changed` exactly once, possibly
+/// after `Unchanged` reports from the other watcher's re-read (see
+/// [`next_changed`]).
 #[test]
 fn every_watcher_on_a_store_receives_every_event() {
     for backend in BACKENDS {
@@ -495,33 +537,20 @@ fn every_watcher_on_a_store_receives_every_event() {
 
         std::fs::write(store.paths().config_file(), font_size_doc(17)).unwrap();
         for (name, watcher) in [("first", &first), ("second", &second)] {
-            let event = watcher
-                .recv_timeout(EVENTUALLY)
-                .unwrap_or_else(|e| panic!("{backend:?}: {name} watcher saw nothing: {e}"));
-            let changed = expect_changed(event, backend);
+            let changed = next_changed(watcher, backend, name);
             assert_eq!(
                 changed.config.appearance.font_size, 17.0,
                 "{backend:?}: {name}"
             );
-            // The other watcher's re-read finds the change applied and
-            // reports `Unchanged` (#535): at most that one more.
-            match watcher.recv_timeout(Duration::from_millis(200)) {
-                Err(_) | Ok(ConfigEvent::Unchanged) => {}
-                Ok(event) => {
-                    panic!("{backend:?}: {name} watcher reported the change twice: {event:?}")
-                }
-            }
-            assert!(
-                watcher.recv_timeout(Duration::from_millis(200)).is_err(),
-                "{backend:?}: {name} watcher reported more"
-            );
+            expect_only_unchanged(watcher, backend, name);
         }
 
         // Dropping one watcher does not affect the other.
         drop(first);
         std::fs::write(store.paths().config_file(), font_size_doc(18)).unwrap();
-        let changed = expect_changed(second.recv_timeout(EVENTUALLY).expect("second"), backend);
+        let changed = next_changed(&second, backend, "second");
         assert_eq!(changed.config.appearance.font_size, 18.0);
+        expect_only_unchanged(&second, backend, "second");
     }
 }
 
