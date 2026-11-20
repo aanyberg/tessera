@@ -125,7 +125,11 @@ extension SettingsField {
     /// the nearest step, which a press that does not move must not write
     /// (#534). A value the label shows differently is always written, so on
     /// a slider whose label is finer than its step (dim, 1 % against 5 %)
-    /// the step nearest a value off it can be chosen.
+    /// the step nearest a value off it can be chosen. A slider's value the
+    /// label shows as the one from before a hand edit applied during the
+    /// mouse press, with no step since, is the press's own value sent
+    /// again and no step either (``SettingsModel/valueBeforeHandEdit(_:)``,
+    /// #564); a stepper's step can land there from the edit, and is one.
     @MainActor
     func doubleBinding(_ context: SettingsFieldContext) -> Binding<Double> {
         Binding(
@@ -134,6 +138,11 @@ extension SettingsField {
                 guard context.isCurrent else { return }
                 let value = Self.rounded(new, control)
                 guard Self.shown(value, control) != Self.shown(context.current?.double ?? 0, control) else { return }
+                if case .slider = control, let before = context.model.valueBeforeHandEdit(context.path)?.double,
+                    Self.shown(value, control) == Self.shown(before, control)
+                {
+                    return
+                }
                 context.model.change(context.path, .float(value))
             })
     }
