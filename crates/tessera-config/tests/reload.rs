@@ -467,11 +467,19 @@ fn continuous_writes_are_applied_within_max_wait() {
             })
         };
 
+        // An `Unchanged` can come first: a re-read that runs while a write
+        // is half done (its temporary file created, not yet renamed) finds
+        // nothing new (#578). Skip it, within the same 800 ms.
         let started = Instant::now();
-        let event = watcher
-            .recv_timeout(Duration::from_millis(800))
-            .unwrap_or_else(|e| panic!("{backend:?}: no event while writes continue: {e}"));
-        let changed = expect_changed(event, backend);
+        let deadline = started + Duration::from_millis(800);
+        let changed = loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match watcher.recv_timeout(left) {
+                Ok(ConfigEvent::Unchanged) => {}
+                Ok(event) => break expect_changed(event, backend),
+                Err(e) => panic!("{backend:?}: no Changed while writes continue: {e}"),
+            }
+        };
         assert!(
             changed.config.appearance.font_size >= 30.0,
             "{backend:?}: {changed:?}"
