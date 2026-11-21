@@ -2704,11 +2704,10 @@ extension SettingsTests {
     /// waits the line says so; under the cap neither shows.
     ///
     /// The waiting line is read in a pane opened while the delete waits,
-    /// as Settings opened again shows it. On CI's macOS 27.0.1 (PR #584)
-    /// the pane open before it still read the cap line through the whole
-    /// 2 s lock, whatever the load; locally (macOS 27.2) the same view
-    /// changes in place within 40 ms. Whether an open window shows the
-    /// change on macOS 27.0 is an eye check.
+    /// as Settings opened again shows it. On CI (PR #584: macOS 27.0.1,
+    /// Xcode 27.1, app active) the pane open before it kept the cap line
+    /// through the whole 2 s lock; the cause (OS, activation) is not
+    /// known. #585 tracks it and restores the in-place check.
     func testThePaneSaysWhyAddIsDisabledAtTheCapAndWhileItWaits() async throws {
         let profiles = (0..<256).map { #"{"name": "p\#($0)"}"# }.joined(separator: ", ")
         let (model, source, _) = try fakeModel(#"{"general": {"default_profile": "p0"}, "profiles": [\#(profiles)]}"#)
