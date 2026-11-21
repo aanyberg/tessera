@@ -36,9 +36,11 @@ struct ProfilesPane: View {
                 // As the other panes do: also why an add or delete this
                 // pane made went with the failure, which leaves no notice
                 // by the list (#547, #570). Selectable, as the status line
-                // is: it quotes the file.
+                // is: it quotes the file. A new view per error, as for the
+                // status line.
                 SettingsMessage(text: error, notSaved: false)
                     .textSelection(.enabled)
+                    .id(error)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding([.horizontal, .top], 20)
             }
@@ -117,9 +119,13 @@ struct ProfilesPane: View {
                 .padding(.top, 6)
                 if let status = model.profilesStatus {
                     // Why the list and the profile, or Add and Duplicate,
-                    // are disabled (#344 m-f, 21.6a m4).
+                    // are disabled (#344 m-f, 21.6a m4). A new view per
+                    // line: on CI's macOS 27.0.1 with the app active, a
+                    // selectable Text changed in place kept its old string
+                    // (#585).
                     Text(status)
                         .textSelection(.enabled)
+                        .id(status)
                         .font(.callout)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -167,8 +173,12 @@ private struct ProfileDetail: View {
             if let file = profile.file {
                 Section {
                     // Plain text: the file name is the core's, sanitised.
+                    // A new view per file, as for the status line; a guard
+                    // only, since the Form's id below already rebuilds the
+                    // note when the profile or its file changes.
                     Text(ProfilesPane.fileNote(file))
                         .textSelection(.enabled)
+                        .id(file)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
