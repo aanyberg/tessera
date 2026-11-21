@@ -740,14 +740,26 @@ fn options(backend: WatchBackend) -> WatchOptions {
     }
 }
 
-/// The next `Changed`, within `within`, skipping `ThemesChanged`.
+/// The next `Changed`, within `within`, skipping `ThemesChanged` and the
+/// `Unchanged` reports that may come before it (#578, PR #586's run).
+///
+/// With one watcher, an `Unchanged` is a re-read that ran while a save
+/// was half done, so it found the files as already applied: the native
+/// backend sees `profiles/` change when [`write_atomic`] creates its
+/// temporary file (`.a.toml.<pid>.<n>.tmp`, which the loader skips: it
+/// is not a `*.toml` file), and if writing and syncing it takes longer than the
+/// debounce (a loaded machine) the re-read runs before the rename and
+/// finds nothing new (the files are quiet meanwhile: the temporary file
+/// itself is not watched). The `Changed` follows at the rename. Only
+/// `Changed` counts as a reload, so a save that reloads twice still fails
+/// [`more_changes`].
 fn next_change(watcher: &Watcher, within: Duration, what: &str) -> Arc<Config> {
     let started = Instant::now();
     loop {
         let left = within.saturating_sub(started.elapsed());
         match watcher.recv_timeout(left) {
             Ok(ConfigEvent::Changed(changed)) => return changed.config,
-            Ok(ConfigEvent::ThemesChanged) => {}
+            Ok(ConfigEvent::ThemesChanged | ConfigEvent::Unchanged) => {}
             Ok(other) => panic!("{what}: {other:?}"),
             Err(error) => panic!("{what}: no reload within {within:?}: {error}"),
         }
