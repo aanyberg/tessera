@@ -2,7 +2,7 @@
 
 A native macOS terminal emulator with a polished, approachable interface, built on a fast, modular Rust core.
 
-> **Status:** 0.2.0. Windows, tabs, split panes, scrollback, selection, links, find, themes, profiles, a Settings
+> **Status:** 0.2.1. Windows, tabs, split panes, scrollback, selection, links, find, themes, profiles, a Settings
 > window and `config.toml` work today, along with a first plugin host. A status bar and an update mechanism
 > are planned for 0.3.0 (see [Roadmap](#roadmap)).
 
