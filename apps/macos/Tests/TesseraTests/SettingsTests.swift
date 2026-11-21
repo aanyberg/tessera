@@ -2762,6 +2762,94 @@ extension SettingsTests {
         XCTAssertNil(model.profilesStatus)
     }
 
+    /// #585: a pane open at the cap shows the waiting line in place of the
+    /// cap line as soon as a delete waits, within the 2 s settle. On CI's
+    /// macOS 27.0.1 (PR #584) the selectable line kept the cap line for the
+    /// whole lock; locally (macOS 27.2) it changed in place either way.
+    func testAnOpenPaneShowsTheWaitingLineInPlaceOfTheCapLine() async throws {
+        let profiles = (0..<256).map { #"{"name": "p\#($0)"}"# }.joined(separator: ", ")
+        let (model, source, _) = try fakeModel(#"{"general": {"default_profile": "p0"}, "profiles": [\#(profiles)]}"#)
+        let window = profilesPane(model)
+        defer {
+            window.contentView = nil
+            window.close()
+        }
+        let cap = "Tessera reads at most 256 profiles, those in profiles/ included; delete one to add another."
+        let waiting = "Waiting for config.toml to be applied; the profiles can be edited once it is."
+        try await waitUntil("the list shows the profiles") {
+            Self.views(NSTableView.self, in: window.contentView).first?.numberOfRows == 256
+        }
+        let table = try XCTUnwrap(Self.views(NSTableView.self, in: window.contentView).first)
+        Self.click(table, row: 0)
+        try await waitUntil("p0's fields are shown") { Self.commandField(in: window) != nil }
+        XCTAssertTrue(Self.shownTexts(in: window.contentView).contains(cap), "the status line")
+
+        // The lock holds until the test applies the delete, however slow
+        // the pane is to read: a stale line cannot pass by the lock ending.
+        model.profileSettleTimeout = .seconds(60)
+        XCTAssertTrue(model.deleteProfile(5))
+        XCTAssertEqual(model.profilesStatus, waiting)
+        try await waitUntil("the open pane says it waits, not the cap") {
+            let shown = Self.shownTexts(in: window.contentView)
+            return shown.contains(waiting) && !shown.contains(cap)
+        }
+        try await waitUntil("written") { !model.isWriting }
+        XCTAssertEqual(model.profilesStatus, waiting, "written, not yet applied")
+        let fewer = (0..<256).filter { $0 != 5 }.map { #"{"name": "p\#($0)"}"# }.joined(separator: ", ")
+        source.snapshot = TesseraConfigSnapshot(
+            generation: 1, config: try Self.json(#"{"general": {"default_profile": "p0"}, "profiles": [\#(fewer)]}"#))
+        model.reload()
+        XCTAssertNil(model.profilesStatus)
+    }
+
+    /// #585: an open pane shows a new load error in place of the one it
+    /// showed, in the text and to VoiceOver.
+    func testAnOpenPaneShowsANewLoadErrorInPlaceOfTheOldOne() async throws {
+        let (model, source, _) = try fakeModel(Self.threeProfiles)
+        source.snapshot.loadError = "line 1: first"
+        model.reload()
+        let first = SettingsModel.loadErrorMessage("line 1: first")
+        let second = SettingsModel.loadErrorMessage("line 2: second")
+        let window = profilesPane(model)
+        defer {
+            window.contentView = nil
+            window.close()
+        }
+        try await waitUntil("the first error is shown") { Self.shownTexts(in: window.contentView).contains(first) }
+
+        source.snapshot.loadError = "line 2: second"
+        model.reload()
+        XCTAssertEqual(model.loadError, second)
+        try await waitUntil("the second error is shown, not the first") {
+            let shown = Self.shownTexts(in: window.contentView)
+            return shown.contains(second) && !shown.contains(first)
+        }
+    }
+
+    /// #585: switching between two profiles of `profiles/` shows the
+    /// selected one's file, never the other's.
+    func testAnOpenPaneShowsTheFileOfEachSelectedProfile() async throws {
+        let (model, _, _) = try fakeModel(Self.entriesAndFiles)
+        let window = profilesPane(model)
+        defer {
+            window.contentView = nil
+            window.close()
+        }
+        let extra = ProfilesPane.fileNote("profiles/extra.toml")
+        let zeta = ProfilesPane.fileNote("profiles/zeta.toml")
+        try await waitUntil("the list shows the profiles") {
+            Self.views(NSTableView.self, in: window.contentView).first?.numberOfRows == 4
+        }
+        let table = try XCTUnwrap(Self.views(NSTableView.self, in: window.contentView).first)
+        for (row, note, other) in [(2, extra, zeta), (3, zeta, extra), (2, extra, zeta)] {
+            Self.click(table, row: row)
+            try await waitUntil("row \(row) shows its own file") {
+                let shown = Self.shownTexts(in: window.contentView)
+                return shown.contains(note) && !shown.contains(other)
+            }
+        }
+    }
+
     /// #312 m2, mutant M7: a second add clears the message the first one's
     /// failure left by the list as it starts.
     func testASecondAddClearsTheFirstAddsMessage() async throws {
