@@ -31,7 +31,7 @@ defaults:
 jobs:
   release:
     name: Universal Tessera.app
-    runs-on: macos-15
+    runs-on: xcode-27
     # Notarization normally takes minutes; notarytool below gives up after 45.
     timeout-minutes: 120
     steps:
@@ -125,7 +125,7 @@ jobs:
         run: |
           # Pin the Xcode the app is known to build with; fail loudly if the
           # runner image no longer ships it instead of silently using another.
-          sudo xcode-select -s /Applications/Xcode_16.4.app
+          sudo xcode-select -s /Applications/Xcode_27.1.app
           xcodebuild -version
 
       - name: Build universal TesseraCore.xcframework

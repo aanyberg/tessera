@@ -246,12 +246,48 @@ final class MainMenuTests: XCTestCase {
     /// running app only). Not its Close All (`closeAll:`), which it adds
     /// only to a menu bar without a ⌥⌘W item: Tessera's own takes its
     /// place (#464), so one would fail this test.
+    ///
+    /// In an active app on macOS 15 and later (CI's runner; the locked
+    /// session of a local run never is one) AppKit also adds to Window the
+    /// window tiling items (Fill, Center, the Move & Resize and Full Screen
+    /// Tile submenus), the Minimize All, Zoom All and Arrange in Front
+    /// alternates and, with Stage Manager on, Remove Window from Set. The
+    /// tiling and Stage Manager items run AppKit's private actions (an
+    /// underscore; Tessera's never start with one); a submenu is AppKit's
+    /// when every item in it is.
     private static func isAppKitItem(_ item: NSMenuItem) -> Bool {
         let added: Set<String> = [
             "makeKeyAndOrderFront:", "orderFrontCharacterPalette:", "startDictation:",
-            "toggleFullScreen:", "toggleTabOverview:", "_handleInsertFromContactsCommand:",
+            "toggleFullScreen:", "toggleTabOverview:", "miniaturizeAll:", "zoomAll:", "alternateArrangeInFront:",
         ]
-        return item.action.map { added.contains(NSStringFromSelector($0)) } ?? false
+        if let submenu = item.submenu, item.action == #selector(NSMenu.submenuAction(_:)) {
+            // A submenu its delegate fills as it opens is filled first.
+            submenu.delegate?.menuNeedsUpdate?(submenu)
+            let items = submenu.items.filter { !$0.isSeparatorItem }
+            return !items.isEmpty && items.allSatisfy(isAppKitItem)
+        }
+        guard let action = item.action.map(NSStringFromSelector) else { return false }
+        return added.contains(action) || action.hasPrefix("_")
+    }
+
+    /// `menu`'s items but AppKit's (`isAppKitItem`), and but a separator
+    /// that AppKit's left next to another: its tiling items come with one
+    /// of their own.
+    private static func authoredItems(of menu: NSMenu) -> [NSMenuItem] {
+        var kept: [NSMenuItem] = []
+        var removedSinceKept = false
+        for item in menu.items {
+            if isAppKitItem(item) {
+                removedSinceKept = true
+                continue
+            }
+            if item.isSeparatorItem, removedSinceKept, kept.last?.isSeparatorItem ?? true {
+                continue
+            }
+            kept.append(item)
+            removedSinceKept = false
+        }
+        return kept
     }
 
     func testTheMenuBarHasTheMenusInOrder() throws {
@@ -268,7 +304,7 @@ final class MainMenuTests: XCTestCase {
             // validated.
             if title == "Tessera" { menu.update() }
             // AppKit adds items of its own (see `isAppKitItem`).
-            var installed = menu.items.filter { !Self.isAppKitItem($0) }
+            var installed = Self.authoredItems(of: menu)
             // And the AutoFill submenu, after a separator, at the end of Edit.
             while let last = installed.last, last.isSeparatorItem || last.title == "AutoFill" {
                 installed.removeLast()
@@ -278,6 +314,60 @@ final class MainMenuTests: XCTestCase {
                 XCTAssertNil(item.target, "\(title) > \(item.title) goes up the responder chain")
             }
         }
+    }
+
+    /// The Window menu as AppKit fills it in an active app with Stage
+    /// Manager on (CI's macOS 27 runner, PR #584), which a local run never
+    /// sees: `authoredItems` leaves Tessera's own, and only those.
+    func testTheWindowItemsAnActiveAppGetsFromAppKitAreSetApart() throws {
+        func item(_ title: String, _ action: String?, key: String = "", alternate: Bool = false) -> NSMenuItem {
+            let item = NSMenuItem(title: title, action: action.map(NSSelectorFromString), keyEquivalent: key)
+            item.isAlternate = alternate
+            return item
+        }
+        func submenu(_ title: String, _ actions: [String]) -> NSMenuItem {
+            let parent = item(title, "submenuAction:")
+            parent.submenu = NSMenu(title: title)
+            for action in actions { parent.submenu?.addItem(item(action, action)) }
+            return parent
+        }
+        let menu = NSMenu(title: "Window")
+        for authored in Self.windowItems {
+            let made =
+                authored == .separator
+                ? NSMenuItem.separator()
+                : item(authored.title, authored.action.map(NSStringFromSelector), key: authored.key)
+            made.keyEquivalentModifierMask = authored.modifiers
+            if authored.title == "Select Tab" {
+                made.submenu = NSMenu(title: "Select Tab")
+                made.submenu?.addItem(item("Tab 1", "selectTabAtIndex:", key: "1"))
+            }
+            menu.addItem(made)
+        }
+        // Where CI's AppKit put its own.
+        menu.insertItem(item("Minimize All", "miniaturizeAll:", alternate: true), at: 1)
+        menu.insertItem(item("Zoom All", "zoomAll:", alternate: true), at: 3)
+        let tiling = [
+            item("Fill", "_zoomFill:", key: "f"), item("Center", "_zoomCenter:", key: "c"), .separator(),
+            submenu("Move & Resize", ["_zoomLeft:", "_zoomRight:", "_zoomUntile:"]),
+            submenu("Full Screen Tile", ["_tileLeft:", "_tileRight:"]),
+        ]
+        for (offset, added) in tiling.enumerated() { menu.insertItem(added, at: 4 + offset) }
+        menu.addItem(item("Arrange in Front", "alternateArrangeInFront:", alternate: true))
+        menu.addItem(item("Remove Window from Set", "_removeWindowFromStageManagerSet:"))
+        XCTAssertEqual(menu.numberOfItems, Self.windowItems.count + 9, "the 19 items of CI's menu")
+        XCTAssertEqual(
+            Self.authoredItems(of: menu).map(Item.init).map(\.description), Self.windowItems.map(\.description))
+
+        // Kept: an item with a public action, a submenu with one, and a
+        // separator next to another with no item of AppKit's between them.
+        menu.insertItem(item("Zoom Everything", "zoomEverything:"), at: 5)
+        menu.insertItem(submenu("Tiles", ["_zoomLeft:", "zoomEverything:"]), at: 6)
+        menu.insertItem(.separator(), at: 0)
+        menu.insertItem(.separator(), at: 0)
+        XCTAssertEqual(
+            Self.authoredItems(of: menu).map(Item.init).map(\.title),
+            ["-", "-", "Minimize", "Zoom", "Zoom Everything", "Tiles", "-"] + Self.windowItems.dropFirst(3).map(\.title))
     }
 
     func testTheFindItemsAreInEditFind() throws {

@@ -271,8 +271,8 @@ Agents use these instead of rebuilding the setup in every run:
   In CI the Rust job, which also runs the ffi C tests, has `timeout-minutes: 20` and always runs. The macOS app job has
   37 (a normal `just app-test` is 12-14 minutes); it runs in parallel with the Rust job, no longer waits for it, and is
   skipped for changes that cannot affect the app (**CI skips the macOS app job**), with a 30-minute limit on `just
-  app-test` (macos-15 hit the #278 fork deadlock, whose partner in #443 was AppKit's `NSPersistentUI` queue
-  (`docs/testing.md`), 6 times in 3 runs, so a run needs room for several 150 s hangs and their restarts), whose
+  app-test` (the former macos-15 runner hit the #278 fork deadlock, whose partner in #443 was AppKit's `NSPersistentUI`
+  queue (`docs/testing.md`), 6 times in 3 runs, so a run needs room for several 150 s hangs and their restarts), whose
   xcodebuild calls also fail a single hung test after 120 s (300 s at most). A hang below the test level, where the test
   host itself deadlocks and xcodebuild waits for it (the TSan and `fork` deadlock of #121 and #228, caused by #278), is
   ended by `scripts/app-test-watchdog.sh`, which wraps both xcodebuild calls: when no test line follows a started test
@@ -289,9 +289,9 @@ Agents use these instead of rebuilding the setup in every run:
   timing bounds that grow with the machine's load. A new test that legitimately needs more than 300 s gets its own
   `slow-timeout` override there. **Agents run every test through the watchdog** (`just app-test`, `just app-test-only`,
   `just test`; the gate's own nextest watchdog covers the gate): a bare `xcodebuild test` ran 9.5 hours after its host
-  crashed. The watchdog also ends a run with no output and no CPU progress for `TESSERA_APP_TEST_IDLE_SECONDS`
-  (default 900) or longer than `TESSERA_APP_TEST_HARD_SECONDS` (default 5400), with exit 97 and a HANG line; mutation
-  runs use `just app-test-only`.
+  crashed. The watchdog also ends a run with no output and no CPU progress for `TESSERA_APP_TEST_IDLE_SECONDS` (default
+  900) or longer than `TESSERA_APP_TEST_HARD_SECONDS` (default 5400), with exit 97 and a HANG line; mutation runs use
+  `just app-test-only`.
 - **CI skips the macOS app job (#417).** The `changes` job in `.github/workflows/ci.yml` runs
   `scripts/ci-app-affected.sh --base <PR base sha> --head HEAD` and the `macOS app` job runs only when it prints `true`
   (pushes to main always run it). A skipped required job satisfies branch protection (the check shows as skipped); the
