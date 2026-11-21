@@ -125,7 +125,8 @@ components using the same API.
 
 ### Building from source
 
-Requirements: macOS 15+, Xcode 16+, Rust stable (via `rustup`), and
+Requirements: macOS 15+, Xcode 16+ (CI and releases build with Xcode 27.1 on the
+`xcode-27` image; the deployment target stays macOS 15), Rust stable (via `rustup`), and
 `brew install just cbindgen cargo-deny cargo-nextest xcodegen`. For the universal build also
 `rustup target add aarch64-apple-darwin x86_64-apple-darwin`.
 

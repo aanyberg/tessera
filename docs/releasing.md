@@ -40,7 +40,8 @@ pre-release. After tagging, `just release-notes v0.1.0` shows exactly what the
 workflow will attach; `scripts/release-notes-test.sh` exercises the tag
 selection in a throwaway repository.
 
-The workflow then, on a `macos-15` runner:
+The workflow then, on the GitHub-hosted `xcode-27` runner (macOS 27, Xcode 27.1
+selected with `xcode-select`; the deployment target stays macOS 15):
 
 - `just xcframework` – universal (arm64 + x86_64) `TesseraCore.xcframework`.
 - `just archive <short> <build>` – `xcodebuild archive`, Release configuration,

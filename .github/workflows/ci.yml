@@ -53,11 +53,16 @@ jobs:
 
   rust:
     name: Rust (stable)
-    runs-on: macos-15
+    runs-on: xcode-27
     # A normal run is well under 20 minutes; a hang fails the job instead of stalling merges (#137).
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+      # Same Xcode as the app job, so a change of the image's default cannot move the Rust job's toolchain (#582).
+      - name: Select Xcode
+        run: |
+          sudo xcode-select -s /Applications/Xcode_27.1.app
+          xcodebuild -version
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -78,7 +83,7 @@ jobs:
 
   app:
     name: macOS app
-    runs-on: macos-15
+    runs-on: xcode-27
     # Runs in parallel with `rust` (no `needs: rust`, ~7 minutes saved per PR); when `rust` fails this job still runs and
     # both required checks must pass anyway. Skipped only when `changes` succeeded and said false: a failed `changes`
     # job runs the app job (a skipped required job would otherwise count as a pass).
@@ -95,9 +100,14 @@ jobs:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
       - uses: Swatinem/rust-cache@v2
       - run: brew install just cbindgen xcodegen
-      - run: sudo xcode-select -s /Applications/Xcode_16.4.app || true
+      # The GitHub-hosted macOS 27 image (public preview); Xcode 27.1 is its default, selected explicitly so a change of
+      # default cannot move the build, and a missing Xcode fails the job (#582).
+      - name: Select Xcode
+        run: |
+          sudo xcode-select -s /Applications/Xcode_27.1.app
+          xcodebuild -version
       - run: just app
-      # 30 minutes: macos-15 hits the fork deadlock of #278 in this step (its partner in #443 is AppKit's NSPersistentUI
+      # 30 minutes: macos-15 hit the fork deadlock of #278 in this step (its partner in #443 is AppKit's NSPersistentUI
       # queue); each hang costs the watchdog's 150 s plus a restart, and 6 hangs in 3 runs passed 18 minutes. Fixing the
       # hangs is #278 and #443; this only keeps a run that recovers from being cut off.
       - run: just app-test
