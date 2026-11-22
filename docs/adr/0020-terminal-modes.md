@@ -362,9 +362,30 @@ cloned the rows first. It now works as follows; where this list and the text abo
 - **The rows are taken, not cloned.** The alternate screen is discarded by the leave anyway, so its rows are taken out
   of it first: the carry allocates the list of rows and no cells (`tests/rect_alloc.rs`). On a 200 x 500 screen of
   text a drawn screen and a carrying command end cost 0.99 times the same unit with the program leaving the screen
-  itself (1.61 times before, 1.34 ms against 0.84 ms; release, best of 15).
+  itself (1.61 times before, 1.34 ms against 0.84 ms; release, best of 15). Since #556 the command end is also timed
+  on its own, the drawing outside the clock: the carrying one costs 2.0 to 2.6 times the command end after the
+  program's own DECRST 1049 (both free the 200 rows a screen loses; the carry also moves each row and its line break),
+  with a bar of 5 times (release, best of 101, interleaved); a carry that clones the rows costs 18 to 25 times, which
+  the whole unit (1.06 times) hid.
 - **Trim.** A row's trailing cells are trimmed to the shell's pen only when blank in the shell's background (the
-  pen's): a blank in another background is not blank, so a status bar keeps its colour to the end of the row. The
-  same rule picks the first and last rows that show anything.
+  pen's): a blank in another background is kept, so a status bar keeps its colour to the end of the row.
+- **Which rows are carried (#556, 2026-11-22).** A colour alone is not text: a row holding only spaces and erased
+  cells is blank whatever its colours (background, foreground, inverse video) and whatever hyperlink it carries (a
+  linked space is blank), and only an underline, strikethrough or overline on a space, a wide character's pad or any
+  other character makes a row show text. The carry takes the rows
+  from the first to the last that show text: blank rows before and after them are dropped, blank rows between text rows
+  are kept in their colours. Until #556 the trim's rule picked the rows too, so a program drawn in a background of its
+  own (mc, vim with a colour scheme, a shell that sets its colours at start-up, whose default-background alternate
+  rows then differed from its pen) was carried whole, coloured blank rows included: on a 1024 x 2048 screen each
+  command end pushed 1024 lines into the scrollback (bounded by its cap). It now pushes its text rows only
+  (`tests/stuck_modes.rs`, mc-, vim- and shell-colour screens and the 1024 x 2048 cycle). The rows are scanned once per
+  command end, not per byte, and the carry still moves at most the screen's height into the scrollback, whose cap
+  bounds it (docs/security.md S5, S6).
+- **The carry is no continuation (#556 M3).** When the restored cursor is at the start of a row that continues a
+  soft-wrapped line above it (the row above, or the newest scrollback line for the top row, is wrapped; a long command
+  line followed by CR), the carry starts on the next row, as when the cursor is not at a line's start: the cursor's row
+  is cleared from its start and ends the shell's line, so a reflow keeps the carried text apart instead of joining it
+  to the shell's line. A pending wrap on a row that was already wrapped ends that row too. Printing over such a row is
+  unchanged: text a program prints there itself still continues the line above.
 - **The command end mark.** Once the reset took the primary screen back, the `D` is recorded there, on the line below
   the carried text (where the next prompt starts), with its request (ADR 0039, restating N12).

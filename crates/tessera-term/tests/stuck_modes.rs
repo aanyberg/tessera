@@ -13,6 +13,8 @@
 //! `TERM=xterm-256color`; `crates/tessera-app-core/tests/stuck_modes.rs`
 //! runs the real tmux in a session and kills its client.
 
+use std::time::{Duration, Instant};
+
 use tessera_grid::Mark;
 use tessera_term::{
     KeyboardModes, KittyFlags, ModifyOtherKeys, MouseEncoding, MouseReport, MouseReportButton,
@@ -651,25 +653,288 @@ fn trimmed_blanks_lose_a_protected_alt_pen() {
     }
 }
 
-/// #526 (24.14 m4): which rows are carried is decided by the same rule as
-/// the trim: a row of blanks in a background other than the shell's shows,
-/// so full-width coloured rows above and below the text are carried, and
-/// the rows beyond them are not.
+/// #556 (#526 m4, mutant C16): a full-width row of blanks in a colour
+/// other than the shell's is blank too (a colour alone is not text), so
+/// the coloured rows above and below the text are not carried, while one
+/// between two text rows is, in its colour.
 #[test]
-fn full_width_coloured_rows_around_the_text_are_carried() {
+fn full_width_coloured_rows_around_the_text_are_not_carried() {
     let blue = tessera_grid::Color::Indexed(4);
     let mut term = shell();
     term.advance(b"\x1b[?1049h\x1b[H\x1b[2J\x1b[2;1H\x1b[44m\x1b[K\x1b[m");
-    term.advance(b"\x1b[3;1Htext\x1b[4;1H\x1b[44m\x1b[K\x1b[m\x1b]133;D;1\x07");
-    assert_eq!(rows(&term, 5), ["$ ssh host", "", "text", "", ""]);
-    assert_eq!(backgrounds(&term, 1), vec![blue; 40], "the row above");
-    assert_eq!(backgrounds(&term, 3), vec![blue; 40], "the row below");
+    term.advance(b"\x1b[3;1Htext\x1b[4;1H\x1b[44m\x1b[K\x1b[m\x1b[5;1Hmore");
+    term.advance(b"\x1b[6;1H\x1b[44m\x1b[K\x1b[m\x1b]133;D;1\x07");
+    assert_eq!(rows(&term, 5), ["$ ssh host", "text", "", "more", ""]);
+    assert_eq!(backgrounds(&term, 2), vec![blue; 40], "the row between");
     assert_eq!(
         backgrounds(&term, 4),
         vec![tessera_grid::Color::Default; 40],
         "the row after the carry"
     );
     assert_eq!((term.grid().cursor().row, term.grid().cursor().col), (4, 0));
+}
+
+/// #556: spaces that draw something are text: a row of underlined (a
+/// form's input field), struck-through, overlined or curly-underlined
+/// spaces, each the last row of its screen, is carried after the text
+/// above it; a row of inverse spaces and a row of hyperlinked spaces after
+/// it are not (a link alone is not text).
+#[test]
+fn spaces_that_draw_a_line_are_carried() {
+    use tessera_grid::{CellFlags, Style};
+    for (sgr, bit) in [
+        ("4", Style::UNDERLINE),
+        ("9", Style::STRIKETHROUGH),
+        ("53", Style::OVERLINE),
+        ("4:3", Style::CURLY_UNDERLINE),
+    ] {
+        let mut term = shell();
+        term.advance(b"\x1b[?1049h\x1b[H\x1b[2Jname:");
+        term.advance(format!("\x1b[2;1H\x1b[{sgr}m          \x1b[m").as_bytes());
+        term.advance(b"\x1b[3;1H\x1b[7m     \x1b[m");
+        term.advance(b"\x1b[4;1H\x1b]8;;https://a.example/\x1b\\     \x1b]8;;\x1b\\");
+        term.advance(b"\x1b]133;D;1\x07");
+        let grid = term.grid();
+        assert_eq!(rows(&term, 2)[1], "name:", "SGR {sgr}");
+        assert!(
+            grid.visible_lines()[2].cells[..10]
+                .iter()
+                .all(|cell| cell.style.has(bit)),
+            "SGR {sgr}: the row is carried"
+        );
+        assert_eq!(
+            (grid.cursor().row, grid.cursor().col),
+            (3, 0),
+            "SGR {sgr}: the inverse and linked rows are not carried"
+        );
+        assert!(
+            grid.visible_lines()[3..].iter().all(|line| line
+                .cells
+                .iter()
+                .all(|cell| !cell.flags.contains(CellFlags::LINK))),
+            "SGR {sgr}: no linked space"
+        );
+    }
+}
+
+/// #556: a row holding only a wide character's pad (the character did not
+/// fit in its last column) is carried as the start of the wrapped line,
+/// so the character stays its continuation.
+#[test]
+fn a_leading_padded_row_is_carried() {
+    let mut term = shell();
+    term.advance("\x1b[?1049h\x1b[H\x1b[2J\x1b[1;40H\u{4e2d}\x1b]133;D;1\x07".as_bytes());
+    let grid = term.grid();
+    assert!(grid.visible_lines()[1].cells[39].is_pad());
+    assert!(
+        grid.visible_lines()[1].wrapped,
+        "the character continues it"
+    );
+    assert_eq!(rows(&term, 4), ["$ ssh host", "", "\u{4e2d}", ""]);
+}
+
+/// The rows of a 12 x 40 screen as mc draws them in its blue skin: a
+/// menu bar of inverse spaces, panels of spaces printed in white on blue,
+/// erased rows in blue (BCE), and text on rows 4 to 7 only (row 6 a blank
+/// panel row between them).
+fn mc_screen(term: &mut Terminal) {
+    let spaces = [b' '; 40];
+    term.advance(b"\x1b[?1049h\x1b[44m\x1b[H\x1b[2J");
+    term.advance(b"\x1b[1;1H\x1b[30;46;7m");
+    term.advance(&spaces);
+    for row in 2..=11 {
+        term.advance(format!("\x1b[{row};1H\x1b[0;37;44m").as_bytes());
+        term.advance(&spaces);
+    }
+    term.advance(b"\x1b[4;2H\x1b[1;33;44m.n  Name\x1b[5;2H\x1b[0;37;44m/..");
+    term.advance(b"\x1b[7;2Hnotes.txt\x1b[12;1H\x1b[0;44m\x1b[K\x1b[m");
+}
+
+/// #556 (M1): mc killed with its screen up (the ssh connection dropped):
+/// only the rows from its first to its last text row are carried, not its
+/// menu bar and blank panel rows, and the kept rows keep their colours.
+#[test]
+fn an_mc_screen_carries_only_its_text_rows() {
+    let blue = tessera_grid::Color::Indexed(4);
+    let mut term = Terminal::new(12, 40);
+    term.advance(b"\x1b]133;A\x07$ \x1b]133;B\x07ssh host mc\r\n\x1b]133;C\x07");
+    mc_screen(&mut term);
+    let pushed = term.grid().scrollback_pushed();
+    term.advance(b"\x1b]133;D;255\x07");
+    assert_eq!(
+        rows(&term, 7),
+        [
+            "$ ssh host mc",
+            " .n  Name",
+            " /..",
+            "",
+            " notes.txt",
+            "",
+            ""
+        ]
+    );
+    assert_eq!(term.grid().scrollback_pushed(), pushed, "nothing scrolled");
+    assert_eq!((term.grid().cursor().row, term.grid().cursor().col), (5, 0));
+    assert_eq!(
+        backgrounds(&term, 3),
+        vec![blue; 40],
+        "the blank panel row between"
+    );
+    assert_eq!(
+        backgrounds(&term, 4)[30..],
+        [blue; 10],
+        "a panel's trailing blanks"
+    );
+}
+
+/// #556 (M1): vim in a colour scheme with a background of its own
+/// (`ESC [ 48 ; 5 ; 235 m`, `fillchars=eob: `): three text rows, the rest
+/// of the window and the command line erased in its background. Only the
+/// three text rows are carried.
+#[test]
+fn a_vim_screen_in_a_colour_scheme_carries_only_its_text_rows() {
+    let dark = tessera_grid::Color::Indexed(235);
+    let mut term = shell();
+    term.advance(b"\x1b[?1049h\x1b[48;5;235m\x1b[H\x1b[2J\x1b[38;5;252m");
+    term.advance(b"fn main() {\x1b[K\r\n    run();\x1b[K\r\n}\x1b[K\r\n");
+    for _ in 4..10 {
+        term.advance(b"\x1b[K\r\n");
+    }
+    term.advance(b"\x1b[K\x1b]133;D;1\x07");
+    assert_eq!(
+        rows(&term, 6),
+        ["$ ssh host", "fn main() {", "    run();", "}", "", ""]
+    );
+    assert_eq!(
+        backgrounds(&term, 3)[1..],
+        [dark; 39],
+        "the text row keeps its colour"
+    );
+    assert_eq!(
+        backgrounds(&term, 4),
+        vec![tessera_grid::Color::Default; 40],
+        "the next prompt's row is the shell's"
+    );
+    assert_eq!((term.grid().cursor().row, term.grid().cursor().col), (4, 0));
+}
+
+/// #556 (M2): a shell whose own pen has a background (set at its start)
+/// and a program that drew in the default one: the program's blank rows
+/// are blank, though not in the shell's background, so only its text row
+/// is carried.
+#[test]
+fn a_shell_in_a_background_of_its_own_carries_only_the_text_rows() {
+    let mut term = Terminal::new(10, 40);
+    term.advance(b"\x1b[44m\x1b[2J\x1b[H$ ssh host\r\n");
+    term.advance(b"\x1b[?1049h\x1b[m\x1b[H\x1b[2J\x1b[3;1Hremote text\x1b]133;D;255\x07");
+    assert_eq!(rows(&term, 4), ["$ ssh host", "remote text", "", ""]);
+    assert_eq!((term.grid().cursor().row, term.grid().cursor().col), (2, 0));
+    // The carried row keeps the program's default background to its end:
+    // its trailing blanks are not in the shell's background, so they are
+    // not trimmed to the shell's blue (ADR 0020, "Trim"); the rows below
+    // the carry are the shell's.
+    let blue = tessera_grid::Color::Indexed(4);
+    assert_eq!(
+        backgrounds(&term, 1),
+        vec![tessera_grid::Color::Default; 40],
+        "the carried row"
+    );
+    assert_eq!(
+        backgrounds(&term, 2),
+        vec![blue; 40],
+        "the next prompt's row"
+    );
+}
+
+/// #556 (M1): a 1024 x 2048 alternate screen filled with a colour of its
+/// own and three text rows in its middle, three times over: each command
+/// end pushes its three text rows into the scrollback, not 1024 rows.
+#[test]
+fn a_coloured_1024_by_2048_screen_pushes_only_its_text_rows() {
+    let mut term = Terminal::new(1024, 2048);
+    term.advance(b"\x1b[1023;1H$ tui\r\n");
+    for cycle in 0..3 {
+        term.advance(b"\x1b[?1049h\x1b[48;5;17m\x1b[H\x1b[2J");
+        for row in 500..503 {
+            term.advance(format!("\x1b[{row};1Hcycle {cycle} row {row}").as_bytes());
+        }
+        let pushed = term.grid().scrollback_pushed();
+        term.advance(b"\x1b]133;D;1\x07");
+        assert_eq!(
+            term.grid().scrollback_pushed() - pushed,
+            3,
+            "cycle {cycle}: the text rows"
+        );
+        assert_eq!(
+            rows(&term, 1024)[1020..],
+            [
+                format!("cycle {cycle} row 500"),
+                format!("cycle {cycle} row 501"),
+                format!("cycle {cycle} row 502"),
+                String::new()
+            ]
+        );
+        term.advance(b"$ tui\r\n");
+    }
+    assert!(term.grid().scrollback_len() <= term.grid().max_scrollback());
+}
+
+/// #556 (M3): the shell's line above the restored cursor is soft-wrapped
+/// onto the cursor's row (a long command line, then CR): the carried text
+/// starts on the next row, the cursor's row cleared and ended, so a
+/// reflow keeps it apart from the shell's line instead of joining them.
+#[test]
+fn the_first_carried_row_does_not_continue_a_wrapped_shell_line() {
+    let mut term = Terminal::new(6, 10);
+    term.advance(b"$ ssh host-1\r");
+    assert!(term.grid().visible_lines()[0].wrapped);
+    term.advance(b"\x1b[?1049h\x1b[Hgone\x1b]133;D;1\x07");
+    assert_eq!(rows(&term, 4), ["$ ssh host", "", "gone", ""]);
+    assert!(
+        !term.grid().visible_lines()[1].wrapped,
+        "the shell's line ends"
+    );
+    term.resize(6, 20);
+    assert_eq!(rows(&term, 3), ["$ ssh host", "gone", ""]);
+}
+
+/// #556 (M3): the same with the restored cursor on the top row, whose
+/// soft-wrapped line above is the newest scrollback line.
+#[test]
+fn the_first_carried_row_does_not_continue_a_wrapped_history_line() {
+    let mut term = Terminal::new(2, 10);
+    term.advance(b"\x1b[2;1H");
+    term.advance(&[b'x'; 25]);
+    term.advance(b"\x1b[H");
+    let newest = term.grid().scrollback_len() - 1;
+    assert!(term.grid().scrollback_line(newest).unwrap().wrapped);
+    term.advance(b"\x1b[?1049h\x1b[Hgone\x1b]133;D;1\x07");
+    let gone = all_lines(&term)
+        .iter()
+        .position(|line| line == "gone")
+        .unwrap();
+    let grid = term.grid();
+    assert!(
+        !grid.logical_line(gone - 1).unwrap().wrapped,
+        "the line above ends"
+    );
+    term.resize(2, 40);
+    assert!(all_lines(&term).contains(&"gone".to_owned()));
+}
+
+/// #556 (M3): a pending wrap on a row that was already soft-wrapped (the
+/// cursor moved back onto it and printed its last column): the row ends,
+/// so the carried text below it is no continuation.
+#[test]
+fn a_pending_wrap_on_a_wrapped_row_ends_it() {
+    let mut term = Terminal::new(4, 10);
+    term.advance(&[b'x'; 25]);
+    term.advance(b"\x1b[2;10Hy");
+    assert!(term.grid().pending_wrap() && term.grid().visible_lines()[1].wrapped);
+    term.advance(b"\x1b[?1049h\x1b[Hgone\x1b]133;D;1\x07");
+    let grid = term.grid();
+    assert!(!grid.visible_lines()[1].wrapped, "the shell's row ends");
+    assert_eq!(rows(&term, 4), ["xxxxxxxxxx", "xxxxxxxxxy", "gone", ""]);
 }
 
 /// A coloured soft-wrapped row whose wrap scrolls at the bottom of the
@@ -780,9 +1045,8 @@ fn a_pending_wrap_keeps_the_last_character() {
     assert!(!term.grid().visible_lines()[0].wrapped);
 }
 
-/// A 200 x 500 alternate screen of text after `$ tui`, left by the
-/// program itself (`leave`, DECRST 1049) or not, then a command end.
-fn full_screen_unit(leave: bool) -> Terminal {
+/// A 200 x 500 alternate screen of text after `$ tui`, drawn and still up.
+fn full_screen() -> Terminal {
     let mut term = Terminal::new(200, 500);
     term.advance(b"\x1b]133;A\x07$ \x1b]133;B\x07tui\r\n\x1b]133;C\x07\x1b[?1049h");
     let mut fill = Vec::new();
@@ -791,34 +1055,67 @@ fn full_screen_unit(leave: bool) -> Terminal {
         fill.extend(b"0123456789".repeat(50));
     }
     term.advance(&fill);
-    if leave {
-        term.advance(b"\x1b[?1049l");
-    }
-    term.advance(b"\x1b]133;D;0\x07");
     term
 }
 
-/// #489 (#461 r2-M3): the carry costs at most 1.1 times the same unit
-/// without it (a 200 x 500 alternate screen drawn, then a command end
-/// after the program left it itself), the best of 15 runs each,
-/// interleaved: the rows are moved, not cloned and printed again (2.3
-/// times before).
+/// The times a run of [`full_screen`] takes: drawing the screen and the
+/// command end after it, with the carry (`carry`) or after the program
+/// left the alternate screen itself (DECRST 1049, timed with the command
+/// end). The terminal is dropped after the clock stops.
+fn unit_times(carry: bool) -> (Duration, Duration) {
+    let start = Instant::now();
+    let mut term = full_screen();
+    let drawn = start.elapsed();
+    let end: &[u8] = if carry {
+        b"\x1b]133;D;0\x07"
+    } else {
+        b"\x1b[?1049l\x1b]133;D;0\x07"
+    };
+    let start = Instant::now();
+    term.advance(end);
+    let ended = start.elapsed();
+    assert!(!term.modes().alt_screen);
+    (drawn, ended)
+}
+
+/// How many times the carrying command end on its own may cost the
+/// command end after the program left the screen itself, the leave
+/// included: both free the 200 rows one screen loses, and the carry also
+/// moves each row and its line break (2.1 to 2.6 times measured, release,
+/// best of 101; cloning the rows instead of taking them costs 20 to 25
+/// times).
+const CARRY_ALONE_BAR: f64 = 5.0;
+
+/// #489 (#461 r2-M3): a 200 x 500 alternate screen drawn, then a carrying
+/// command end, costs at most 1.1 times the same unit with the program
+/// leaving the screen itself; and (#556 m1) the command end measured on
+/// its own, the drawing outside the clock, costs at most
+/// [`CARRY_ALONE_BAR`] times the leave, so a carry that clones the rows
+/// fails though the whole unit hides it (1.007 times). The best of 101
+/// runs each, interleaved: the rows are moved, not cloned and printed
+/// again.
 #[test]
 #[cfg_attr(debug_assertions, ignore = "timing: release only")]
 fn the_carry_of_a_full_screen_costs_a_tenth_more_at_most() {
-    let best = |leave: bool, best: &mut std::time::Duration| {
-        let start = std::time::Instant::now();
-        let term = full_screen_unit(leave);
-        *best = (*best).min(start.elapsed());
-        assert!(!term.modes().alt_screen);
+    let (mut carried, mut left) = ([Duration::MAX; 2], [Duration::MAX; 2]);
+    let best = |best: &mut [Duration; 2], (drawn, ended): (Duration, Duration)| {
+        best[0] = best[0].min(drawn + ended);
+        best[1] = best[1].min(ended);
     };
-    let (mut carried, mut left) = (std::time::Duration::MAX, std::time::Duration::MAX);
-    for _ in 0..15 {
-        best(false, &mut carried);
-        best(true, &mut left);
+    for _ in 0..101 {
+        best(&mut carried, unit_times(true));
+        best(&mut left, unit_times(false));
     }
     assert!(
-        carried.as_secs_f64() <= 1.1 * left.as_secs_f64(),
-        "{carried:?} with the carry, {left:?} without"
+        carried[0].as_secs_f64() <= 1.1 * left[0].as_secs_f64(),
+        "the unit: {:?} with the carry, {:?} without",
+        carried[0],
+        left[0]
+    );
+    assert!(
+        carried[1].as_secs_f64() <= CARRY_ALONE_BAR * left[1].as_secs_f64(),
+        "the command end alone: {:?} with the carry, {:?} after the leave",
+        carried[1],
+        left[1]
     );
 }
