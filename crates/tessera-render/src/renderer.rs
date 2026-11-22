@@ -541,6 +541,14 @@ impl Renderer {
         let cells = &cells[..cells.len().min(cols)];
         let clusters = clusters.unwrap_or(&NO_CLUSTERS);
         let row = &mut self.rows[r];
+        // Before the fallback index is ready, a face may be provisional
+        // (`.notdef`, or a chain family's synthetic bold that a real bold
+        // found through the index beats); the fonts count those, so a
+        // count that moved while this row was shaped marks it for shaping
+        // again once the index lands. Another shaper on the same fonts may
+        // move it too, which only costs that one extra shaping.
+        let provisional = |shaper: &Shaper| shaper.fonts().lock().provisional();
+        let before = (!fallback_ready).then(|| provisional(&self.shaper));
         // Hidden cells are shaped as blanks, so no ligature reaches
         // across a hidden boundary (a hidden `>` must not turn a visible
         // `=` into an arrow). So is a wide character in the last visible
@@ -568,11 +576,7 @@ impl Renderer {
                 .shape_line_into(cells, clusters, &mut row.shaped);
         }
         row.len = cells.len();
-        row.pending_fallback = !fallback_ready
-            && row
-                .shaped
-                .iter()
-                .any(|g| g.glyph_id == 0 && !g.face_id.is_builtin());
+        row.pending_fallback = before.is_some_and(|n| provisional(&self.shaper) != n);
         self.stats.rows_shaped += 1;
     }
 
@@ -1132,6 +1136,155 @@ mod tests {
         assert_eq!(renderer.stats().rows_shaped, shaped + 1);
         assert!(!renderer.rows[0].pending_fallback, "resolved for good");
         assert!(!renderer.needs_redraw());
+    }
+
+    /// A renderer on fonts whose fallback index lands only when the test
+    /// calls [`crate::Fonts::build_index_now`].
+    fn renderer_without_index() -> Option<(Gpu, Renderer, crate::OffscreenTarget)> {
+        if std::env::var_os("TESSERA_SKIP_GPU_TESTS").is_some() {
+            return None;
+        }
+        let gpu = Gpu::headless().expect("a Metal adapter");
+        let config = crate::FontConfig::default();
+        let fonts = crate::Fonts::without_index(&config).expect("fonts");
+        let shaper = Shaper::with_fonts(fonts, config.size_pt, config.scale);
+        let renderer = Renderer::new(&gpu, Theme::default(), shaper).expect("renderer");
+        let m = renderer.cell_metrics();
+        let size = PhysicalSize::new(20 * m.width_px + 16, 3 * m.height_px + 16);
+        let target = crate::OffscreenTarget::new(&gpu, size, wgpu::TextureFormat::Rgba8Unorm);
+        Some((gpu, renderer, target))
+    }
+
+    /// #555: a bold row shaped while the fallback index builds draws
+    /// U+24F5 with a chain family's synthetic bold (no chain family has a
+    /// bold face for it); once the index lands, the row is shaped again
+    /// without damage and draws the real bold the index finds (see
+    /// `bold_found_through_the_index_beats_the_chains_synthetic_bold` in
+    /// `font.rs`). The glyph is not `.notdef`, so only the provisional
+    /// face marks the row.
+    #[test]
+    fn a_synthetic_bold_row_is_reshaped_with_the_real_bold_when_the_index_lands() {
+        let Some((gpu, mut renderer, target)) = renderer_without_index() else {
+            return;
+        };
+        let ch = '\u{24F5}';
+        let row: Vec<Cell> = [
+            Cell::new('a', Style::DEFAULT.with(Style::BOLD)),
+            Cell::new(ch, Style::DEFAULT.with(Style::BOLD)),
+        ]
+        .into();
+        let rows: [&[Cell]; 1] = [&row];
+        target
+            .render(&gpu, &mut renderer, &FrameInput::new(&rows))
+            .expect("frame");
+        let glyph = |renderer: &Renderer| {
+            renderer.rows[0]
+                .shaped
+                .iter()
+                .find(|g| g.cell_index == 1)
+                .copied()
+                .expect("a glyph for U+24F5")
+        };
+        let before = glyph(&renderer);
+        if !before.synthetic_bold || before.glyph_id == 0 {
+            eprintln!("skipping: a chain family has a bold U+24F5 here: {before:?}");
+            return;
+        }
+        assert!(renderer.rows[0].pending_fallback, "{before:?}");
+        assert!(!renderer.needs_redraw(), "nothing to do before the index");
+        renderer.shaper().fonts().build_index_now();
+        assert!(renderer.needs_redraw(), "the host must draw again");
+        // What the row draws once the index is ready, shaped from scratch.
+        let expected = renderer.shaper.shape_line(&row);
+        let real = expected
+            .iter()
+            .find(|g| g.cell_index == 1)
+            .copied()
+            .expect("a glyph for U+24F5");
+        if real.synthetic_bold {
+            eprintln!("skipping: the index has no real bold U+24F5 here: {real:?}");
+            return;
+        }
+        let shaped = renderer.stats().rows_shaped;
+        let frame = FrameInput::new(&rows).with_damage(DamageRows::None);
+        target.render(&gpu, &mut renderer, &frame).expect("frame");
+        assert_eq!(renderer.stats().rows_shaped, shaped + 1, "shaped again");
+        let after = glyph(&renderer);
+        assert!(!after.synthetic_bold, "{after:?}");
+        assert_ne!(after.face_id, before.face_id, "{after:?} vs {before:?}");
+        assert_eq!(renderer.rows[0].shaped, expected);
+        assert!(!renderer.rows[0].pending_fallback, "resolved for good");
+        assert!(!renderer.needs_redraw());
+    }
+
+    /// A row that drew `.notdef` for a character only the index covers
+    /// is shaped again when it lands, and then draws the covering face.
+    #[test]
+    fn a_notdef_row_is_reshaped_with_the_covering_face_when_the_index_lands() {
+        let Some((gpu, mut renderer, target)) = renderer_without_index() else {
+            return;
+        };
+        // Characters the fixed chain is unlikely to cover (as in
+        // `misses_wait_for_the_index_without_being_cached` in `font.rs`).
+        let row = text_row("a\u{13000}\u{10900}\u{1E900}\u{11400}");
+        let rows: [&[Cell]; 1] = [&row];
+        target
+            .render(&gpu, &mut renderer, &FrameInput::new(&rows))
+            .expect("frame");
+        let notdef = |renderer: &Renderer| {
+            renderer.rows[0]
+                .shaped
+                .iter()
+                .filter(|g| g.glyph_id == 0)
+                .count()
+        };
+        let before = notdef(&renderer);
+        renderer.shaper().fonts().build_index_now();
+        let expected = renderer.shaper.shape_line(&row);
+        if before == 0 || expected.iter().filter(|g| g.glyph_id == 0).count() == before {
+            eprintln!("skipping: the index covers none of the probes the chain lacks");
+            return;
+        }
+        assert!(renderer.rows[0].pending_fallback);
+        assert!(renderer.needs_redraw(), "the host must draw again");
+        let shaped = renderer.stats().rows_shaped;
+        let frame = FrameInput::new(&rows).with_damage(DamageRows::None);
+        target.render(&gpu, &mut renderer, &frame).expect("frame");
+        assert_eq!(renderer.stats().rows_shaped, shaped + 1, "shaped again");
+        assert_eq!(renderer.rows[0].shaped, expected);
+        assert!(notdef(&renderer) < before);
+        assert!(!renderer.rows[0].pending_fallback, "resolved for good");
+    }
+
+    /// Rows whose faces cannot change when the index lands are not shaped
+    /// again: plain and bold ASCII (Menlo has a real bold), box drawing
+    /// (the built-in face).
+    #[test]
+    fn rows_with_settled_faces_are_not_reshaped_when_the_index_lands() {
+        let Some((gpu, mut renderer, target)) = renderer_without_index() else {
+            return;
+        };
+        let bold = |text: &str| -> Vec<Cell> {
+            text.chars()
+                .map(|ch| Cell::new(ch, Style::DEFAULT.with(Style::BOLD)))
+                .collect()
+        };
+        let rows = [
+            text_row("plain ascii"),
+            bold("bold ascii"),
+            text_row("\u{2500}\u{2502}\u{250C}"),
+        ];
+        let rows = frame(&rows);
+        target
+            .render(&gpu, &mut renderer, &FrameInput::new(&rows))
+            .expect("frame");
+        assert!(renderer.rows.iter().all(|r| !r.pending_fallback));
+        renderer.shaper().fonts().build_index_now();
+        assert!(!renderer.needs_redraw(), "nothing waits for the index");
+        let shaped = renderer.stats().rows_shaped;
+        let frame = FrameInput::new(&rows).with_damage(DamageRows::None);
+        target.render(&gpu, &mut renderer, &frame).expect("frame");
+        assert_eq!(renderer.stats().rows_shaped, shaped, "no row shaped again");
     }
 
     /// Each row's shaped-glyph vector is reused: re-shaping a row writes
