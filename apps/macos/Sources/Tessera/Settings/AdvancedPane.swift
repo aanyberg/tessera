@@ -12,7 +12,7 @@ struct AdvancedPane: View {
             note: "For tabs opened from now on."),
         SettingsField(
             key: "terminal.shell_integration", title: "Shell integration",
-            control: .choice([.init(value: "auto", title: "On (zsh and fish)"), .init(value: "off", title: "Off")]),
+            control: .choice([.init(value: "auto", title: "On (zsh, bash and fish)"), .init(value: "off", title: "Off")]),
             note: "Marks prompts and commands, and reports the working directory, in the shells Tessera starts."),
         SettingsField(
             key: "terminal.clipboard_write", title: "Programs may write the clipboard (OSC 52)", control: .toggle),

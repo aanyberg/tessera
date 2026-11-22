@@ -11,6 +11,8 @@ publish.workspace = true
 
 [dependencies]
 tessera-grid.workspace = true
+# O_NONBLOCK for reading untrusted startup files.
+libc.workspace = true
 
 [dev-dependencies]
 # The live test runs the scripts in real shells through a PTY.

@@ -94,7 +94,7 @@ in the [configuration reference](docs/config.md).
 
 ### Shell integration
 
-For zsh and fish, Tessera loads its shell integration automatically (bash support is to follow). It marks prompts
+For zsh, bash and fish, Tessera loads its shell integration automatically. It marks prompts
 and commands and reports each shell's working directory. Set `shell_integration = "off"` under `[terminal]` to
 disable it. Details in [`shell-integration/README.md`](shell-integration/README.md).
 

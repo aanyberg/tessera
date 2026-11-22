@@ -543,10 +543,10 @@ impl App {
     /// with it, so the child's `TESSERA_SESSION_ID` always matches. Events
     /// of the new session may reach the observer before this returns.
     ///
-    /// With `[terminal] shell_integration = "auto"` (the default) a zsh or
-    /// fish is started so it loads Tessera's shell integration scripts,
-    /// which are written under [`ConfigPaths::shell_integration_dir`] first
-    /// (ADR 0021; bash is started unchanged until bash support lands): the
+    /// With `[terminal] shell_integration = "auto"` (the default) a zsh,
+    /// bash or fish is started so it loads Tessera's shell integration
+    /// scripts, which are written under [`ConfigPaths::shell_integration_dir`]
+    /// first (ADR 0021): the
     /// program's file name (or, for [`Program::LoginShell`], the child's
     /// `$SHELL`) picks the shell, and the variables the injection adds count
     /// toward the `execve` size limit below. Nothing

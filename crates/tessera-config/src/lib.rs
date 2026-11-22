@@ -482,7 +482,7 @@ pub struct Terminal {
     /// the 10,000,000 limit a full history takes about 18 GB of memory and
     /// each resize stalls the pane for 2-4 seconds.
     pub scrollback_lines: u32,
-    /// Shell integration for zsh and fish (bash support is to follow):
+    /// Shell integration for zsh, bash and fish:
     /// `"auto"` makes the shells Tessera starts load its scripts, which mark
     /// prompts and commands and report the working directory; `"off"` starts
     /// them unchanged. A session started with `TESSERA_SHELL_INTEGRATION` in
@@ -516,7 +516,7 @@ pub struct Terminal {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ShellIntegration {
-    /// Inject into zsh and fish; other programs (bash too, for now) are
+    /// Inject into zsh, bash and fish; other programs are
     /// started unchanged.
     #[default]
     Auto,

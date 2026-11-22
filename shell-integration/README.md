@@ -17,7 +17,7 @@ startup, which script version is running
 
 ## Automatic (the default)
 
-Tessera loads the scripts into the zsh and fish it starts without
+Tessera loads the scripts into the zsh, bash and fish it starts without
 installing anything: the scripts are compiled into Tessera and written to
 `~/Library/Application Support/Tessera/shell-integration/<version>/` the
 first time a shell needs them, and the shell is pointed at them through
@@ -29,22 +29,30 @@ its environment:
   have none of `.zshenv`, `.zprofile`, `.zshrc` or `.zlogin`, Tessera leaves
   zsh alone so its new-user setup can run: `touch ~/.zshrc` turns the
   integration on.
-- **bash**: not loaded automatically yet; bash support is a follow-up.
-  The way Tessera would load it into a login bash (a `PROMPT_COMMAND`
-  loader) breaks under prompt tools that wrap the existing
-  `PROMPT_COMMAND`, such as starship: they keep running the loader after
-  it has removed itself and print an error after every command. Until then
-  bash starts exactly as without Tessera; you can source the script
-  yourself (see [Manual installation](#manual-installation)).
+- **bash**: an interactive non-login bash starts as `bash --rcfile
+  <our script>`, which sources your `~/.bashrc` (or your own `--rcfile`)
+  first. A login bash (Tessera's default) gets an exported `PROMPT_COMMAND`
+  ending in a loader that sources the script at the first prompt, after
+  your `.bash_profile` ran; the script takes the loader out again and stops
+  exporting `PROMPT_COMMAND`, and a copy a prompt tool kept (starship) does
+  nothing after that. A bash running a command (`-c`) or a script is left
+  alone, and so is a login bash whose startup files assign
+  `PROMPT_COMMAND`, make it an array (`PROMPT_COMMAND+=(...)`, oh-my-bash
+  on bash 5.1+) or add to it both after a newline and after a `;`. A
+  `--norc` or posix-mode bash (`--posix`, `-o posix`, `POSIXLY_CORRECT`,
+  `SHELLOPTS` with `posix`) takes the loader, not `--rcfile`. On bash 3.2
+  the script keeps `PIPESTATUS` for a command line that names it; the
+  limits are in the script's header and ADR 0021.
 - **fish**: our directory goes first in `XDG_DATA_DIRS`, so fish loads the
   `vendor_conf.d` script, which takes it out again. fish 4.0 and later mark
   prompts themselves (and 4.3 and later report the directory); the script
   then only sends the handshake.
 
-Every injected shell gets `TESSERA_SHELL_INTEGRATION=enabled`. The scripts
-read it at the first prompt, so your startup files can change it, and then
-unset it, so shells you start inside a session (`exec zsh`, tmux) are not
-integrated automatically.
+Every injected shell gets `TESSERA_SHELL_INTEGRATION=enabled` (a login
+bash gets the words in its loader instead). The scripts read it at the
+first prompt, so your startup files can change it, and then unset it, so
+shells you start inside a session (`exec zsh`, tmux) are not integrated
+automatically.
 
 ### Turning it off
 
@@ -113,11 +121,52 @@ kept). An existing `DEBUG` trap keeps running; with
 [bash-preexec](https://github.com/rcaloras/bash-preexec) loaded, its hook
 lists are used instead. Once loaded, `PROMPT_COMMAND` is no longer
 exported, so shells started inside a session do not inherit our hooks.
-Limits: a `PROMPT_COMMAND` entry (or bash 5.1 array element) added after
-ours runs after the prompt marks for one prompt, then the script moves its
-own entry back to the end; a `DEBUG` trap set after the script loaded is
+On bash 5.1 and later a `PROMPT_COMMAND` that is an array (bash-preexec
+0.6 or later makes one, atuin loads it; oh-my-bash appends an element) is
+not integrated: the shell runs as without Tessera, with no marks
+([#613](https://github.com/aanyberg/tessera/issues/613)).
+Limits: a `PROMPT_COMMAND` entry added after
+ours runs after the prompt marks for one prompt (it sees the command's `$?`
+there but not its `PIPESTATUS`), then the script moves its own entry back
+to the end, and from the next prompt on the entry sees both as without
+Tessera; a `DEBUG` trap set after the script loaded is
 replaced at the next prompt; and a command line that only runs a subshell,
-`(cd x; make)`, is reported as a prompt with no command (a bare `D`).
+`(cd x; make)`, is reported as a prompt with no command (a bare `D`; with
+`set -T` or `extdebug` the subshell sends the `C` itself). An entry
+appended with `PROMPT_COMMAND="$PROMPT_COMMAND; cmd"` keeps every mark
+while `PS1` keeps our `B` mark (not with `shopt -u promptvars`).
+
+bash with prompt tools, in a login shell:
+
+- **starship**: it moves `PROMPT_COMMAND` into its own hook and rewrites
+  `PS1` after the script loaded, so the first prompt and the first command
+  are unmarked; every later prompt and command is marked.
+- **bash-preexec** (0.5.0 to 0.7.0): marked from the first prompt on bash
+  3.2 to 5.0; on 5.1 and later only 0.5.0, as 0.6.0 and later make
+  `PROMPT_COMMAND` an array (not integrated).
+- **oh-my-bash**: it adds to `PROMPT_COMMAND` as an array
+  (`PROMPT_COMMAND+=(...)`), so a login bash that loads it is left alone, on
+  every bash version: no marks (ADR 0021, B5h). Workaround: run a non-login
+  bash (`/bin/bash -i` as the profile's command, or `bash` typed at the login
+  shell), which takes the `--rcfile` route and is marked from the first
+  prompt on bash 3.2 to 5.0, also with bash-preexec (on 5.1 and later its
+  array is not integrated); or source `bash/tessera.bash` yourself at
+  the end of `~/.bashrc`, after oh-my-bash.
+- **A startup file that assigns `PROMPT_COMMAND`** (rather than adding to
+  it): Tessera reads `.bash_profile` (or `.bash_login`, or `.profile`),
+  `.bashrc` and the files they source by a literal `~/`, `$HOME` or absolute
+  path, without running them, and starts such a login bash with no
+  integration, as if Tessera did not know it. The same happens when one of
+  those files is not a regular file, is over 1 MiB, cannot be read in about a
+  second, or when they source more than about 30 files. Add to the variable
+  instead (`PROMPT_COMMAND="${PROMPT_COMMAND:+$PROMPT_COMMAND$'\n'}history -a"`),
+  which marks everything but the first command, or source the script
+  yourself. An assignment Tessera cannot see (behind a computed `source`
+  path, in `eval`, or in `/etc`) still removes the loader and stays exported,
+  so a child bash or `sh` that lacks a function it names prints `command not
+  found` at its prompts.
+
+powerlevel10k is zsh-only; its instant prompt is the zsh limit above.
 
 ## Checking the scripts
 

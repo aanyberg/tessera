@@ -50,8 +50,8 @@ again (as in kitty: a manual `zsh` inside a session is plain).
   `--no-rcs`, `-o norcs`, `+o rcs`), is not touched: it would never run our
   `.zshenv` (or not interactively), so our `ZDOTDIR` would reach the
   programs it starts (a tmux pane, say).
-- **bash** (not injected yet, see "Bash: a follow-up" below; this is the
-  design the script and `Injection::for_bash` implement): kitty's mechanism (`ENV=<script>` plus `--posix`, the script
+- **bash** (injected since the 2026-11-17 amendment below, which replaces
+  the login route described here): kitty's mechanism (`ENV=<script>` plus `--posix`, the script
   then leaving POSIX mode) does not work on the macOS `/bin/bash` 3.2.57:
   `bash --posix -i` never reads `$ENV` there (fixture B8), and kitty refuses
   bash older than 4 anyway. Tessera uses two mechanisms that work on 3.2 and
@@ -187,12 +187,9 @@ skips the command. The trap saves `$?` and `$_` first
 and ends with a function whose status and last argument they are
 (bash-preexec's technique), so `mkdir d` followed by `cd $_` and a user trap
 after ours see what they would without it. bash 5.1 and later run every
-element of an array `PROMPT_COMMAND`; the script joins the elements into one
-string (at load and at each prompt) so its entries stay first and last. bash
-runs a copy of the array taken when the prompt starts, so at the prompt
-right after an element is added interactively that element still runs
-after ours: the script does not arm its trap then, and that one command has
-no `C` and ends with a bare `D`. With bash-preexec loaded its
+element of an array `PROMPT_COMMAND`; the integration takes a string
+`PROMPT_COMMAND` only, and leaves a shell whose `PROMPT_COMMAND` is an array
+as it is without Tessera (see **Arrays are not integrated** below). With bash-preexec loaded its
 `preexec_functions`/`precmd_functions` are used instead. Limits, documented
 in the script: a `DEBUG` trap the user sets after the script loaded is
 replaced at the next prompt by ours chained to the one found at load
@@ -231,7 +228,8 @@ logged). #45 navigates between `A` marks and selects command output
 between `C` and `D`. Per-profile overrides of `shell_integration` arrive
 with profiles (#39).
 
-**Bash: a follow-up.** Tessera does not inject bash yet:
+**Bash: a follow-up** (resolved by the 2026-11-17 amendment). Tessera did
+not inject bash at first:
 `Injection::for_shell` leaves every bash alone and `App::spawn_session`
 starts it unchanged, while the script, `Injection::for_bash` (the rules
 above) and their live tests stay in the tree. The adversarial run on the
@@ -256,7 +254,8 @@ a fresh copy in its place.
   reports without installing anything; `TESSERA_SHELL_INTEGRATION=0` or
   `shell_integration = "off"` opts out, and the scripts can be sourced
   manually in other shells (`shell-integration/README.md`).
-- bash users are not integrated automatically yet (a follow-up); a new zsh
+- bash users are integrated automatically too (2026-11-17 amendment),
+  except a login bash whose startup files assign `PROMPT_COMMAND`; a new zsh
   user without startup files and shells started inside a session (`exec
   zsh`, tmux) are not integrated automatically either.
 - Every script change bumps `SCRIPTS_VERSION`; the old directory is pruned
@@ -267,6 +266,127 @@ a fresh copy in its place.
 - `tests/live.rs` runs the scripts in `/bin/zsh`, `/bin/bash`, Homebrew's
   bash 5 and fish (each skipped when absent) through a real PTY on every
   test run.
+
+## Amendment 2026-11-17: bash is injected, with a guarded loader
+
+`Injection::for_shell(Shell::Bash, ..)` returns the bash injection
+(`Injection::for_bash` is gone) and `App::spawn_session` uses it. The
+routes, by launch, on every bash version (one route each, no version probe;
+kitty's `--posix`/`ENV` route is not used for bash 4 and later either, so
+3.2 and 5.x run the same code):
+
+| Launch | Route |
+| --- | --- |
+| interactive non-login (`-i`, or no `-c`/script operand) | `--rcfile <scripts>/bash/tessera.bash`, unchanged from above (`TESSERA_SHELL_INTEGRATION`, `TESSERA_BASH_INJECT=rcfile`, `TESSERA_BASH_RCFILE`, all taken out of the environment before `~/.bashrc`) |
+| login (`-bash`, `-l`), `--posix`, `--norc` | an exported `PROMPT_COMMAND` ending in the loader below; no other variable |
+| `-c` (even `-ic`), a script without `-i` | none |
+
+The loader is self-contained text, with the feature words and the script's
+path quoted literally (a `'` as `'\''`), and no variable of ours:
+
+```bash
+builtin [ -n "${_tessera_si_loader-}" ] || _tessera_si_load='enabled' . '<scripts>/bash/tessera.bash' 2>/dev/null
+```
+
+The guard and the redirection keep a loader that outlives its shell silent.
+A prompt tool
+that copies `PROMPT_COMMAND` before the loader removed itself (starship
+moves it into `STARSHIP_PROMPT_COMMAND` and evaluates that copy at every
+prompt) runs a copy that the first guard turns into a no-op once the
+script has set `_tessera_si_loader`, instead of the old
+`. "$TESSERA_BASH_SCRIPT"`, which ran `. ""` and printed `No such file or
+directory` after every command once the variable was unset. A loader that
+never ran stays exported when a startup file replaces the shell
+(`.bash_profile` with `exec tmux` leaves it in the tmux server's
+environment, so every new pane inherits it), and an update prunes the
+script it names: the redirection makes such a shell's failing `.` silent at
+every prompt, with no integration, rather than print that error (an
+interactive shell survives it, also in POSIX mode). The path is written once
+because bash-preexec's sanitizer on bash 3.2 slows down steeply with the
+length of `PROMPT_COMMAND`. The temporary assignment uses `.`, not `builtin .`: bash 3.2 drops a temporary
+assignment to `builtin` after the first command of the sourced file. The
+script takes the feature words from `_tessera_si_load`, unsets it, sets
+`TESSERA_SHELL_INTEGRATION` unexported (unless a startup file set it),
+replaces the loader text it rebuilds from the same words and its own
+`BASH_SOURCE` with `:`, and stops exporting `PROMPT_COMMAND`. So no
+`TESSERA_*` variable and no `PROMPT_COMMAND` reaches a child of an
+integrated login bash.
+
+Prompt tools (stand-ins of starship 1.27 and master, bash-preexec 0.7.0,
+0.6.0 and 0.5.0 and oh-my-bash in
+`crates/tessera-shell-integration/tests/fixtures/bash-tools/`, table in
+`tests/fixtures/bash_spec.txt`, run by `tests/bash_tools.rs` on `/bin/bash`
+3.2.57 and, with its own first-prompt columns, on bash 5.1 and later; taken
+on Homebrew's 5.3):
+
+- Loaded where the shell's own `PROMPT_COMMAND` runs the loader (no tool,
+  bash-preexec, oh-my-bash, both): the first prompt has `A`/`B` and every
+  command `C` and `D;<status>`, except for the bash 5.1 cases below. With
+  bash-preexec, whose install entry the script finds through
+  `__bp_install_string` (each release has its own text), that entry moves
+  to the end of `PROMPT_COMMAND` and the first prompt gets its marks from
+  the precmd it forces; afterwards the script's prompt entry stays the last
+  one before `__bp_interactive_mode`, so a theme's entry that rebuilds `PS1`
+  runs first. A `C` is only sent for a prompt whose `PS1` shows our marks
+  (no `C` that does not follow a `B`, also with bash-preexec's `PS0` path on
+  bash 5.3) and a bare `D` only after one. The `DEBUG` trap is armed at load only when the
+  loader was the last entry of `PROMPT_COMMAND` at top level, since an
+  entry after it, or a tool's function around it, would fire the trap and
+  send a stray `C` before the first prompt.
+- Loaded inside another tool's hook (starship evaluates its copy of
+  `PROMPT_COMMAND` in a function and rewrites `PS1` after it): the first
+  prompt and the first command are unmarked, with no stray `C` and no bare
+  `D`; every later prompt has `A`/`B` and every later command `C` and
+  `D;<status>` (lead decision D3).
+- bash 5.1 and later with an array `PROMPT_COMMAND` (oh-my-bash appends an
+  element, bash-preexec 0.6 and later make one): not integrated, on every
+  route (the 2026-11-22 amendment, **Arrays are not integrated** below).
+- A startup file that assigns `PROMPT_COMMAND` would drop the loader and,
+  because bash keeps the export attribute of a variable that came from the
+  environment, leave its own value exported with no code of ours running to
+  clear it. A child `bash`, `bash --norc`, `sh -i` or `script` that lacks the
+  function it names then prints `__p: command not found` at every prompt. So
+  before giving a bash the loader, `Injection::for_shell` reads what that
+  bash would read, without running anything: for a login shell the first of
+  `~/.bash_profile`, `~/.bash_login` and `~/.profile`, and `~/.bashrc`; for
+  `--posix` `$ENV` and, unless `--norc`, `~/.bashrc` (the macOS bash 3.2 reads
+  that instead); and one level of `.`/`source` with a literal `~/`, `$HOME` or
+  absolute path. If one of them assigns the variable without expanding its
+  old value (`+=`, `"x;$PROMPT_COMMAND"` and array appends stay injected) bash
+  starts exactly as if Tessera did not know it. Sourced files holding
+  bash-preexec or a cached `starship init` are exempt: they assign the
+  variable and keep its entries.
+  The decision errs towards not injecting, since a false alarm costs one
+  shell's integration and a miss prints errors in its children. The files are
+  untrusted input: regular files only, opened so that a FIFO or device cannot
+  block, 1 MiB per file and 32 paths per scan, and anything over a limit,
+  unreadable or without an absolute `HOME` counts as "do not inject". Spawning
+  runs on the app's main thread and a regular file on a stalled disk can block
+  in `read`, so the scan runs on its own thread: the caller waits for about a
+  second and then starts bash uninjected, and at most 8 scans can be alive.
+  What remains: an assignment behind a computed `source` path, in `eval`, or
+  in `/etc` is not seen, and then the child errors above still happen. The
+  way to end them is a route that runs before the startup files, `--noprofile`
+  with an emulated login through the `--rcfile` route (prototyped; the 0.3.0
+  follow-up). The `--rcfile` route itself is not affected: there the script
+  clears the export, with or without bash-preexec.
+- An entry appended with `PROMPT_COMMAND="$PROMPT_COMMAND; cmd"` stays
+  valid (the script's own entries are newline-separated and the last ends
+  without a separator); since bash now runs `cmd` after our entries, the
+  trap is armed from the expansion of `PS1` instead
+  (`${_tessera_si_none[_tessera_si_armed=1]-}` inside the `B` mark), so
+  every command keeps its `C` (not with `promptvars` off or with `PS1`
+  rebuilt by the appended command, which then gets the bare-`D` case).
+- OSC 7 is encoded once per directory and host (the encoded value is
+  cached; one value, S5), not at every prompt: a 3.4 KB non-ASCII
+  directory took 79 ms per prompt on bash 3.2.
+
+A bash 4.0 to 5.0, when it is the one installed, runs the same tests and
+holds every rule except the first-prompt marks; a real login bash with the
+user's own dotfiles is eye check E5. The other limits stand as described under **Hooks** (a command
+line that only runs a subshell ends with a bare `D`; `extdebug` and `set -T`
+let the subshell send the `C`). powerlevel10k is zsh-only, so it does not
+apply to bash.
 
 ## Amendment: bash marks stay out of redirected output (#538, 2026-11-19)
 
@@ -349,3 +469,210 @@ The user's trap now also runs for the read, once more per prompt. Loaded from
 startup file set: bash 5.3 keeps the trap the file sets, so the user's is
 lost, and 3.2 puts it back, so the first command has no `C` (documented in
 the script).
+
+## Amendment: bash injection is on, with the scan's terminator, a 3.2 PIPESTATUS restore and the M10 table (#158, #540, 2026-11-22)
+
+Bash is injected on the `--rcfile` route and the login route. The decisions
+of the wave 27 review (fixture rows in
+`crates/tessera-shell-integration/tests/fixtures/bash_spec.txt`, one live test
+each in `tests/bash_rows.rs`):
+
+- **The scan picks what follows the loader (B5).** The login route's
+  `PROMPT_COMMAND` ends with the loader, so `.bash_profile` appends land right
+  after its last word. The startup scan classifies every append it sees: one
+  that starts with a separator (`"$PROMPT_COMMAND; x"`,
+  `"${PROMPT_COMMAND:+$PROMPT_COMMAND;}x"`, blanks then a separator) or a
+  newline is fine after the bare loader; a glued one (`+='x'`,
+  `"${PROMPT_COMMAND}x"`, `"$PROMPT_COMMAND x"`, and one led by an expansion
+  the scan does not know) needs a newline after it. Every append
+  separator-led: nothing follows the loader; any glued one, or none seen: a
+  newline follows it; both kinds: no injection (no single ending suits both).
+  A separator-led append the scan cannot see (beyond the caps, in `eval`,
+  behind a computed path) prints one syntax error on the loading prompt.
+  The scan's own choices, each a fixture row: blanks before a separator
+  (`"$PROMPT_COMMAND ; x"`) count as separator-led (pc B5j, scan U2); an
+  append led by an expansion the scan cannot read (`"$PROMPT_COMMAND$x y"`)
+  counts as glued, so a `$x` that starts with `;` gets the newline and
+  prints a syntax error at the loading prompt (pc B5k, scan U3); a
+  POSIX-mode login bash has every profile scanned (`.bash_profile`,
+  `.bash_login` and `.profile`), since 3.2 and 5.x differ on which they read
+  (scan U1). Once loaded, the script removes the loader together with the
+  `;`, `&&`, `||`, `&`, `|`, newlines and blanks that followed it, so the
+  user's entry starts with its command (`b5_loaded_entries_lose_the_separator`;
+  a leading `&&` was a syntax error at every later prompt, pc B5l). A leading
+  `||` is a semantic change: `"$PROMPT_COMMAND || cmd"` runs `cmd` at every
+  prompt from the second on, where without Tessera it is a syntax error at
+  every prompt; the lesser harm, and rare.
+- **Arrays leave the shell alone (B5h).** `PROMPT_COMMAND+=(...)`,
+  `PROMPT_COMMAND=(...)` and any subscripted assignment mean no injection on
+  the login route, on every bash: on 3.2 an element added to a string
+  `PROMPT_COMMAND` lands at `[1]`, which never runs. Users of such startup
+  files get no marks on the login route. oh-my-bash is one: its
+  `PROMPT_COMMAND+=(...)` is in its own files, which the scan reads as text
+  whatever the bash version, so an oh-my-bash login shell is not injected on
+  any bash (its fixture rows X5, X6, X7, X14e, X15c and X15d are skipped on
+  the login route as `login-alone`, and run on the `--rcfile` route).
+  Workaround: start a non-login bash (the `--rcfile` route; for example the
+  profile's command `/bin/bash -i`, or `bash` run from the login shell), or
+  source `tessera.bash` from `.bashrc` after oh-my-bash.
+- **The loader text is removed completely (B6).** After loading, nothing of
+  the loader is left in `PROMPT_COMMAND` (no `:` or test). No status-capturing
+  wrapper: the entry on the loading prompt sees the status the loader left
+  (0; B6b, stated limit); from the second prompt on, the user's entries see
+  the command's `$?` and `PIPESTATUS` as without Tessera. An entry added
+  at a prompt (`PROMPT_COMMAND+=$'\n'cmd`, `PROMPT_COMMAND="$PROMPT_COMMAND;
+  cmd"`) runs after our tail at that prompt and sees
+  the command's `$?` but not its `PIPESTATUS` there, as on main; from the
+  next prompt on the script has moved it up behind the head's restore,
+  without its leading separators, and it sees both as without Tessera
+  (`entries_added_at_a_prompt_see_the_users_status`).
+  A string `PROMPT_COMMAND` is never made an array (the
+  `PROMPT_COMMAND="$PROMPT_COMMAND; f"` idiom has to keep working); an
+  array is not integrated (**Arrays are not integrated** below).
+- **The scan does not block on what it reads (B8).** A path is stat'ed
+  (following links) first; anything but a regular file is left to bash
+  unopened. It is then opened with `O_NONBLOCK|O_NOCTTY|O_CLOEXEC` and
+  fstat'ed: a file swapped between the two (other device or inode, or no
+  longer regular) is not read. The caps (1 MiB, 32 files, 8 scans, 1 s) are
+  unchanged.
+- **Tool names count as definitions only (M2).** A file that assigns
+  `PROMPT_COMMAND` is exempt as a prompt tool's only when it defines one of
+  the tool names (`name=`, `name()`, `function name` at a line start, outside
+  a heredoc body), not when it mentions one.
+- **The `--rcfile` route only where bash reads it (M10).** Not for `--norc`,
+  `-norc`, `--posix`, `-posix`, `-o posix` (bash's single-dash long options
+  are recognised), an environment with `POSIXLY_CORRECT` or a `SHELLOPTS`
+  holding `posix`; those launches take the loader or no injection, so no
+  `TESSERA_*` variable is left in a shell that never read our rc file.
+  Posix mode counts on the login route too, where the scan then reads every
+  profile.
+- **PIPESTATUS on bash 3.2 (#540).** bash 3.2 resets `PIPESTATUS` in any
+  DEBUG trap. `_tessera_si_precmd` saves `$?` and `PIPESTATUS` first; the
+  armed trap, for a command whose text names `PIPESTATUS` (no trap of the
+  user's, `extdebug` off), puts them back with a pre-generated pipeline of
+  `_tessera_si_rv` calls (2 to 9 commands, a `z`/`n` pair per length by the
+  status's sign: 16 bounded pipelines, plus a function call for one failed
+  command), never the last command of its list. The user's `PROMPT_COMMAND`
+  entries get the same restore before each of their commands on 3.2, which
+  is all they need there (so the head has no restore on 3.2, P18 under
+  `set -T`); on bash 4 and later (which keep `PIPESTATUS` in the trap) a
+  string `PROMPT_COMMAND`'s entries get the head's restore. The
+  head's top-level commands (the trap read and install) are `eval`'d from a
+  variable, so `PROMPT_COMMAND` holds one line of ours before the user's
+  entries: 71 bytes on 3.2, that line plus a compact `case` on bash 4 and
+  later (2026 bytes; `the_head_before_the_users_entries_stays_short` bounds
+  both). The bound: the trap text and the bash 4+ head hold 16
+  pre-generated pipelines each (`z2`..`z9`, `n2`..`n9`, at most 9 commands),
+  fixed when the script loads, never built from what the user ran; more than 9 pipeline
+  commands are not restored (P15). Cost, one fork per pipeline command per
+  restore: on bash 3.2, after a pipeline of 2 to 9 commands, for a command
+  line naming `PIPESTATUS` and, with user entries, before each top-level
+  command of those entries; on bash 4 and later only the head's restore for
+  the user's entries, that is with a `PROMPT_COMMAND` entry of the user's and
+  after a pipeline of 2 to 9 commands, once per prompt (up to 9 forks).
+  Under `set -T` (the DEBUG trap runs in functions) bash 3.2 also restores
+  before each command a user entry function runs and twice for the
+  function's call; the trap text skips commands inside our own functions
+  (`FUNCNAME`), so the hooks add nothing per command of theirs. With
+  `f() { echo; true; true; }` as the entry, `true | false | true` costs 15
+  forks on 3.2 (5 restores) and 3 on 5.3, the head's
+  (`p18_set_t_forks_for_the_users_commands_only`).
+  With no user entries bash 4 and later fork for nothing: P18
+  (`p18_bash_4_restores_nothing`) logs every restoring command's `$BASHPID`
+  on 5.3 and sees none forked after `true | false | true`, then 3 forked once
+  an entry is added. An ordinary line forks nothing on any bash
+  (`_tessera_si_restores` counts the restores).
+- **Accepted limits**, each pinned by a fixture row: P14 (`extdebug`: no
+  restore), P15 (more than 9 pipeline commands), the gate miss G1 (a function
+  that reads `PIPESTATUS` called by a line that does not name it); P16 (after
+  an empty line) passes. P17 / M7 (a user DEBUG trap: no restore, and the trap also runs for
+  the hooks' first commands at each prompt, so it fires more often than
+  without Tessera); M1 (as documented above, the user's trap also runs
+  during the prompt hooks); on the login route with a DEBUG trap set in
+  `.bash_profile`, bash 3.2's first command has no `C` and a bare `D`.
+- **Known limits.** bash-preexec 0.7.0's sanitizer (`__bp_sanitize_string`,
+  run when `. bash-preexec.sh` installs at a prompt) is slow on any string
+  `PROMPT_COMMAND` with text before its install `:`, with or without
+  Tessera: its extglob loop grows steeply with that text (with an 80-byte
+  string before the `:`, sourcing it stalls bash 3.2 for about 8 s and 5.3
+  for about 2 s; main's 260-byte head stalled it for 7 to 11 s on 3.2 and
+  5.5 to 6 s on 5.3). Our part is kept short for it: measured at a prompt
+  with bash-preexec 0.7.0 (`. bash-preexec.sh` until the next prompt,
+  load 9 to 16), 0.5 to 0.95 s on 3.2 (main 10.7 s), 0.01 s on 5.3 (main
+  5.45 s; there bash-preexec 0.7 adds its install as an array element, so
+  the shell leaves the integration); on bash 4.x and 5.0, which sanitize
+  the whole string, the bash 4+ head costs the sanitizer 0.09 s (measured
+  on 5.3). A user's own long entries before
+  bash-preexec still stall it as they do without Tessera.
+- **`set -u`.** Every expansion of `PROMPT_COMMAND` and of our variables is
+  safe under `set -u` (the array attribute test turns `nounset` off inside
+  its function), on 3.2 and 5.3, on both routes
+  (`set_u_shells_are_integrated`; an array under `set -u` is left alone
+  without an error, `an_array_prompt_command_is_left_alone`).
+- **Arrays are not integrated (2026-11-22, lead decision after #158 r4,
+  [#613](https://github.com/aanyberg/tessera/issues/613)).** On bash 5.1 and later a shell whose `PROMPT_COMMAND` is an
+  array when the script loads, or turns into one at a prompt, runs as it
+  does without Tessera: no hooks, no DEBUG trap of ours, no marks.
+  `_tessera_si_off=array` records why (no user text). In plain words: bash
+  5.1+ with bash-preexec 0.6 or later (atuin, for example, loads it), or
+  with oh-my-bash, gets no shell integration. Placing our head and tail as
+  elements of their own (r3 B2) left the user's indices shifted by one and
+  edits of our slots running stale elements; that path is removed. At
+  load, an array means nothing is installed and no handshake is sent
+  (`an_array_prompt_command_is_left_alone`, the `off` rows of
+  `bash_spec.txt`). Turned into one at a prompt, the next prompt takes the
+  integration out: our text leaves every element, the marks leave `PS1`,
+  our functions leave bash-preexec's lists, and our trap puts the user's
+  back when it fires next; the command that made the array ends with
+  `D;<status>` when our head still ran first and a bare `D` otherwise
+  (`a_string_turned_into_an_array_is_left_alone`). bash-preexec 0.6 makes
+  the array at its first prompt, after the handshake and that prompt's
+  OSC 7: no `133` mark is sent. Known limit: a whole new array
+  (`PROMPT_COMMAND=(...)`), like a whole new string, leaves nothing of ours
+  to run, so it is not taken out: `PS1` keeps its `A` and `B` marks, and no
+  `C` or `D` (so no status) is sent from then on.
+- **An entry put before our head (#158 r4 B1).** `PROMPT_COMMAND="cmd;
+  $PROMPT_COMMAND"` at a prompt, or a `.bashrc` that does this and is
+  sourced again (`. ~/.bashrc`), runs `cmd` before the head reads `$?`. The
+  head sends `D;<status>` only when it is the start of `PROMPT_COMMAND` (or
+  bash-preexec's prologue, which keeps `$?`, is: #158 r5 B2); otherwise that
+  command's `D` is bare. With bash-preexec, whether sourced before the
+  script or at a prompt, the string is left as it is, so every later `D` is
+  bare while the entry stays first
+  (`an_entry_put_before_bash_preexec_never_sends_a_wrong_status`). The tail puts the head first again, and from the
+  next prompt every command gets its own status
+  (`an_entry_put_before_our_head_never_sends_a_wrong_status`, both repros
+  on 3.2 and 5.3). Not covered, and tracked in #590: removing our head's
+  line (`PROMPT_COMMAND=${PROMPT_COMMAND#*$'\n'}`) gives the user's entry a
+  stale `$?` for one prompt and that command no `C`; removing our tail's
+  last line (`PROMPT_COMMAND=${PROMPT_COMMAND%$'\n'*}`) sends two `D`s at
+  every later prompt and runs the user's entries twice.
+- **bash-preexec sourced at a prompt on bash 3.2 (#158 r3 B3).** Once a
+  string `PROMPT_COMMAND` holds bash-preexec's `__bp_precmd_invoke_cmd`, the
+  hooks no longer move head and tail around it (re-placing them each prompt
+  made bash-preexec 0.7.0's sanitizer run on our text: 3.5 to 5.6 s per
+  prompt). Head and tail stay where bash-preexec put them, the `B` mark
+  comes from the `PS1` arm, and a prompt whose head did not run sends a bare
+  `D`. The first command after `. bash-preexec.sh` runs while bash-preexec
+  installs itself: no `C`, a bare `D`; every later command keeps its `C` and
+  `D;<status>` (`bash_preexec_sourced_at_a_prompt_keeps_its_prompt_command`).
+  Measured with bash-preexec 0.7.0 on 3.2 at load 10 to 20: 0.004 s per later
+  prompt (0.002 s without Tessera); the source itself 1.4 s.
+- **bash-preexec 0.5 and 0.6 sourced at a prompt.** Their install text,
+  appended after our tail, saves `trap -p DEBUG` as the trap to keep and
+  runs it as a preexec function. While that text is in `PROMPT_COMMAND`,
+  our trap puts the user's trap back when it fires for it, so bash-preexec
+  keeps the user's trap and never ours (ours, run from its preexec, would
+  replace its trap and its preexec functions would never run again). The
+  command after the source gets no `C` and a bare `D`, as above
+  (`bash_preexec_sourced_at_a_prompt_runs_preexec_functions`, every bash and
+  version). On bash 5.1+ 0.6 (and 0.7) make `PROMPT_COMMAND` an array at
+  that prompt: the shell leaves the integration, and their preexec
+  functions run as without Tessera.
+- **direnv sourced again at a prompt (#158 r3 M6).** direnv's hook tests
+  `";${PROMPT_COMMAND[*]};"` for `;_direnv_hook;`. On a string
+  `PROMPT_COMMAND` our head is first and ends with a newline, so a second
+  `eval "$(direnv hook bash)"` at a prompt does not see the first hook and
+  adds another; `_direnv_hook` then runs twice per prompt (it is
+  idempotent). Startup files are not affected: they run before the head is
+  placed.

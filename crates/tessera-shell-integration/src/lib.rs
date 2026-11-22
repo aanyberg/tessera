@@ -16,6 +16,7 @@
 
 #![forbid(unsafe_code)]
 
+mod bash_startup;
 pub mod inject;
 pub mod osc7;
 pub mod scripts;

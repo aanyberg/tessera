@@ -56,7 +56,7 @@ app_appearance = "dark"
 [terminal]
 # Maximum number of lines kept in scrollback per pane.
 scrollback_lines = 10000
-# Shell integration for zsh and fish (bash support is to follow): "auto"
+# Shell integration for zsh, bash and fish: "auto"
 # makes the shells Tessera starts load its scripts (prompt marks, working
 # directory reports); "off" starts them unchanged. TESSERA_SHELL_INTEGRATION=0 in a shell's
 # environment turns it off for that shell.

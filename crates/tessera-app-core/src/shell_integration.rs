@@ -1,13 +1,13 @@
 //! Shell integration on spawn (ADR 0021).
 //!
 //! [`App::spawn_session`](crate::App::spawn_session) passes its options
-//! through [`apply`]: with `[terminal] shell_integration = "auto"` a zsh or
-//! fish gets the environment that makes it load the scripts
+//! through [`apply`]: with `[terminal] shell_integration = "auto"` a zsh,
+//! bash or fish gets the environment (and a non-login bash the arguments)
+//! that makes it load the scripts
 //! `tessera-shell-integration` materialises under
 //! [`ConfigPaths::shell_integration_dir`](tessera_config::ConfigPaths::shell_integration_dir).
 //! The added variables are part of `SpawnOptions::env`, so the spawn's
-//! `execve` size check counts them like any other. bash is started
-//! unchanged for now (bash support is a follow-up, ADR 0021).
+//! `execve` size check counts them like any other.
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -200,22 +200,61 @@ mod tests {
     }
 
     #[test]
-    fn bash_is_started_unchanged() {
+    fn bash_loads_the_script_from_its_rcfile_or_prompt_command() {
         let dirs = dirs();
-        for options in [
-            SpawnOptions::command("/bin/bash", "1"),
+        let script = version_dir(&dirs.scripts).join("bash/tessera.bash");
+        let user = [("SHELL", "/bin/bash"), ("HOME", dirs.home.as_str())];
+        let out = apply_with(
             SpawnOptions::command("/bin/bash", "1").arg("-i"),
+            ShellIntegration::Auto,
+            &dirs.scripts,
+            inherited(&user),
+        );
+        assert_eq!(args_of(&out), ["--rcfile", script.to_str().unwrap(), "-i"]);
+        assert_eq!(env_of(&out, ENABLED_VAR), [OsStr::new("enabled")]);
+        // A login shell: no arguments, only the loader in PROMPT_COMMAND.
+        let out = apply_with(
             SpawnOptions::login_shell("1"),
-        ] {
-            let out = apply_with(
-                options.clone(),
-                ShellIntegration::Auto,
-                &dirs.scripts,
-                inherited(&[("SHELL", "/bin/bash"), ("HOME", &dirs.home)]),
-            );
-            assert_eq!(out, options);
-        }
+            ShellIntegration::Auto,
+            &dirs.scripts,
+            inherited(&user),
+        );
+        assert_eq!(args_of(&out), Vec::<String>::new());
+        assert_eq!(env_of(&out, ENABLED_VAR), Vec::<&OsStr>::new());
+        // No startup file appends to it: a newline follows the loader.
+        let mut loader = tessera_shell_integration::inject::bash_loader(&script);
+        loader.push("\n");
+        assert_eq!(env_of(&out, "PROMPT_COMMAND"), [loader.as_os_str()]);
+        assert!(script.is_file(), "scripts not written");
+    }
+
+    /// A profile that replaces `PROMPT_COMMAND` would lose the loader and
+    /// export its own value: that bash starts exactly as without Tessera,
+    /// and nothing is written. The `HOME` is the child's.
+    #[test]
+    fn a_bash_whose_profile_replaces_prompt_command_is_left_alone() {
+        let dirs = dirs();
+        let profile = Path::new(&dirs.home).join(".bash_profile");
+        std::fs::write(&profile, "__p() { :; }; PROMPT_COMMAND=__p\n").unwrap();
+        let out = apply_with(
+            SpawnOptions::login_shell("1").env("HOME", &dirs.home),
+            ShellIntegration::Auto,
+            &dirs.scripts,
+            inherited(&[("SHELL", "/bin/bash"), ("HOME", "/nonexistent")]),
+        );
+        assert_eq!(env_of(&out, "PROMPT_COMMAND"), Vec::<&OsStr>::new());
+        assert_eq!(args_of(&out), Vec::<String>::new());
         assert!(!dirs.scripts.exists(), "scripts written for nothing");
+        // Adding to it keeps the integration.
+        std::fs::write(&profile, "PROMPT_COMMAND=\"x;$PROMPT_COMMAND\"\n").unwrap();
+        let out = apply_with(
+            SpawnOptions::login_shell("1").env("HOME", &dirs.home),
+            ShellIntegration::Auto,
+            &dirs.scripts,
+            inherited(&[("SHELL", "/bin/bash")]),
+        );
+        assert_eq!(env_of(&out, "PROMPT_COMMAND").len(), 1);
+        assert!(dirs.scripts.exists(), "scripts not written");
     }
 
     #[test]
