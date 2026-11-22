@@ -15,6 +15,9 @@ import TesseraKit
 /// each pane's backdrop, which would otherwise show its material, not the
 /// radius.
 ///
+/// The scroll bar's overlay knob is drawn for the session's background too
+/// (``TerminalScroller/themeBackground``).
+///
 /// The appearance is the session's (``TesseraSession/appearance()``), read
 /// when the surface attaches and again on every
 /// ``TesseraAppDelegate/appearanceDidChange(opaque:)``; nothing here reads
@@ -51,6 +54,7 @@ extension TerminalSurfaceView {
             appearance = nil
         }
         backgroundAppearance = appearance
+        scroller.themeBackground = appearance?.background
         let blur = surface.isAttached && (appearance?.blur ?? false)
         if blur, backdrop == nil {
             let view = PaneBackdropView(frame: bounds)

@@ -26,10 +26,12 @@ import TesseraKit
 /// - Overlay knob: AppKit draws the knob of an overlay scroller outside an
 ///   `NSScrollView` at alpha 0 and never widens it (#495), so in overlay
 ///   style this scroller draws its own knob over AppKit's knob rect, and
-///   AppKit's own knob and slot are not drawn. A scroll shows the narrow
-///   knob alone; under the pointer, or while the knob is held, the knob is
-///   wide, over AppKit's slot drawn as wide, and stays so until the
-///   scroller has faded out after the pointer left.
+///   AppKit's own knob and slot are not drawn. The knob is light on a
+///   dark ``themeBackground`` and dark on a light one, whatever the app's
+///   appearance (#558), and the slot is drawn to match. A scroll shows the
+///   narrow knob alone; under the pointer, or while the knob is held, the
+///   knob is wide, over AppKit's slot drawn as wide, and stays so until
+///   the scroller has faded out after the pointer left.
 /// - Input: dragging the knob or clicking the track reports where to go
 ///   through ``onScroll``; the terminal view moves the session's view.
 @MainActor
@@ -47,6 +49,17 @@ final class TerminalScroller: NSScroller {
     /// the system setting is the user's).
     var preferredStyleOverride: NSScroller.Style? {
         didSet { styleChanged() }
+    }
+    /// The session's configured background (its profile's theme), which
+    /// the overlay knob is drawn to show on (``themeKnobStyle``),
+    /// as the terminal view last read it (on attach and on every appearance
+    /// change of the core); `nil` before the first, when the knob follows
+    /// the app's appearance.
+    var themeBackground: TesseraSession.Appearance.Color? {
+        didSet {
+            guard themeBackground != oldValue else { return }
+            applyOverlayColors()
+        }
     }
     /// The knob is being dragged or the track held. While the knob is
     /// dragged, positions read meanwhile are applied once it is released,
@@ -321,6 +334,7 @@ final class TerminalScroller: NSScroller {
             scrollerStyle = style
         }
         applyStripBackground()
+        applyOverlayColors()
         applyHidden()
         if hasHistory, let position {
             applyKnob(position)
@@ -387,15 +401,44 @@ final class TerminalScroller: NSScroller {
         layoutOverlayKnob()
     }
 
-    /// AppKit's overlay knob colours for the knob style, measured from its
-    /// `drawKnob()` on macOS 27: a dark knob (light appearance, or
-    /// `.dark`) is black at half opacity with a 1 pt white rim at 15 %
-    /// outside it, a light one white at half opacity with a black rim at
-    /// 20 %. Layer colours are not dynamic: a change of appearance applies
-    /// them again, and redraws the slot.
+    /// The knob style for the theme: in overlay style, `.dark` on a light
+    /// ``themeBackground`` (``isLightBackground(_:)``) and `.light` on a
+    /// dark one, which AppKit's slot follows too; `.default` (the app's
+    /// appearance) before the first, and in legacy style, whose knob is
+    /// AppKit's on a strip of the appearance's colour.
+    private var themeKnobStyle: NSScroller.KnobStyle {
+        guard scrollerStyle == .overlay, let themeBackground else { return .default }
+        return Self.isLightBackground(themeBackground) ? .dark : .light
+    }
+
+    /// Whether a dark knob shows on `color`: its WCAG relative luminance
+    /// (sRGB components linearised, weighted 0.2126, 0.7152, 0.0722) is at
+    /// least 0.5; below, the knob is light. Alpha is not looked at: a
+    /// translucent background shows the theme's colour over what is behind
+    /// the window.
+    static func isLightBackground(_ color: TesseraSession.Appearance.Color) -> Bool {
+        func linear(_ component: Float) -> Double {
+            let c = Double(min(max(component, 0), 1))
+            return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4)
+        }
+        let luminance = 0.2126 * linear(color.red) + 0.7152 * linear(color.green) + 0.0722 * linear(color.blue)
+        return luminance >= 0.5
+    }
+
+    /// Sets the knob style for the theme (``themeKnobStyle``) and AppKit's
+    /// overlay knob colours for it, measured from its `drawKnob()` on
+    /// macOS 27: a dark knob (`.dark`, or `.default` in light appearance)
+    /// is black at half opacity with a 1 pt white rim at 15 % outside it, a
+    /// light one white at half opacity with a black rim at 20 %. Layer
+    /// colours are not dynamic: a change of ``themeBackground``, of style
+    /// or of appearance applies them again, and redraws the slot.
     private func applyOverlayColors() {
+        let style = themeKnobStyle
+        if knobStyle != style {
+            knobStyle = style
+        }
         let darkKnob: Bool
-        switch knobStyle {
+        switch style {
         case .dark: darkKnob = true
         case .light: darkKnob = false
         default: darkKnob = effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) != .darkAqua
@@ -405,7 +448,8 @@ final class TerminalScroller: NSScroller {
         slotLayer.setNeedsDisplay()
     }
 
-    /// AppKit's slot, as wide as the layer it is drawn into.
+    /// AppKit's slot, as wide as the layer it is drawn into, for the knob
+    /// style.
     private func drawOverlaySlot(in context: CGContext, size: CGSize) {
         NSGraphicsContext.saveGraphicsState()
         NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: true)
