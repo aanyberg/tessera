@@ -355,7 +355,8 @@ hangs() { cut -f2 "$state/test" | paste -s -d ';' - | sed 's/;/; /g'; }
 # thread and blocking interceptor), so a match on the name alone would retry every hang. A thread counts when the leaf
 # holding at least half its samples, without its trailing wait frames (libsystem_kernel and libsystem_platform, and
 # libsystem_pthread's `cthread_yield` and its `swtch_pri` stub, through which macOS 15's runtime semaphore yields),
-# ends in a `__tsan::` or `__sanitizer::` function: SlotLock, a runtime mutex, semaphore or futex wait, a fork hook.
+# ends in a `__tsan::` or `__sanitizer::` function: SlotLock, a runtime mutex, semaphore or futex wait, a fork hook,
+# or macOS 27's `__sanitizer::InternalAlloc` waiting on an unfair lock in libsystem_platform (CI run 44917832924).
 # `_pthread_cond_wait` is not a wait frame here: under it sits the interceptor trampoline every blocked thread has.
 tsan_hang() {
     perl -e '
