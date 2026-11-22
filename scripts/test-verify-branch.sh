@@ -170,6 +170,37 @@ change crates/tessera-pty/src/lib.rs '// untimed change'
 change crates/tessera-ffi/src/lib.rs '// untimed change'
 commit
 
+# Matchers verify-branch.sh cannot read fail loudly (#561): non-zero exit, the filter text in the message, no target.
+unreadable_filters=(
+    'package(tessera-grid) & binary(~edit)'
+    'package(~tessera-grid) & binary(edit)'
+    'package(tessera-grid) & binary(/ed.t/)'
+    'package(tessera-grid) & binary(#ed*)'
+    'package(tessera-grid) & binary(ed*)'
+    'package(tessera-grid) & !binary(edit)'
+    'package(tessera-grid) & not binary(edit)'
+    'package(tessera-grid) - binary(edit)'
+    '(package(=tessera-pty) & binary(=plugins)) | (package(tessera-grid) & binary(e?it))'
+)
+n=0
+for f in "${unreadable_filters[@]}"; do
+    n=$((n + 1))
+    branch "unreadable-$n"
+    printf '[[profile.default.overrides]]\nfilter = %s\ntest-group = "timing"\n' "'$f'" > .config/nextest.toml
+    change crates/tessera-grid/src/lib.rs '// untimed change'
+    change crates/tessera-pty/src/lib.rs '// untimed change'
+    commit
+done
+
+# The repository's own .config/nextest.toml: the exact targets, with every package it names touched.
+branch real-toml
+cp "$here/../.config/nextest.toml" .config/nextest.toml
+for pk in $(grep -o 'package([^)]*)' .config/nextest.toml | sed -E 's/package\( *=? *//; s/ *\)//' | sort -u); do
+    [ -d "crates/$pk" ] || package "$pk" lib.rs
+    change "crates/$pk/src/lib.rs" '// untimed change'
+done
+commit
+
 branch everything
 for b in app-core-lib render-golden render-helper devwin-bin term-devwin overrides; do
     git merge -q --no-edit "$b"
@@ -213,6 +244,43 @@ list devwin-only;       expect 'a bin-only package named by an alternative is a 
 list overrides;         expect 'nextest overrides' "$header${nl}tessera-config:reload${nl}tessera-term:decscusr${nl}tessera-term:lib" --list-targets
 list real-line;         expect 'one target per binary of an alternative (#273)' "$header${nl}tessera-config:reload${nl}tessera-config:watch_themes" --list-targets
 list exact-match;       expect 'exact-match package(=x) and binary(=x) name x' "$header${nl}tessera-ffi:lib${nl}tessera-grid:edit${nl}tessera-pty:plugins" --list-targets
+# unreadable <case> <branch> <filter text>: exits non-zero, names the filter text and the config, prints no target.
+unreadable() {
+    name="$1" br="$2" text="$3"
+    git -C "$repo" switch -q "$br"
+    for runner in direct bash zsh; do
+        rc=0
+        case "$runner" in
+            direct) "$script" "$repo" --list-targets > "$work/out" 2> "$work/err" || rc=$? ;;
+            *) "$runner" "$script" "$repo" --list-targets > "$work/out" 2> "$work/err" || rc=$? ;;
+        esac
+        if [ "$rc" -eq 0 ]; then not_ok "$name ($runner): exit 0"
+        elif grep -q 'tessera-' "$work/out"; then not_ok "$name ($runner): printed a target: $(cat "$work/out")"
+        elif ! grep -qF "$text" "$work/err" || ! grep -q 'nextest.toml' "$work/err"; then
+            not_ok "$name ($runner): message lacks the filter text or override: $(cat "$work/err")"
+        else ok "$name ($runner)"; fi
+    done
+}
+n=0
+while IFS='|' read -r what; do
+    n=$((n + 1))
+    # The nth filter: the arrays differ in base under bash and zsh, so read it by position with sed.
+    text="$(printf '%s\n' "${unreadable_filters[@]}" | sed -n "${n}p")"
+    unreadable "unreadable filter: $what" "unreadable-$n" "$text"
+done <<'EOF2'
+a ~ matcher in binary()
+a ~ matcher in package()
+a /regex/ matcher
+a #glob matcher
+a bare name with glob metacharacters
+a negated term (!)
+a negated term (not)
+a differenced term (a - b)
+one unreadable alternative among readable ones
+EOF2
+list real-toml
+real_targets="tessera-app-core:lib${nl}tessera-app-core:plugins${nl}tessera-app-core:smart_selection${nl}tessera-app-core:theme${nl}tessera-config:edit${nl}tessera-config:reload${nl}tessera-config:watch_themes${nl}tessera-devtool:theme${nl}tessera-devwin:lib${nl}tessera-ffi:lifecycle${nl}tessera-ffi:surface${nl}tessera-pty:close${nl}tessera-render:device_loss${nl}tessera-render:shaping${nl}tessera-term:decscusr${nl}tessera-term:rect${nl}tessera-term:rect_fixes${nl}tessera-term:wide"
+expect 'the repository nextest.toml yields its exact targets' "$header${nl}$real_targets" --list-targets
 list everything
 all="tessera-app-core:lib${nl}tessera-config:reload${nl}tessera-devwin:bins${nl}tessera-render:golden${nl}tessera-render:tests${nl}tessera-term:decscusr${nl}tessera-term:lib"
 expect 'every trigger' "$header${nl}$all" --list-targets
