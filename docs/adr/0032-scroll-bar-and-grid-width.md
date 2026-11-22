@@ -254,10 +254,14 @@ wheel and clicks) left for 0.3.0. In overlay style:
   placed on AppKit's `rect(for: .knob)`: its position, length and minimum
   length are AppKit's. It is a rounded fill with a 1 pt rim outside it, in
   AppKit's colours measured from its `drawKnob()` on macOS 27: black at half
-  opacity with a white rim at 15 % for a dark knob (light appearance), white
-  at half opacity with a black rim at 20 % for a light one (dark
-  appearance). Layer colours are not dynamic: an appearance change applies
-  them again.
+  opacity with a white rim at 15 % for a dark knob, white at half opacity
+  with a black rim at 20 % for a light one. The knob is dark on a session
+  background (its profile's theme) whose WCAG relative luminance is at
+  least 0.5 and light below, whatever the app's appearance (#558): the
+  scroller's `knobStyle` is set to `.dark` or `.light` (`.default` in
+  legacy style), which AppKit's slot follows too. Layer colours are not
+  dynamic: a change of the theme, the style or the appearance applies them
+  again.
 - A scroll shows the narrow knob alone, as AppKit's `flashScrollers` does:
   AppKit's knob rect at the right edge, at most half the wide one (x 8 to
   14 of 17 on macOS 27; macOS 15 gives a wider rect for a scroller outside

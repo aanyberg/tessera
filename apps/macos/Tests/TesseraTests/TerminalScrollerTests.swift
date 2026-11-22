@@ -118,6 +118,14 @@ final class TerminalScrollerTests: XCTestCase {
             return p.alpha >= 0.33 && max(p.red, p.green, p.blue) < 0.6
         }
 
+        /// A light knob pixel (a dark theme's, #558): light, at least a
+        /// third opaque. Not to be told from the slot in light
+        /// appearance, so only where no slot is drawn.
+        func isLightKnob(_ x: CGFloat, _ y: CGFloat) -> Bool {
+            let p = pixel(x, y)
+            return p.alpha >= 0.33 && min(p.red, p.green, p.blue) > 0.6
+        }
+
         /// Something drawn that is not the knob (the slot).
         func isSlot(_ x: CGFloat, _ y: CGFloat) -> Bool {
             pixel(x, y).alpha > 0.05 && !isKnob(x, y)
@@ -126,8 +134,8 @@ final class TerminalScrollerTests: XCTestCase {
         /// The knob's extent down column `x`: the top of the first and the
         /// bottom of the last pixel that is a knob pixel, or `nil` without
         /// one. Off the knob's middle column its rounded ends are shorter.
-        func knob(atX x: CGFloat) -> (top: CGFloat, bottom: CGFloat)? {
-            let rows = (0..<height).map(CGFloat.init).filter { isKnob(x, $0 + 0.5) }
+        func knob(atX x: CGFloat, light: Bool = false) -> (top: CGFloat, bottom: CGFloat)? {
+            let rows = (0..<height).map(CGFloat.init).filter { light ? isLightKnob(x, $0 + 0.5) : isKnob(x, $0 + 0.5) }
             guard let first = rows.first, let last = rows.last else { return nil }
             return (first, last + 1)
         }
@@ -420,6 +428,145 @@ final class TerminalScrollerTests: XCTestCase {
         XCTAssertTrue(drawn.isSlot(x, scroller.rect(for: .knobSlot).maxY - 4), "the slot to the new bottom")
     }
 
+    // MARK: The knob against the theme (#558)
+
+    /// Dracula's and Solarized Light's backgrounds, as the core reports
+    /// them.
+    private static let darkTheme = TesseraSession.Appearance.Color(
+        red: 0x28 / 255, green: 0x2a / 255, blue: 0x36 / 255, alpha: 1)
+    private static let lightTheme = TesseraSession.Appearance.Color(
+        red: 0xfd / 255, green: 0xf6 / 255, blue: 0xe3 / 255, alpha: 1)
+
+    /// The knob's colour as drawn: `light` (white-ish, at least a third
+    /// opaque), `dark` (``Rendering/isKnob(_:_:)``) or `nil` for neither.
+    private func knobShade(_ drawn: Rendering, _ x: CGFloat, _ y: CGFloat) -> String? {
+        if drawn.isLightKnob(x, y) { return "light" }
+        return drawn.isKnob(x, y) ? "dark" : nil
+    }
+
+    /// AppKit's slot at its lower end, under no knob: `light` for its
+    /// light-appearance slot (white at three quarters), `dark` for its
+    /// dark-appearance one (light grey at 15 %, which a dark background
+    /// shows through), `nil` where nothing is drawn.
+    private func slotShade(_ drawn: Rendering, _ scroller: TerminalScroller) -> String? {
+        let p = drawn.pixel(hoverPoint(scroller).x, scroller.rect(for: .knobSlot).maxY - 4)
+        guard p.alpha > 0.05 else { return nil }
+        return p.alpha > 0.5 ? "light" : "dark"
+    }
+
+    /// What AppKit itself draws for the scroller (its slot and knob, asked
+    /// to draw as AppKit does), unlike ``render(_:ignoringOpacity:)``,
+    /// whose layer rendering has no legacy knob.
+    private func appKitsDrawing(_ scroller: TerminalScroller) throws -> Rendering {
+        let width = Int(scroller.bounds.width), height = Int(scroller.bounds.height)
+        let context = try XCTUnwrap(
+            CGContext(
+                data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: width * 4,
+                space: try XCTUnwrap(CGColorSpace(name: CGColorSpace.sRGB)),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: true)
+        scroller.effectiveAppearance.performAsCurrentDrawingAppearance {
+            scroller.drawKnobSlot(in: scroller.rect(for: .knobSlot), highlight: false)
+            scroller.drawKnob()
+        }
+        NSGraphicsContext.restoreGraphicsState()
+        let data = try XCTUnwrap(context.data).assumingMemoryBound(to: UInt8.self)
+        return Rendering(
+            width: width, height: height, bytes: Array(UnsafeBufferPointer(start: data, count: width * height * 4)))
+    }
+
+    func testTheKnobIsLightOnADarkThemeAndDarkOnALightOneWhateverTheAppearance() throws {
+        let (scroller, window) = makeScroller()
+        defer { window.close() }
+        try enter(scroller)
+        let x = hoverPoint(scroller).x, y = scroller.rect(for: .knob).midY
+        let light = try render(scroller, ignoringOpacity: true)
+        XCTAssertEqual(knobShade(light, x, y), "dark", "no theme yet, light appearance: AppKit's dark knob")
+        XCTAssertEqual(slotShade(light, scroller), "light", "and AppKit's light slot")
+
+        // A dark theme in light appearance: the light knob, on a dark slot.
+        scroller.themeBackground = Self.darkTheme
+        var drawn = try render(scroller, ignoringOpacity: true)
+        XCTAssertEqual(knobShade(drawn, x, y), "light", "a dark theme in light appearance: \(drawn.pixel(x, y))")
+        XCTAssertEqual(slotShade(drawn, scroller), "dark", "its slot")
+        // Narrow, after the pointer left and a scroll showed it again.
+        try exit(scroller)
+        clock += 10
+        scroller.flash()
+        drawn = try render(scroller, ignoringOpacity: true)
+        let narrow = scroller.rect(for: .knob)
+        XCTAssertEqual(knobShade(drawn, narrow.maxX - 1.5, narrow.midY), "light", "the narrow knob")
+        try enter(scroller)
+
+        // A light theme in dark appearance: the dark knob, on a light slot.
+        window.appearance = NSAppearance(named: .darkAqua)
+        drawn = try render(scroller, ignoringOpacity: true)
+        XCTAssertEqual(knobShade(drawn, x, y), "light", "the appearance alone changes nothing")
+        XCTAssertEqual(slotShade(drawn, scroller), "dark")
+        scroller.themeBackground = Self.lightTheme
+        drawn = try render(scroller, ignoringOpacity: true)
+        XCTAssertEqual(knobShade(drawn, x, y), "dark", "a light theme in dark appearance: \(drawn.pixel(x, y))")
+        XCTAssertEqual(slotShade(drawn, scroller), "light", "its slot")
+        window.appearance = NSAppearance(named: .aqua)
+        drawn = try render(scroller, ignoringOpacity: true)
+        XCTAssertEqual(knobShade(drawn, x, y), "dark", "light appearance again: still dark")
+        XCTAssertEqual(slotShade(drawn, scroller), "light")
+
+        // Back to a dark theme: light again.
+        scroller.themeBackground = Self.darkTheme
+        drawn = try render(scroller, ignoringOpacity: true)
+        XCTAssertEqual(knobShade(drawn, x, y), "light", "a dark theme again")
+        XCTAssertEqual(slotShade(drawn, scroller), "dark")
+
+        // Legacy style is AppKit's knob on a strip of the appearance's
+        // colour, whatever the theme, and overlay style again the theme's.
+        let (plain, plainWindow) = makeScroller(style: .legacy)
+        defer { plainWindow.close() }
+        try exit(scroller)
+        scroller.preferredStyleOverride = .legacy
+        plain.frame = scroller.frame
+        // AppKit's legacy knob on macOS 27 draws the same whatever the
+        // style, so the style itself is pinned too.
+        XCTAssertEqual(scroller.knobStyle, .default, "legacy: the appearance's knob style")
+        let legacy = try appKitsDrawing(scroller)
+        XCTAssertGreaterThan(legacy.maxAlpha, 0, "AppKit's legacy knob")
+        XCTAssertEqual(legacy.bytes, try appKitsDrawing(plain).bytes, "legacy: AppKit's knob, as without a theme")
+        scroller.preferredStyleOverride = .overlay
+        try enter(scroller)
+        drawn = try render(scroller, ignoringOpacity: true)
+        XCTAssertEqual(knobShade(drawn, x, y), "light", "overlay again: the dark theme's")
+        XCTAssertEqual(slotShade(drawn, scroller), "dark")
+    }
+
+    /// The knob is dark on a background whose WCAG relative luminance is
+    /// at least 0.5 (sRGB grey 0.7354), light below. Each colour pins one
+    /// part of the formula: the linearisation (grey 0.6, 0.32 linear), the
+    /// green weight (pure green, 0.715, where an average gives 0.33), the
+    /// red weight (red with green 0.7: 0.533, 0.393 with blue's weight) and
+    /// the blue one (blue with green 0.75: 0.446, 0.586 with red's). Alpha
+    /// is not looked at.
+    func testTheKnobStyleComesFromTheBackgroundsRelativeLuminance() {
+        typealias Color = TesseraSession.Appearance.Color
+        let cases: [(Color, Bool, String)] = [
+            (Self.darkTheme, false, "Dracula"),
+            (Self.lightTheme, true, "Solarized Light"),
+            (Color(red: 0, green: 0, blue: 0, alpha: 1), false, "black"),
+            (Color(red: 1, green: 1, blue: 1, alpha: 1), true, "white"),
+            (Color(red: 0.73, green: 0.73, blue: 0.73, alpha: 1), false, "grey 0.73: 0.492"),
+            (Color(red: 0.74, green: 0.74, blue: 0.74, alpha: 1), true, "grey 0.74: 0.507"),
+            (Color(red: 0.6, green: 0.6, blue: 0.6, alpha: 1), false, "grey 0.6, linearised"),
+            (Color(red: 0, green: 1, blue: 0, alpha: 1), true, "green"),
+            (Color(red: 1, green: 0.7, blue: 0, alpha: 1), true, "red's weight"),
+            (Color(red: 0, green: 0.75, blue: 1, alpha: 1), false, "blue's weight"),
+            (Color(red: 0x28 / 255, green: 0x2a / 255, blue: 0x36 / 255, alpha: 0.3), false, "translucent Dracula"),
+            (Color(red: 1, green: 1, blue: 1, alpha: 0), true, "transparent white"),
+        ]
+        for (color, light, what) in cases {
+            XCTAssertEqual(TerminalScroller.isLightBackground(color), light, what)
+        }
+    }
+
     func testTheKnobMovesWithoutAnAnimation() throws {
         // The knob tracks the view at once; the scroller's own opacity is
         // what fades.
@@ -667,8 +814,82 @@ final class TerminalScrollerTests: XCTestCase {
         let scroller = view.scroller
         XCTAssertTrue(scroller.isRevealed, "the scroll shows it")
         let drawn = try render(scroller, ignoringOpacity: true)
-        let knob = try XCTUnwrap(drawn.knob(atX: scroller.rect(for: .knob).midX), "the knob is drawn")
+        // Dark or light for the default theme (#558).
+        let column = scroller.rect(for: .knob).midX
+        let knob = try XCTUnwrap(drawn.knob(atX: column) ?? drawn.knob(atX: column, light: true), "the knob is drawn")
         XCTAssertEqual(knob.top, scroller.rect(for: .knobSlot).minY, accuracy: 2, "at the top: the oldest line")
+    }
+
+    /// The app's path (#558): each pane's knob follows its session's
+    /// profile's theme as the core reports it on attach, not the window's
+    /// appearance, and a live reload of `config.toml` that swaps the themes
+    /// swaps the knobs. On a core of the test's own, its configuration in a
+    /// temporary directory; nothing is posted and no view is told its
+    /// background by the test. The scroll position is the test's (the
+    /// panes' `cat` has no history), set right before each drawing.
+    func testEachPanesKnobFollowsItsThemeThroughALiveReload() async throws {
+        func config(_ first: String, _ second: String) -> String {
+            """
+            [appearance]
+            theme = "\(first)"
+            [[profiles]]
+            name = "second"
+            [profiles.appearance]
+            theme = "\(second)"
+            """
+        }
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("tessera-scroller-theme-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let file = dir.appendingPathComponent("config.toml")
+        try config("Dracula", "Solarized Light").write(to: file, atomically: true, encoding: .utf8)
+        let previous = ProcessInfo.processInfo.environment["TESSERA_CONFIG_DIR"]
+        setenv("TESSERA_CONFIG_DIR", dir.path, 1)
+        let host = TransparencyHost(core: try TesseraApp())
+        addTeardownBlock { @MainActor in
+            for controller in host.controllers {
+                controller.window?.close()
+            }
+            host.core.shutdown()
+            if let previous { setenv("TESSERA_CONFIG_DIR", previous, 1) } else { unsetenv("TESSERA_CONFIG_DIR") }
+            try? FileManager.default.removeItem(at: dir)
+        }
+        let controller = try host.open(profile: nil)
+        let window = try XCTUnwrap(controller.window)
+        window.appearance = NSAppearance(named: .aqua)
+        let first = controller.focusedPane
+        host.nextProfile = "second"
+        let second = try XCTUnwrap(controller.splitFocusedPane(.right), "the split is refused")
+        controller.paneContainer.layoutSubtreeIfNeeded()
+        guard MTLCreateSystemDefaultDevice() != nil, first.view.surface.isAttached, second.view.surface.isAttached
+        else {
+            throw XCTSkip("the core could not attach a renderer to the views (no GPU can present, or no font)")
+        }
+        func knob(_ pane: Pane) throws -> String? {
+            let scroller = pane.view.scroller
+            scroller.preferredStyleOverride = .overlay
+            scroller.update(Self.middle)
+            let rect = scroller.rect(for: .knob)
+            return knobShade(try render(scroller, ignoringOpacity: true), rect.maxX - 1.5, rect.midY)
+        }
+        XCTAssertEqual(try knob(first), "light", "Dracula in light appearance")
+        XCTAssertEqual(try knob(second), "dark", "Solarized Light, the second profile's")
+        window.appearance = NSAppearance(named: .darkAqua)
+        XCTAssertEqual(try knob(first), "light", "dark appearance changes nothing")
+        XCTAssertEqual(try knob(second), "dark", "a light theme in dark appearance")
+
+        try config("Solarized Light", "Dracula").write(to: file, atomically: true, encoding: .utf8)
+        let deadline = ContinuousClock.now + .seconds(10)
+        while try knob(first) != "dark" || knob(second) != "light" {
+            guard ContinuousClock.now < deadline else {
+                let shades = [try knob(first), try knob(second)].map { $0 ?? "none" }
+                return XCTFail("the reload swaps the knobs: \(shades)")
+            }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        window.appearance = NSAppearance(named: .aqua)
+        XCTAssertEqual(try knob(first), "dark", "Solarized Light in light appearance")
+        XCTAssertEqual(try knob(second), "light", "Dracula in light appearance")
     }
 
     // MARK: Lifetime
