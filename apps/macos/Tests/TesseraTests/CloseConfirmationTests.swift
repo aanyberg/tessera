@@ -227,12 +227,11 @@ final class CloseConfirmationTests: XCTestCase {
     // MARK: AppKit's own multi-tab closes
 
     /// AppKit's tab closes (the tab bar's Close Other Tabs, Close Tabs to
-    /// the Right, Close Window from the Window menu, and `NSApplication`'s
-    /// `closeAll:`) ask each tab through `windowShouldClose`: a busy tab's
-    /// sheet must hold back only that tab, so the idle tabs close and every
-    /// busy tab asks. (AppKit's Close All menu item, which sent `closeAll:`,
-    /// is no longer added: Tessera's own ⌥⌘W takes its place, #464; the
-    /// action stays reachable, as from another menu item or a script.)
+    /// the Right, Close Window from the Window menu) ask each tab through
+    /// `windowShouldClose`: a busy tab's sheet must hold back only that tab,
+    /// so the idle tabs close and every busy tab asks. (`NSApplication`'s
+    /// `closeAll:` is the single Close All since #526, one alert for every
+    /// window: ``QuitAndCloseAllTests``.)
     func testCloseOtherTabsClosesTheIdleTabsAndAsksEveryBusyOne() async throws {
         try await checkAppKitClose("performCloseOtherTabs:", on: 0, keeps: [0])
     }
@@ -243,48 +242,6 @@ final class CloseConfirmationTests: XCTestCase {
 
     func testCloseTabbedWindowGroupClosesTheIdleTabsAndAsksEveryBusyOne() async throws {
         try await checkAppKitClose("performCloseTabbedWindowGroup:", on: 0, keeps: [])
-    }
-
-    func testCloseAllClosesTheIdleTabsAndAsksEveryBusyOne() async throws {
-        try await checkAppKitClose("closeAll:", on: nil, keeps: [])
-    }
-
-    /// AppKit's `closeAll:` (its Close All, no longer in the menu, #464)
-    /// over two windows: every idle tab closes, every busy tab of either window asks
-    /// once on its own sheet, and a second Close All while they ask adds
-    /// none. Cancel keeps a tab; Close closes it.
-    func testCloseAllAsksOncePerBusyTabOfEveryWindow() async throws {
-        let selector = NSSelectorFromString("closeAll:")
-        guard NSApp.responds(to: selector) else {
-            throw XCTSkip("NSApplication does not answer closeAll: on this macOS")
-        }
-        let first = try openTabs(2)
-        let second = try openTabs(3)
-        let busy = [first[1], second[0], second[1]]
-        for window in busy {
-            try await start("sleep 100", in: try controller(of: window))
-        }
-
-        NSApp.perform(selector, with: nil)
-
-        XCTAssertFalse(first[0].isVisible, "idle tabs close")
-        XCTAssertFalse(second[2].isVisible, "idle tabs close")
-        XCTAssertEqual(
-            Set(presenter.sheets.map { ObjectIdentifier($0.window) }), Set(busy.map(ObjectIdentifier.init)),
-            "every busy tab asks")
-        XCTAssertEqual(presenter.sheets.count, 3, "once each")
-        XCTAssertTrue(
-            presenter.sheets.allSatisfy { $0.confirmation == CloseConfirmation(scope: .tab, processNames: ["sleep"]) })
-
-        NSApp.perform(selector, with: nil)
-        XCTAssertEqual(presenter.sheets.count, 3, "a second Close All while they ask asks nothing more")
-
-        for sheet in presenter.sheets {
-            sheet.answer(sheet.window !== second[1])
-        }
-        XCTAssertEqual(
-            appDelegate.windowControllers.compactMap(\.window).map(ObjectIdentifier.init), [ObjectIdentifier(second[1])],
-            "Cancel keeps its tab, Close closes the others")
     }
 
     /// The shell of a tab exits cleanly while the tab's close sheet (a real
@@ -361,17 +318,17 @@ final class CloseConfirmationTests: XCTestCase {
         XCTAssertEqual(appDelegate.windowControllers.count, 1)
     }
 
-    /// Tabs [idle, busy, idle, busy]: `action` sent to tab `target` (or to
-    /// the application) closes the idle tabs it covers at once and asks each
-    /// busy one on its own sheet; after Close only the tabs at `keeps` stay.
-    private func checkAppKitClose(_ action: String, on target: Int?, keeps: [Int]) async throws {
+    /// Tabs [idle, busy, idle, busy]: `action` sent to tab `target` closes
+    /// the idle tabs it covers at once and asks each busy one on its own
+    /// sheet; after Close only the tabs at `keeps` stay.
+    private func checkAppKitClose(_ action: String, on target: Int, keeps: [Int]) async throws {
         let selector = NSSelectorFromString(action)
         let windows = try openTabs(4)
         for index in [1, 3] {
             try await start("sleep 100", in: try controller(of: windows[index]))
         }
         windows[0].tabGroup?.selectedWindow = windows[0]
-        let receiver: NSObject = target.map { windows[$0] } ?? NSApp
+        let receiver = windows[target]
         guard receiver.responds(to: selector) else {
             throw XCTSkip("\(type(of: receiver)) does not answer \(action) on this macOS")
         }

@@ -114,9 +114,9 @@ enum MainMenu {
         // tab bar's window once its last tab is gone.
         add(menu, "close_tab", "Close Tab", #selector(NSWindow.performClose(_:)), "w")
         // Close All, under ⌥ (#464). AppKit adds an alternate of its own
-        // (`closeAll:`, aimed at NSApplication, which asks each busy tab on
-        // its own sheet) when the menu bar is installed, unless an item
-        // already has ⌥⌘W then; a later rebinding of this one does not
+        // (`closeAll:`, aimed at NSApplication, which `TesseraApplication`
+        // turns into this same Close All, #526) when the menu bar is
+        // installed, unless an item already has ⌥⌘W then; a later rebinding of this one does not
         // bring it back. AppKit pairs an alternate only with an item of the
         // same key, so one rebound to another key is an ordinary, visible
         // item (`apply(_:to:)`).

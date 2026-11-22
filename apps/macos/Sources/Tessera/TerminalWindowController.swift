@@ -40,17 +40,12 @@ protocol TerminalWindowControllerDelegate: AnyObject {
     /// Asks before a pane, tab or window whose sessions run a job closes;
     /// `nil` closes without asking.
     var closeConfirmationPresenter: (any CloseConfirmationPresenter)? { get }
-    /// Whether the event being handled is an Option-click on a close
-    /// button, which the delegate turns into one Close All: the tab then
-    /// neither closes nor asks.
-    func terminalWindowControllerTakesOptionClickOnCloseButton() -> Bool
     /// A pane of `controller`'s tab may have got the keyboard: a pane was
     /// focused, the tab selected or its window made key (#470).
     func terminalWindowControllerFocusMayHaveChanged(_ controller: TerminalWindowController)
 }
 
 extension TerminalWindowControllerDelegate {
-    func terminalWindowControllerTakesOptionClickOnCloseButton() -> Bool { false }
     func terminalWindowControllerFocusMayHaveChanged(_ controller: TerminalWindowController) {}
 }
 
@@ -657,16 +652,19 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, NSMe
     // MARK: NSWindowDelegate
 
     /// The tab's close button, AppKit's own multi-tab closes (Close Other
-    /// Tabs, Close All), which ask each tab, and ⌘W on the last pane:
+    /// Tabs, Close Tabs to the Right), which ask each tab, and ⌘W on the
+    /// last pane (AppKit's Close All, `closeAll:`, is the app's single one,
+    /// ``TesseraApplication``):
     /// closes at once while every pane's shell is at its prompt; while any
     /// pane runs a job, asks once on a sheet, naming every busy pane's job
     /// (D2), and closes only if the user confirms. A request is ignored
     /// while this tab is already asking, or while its window asks for all
     /// its tabs (⇧⌘W); another tab's own question holds back nothing here.
-    /// An Option-click on a close button, which AppKit passes to every
-    /// window, is one Close All instead, asked by the delegate.
+    /// An Option-click on a close button is Close All, which asks for every
+    /// window: the tab refuses it (AppKit's close of a window with tabs
+    /// offers each other tab its close first).
     func windowShouldClose(_ sender: NSWindow) -> Bool {
-        if delegate?.terminalWindowControllerTakesOptionClickOnCloseButton() == true {
+        if AppDelegate.isOptionClickOnCloseButton(NSApp.currentEvent) {
             return false
         }
         if pendingClose != nil || windowAsks {
