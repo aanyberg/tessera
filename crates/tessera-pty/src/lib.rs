@@ -44,6 +44,7 @@ use std::sync::mpsc::Receiver;
 #[cfg(not(unix))]
 compile_error!("tessera-pty supports Unix platforms only");
 
+mod bounded;
 mod foreground;
 mod native;
 
@@ -230,6 +231,19 @@ pub enum PtyError {
         program: String,
         /// Platform-provided explanation.
         reason: String,
+    },
+    /// The file system gave no answer within 5 s while the program was
+    /// looked up (its path, each `PATH` candidate, or the login shell
+    /// stated or checked for execute permission), as on a stalled network
+    /// volume. Nothing was opened or forked. The program's path is left
+    /// out of the error and the logs (docs/security.md S8); `path_bytes`
+    /// is its length as given (`$SHELL` for the login shell).
+    #[error(
+        "the program ({path_bytes}-byte path) could not be looked up: the file system gave no answer in time"
+    )]
+    ProgramTimedOut {
+        /// Bytes in the program's path as given.
+        path_bytes: usize,
     },
     /// A window-size update was rejected by the kernel.
     #[error("failed to resize pty: {0}")]

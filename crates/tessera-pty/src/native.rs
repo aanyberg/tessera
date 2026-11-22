@@ -16,12 +16,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use nix::errno::Errno;
 use nix::sys::signal::{self, Signal};
 use nix::unistd::Pid;
 use portable_pty::{CommandBuilder, MasterPty, native_pty_system};
 
+use crate::bounded::{TimedOut, run_bounded};
 use crate::foreground::{self, ForegroundProcess};
 use crate::{ExitStatus, Program, Pty, PtyError, PtyEvent, PtyEvents, PtySize, SpawnOptions};
 
@@ -235,12 +237,36 @@ impl NativePty {
     /// interpreter is missing, not a regular file or not executable
     /// (checked before anything is opened or forked; a script with CRLF
     /// line endings names `/bin/sh\r` and is refused with a hint), or if
-    /// an argument or variable contains a NUL byte, [`PtyError::Io`] if the
+    /// an argument or variable contains a NUL byte,
+    /// [`PtyError::ProgramTimedOut`] if the file system gave no answer
+    /// within 5 s while the program was looked up (see below),
+    /// [`PtyError::Io`] if the
     /// reader or writer side of the master or one of their threads could
     /// not be set up.
     ///
     /// Every error leaves nothing behind: a child started before the
     /// failure is killed and reaped, and both ends of the PTY are closed.
+    ///
+    /// Finding the program and checking its `#!` line touch the file
+    /// system, which can block (a stalled network volume, an iCloud file
+    /// not yet downloaded), so both run on helper threads and the caller
+    /// waits for each a bounded time. The lookup (the `stat` and
+    /// `access(2)` calls `portable-pty` makes on the program, each `PATH`
+    /// candidate and `$SHELL`) gets 5 s; without an answer by then the
+    /// spawn fails with [`PtyError::ProgramTimedOut`] before
+    /// `portable-pty`, which would make the same calls on the caller, is
+    /// called. A program found through `PATH` is handed to `portable-pty`
+    /// by its path, so it checks that one file again (then cached) instead
+    /// of searching `PATH` again, and the child sees that path in
+    /// `argv[0]`. The `#!` check (the program's first 512 bytes and a
+    /// `stat` of the interpreter) gets 200 ms; without an answer by then
+    /// the check is skipped and the program left to `exec`, so a script
+    /// with a broken interpreter then spawns and its child ends at once as
+    /// described below. While four earlier lookups or checks are still
+    /// stuck, both give up at once: the spawn fails. A stuck helper's
+    /// thread ends when its call does. `portable-pty` still stats the
+    /// working directory and `$SHELL`, and the program it is handed, on
+    /// the caller; after a lookup in time those answers are cached.
     ///
     /// A file that is not a `#!` script and not a binary (`ENOEXEC`, such
     /// as a text file without a `#!` line or an empty file) is not refused:
@@ -262,12 +288,7 @@ impl NativePty {
     /// others.
     pub fn spawn(options: &SpawnOptions) -> Result<(Self, PtyEvents), PtyError> {
         check_size(options.size)?;
-        let command = build_command(options);
-        check_exec_size(&command, options)?;
-        check_interpreter(&command).map_err(|reason| PtyError::Spawn {
-            program: describe_program(&options.program),
-            reason,
-        })?;
+        let command = checked_command(options)?;
         let pair = redrive_open(|| native_pty_system().openpty(options.size.into()))
             .map_err(|err| PtyError::Open(err.to_string()))?;
         // On Linux the parent must not keep the slave open: the master
@@ -505,7 +526,9 @@ impl Drop for ChildGuard {
 static THREAD_START_HOOK: OnceLock<fn()> = OnceLock::new();
 
 /// Installs `hook`, which every thread this crate starts (each PTY's
-/// `pty-reader-<pid>` and `pty-writer-<pid>`) runs first.
+/// `pty-reader-<pid>` and `pty-writer-<pid>`, and the `pty-spawn-program`
+/// and `pty-spawn-check` helpers that look up and check a program before
+/// [`NativePty::spawn`] forks) runs first.
 ///
 /// For thread attributes the caller sets per thread, such as the macOS
 /// quality-of-service class `tessera-ffi` gives session threads (ADR
@@ -521,7 +544,7 @@ pub fn set_thread_start_hook(hook: fn()) -> bool {
 /// Runs the hook [`set_thread_start_hook`] installed, if any. A panicking
 /// hook is logged (without its payload) and the thread carries on: a
 /// reader that died here would strand the child.
-fn run_thread_start_hook() {
+pub(crate) fn run_thread_start_hook() {
     if let Some(hook) = THREAD_START_HOOK.get()
         && panic::catch_unwind(*hook).is_err()
     {
@@ -629,6 +652,111 @@ fn check_exec_size(command: &CommandBuilder, options: &SpawnOptions) -> Result<(
     ExecLimits::system().check(exec_bytes(command, options))
 }
 
+/// The command for `options`, checked before anything is opened or
+/// forked: its size ([`check_exec_size`]), its program looked up
+/// ([`resolve_program_bounded`]) and, for a `#!` script, its interpreter
+/// ([`check_interpreter_bounded`]).
+fn checked_command(options: &SpawnOptions) -> Result<CommandBuilder, PtyError> {
+    let mut command = build_command(options);
+    check_exec_size(&command, options)?;
+    let program = resolve_program_bounded(&mut command)?;
+    check_interpreter_bounded(program, &command).map_err(|reason| PtyError::Spawn {
+        program: describe_program(&options.program),
+        reason,
+    })?;
+    Ok(command)
+}
+
+/// How long [`NativePty::spawn`] waits for the program to be looked up
+/// ([`resolve_program`]: its path, each `PATH` candidate, or the login
+/// shell stated and checked for execute permission). A file system that
+/// gives no answer (a stalled network volume) would otherwise hold the
+/// caller, the app's main thread, for as long as it takes, which on a
+/// stalled `WebDAV` volume is more than a minute. Past it the spawn fails
+/// with [`PtyError::ProgramTimedOut`]: `portable-pty` would stat the same
+/// paths again on the caller. Longer than [`SPAWN_CHECK_TIMEOUT`] because
+/// a lookup that ends late still lets the spawn go on, where a skipped
+/// header check only loses a better error.
+const SPAWN_PROGRAM_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long [`NativePty::spawn`] waits for [`check_interpreter`], which
+/// reads the program's header and stats its `#!` interpreter: a file not
+/// yet downloaded (an iCloud file) would otherwise hold the caller for as
+/// long as the download takes. Past it the check is skipped and the
+/// program left to `exec`.
+const SPAWN_CHECK_TIMEOUT: Duration = Duration::from_millis(200);
+
+/// [`resolve_program`] on a `pty-spawn-program` helper thread, waited for
+/// at most [`SPAWN_PROGRAM_TIMEOUT`] (see [`run_bounded`]). Without an
+/// answer in time, or with [`crate::bounded::MAX_STUCK_HELPERS`] earlier
+/// lookups or checks still stuck, the spawn fails with
+/// [`PtyError::ProgramTimedOut`] before `portable-pty` is called; the
+/// lookup's late answer is dropped on its helper.
+///
+/// A program found through a `PATH` search replaces `argv[0]` with its
+/// path, so `portable-pty` checks that one file instead of searching
+/// `PATH` again on the caller (the child sees the path in `argv[0]`). The
+/// program as `exec` will run it, if it was found.
+fn resolve_program_bounded(command: &mut CommandBuilder) -> Result<Option<PathBuf>, PtyError> {
+    let lookup = command.clone();
+    let resolved = run_bounded("pty-spawn-program", SPAWN_PROGRAM_TIMEOUT, move || {
+        resolve_program(&lookup)
+    })
+    .map_err(|TimedOut| PtyError::ProgramTimedOut {
+        path_bytes: program_len(command),
+    })?;
+    Ok(resolved.map(|Resolved { path, searched }| {
+        if searched && let Some(program) = command.get_argv_mut().first_mut() {
+            *program = path.clone().into_os_string();
+        }
+        path
+    }))
+}
+
+/// [`check_interpreter`] of `program` on a `pty-spawn-check` helper thread,
+/// waited for at most [`SPAWN_CHECK_TIMEOUT`] (see [`run_bounded`]).
+/// Without an answer in time, or with
+/// [`crate::bounded::MAX_STUCK_HELPERS`] earlier checks still stuck, the
+/// check is skipped and the program left to `exec`, which runs it or fails
+/// after the fork as described on [`NativePty::spawn`]. The skip is logged
+/// at debug with the length of the program's path only (docs/security.md
+/// S8). A program that was not found (`None`) is left to `portable-pty`,
+/// which refuses it with its own reason.
+fn check_interpreter_bounded(
+    program: Option<PathBuf>,
+    command: &CommandBuilder,
+) -> Result<(), String> {
+    let Some(program) = program else {
+        return Ok(());
+    };
+    let program_len = program.as_os_str().len();
+    let check = command.clone();
+    run_bounded("pty-spawn-check", SPAWN_CHECK_TIMEOUT, move || {
+        check_interpreter(&program, &check)
+    })
+    .unwrap_or_else(|TimedOut| {
+        tracing::debug!(
+            program_len,
+            "the spawn check had no answer in time; leaving the program to exec"
+        );
+        Ok(())
+    })
+}
+
+/// Bytes in the path of the program `command` runs as given (`$SHELL` for
+/// the login shell), for errors that must not carry it. Reads only the
+/// command, never the file system.
+fn program_len(command: &CommandBuilder) -> usize {
+    if command.is_default_prog() {
+        command.get_env("SHELL").map_or(0, OsStr::len)
+    } else {
+        command
+            .get_argv()
+            .first()
+            .map_or(0, |program| program.len())
+    }
+}
+
 /// Bytes of a file `execve(2)` reads to find its `#!` line: XNU's
 /// `IMG_SHSIZE`. A `#!` line that does not end within them is no `#!` line
 /// to the kernel.
@@ -647,19 +775,15 @@ const SHEBANG_HEADER_BYTES: usize = 512;
 /// file with no `#!` line (`ENOEXEC`) is not refused, because `execvp(3)`
 /// runs it with `/bin/sh`.
 ///
-/// The program checked is the one `portable-pty` will run (see
-/// [`resolve_program`]); one it cannot resolve is left to `portable-pty`,
-/// which refuses it with its own reason. Best effort: the file can change
-/// between this check and the `exec`.
+/// `program` is the file `portable-pty` will run (see
+/// [`resolve_program`]). Best effort: the file can change between this
+/// check and the `exec`.
 ///
 /// The `#!` rules are XNU's ([`shebang_interpreter`], `IMG_SHSIZE`) and run
 /// unchanged on Linux, which is a development target only: its kernel's
 /// own rules differ, and this check does not follow them.
-fn check_interpreter(command: &CommandBuilder) -> Result<(), String> {
-    let Some(program) = resolve_program(command) else {
-        return Ok(());
-    };
-    let header = read_header(&program);
+fn check_interpreter(program: &Path, command: &CommandBuilder) -> Result<(), String> {
+    let header = read_header(program);
     let Some(interpreter) = shebang_interpreter(&header) else {
         return Ok(());
     };
@@ -695,33 +819,83 @@ fn check_interpreter(command: &CommandBuilder) -> Result<(), String> {
     Err(format!("its #! interpreter {shown:?} {problem}{crlf}"))
 }
 
-/// The file `portable-pty` will hand to `exec` for `command`, resolved the
-/// way its `CommandBuilder` does: the login shell is `$SHELL` if executable,
-/// else the password database's shell, else `/bin/sh`; an absolute program
-/// is used as given; a program starting with `./` or `../` is joined to the
-/// working directory; any other relative program is looked up in the
-/// command's `PATH` (the caller's environment over this process's), each
-/// entry joined to the working directory, taking the first candidate that
-/// is executable and not a directory. `None` where `portable-pty` would
-/// refuse the program itself or the working directory is unknown.
-fn resolve_program(command: &CommandBuilder) -> Option<PathBuf> {
+/// A program as [`resolve_program`] found it.
+#[derive(Debug, PartialEq, Eq)]
+struct Resolved {
+    /// The file `exec` will run.
+    path: PathBuf,
+    /// Found through a `PATH` search (a name without a `/` at its start or
+    /// a `./` or `../` prefix).
+    searched: bool,
+}
+
+/// The file `portable-pty` will hand to `exec` for `command`, looked up
+/// with the same file system calls its `CommandBuilder::as_command` makes,
+/// in the same order, so a slow file system holds this lookup (on a
+/// helper, see [`resolve_program_bounded`]) and not the caller, and the
+/// calls `portable-pty` repeats on the caller find their answers cached.
+///
+/// It first stats the requested working directory and checks `$SHELL`
+/// for execute permission, which `portable-pty` does whatever it runs.
+/// The login shell is `$SHELL` if executable, else the password database's
+/// shell, else `/bin/sh`. Any other program is probed ([`probe`]) as given
+/// when absolute, joined to the working directory when it starts with
+/// `./` or `../`, and otherwise looked up in the command's `PATH` (the
+/// caller's environment over this process's), each entry joined to the
+/// working directory, taking the first candidate that is executable and
+/// not a directory. `None` where the `PATH` search finds nothing or the
+/// working directory or `PATH` is unknown here; `portable-pty` then
+/// refuses the program with its own reason.
+fn resolve_program(command: &CommandBuilder) -> Option<Resolved> {
+    let dir = working_dir(command);
+    let shell = command.get_shell();
     if command.is_default_prog() {
-        return Some(PathBuf::from(command.get_shell()));
+        return Some(Resolved {
+            path: PathBuf::from(shell),
+            searched: false,
+        });
     }
     let exe = Path::new(command.get_argv().first()?);
+    let given = |path: PathBuf| {
+        probe(&path);
+        Some(Resolved {
+            path,
+            searched: false,
+        })
+    };
     if exe.is_absolute() {
-        return Some(exe.to_path_buf());
+        return given(exe.to_path_buf());
     }
-    let dir = working_dir(command)?;
+    let dir = dir?;
     if matches!(
         exe.components().next(),
         Some(Component::CurDir | Component::ParentDir)
     ) {
-        return Some(dir.join(exe));
+        return given(dir.join(exe));
     }
     std::env::split_paths(command.get_env("PATH")?)
         .map(|entry| dir.join(entry).join(exe))
-        .find(|candidate| !candidate.is_dir() && executable(candidate))
+        .find(|candidate| probe(candidate))
+        .map(|path| Resolved {
+            path,
+            searched: true,
+        })
+}
+
+/// Whether `path` is executable and not a directory, asked as
+/// `portable-pty`'s `search_path` asks: a stat (`is_dir`), then
+/// `access(X_OK)`, then `access(F_OK)` when that fails.
+fn probe(path: &Path) -> bool {
+    #[cfg(test)]
+    slow_read::pause(path, slow_read::Stage::Lookup);
+    if path.is_dir() {
+        return false;
+    }
+    if executable(path) {
+        return true;
+    }
+    access(path, nix::libc::F_OK);
+    false
 }
 
 /// The child's working directory as `portable-pty` picks it: the requested
@@ -744,12 +918,17 @@ fn working_dir(command: &CommandBuilder) -> Option<PathBuf> {
 /// `access(path, X_OK)`: whether this process's real user may execute
 /// `path`, as `portable-pty` asks before it spawns.
 fn executable(path: &Path) -> bool {
+    access(path, nix::libc::X_OK)
+}
+
+/// `access(path, mode) == 0`.
+fn access(path: &Path, mode: nix::libc::c_int) -> bool {
     let Ok(path) = CString::new(path.as_os_str().as_bytes()) else {
         return false;
     };
     // SAFETY: `path` is a NUL-terminated string that outlives the call, and
     // `access(2)` only reads it.
-    unsafe { nix::libc::access(path.as_ptr(), nix::libc::X_OK) == 0 }
+    unsafe { nix::libc::access(path.as_ptr(), mode) == 0 }
 }
 
 /// The first [`SHEBANG_HEADER_BYTES`] of `program`, zero-filled past its
@@ -760,6 +939,8 @@ fn executable(path: &Path) -> bool {
 /// read-only, non-blocking and without becoming a controlling terminal,
 /// and symbolic links are followed, as `exec` follows them.
 fn read_header(program: &Path) -> [u8; SHEBANG_HEADER_BYTES] {
+    #[cfg(test)]
+    slow_read::pause(program, slow_read::Stage::Header);
     let mut header = [0u8; SHEBANG_HEADER_BYTES];
     if !std::fs::metadata(program).is_ok_and(|meta| meta.is_file()) {
         return header;
@@ -889,6 +1070,102 @@ fn exec_bytes(command: &CommandBuilder, options: &SpawnOptions) -> ExecFootprint
             .saturating_add(2 * POINTER)
             .saturating_add(path.saturating_add(1)),
         longest,
+    }
+}
+
+/// Test-only stand-in for a slow file: a [`probe`] (the program lookup's
+/// stat) or [`read_header`] of a path a test names blocks until the test
+/// releases it, as on a stalled network volume or a file not yet
+/// downloaded. Only the named paths are held, each at one stage, so other
+/// tests running beside it (`cargo test`) are unaffected. A held call
+/// gives up after [`slow_read::MOST`], so a regression fails its test
+/// instead of hanging.
+#[cfg(test)]
+mod slow_read {
+    use std::path::{Path, PathBuf};
+    use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
+    use std::time::Duration;
+
+    /// Longest a held call blocks without a release.
+    pub(super) const MOST: Duration = Duration::from_secs(10);
+
+    /// Where a path is held.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Stage {
+        /// The program lookup's [`super::probe`].
+        Lookup,
+        /// [`super::read_header`].
+        Header,
+    }
+
+    /// A held path and what its calls did.
+    struct Hold {
+        path: PathBuf,
+        stage: Stage,
+        held: bool,
+        /// Names of the threads that started a call on it.
+        callers: Vec<String>,
+        /// Calls on it that have returned.
+        finished: usize,
+    }
+
+    static HOLDS: Mutex<Vec<Hold>> = Mutex::new(Vec::new());
+    static RELEASED: Condvar = Condvar::new();
+
+    fn lock() -> MutexGuard<'static, Vec<Hold>> {
+        HOLDS.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn find<'a>(holds: &'a mut [Hold], path: &Path, stage: Stage) -> Option<&'a mut Hold> {
+        holds
+            .iter_mut()
+            .find(|hold| hold.path == path && hold.stage == stage)
+    }
+
+    /// Makes every call at `stage` on `path` block until [`release`].
+    pub(super) fn hold(path: &Path, stage: Stage) {
+        let mut holds = lock();
+        holds.retain(|hold| hold.path != path || hold.stage != stage);
+        holds.push(Hold {
+            path: path.to_path_buf(),
+            stage,
+            held: true,
+            callers: Vec::new(),
+            finished: 0,
+        });
+    }
+
+    /// Lets the held calls at `stage` on `path`, and every later one,
+    /// return.
+    pub(super) fn release(path: &Path, stage: Stage) {
+        if let Some(hold) = find(&mut lock(), path, stage) {
+            hold.held = false;
+        }
+        RELEASED.notify_all();
+    }
+
+    /// The names of the threads that started a call at `stage` on `path`,
+    /// and how many of those calls have returned.
+    pub(super) fn calls(path: &Path, stage: Stage) -> (Vec<String>, usize) {
+        find(&mut lock(), path, stage).map_or_default(|hold| (hold.callers.clone(), hold.finished))
+    }
+
+    /// Blocks while `path` is held at `stage`, at most [`MOST`].
+    pub(super) fn pause(path: &Path, stage: Stage) {
+        let mut holds = lock();
+        let Some(active) = find(&mut holds, path, stage) else {
+            return;
+        };
+        let name = std::thread::current().name().unwrap_or("?").to_owned();
+        active.callers.push(name);
+        let (mut holds, _) = RELEASED
+            .wait_timeout_while(holds, MOST, |holds| {
+                find(holds, path, stage).is_some_and(|hold| hold.held)
+            })
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(active) = find(&mut holds, path, stage) {
+            active.finished += 1;
+        }
     }
 }
 
@@ -1156,7 +1433,7 @@ fn redrive_open<T, E: fmt::Display>(mut open: impl FnMut() -> Result<T, E>) -> R
         match open() {
             Err(err) if attempt < OPEN_ATTEMPTS && lost_allocation_race(&err) => {
                 tracing::debug!(attempt, "pty allocation race lost; opening again");
-                thread::sleep(std::time::Duration::from_millis(attempt.into()));
+                thread::sleep(Duration::from_millis(attempt.into()));
                 attempt += 1;
             }
             result => return result,
@@ -1865,6 +2142,11 @@ mod tests {
             shebang_interpreter(&read_header(&path)).map(<[u8]>::to_vec)
         };
         assert_eq!(
+            parsed_with_line_end_at(510),
+            Some(b"/bin/sh".to_vec()),
+            "the 511th byte is in the header"
+        );
+        assert_eq!(
             parsed_with_line_end_at(511),
             Some(b"/bin/sh".to_vec()),
             "the 512th byte is in the header"
@@ -1896,12 +2178,258 @@ mod tests {
             std::fs::write(&script, format!("#!{shown}\n")).unwrap();
             let command = build_command(&SpawnOptions::command(&script, "1"));
             assert_eq!(
-                check_interpreter(&command),
+                check_interpreter(&script, &command),
                 Err(format!(
                     "its #! interpreter {shown:?} cannot be reached ({})",
                     io::Error::from_raw_os_error(errno)
                 ))
             );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The fields of every event logged on the thread it is the default
+    /// subscriber of, each as `name=value` (values in `Debug` form).
+    #[derive(Clone, Default)]
+    struct LogRecorder(Arc<Mutex<Vec<Vec<String>>>>);
+
+    struct FieldList(Vec<String>);
+
+    impl tracing::field::Visit for FieldList {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn fmt::Debug) {
+            self.0.push(format!("{}={value:?}", field.name()));
+        }
+    }
+
+    impl tracing::Subscriber for LogRecorder {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut fields = FieldList(vec![format!("level={}", event.metadata().level())]);
+            event.record(&mut fields);
+            self.0.lock().unwrap().push(fields.0);
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// #554: a program whose header read blocks (a file not yet
+    /// downloaded) is checked on a helper, and the spawn goes on without
+    /// the check once [`SPAWN_CHECK_TIMEOUT`] has passed, logging only the
+    /// path's length. That the caller is not held is shown by order (the
+    /// spawn returns while the read is still blocked); the wall-time bar is
+    /// on the bounded wait alone, since the rest of a spawn (`openpty`,
+    /// `fork`) takes what a loaded machine gives it.
+    #[test]
+    fn a_slow_header_read_does_not_hold_the_caller() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = scratch_dir("slow-header");
+        let script = dir.join("script");
+        std::fs::write(&script, "#!/bin/sh\nexit 7\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        slow_read::hold(&script, slow_read::Stage::Header);
+        let header = || slow_read::calls(&script, slow_read::Stage::Header);
+        let options = SpawnOptions::command(&script, "slow");
+
+        // The bounded wait: the check of the held file gives up in time.
+        let start = std::time::Instant::now();
+        let checked = check_interpreter_bounded(Some(script.clone()), &build_command(&options));
+        let took = start.elapsed();
+        assert_eq!(checked, Ok(()), "a check without an answer passes");
+        assert!(
+            took >= SPAWN_CHECK_TIMEOUT && took < SPAWN_CHECK_TIMEOUT + Duration::from_millis(100),
+            "the bounded check took {took:?}"
+        );
+
+        let log = LogRecorder::default();
+        let spawned = tracing::subscriber::with_default(log.clone(), || NativePty::spawn(&options));
+        let (pty, events) = spawned.expect("spawned without the check");
+        // No held read has returned, so the spawn did not wait for one.
+        let (readers, finished) = header();
+        assert_eq!(
+            finished, 0,
+            "a held read returned before the spawn: {readers:?}"
+        );
+        assert!(pty.child_pid().is_some());
+
+        // The header was read on the helpers, never on this thread.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while header().0.len() < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the header was not read twice: {:?}",
+                header()
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(header().0, ["pty-spawn-check", "pty-spawn-check"]);
+
+        // The child started: the script runs and exits with its code.
+        let exit = loop {
+            match events.recv_timeout(Duration::from_secs(10)) {
+                Ok(PtyEvent::Exited(status)) => break status,
+                Ok(PtyEvent::Output(_)) => {}
+                Err(err) => panic!("no exit: {err}"),
+            }
+        };
+        assert_eq!(exit, ExitStatus::Exited(7));
+
+        let shown = script.to_str().unwrap();
+        let logged = log.0.lock().unwrap().clone();
+        let skipped: Vec<_> = logged
+            .iter()
+            .filter(|fields| {
+                fields
+                    .iter()
+                    .any(|field| field.contains("no answer in time"))
+            })
+            .collect();
+        assert_eq!(skipped.len(), 1, "{logged:?}");
+        assert!(
+            skipped[0].contains(&"level=DEBUG".to_owned()),
+            "{skipped:?}"
+        );
+        assert!(
+            skipped[0].contains(&format!("program_len={}", shown.len())),
+            "{skipped:?}"
+        );
+        for fields in &logged {
+            assert!(
+                fields.iter().all(|field| !field.contains(shown)),
+                "the path was logged: {fields:?}"
+            );
+        }
+        drop(pty);
+        slow_read::release(&script, slow_read::Stage::Header);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while header().1 < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the held reads did not return on release"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Waits up to 10 s for `done` to hold.
+    fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(std::time::Instant::now() < deadline, "{what}");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// #554: a program whose lookup gets no answer from the file system (a
+    /// stalled network volume) is looked up on a helper, and the spawn
+    /// fails with [`PtyError::ProgramTimedOut`] once
+    /// [`SPAWN_PROGRAM_TIMEOUT`] has passed, without calling
+    /// `portable-pty` (which would stat the program again on the caller)
+    /// and without naming the path. That the caller is not held is shown
+    /// by order: the spawn returns while the lookup's stat is still
+    /// blocked.
+    #[test]
+    fn a_program_lookup_without_an_answer_refuses_the_spawn_by_name() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = scratch_dir("slow-lookup");
+        let script = dir.join("script");
+        std::fs::write(&script, "#!/bin/sh\nexit 7\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        slow_read::hold(&script, slow_read::Stage::Lookup);
+        let lookup = || slow_read::calls(&script, slow_read::Stage::Lookup);
+        let options = SpawnOptions::command(&script, "slow");
+
+        let start = std::time::Instant::now();
+        let spawned = NativePty::spawn(&options);
+        let took = start.elapsed();
+        // The held stat has not returned, so the spawn did not wait for it.
+        let (callers, finished) = lookup();
+        assert_eq!(finished, 0, "the held stat returned before the spawn");
+        assert_eq!(callers, ["pty-spawn-program"]);
+        assert_eq!(fault::take_forked(), None, "a child was forked");
+        let err = match spawned {
+            Err(err @ PtyError::ProgramTimedOut { .. }) => err,
+            other => panic!("not refused as timed out: {other:?}"),
+        };
+        assert!(
+            matches!(err, PtyError::ProgramTimedOut { path_bytes }
+                if path_bytes == script.as_os_str().len()),
+            "{err:?}"
+        );
+        let shown = err.to_string();
+        assert!(!shown.contains(dir.to_str().unwrap()), "{shown}");
+        assert!(took >= SPAWN_PROGRAM_TIMEOUT, "refused after {took:?}");
+
+        slow_read::release(&script, slow_read::Stage::Lookup);
+        wait_until("the held stat did not return on release", || {
+            lookup().1 == 1
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The lookup probes `PATH` candidates in order, through the same
+    /// stat a held volume blocks, and a program it finds there reaches
+    /// `portable-pty` by its path, so `portable-pty` does not search
+    /// `PATH` again on the caller. A program given as a path keeps it.
+    #[test]
+    fn a_program_found_on_path_is_handed_over_by_its_path() {
+        let dir = scratch_dir("path-lookup");
+        let held = dir.join("held");
+        std::fs::create_dir_all(&held).unwrap();
+        let mut options = SpawnOptions::command("sh", "path");
+        let path = std::env::join_paths([held.as_path(), Path::new("/bin")]).unwrap();
+        options.env.push(("PATH".into(), path));
+
+        // The first candidate is probed first, through the seam.
+        let candidate = held.join("sh");
+        slow_read::hold(&candidate, slow_read::Stage::Lookup);
+        let command = build_command(&options);
+        let lookup = thread::spawn(move || resolve_program(&command));
+        wait_until("the first candidate was not probed", || {
+            slow_read::calls(&candidate, slow_read::Stage::Lookup)
+                .0
+                .len()
+                == 1
+        });
+        slow_read::release(&candidate, slow_read::Stage::Lookup);
+        assert_eq!(
+            lookup.join().unwrap(),
+            Some(Resolved {
+                path: PathBuf::from("/bin/sh"),
+                searched: true,
+            })
+        );
+
+        let mut command = build_command(&options);
+        let found = resolve_program_bounded(&mut command).unwrap();
+        assert_eq!(found.as_deref(), Some(Path::new("/bin/sh")));
+        assert_eq!(command.get_argv()[0], "/bin/sh");
+
+        for given in ["/bin/sh", "./sh", "../bin/sh"] {
+            let mut options = SpawnOptions::command(given, "path");
+            options.cwd = Some(PathBuf::from("/bin"));
+            let mut command = build_command(&options);
+            let found = resolve_program_bounded(&mut command).unwrap();
+            let expected = if given.starts_with('/') {
+                PathBuf::from(given)
+            } else {
+                Path::new("/bin").join(given)
+            };
+            assert_eq!(found, Some(expected), "{given}");
+            assert_eq!(command.get_argv()[0], given);
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
