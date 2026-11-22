@@ -2231,7 +2231,12 @@ mod tests {
     /// path's length. That the caller is not held is shown by order (the
     /// spawn returns while the read is still blocked); the wall-time bar is
     /// on the bounded wait alone, since the rest of a spawn (`openpty`,
-    /// `fork`) takes what a loaded machine gives it.
+    /// `fork`) takes what a loaded machine gives it. Its upper end is
+    /// [`SPAWN_CHECK_TIMEOUT`] plus 2 s (#607): a held read blocks for
+    /// [`slow_read::MOST`] (10 s), so a check that waited for it still fails
+    /// the bar, while a loaded CI runner, which took 310 ms and 322 ms
+    /// against the 300 ms of a 100 ms margin, wakes the timed-out caller
+    /// well inside it.
     #[test]
     fn a_slow_header_read_does_not_hold_the_caller() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -2249,7 +2254,7 @@ mod tests {
         let took = start.elapsed();
         assert_eq!(checked, Ok(()), "a check without an answer passes");
         assert!(
-            took >= SPAWN_CHECK_TIMEOUT && took < SPAWN_CHECK_TIMEOUT + Duration::from_millis(100),
+            took >= SPAWN_CHECK_TIMEOUT && took < SPAWN_CHECK_TIMEOUT + Duration::from_secs(2),
             "the bounded check took {took:?}"
         );
 
