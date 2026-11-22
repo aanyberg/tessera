@@ -693,7 +693,6 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use proptest::prelude::*;
-    use tessera_config::SmartRules;
 
     use super::*;
     use crate::selection::Granularity;
@@ -1328,7 +1327,7 @@ mod tests {
                     Point::new(2, 3),
                     Granularity::Line,
                     false,
-                    &SmartRules::default(),
+                    &crate::smart_engine::SmartEngines::default(),
                 );
                 selection.extend(grid, 0, Point::new(47, 3));
                 term.advance(output.as_bytes());

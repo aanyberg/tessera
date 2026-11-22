@@ -2372,6 +2372,7 @@ dependencies = [
  "nix",
  "proptest",
  "regex",
+ "regex-automata",
  "tempfile",
  "tessera-app-core",
  "tessera-config",

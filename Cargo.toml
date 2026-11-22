@@ -67,6 +67,9 @@ winit = "0.30"
 base64 = "0.23"
 # Scrollback search (ADR 0038): linear-time regex, size-limited compile.
 regex = "1"
+# Smart selection's bounded per-rule engine (#518, ADR 0042): the lazy DFA
+# the regex crate is built on, used directly so an attempt can give up.
+regex-automata = { version = "0.4", default-features = false, features = ["std", "syntax", "hybrid", "unicode", "perf-literal"] }
 
 # external, dev
 insta = "1.43"

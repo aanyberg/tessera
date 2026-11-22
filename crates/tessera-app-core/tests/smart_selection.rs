@@ -757,6 +757,43 @@ fn a_rich_copy_past_the_cap_keeps_the_plain_text() {
     assert!(lines * usize::from(cols) * 2 < MAX_RICH_COPY_LEN);
 }
 
+/// #518 (L3, fixture 2.4): the same click on the same text selects the
+/// same, on a fresh app and after clicks on other lines whose rule gave up
+/// and left its DFA cache full. The rule is the one of #433: it gives up on
+/// a long line of `a` (the word is selected there instead) and selects
+/// `ab X` on a short line.
+#[test]
+fn the_same_click_selects_the_same_whatever_came_before() {
+    let thrash = || {
+        Some(vec![SmartRule::new(
+            r"(?:[^X]{0,50}){0,20}X|a",
+            Precision::High,
+        )])
+    };
+    let short = b"ab X ok";
+    let fresh = app_with(thrash(), true);
+    let id = session(&fresh, 2, 40, short);
+    let first = word_click(&fresh, id, 0, 0);
+    assert_eq!(first.1.as_deref(), Some("ab X"));
+
+    let used = app_with(thrash(), true);
+    let long = session(&used, 2, 200, "a".repeat(8000).as_bytes());
+    for col in [10, 100, 190] {
+        let (_, text) = word_click(&used, long, 1, col);
+        assert_eq!(
+            text.map(|t| t.len()),
+            Some(8000),
+            "the rule gave up: the word"
+        );
+    }
+    let id = session(&used, 2, 40, short);
+    assert_eq!(word_click(&used, id, 0, 0), first);
+    assert_eq!(word_click(&used, id, 0, 0), first, "and again");
+    let (_, text) = word_click(&used, long, 1, 10);
+    assert_eq!(text.map(|t| t.len()), Some(8000));
+    assert_eq!(word_click(&used, id, 0, 0), first);
+}
+
 /// SS-C6: a double-click on a 2048-column line with 64 rules takes at
 /// most 5 ms (release builds; the median of 21 clicks, so one preempted
 /// click on a loaded machine does not decide it). The rules are compiled
