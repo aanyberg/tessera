@@ -95,7 +95,7 @@ pub use notify::{
 #[cfg(feature = "test-hooks")]
 #[doc(hidden)]
 pub use panic::tessera_test_panic;
-pub use plugins::tessera_app_plugins_json;
+pub use plugins::{MAX_ENABLED_PLUGINS, tessera_app_plugins_json};
 pub use prompts::{
     tessera_session_has_command_output, tessera_session_scroll_to_prompt,
     tessera_session_select_last_output,

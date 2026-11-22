@@ -604,6 +604,13 @@ impl Default for Profile {
     }
 }
 
+/// Plugin ids the plugin host reads from `[plugins] enabled` (S5): the
+/// loader warns once of a list longer than this (an
+/// [`Warning::OutOfRange`] of `plugins.enabled`, which keeps the list
+/// whole), and the host ignores the ids past it. The C ABI exports it as
+/// `TESSERA_MAX_ENABLED_PLUGINS`.
+pub const MAX_ENABLED_PLUGINS: usize = 64;
+
 /// Plugin enablement.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -617,6 +624,30 @@ pub struct Plugins {
     /// removed and listed again. At most 64 ids of at most 128 bytes are
     /// read; a longer, unknown or extra id is ignored with a warning.
     pub enabled: Vec<String>,
+}
+
+impl Plugins {
+    /// Pushes one warning when `enabled` lists more than
+    /// [`MAX_ENABLED_PLUGINS`] ids. The list is kept whole: the host takes
+    /// the first ids, and an edit's index paths and the Plugins pane see
+    /// the list as written.
+    ///
+    /// The warning gives the cap, not how many ids are listed or what they
+    /// are (S8), so it reads the same for any list past the cap: an edit
+    /// that shortens a list still past it (a Plugins toggle turned off)
+    /// adds no new warning and is not refused, while one that takes a list
+    /// at the cap past it is.
+    pub(crate) fn warn_past_cap(&self, warnings: &mut Vec<Warning>) {
+        if self.enabled.len() > MAX_ENABLED_PLUGINS {
+            warnings.push(Warning::OutOfRange {
+                path: "plugins.enabled".into(),
+                detail: format!(
+                    "lists more than {MAX_ENABLED_PLUGINS} ids; the ids after the first \
+                     {MAX_ENABLED_PLUGINS} are ignored"
+                ),
+            });
+        }
+    }
 }
 
 impl Config {

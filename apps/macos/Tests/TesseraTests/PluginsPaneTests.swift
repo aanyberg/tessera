@@ -377,7 +377,7 @@ final class PluginsPaneTests: XCTestCase {
         XCTAssertEqual(shown.count, SettingsModel.maxUnknownPluginsShown + 1, "\(shown)")
         XCTAssertEqual(shown.first, #""flood.0""#)
         XCTAssertEqual(
-            shown.last, "and \(SettingsModel.maxEnabledPlugins - SettingsModel.maxUnknownPluginsShown) more",
+            shown.last, "and \(TesseraPlugin.maxEnabled - SettingsModel.maxUnknownPluginsShown) more",
             "of the ids the host reads")
         XCTAssertEqual(
             model.pluginsSkipWarning,
@@ -434,7 +434,7 @@ final class PluginsPaneTests: XCTestCase {
     /// The refusal is true at exactly the cap and past it, where the file
     /// lists more than Tessera reads, and it does not say how many are listed.
     func testTheFullRefusalHoldsAtTheCapAndPastIt() throws {
-        let cap = SettingsModel.maxEnabledPlugins
+        let cap = TesseraPlugin.maxEnabled
         for count in [cap, cap + 1] {
             let listed = (0..<count).map { "x.\($0)" }
             let (model, _, writer, _) = try fakeModel(enabled: listed, plugins: [Self.plugin("dev.a")])
@@ -459,11 +459,11 @@ final class PluginsPaneTests: XCTestCase {
         XCTAssertEqual(written.map { Array($0.utf8) }, [Array(nfd.utf8), Array(nfc.utf8)])
     }
 
-    /// At ``SettingsModel/maxEnabledPlugins`` ids a toggle turned on writes
+    /// At `TesseraPlugin.maxEnabled` ids a toggle turned on writes
     /// nothing and says why; turning one off still writes, and a hand edit
     /// that makes room clears the refusal (#489 48b B1, stand-ins).
     func testAtTheCapTurningOnIsRefusedAndOffStillWrites() async throws {
-        let full = ["dev.b"] + (1..<SettingsModel.maxEnabledPlugins).map { "x.\($0)" }
+        let full = ["dev.b"] + (1..<TesseraPlugin.maxEnabled).map { "x.\($0)" }
         let (model, source, writer, _) = try fakeModel(enabled: full, plugins: [Self.plugin("dev.a")])
         let toggle = PluginsPane.enabledBinding(model, "dev.a")
         toggle.wrappedValue = true
@@ -492,7 +492,7 @@ final class PluginsPaneTests: XCTestCase {
     /// 25.2 adversarial M1: at the cap, a hand edit that swaps ids keeps 64
     /// listed, and the refusal, about the list before it, goes.
     func testAHandEditOfAFullListTakesBackTheRefusal() throws {
-        let full = (0..<SettingsModel.maxEnabledPlugins).map { "x.\($0)" }
+        let full = (0..<TesseraPlugin.maxEnabled).map { "x.\($0)" }
         let plugin = Self.plugin("dev.a")
         let (model, source, writer, _) = try fakeModel(enabled: full, plugins: [plugin])
         let toggle = PluginsPane.enabledBinding(model, "dev.a")
@@ -502,7 +502,7 @@ final class PluginsPaneTests: XCTestCase {
         XCTAssertEqual(model.message(SettingsModel.pluginsKey), SettingsModel.pluginsFullRefusal, "the same list")
         let swapped = Array(full.dropLast()) + ["dev.a"]
         try Self.apply(source, model, generation: 2, enabled: swapped, plugins: [plugin])
-        XCTAssertEqual(model.value(SettingsModel.pluginsKey)?.array?.count, SettingsModel.maxEnabledPlugins)
+        XCTAssertEqual(model.value(SettingsModel.pluginsKey)?.array?.count, TesseraPlugin.maxEnabled)
         XCTAssertNil(model.message(SettingsModel.pluginsKey), "another list, as full")
         XCTAssertEqual(writer.calls, [])
     }
@@ -635,7 +635,7 @@ final class PluginsPaneTests: XCTestCase {
     /// shows, and Hello, the 65th, shows off as the host has it (#489 48b
     /// B1). On the app's core.
     func testAtSixtyFourIdsTheToggleIsRefusedAndSixtyFiveShowTheSkipWarning() async throws {
-        let unknown = (0..<SettingsModel.maxEnabledPlugins).map { "x.\($0)" }
+        let unknown = (0..<TesseraPlugin.maxEnabled).map { "x.\($0)" }
         let config = Self.enabledTOML(unknown)
         let controller = try openPlugins(config: config)
         let model = controller.model

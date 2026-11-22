@@ -22,6 +22,7 @@ use tessera_app_core::plugins::{
 };
 use tessera_app_core::{
     App, Config, ConfigPaths, PluginInfo, PluginState, PtySize, SessionId, SpawnOptions,
+    WatchOptions,
 };
 use tessera_plugin_api::{Error, Event, Host, Manifest, SessionId as PluginSession};
 
@@ -1162,8 +1163,10 @@ fn a_slow_plugin_keeps_session_throughput() {
 
 /// `[plugins] enabled` honours 64 ids of up to 128 bytes: an id at the
 /// length cap enables its plugin, one past it is ignored with a warning,
-/// an unknown id gets one warning, and ids past the 64th are ignored with
-/// one warning for all of them. A reload with the same list warns no more.
+/// an unknown id gets one warning, and ids past the 64th are ignored
+/// without one from the host (the loader gives it, #560:
+/// `a_load_past_the_cap_logs_one_warning`). A reload with the same list
+/// warns no more.
 #[test]
 fn enabled_ids_are_capped_in_count_and_length() {
     let root = tempfile::tempdir().unwrap();
@@ -1199,16 +1202,63 @@ fn enabled_ids_are_capped_in_count_and_length() {
     assert!(!info(&app, "test.enabled.late").enabled);
     assert_eq!(late.deactivations(), 1);
     let warned = warnings_here();
-    assert_eq!(warned.len(), 2 * (1 + unknown.len()) + 2, "{warned:?}");
-    assert_eq!(
-        warned.iter().filter(|w| w.contains("more than")).count(),
-        1,
+    // The first 64 of `past_cap` warn again (the list changed): the
+    // too-long id, the extra unknown id and the 61 unknown ids.
+    assert_eq!(warned.len(), 2 * (1 + unknown.len()) + 1, "{warned:?}");
+    assert!(
+        warned.iter().all(|w| !w.contains("more than")),
         "{warned:?}"
     );
 
     // The same list again: no new warnings.
     enable(&app, &past_cap);
     assert_eq!(warnings_here().len(), warned.len());
+}
+
+/// The warnings logged so far, on any thread, about ids past
+/// [`MAX_ENABLED_PLUGINS`]: the loader's and any other that names the cap.
+fn warnings_past_the_cap() -> Vec<String> {
+    let cap = format!("more than {MAX_ENABLED_PLUGINS} ids");
+    log()
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|line| line.level == tracing::Level::WARN && line.text.contains(&cap))
+        .map(|line| line.text.clone())
+        .collect()
+}
+
+/// #560: a `config.toml` whose `[plugins] enabled` lists more than 64 ids
+/// is loaded with exactly one warning about them, the loader's, which
+/// gives no id (S8); the host applies the first 64 without warning again.
+/// A reload with another list still past the cap logs no other.
+#[test]
+fn a_load_past_the_cap_logs_one_warning() {
+    log();
+    let root = tempfile::tempdir().unwrap();
+    let paths = ConfigPaths::new(root.path().join("config"));
+    std::fs::create_dir_all(paths.root()).unwrap();
+    let listed = |count: usize| {
+        let ids: Vec<String> = (0..count).map(|_| format!("\"{HELLO}\"")).collect();
+        format!("[plugins]\nenabled = [{}]\n", ids.join(", "))
+    };
+    std::fs::write(paths.config_file(), listed(MAX_ENABLED_PLUGINS + 1)).unwrap();
+    let app = App::with_config_dir(paths.clone(), WatchOptions::default());
+    assert_eq!(app.config().plugins.enabled.len(), MAX_ENABLED_PLUGINS + 1);
+    wait_for_state(&app, HELLO, PluginState::Active);
+    let warned = warnings_past_the_cap();
+    assert_eq!(warned.len(), 1, "{warned:?}");
+    assert!(warned[0].contains("plugins.enabled"), "{warned:?}");
+    assert!(!warned[0].contains(HELLO), "{warned:?}");
+
+    let generation = app.config_generation();
+    std::fs::write(paths.config_file(), listed(MAX_ENABLED_PLUGINS + 3)).unwrap();
+    wait("the longer list to apply", || {
+        app.config_generation() != generation
+    });
+    assert_eq!(app.config().plugins.enabled.len(), MAX_ENABLED_PLUGINS + 3);
+    assert_eq!(warnings_past_the_cap(), warned);
+    drop(app);
 }
 
 /// A string of `len` bytes: `x` and then two-byte `é`, so a cut at an odd

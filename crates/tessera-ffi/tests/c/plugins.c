@@ -17,6 +17,9 @@
 
 #include "TesseraCore.h"
 
+/* The plugin host's cap on `[plugins] enabled` reaches C (#560). */
+_Static_assert(TESSERA_MAX_ENABLED_PLUGINS == 64, "the plugin host reads 64 ids");
+
 #define EXPECT(expr, status)                                                         \
     do {                                                                             \
         TesseraError expect_status = (expr);                                         \

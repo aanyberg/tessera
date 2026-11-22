@@ -372,13 +372,15 @@ impl Config {
     }
 
     /// Clamps or resets values that are outside their valid range, returning a
-    /// warning for each change.
+    /// warning for each change, and one for a `[plugins] enabled` longer
+    /// than the host reads ([`crate::MAX_ENABLED_PLUGINS`], kept whole).
     pub fn normalize(&mut self) -> Vec<Warning> {
         let mut warnings = Vec::new();
         normalize_appearance(&mut self.appearance, &mut warnings);
         self.selection.normalize(&mut warnings);
         self.notifications.normalize(&mut warnings);
         crate::profile::cap_profiles(self, &mut warnings);
+        self.plugins.warn_past_cap(&mut warnings);
         for (i, profile) in self.profiles.iter_mut().enumerate() {
             if let Some(appearance) = profile.appearance.as_mut() {
                 let prefix = format!("profiles[{i}].appearance");
