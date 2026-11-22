@@ -3,7 +3,16 @@
 //! of an unrelated theme file produces at most one event and never a
 //! `Changed`; the native backend follows the theme file when
 //! `appearance.theme` names another one.
+//!
+//! Load-tolerant (#525): every event a test expects is waited for until it
+//! arrives (up to [`EVENTUALLY`]), never for a fixed window that a starved
+//! watcher can miss; the files a test saves never pass through a partial
+//! state ([`save`]); the one latency bar is the fastest of up to
+//! [`BOUND_ROUNDS`] edits of each kind; and every window that asserts *no* event is a lower bound: a
+//! watcher starved past it can only make the test miss a wrong event, never
+//! fail on a right one.
 
+use std::io::Write as _;
 use std::path::Path;
 use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant};
@@ -19,16 +28,23 @@ fn limit() -> Duration {
     WatchOptions::default().debounce + Duration::from_millis(500)
 }
 
-/// How long a test waits for an event that is due when it does not assert
-/// the issue's bound ([`limit`], asserted only by
+/// How long a test waits for an event that is due (the issue's bound,
+/// [`limit`], is asserted only by
 /// `editing_the_theme_in_use_is_reported_once_within_the_bound`): long
-/// enough for a starved process (`taskpolicy -b` on a loaded machine; #253
-/// item 9). `recv_timeout` returns as soon as the event arrives.
-const EVENTUALLY: Duration = Duration::from_secs(5);
+/// enough for a starved process (`taskpolicy -b` on a loaded machine stalls
+/// a thread for 1 to 26 s; #253 item 9, #525). `recv_timeout` returns as
+/// soon as the event arrives, so only a failing run waits this long.
+const EVENTUALLY: Duration = Duration::from_secs(30);
 
 /// How long to wait to be sure no (further) event comes: the polling
-/// interval, the debounce and generous scheduling slack.
+/// interval, the debounce and generous scheduling slack. A lower bound: a
+/// watcher starved past it reports a wrong event too late to be seen here.
 const QUIET: Duration = Duration::from_millis(600);
+
+/// Rounds of edits `editing_the_theme_in_use_is_reported_once_within_the_bound`
+/// may take until the fastest edit of each kind is reported within
+/// [`limit`].
+const BOUND_ROUNDS: usize = 5;
 
 /// A valid theme file named `name` with background `#rrggbb`.
 fn theme_doc(name: &str, background: &str) -> String {
@@ -98,67 +114,143 @@ fn next_event(watcher: &Watcher, bound: Duration) -> Result<ConfigEvent, RecvTim
     }
 }
 
-fn expect_themes_changed(watcher: &Watcher, backend: WatchBackend, what: &str) {
-    expect_themes_changed_within(watcher, backend, what, EVENTUALLY);
-}
-
-fn expect_themes_changed_within(
-    watcher: &Watcher,
-    backend: WatchBackend,
-    what: &str,
-    bound: Duration,
-) {
+/// Waits up to [`EVENTUALLY`] for the next event (but `Unchanged`), which
+/// must be a `ThemesChanged`, and returns how long it took.
+fn expect_themes_changed(watcher: &Watcher, backend: WatchBackend, what: &str) -> Duration {
     let started = Instant::now();
-    let event = next_event(watcher, bound)
-        .unwrap_or_else(|e| panic!("{backend:?}: no event for {what} within {bound:?}: {e}"));
+    let event = next_event(watcher, EVENTUALLY)
+        .unwrap_or_else(|e| panic!("{backend:?}: no event for {what} within {EVENTUALLY:?}: {e}"));
     assert!(
         matches!(event, ConfigEvent::ThemesChanged),
         "{backend:?}: {what}: expected ThemesChanged, got {event:?}"
     );
-    assert!(
-        started.elapsed() < bound,
-        "{backend:?}: {what}: took {:?}",
-        started.elapsed()
-    );
+    started.elapsed()
+}
+
+/// Asserts that no event (but `Unchanged`) comes within [`QUIET`].
+fn expect_quiet(watcher: &Watcher, backend: WatchBackend, what: &str) {
+    let rest = drain(watcher, QUIET);
+    assert!(rest.is_empty(), "{backend:?}: {what}: then {rest:?}");
 }
 
 fn background(store: &ConfigStore) -> String {
     store.theme().background.to_string()
 }
 
+/// Writes `path` with `std::fs::write`: truncated, then filled. For the
+/// states a test means to show the watcher (an empty file, a flood of
+/// broken ones); a save uses [`save`].
 fn write(path: &Path, text: &str) {
     std::fs::write(path, text).unwrap();
 }
 
+/// Saves `text` as the whole of `path` in one step, so the watcher, however
+/// late it reads, sees the old document or the new one and never a part of
+/// either: an existing file is overwritten in place by a single `write(2)`
+/// (no truncation; a shorter document is padded with newlines to the old
+/// length, which changes nothing it means), and a new one is written under
+/// a hidden name, which the theme lookup ignores, and renamed into place.
+/// `std::fs::write` truncates first, and a writer starved between the
+/// truncation and the write for longer than the debounce is seen as two
+/// saves, an empty file and then the document (#525; documented for
+/// `config.toml` at `ConfigEvent::Invalid`), so a test counting events per
+/// save would fail on a right answer.
+fn save(path: &Path, text: &str) {
+    match std::fs::metadata(path) {
+        Ok(meta) => {
+            let old = usize::try_from(meta.len()).unwrap();
+            let mut doc = text.to_owned();
+            if doc.len() < old {
+                doc.push_str(&"\n".repeat(old - doc.len()));
+            }
+            let mut file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+            let written = file.write(doc.as_bytes()).unwrap();
+            assert_eq!(written, doc.len(), "{}: one write", path.display());
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let name = path.file_name().unwrap().to_str().unwrap();
+            let part = path.with_file_name(format!(".{name}.part"));
+            write(&part, text);
+            std::fs::rename(&part, path).unwrap();
+        }
+        Err(error) => panic!("{}: {error}", path.display()),
+    }
+}
+
+/// One edit of the theme in use in a round of
+/// `editing_the_theme_in_use_is_reported_once_within_the_bound`.
+#[derive(Clone, Copy, Debug)]
+enum Edit {
+    /// In place: no directory event; the native backend must watch the
+    /// file itself.
+    InPlace,
+    /// A rename-save replaces the inode; the next in-place write, to the
+    /// new file, must still be seen.
+    RenameSave,
+}
+
+/// Each edit is reported once and applied, and the fastest edit of each
+/// kind in up to [`BOUND_ROUNDS`] rounds is reported within the issue's
+/// bound ([`limit`]). Every edit's event is waited for until it arrives, so
+/// a loaded machine only adds rounds: at a load of 99 on 10 cores under
+/// `taskpolicy -b` single edits took 1 to 9 s (#525), so a bar on every
+/// edit, or on every edit of one round, cannot hold there. A watcher that
+/// is late at every edit (a delay before the event) fails every round. A
+/// late *phase* is not caught: a polling backend that sampled the theme
+/// file in use only at its full listing would meet the bound by chance at
+/// about half its edits.
 #[test]
 fn editing_the_theme_in_use_is_reported_once_within_the_bound() {
+    use Edit::{InPlace, RenameSave};
+    const ROUND: [Edit; 3] = [InPlace, RenameSave, InPlace];
     for backend in BACKENDS {
         let (_dir, store, watcher) = setup(backend, "mine");
         assert_eq!(background(&store), "#101010");
         let mine = store.paths().themes_dir().join("mine.toml");
-
-        // In place: no directory event; the native backend must watch the
-        // file itself.
-        write(&mine, &theme_doc("Mine", "#111111"));
-        expect_themes_changed_within(&watcher, backend, "in-place write", limit());
-        assert_eq!(background(&store), "#111111", "{backend:?}");
-        let rest = drain(&watcher, QUIET);
-        assert!(
-            rest.is_empty(),
-            "{backend:?}: one event per edit, then {rest:?}"
-        );
-
-        // A rename-save replaces the inode; a later in-place write to the
-        // new file is still seen.
         let tmp = mine.with_extension("toml.tmp");
-        write(&tmp, &theme_doc("Mine", "#121212"));
-        std::fs::rename(&tmp, &mine).unwrap();
-        expect_themes_changed_within(&watcher, backend, "rename-save", limit());
-        assert_eq!(background(&store), "#121212", "{backend:?}");
-        assert!(drain(&watcher, QUIET).is_empty(), "{backend:?}");
-        write(&mine, &theme_doc("Mine", "#131313"));
-        expect_themes_changed_within(&watcher, backend, "write after rename-save", limit());
-        assert_eq!(background(&store), "#131313", "{backend:?}");
+        let mut colour = 0x11_0000_u32;
+        let mut took: Vec<(Edit, Duration)> = Vec::new();
+        let fastest = |took: &[(Edit, Duration)], kind: Edit| {
+            took.iter()
+                .filter(|(edit, _)| std::mem::discriminant(edit) == std::mem::discriminant(&kind))
+                .map(|(_, took)| *took)
+                .min()
+        };
+        let within = |took: &[(Edit, Duration)]| {
+            [InPlace, RenameSave]
+                .into_iter()
+                .all(|kind| fastest(took, kind).is_some_and(|best| best < limit()))
+        };
+        for _ in 0..BOUND_ROUNDS {
+            for edit in ROUND {
+                colour += 1;
+                let hex = format!("#{colour:06x}");
+                let doc = theme_doc("Mine", &hex);
+                match edit {
+                    InPlace => save(&mine, &doc),
+                    RenameSave => {
+                        write(&tmp, &doc);
+                        std::fs::rename(&tmp, &mine).unwrap();
+                    }
+                }
+                let elapsed = expect_themes_changed(&watcher, backend, &format!("{edit:?} {hex}"));
+                assert_eq!(background(&store), hex, "{backend:?}: {edit:?}");
+                expect_quiet(
+                    &watcher,
+                    backend,
+                    &format!("one event per edit, {edit:?} {hex}"),
+                );
+                took.push((edit, elapsed));
+            }
+            if within(&took) {
+                break;
+            }
+        }
+        assert!(
+            within(&took),
+            "{backend:?}: the fastest edit of a kind not reported within {:?}: {took:?}",
+            limit()
+        );
     }
 }
 
@@ -168,10 +260,11 @@ fn editing_an_unrelated_theme_file_is_at_most_one_event_and_no_changed() {
         let (_dir, store, watcher) = setup(backend, "mine");
         let themes = store.paths().themes_dir();
 
-        write(&themes.join("other.toml"), &theme_doc("Other", "#212121"));
+        save(&themes.join("other.toml"), &theme_doc("Other", "#212121"));
         // Pinned per backend: the native one does not watch a theme file
-        // that is not in use; the polling one sees it at its next full
-        // listing, every twenty intervals, then debounces. The wait allows
+        // that is not in use (a no-event window: a lower bound); the
+        // polling one sees it at its next full listing, every twenty
+        // intervals, then debounces. The wait allows
         // four times that for a throttled machine, and at least
         // [`EVENTUALLY`] (#262 N2); it ends at the event.
         let events = if backend == WatchBackend::Poll {
@@ -198,21 +291,14 @@ fn editing_an_unrelated_theme_file_is_at_most_one_event_and_no_changed() {
             "{backend:?}: in-place write: {events:?}"
         );
 
-        // Creating and deleting files the theme in use does not depend on.
-        write(&themes.join("new.toml"), &theme_doc("New", "#303030"));
-        let events = drain(&watcher, limit() + QUIET);
-        assert_eq!(events.len(), 1, "{backend:?}: created: {events:?}");
-        assert!(
-            matches!(events[0], ConfigEvent::ThemesChanged),
-            "{events:?}"
-        );
+        // Creating and deleting files the theme in use does not depend on:
+        // one event each.
+        save(&themes.join("new.toml"), &theme_doc("New", "#303030"));
+        expect_themes_changed(&watcher, backend, "created");
+        expect_quiet(&watcher, backend, "created");
         std::fs::remove_file(themes.join("new.toml")).unwrap();
-        let events = drain(&watcher, limit() + QUIET);
-        assert_eq!(events.len(), 1, "{backend:?}: deleted: {events:?}");
-        assert!(
-            matches!(events[0], ConfigEvent::ThemesChanged),
-            "{events:?}"
-        );
+        expect_themes_changed(&watcher, backend, "deleted");
+        expect_quiet(&watcher, backend, "deleted");
         assert_eq!(background(&store), "#101010", "{backend:?}: still Mine");
     }
 }
@@ -224,7 +310,7 @@ fn files_the_theme_lookup_ignores_are_not_reported() {
         let themes = store.paths().themes_dir();
         // Hidden files and non-TOML files are never themes. The native
         // backend still wakes for them (a directory event) but finds
-        // nothing to report.
+        // nothing to report. A no-event window: a lower bound.
         write(
             &themes.join(".hidden.toml"),
             &theme_doc("Hidden", "#404040"),
@@ -239,13 +325,15 @@ fn files_the_theme_lookup_ignores_are_not_reported() {
 fn an_edit_of_config_toml_alone_is_no_themes_event() {
     for backend in BACKENDS {
         let (_dir, store, watcher) = setup(backend, "mine");
-        write(
+        save(
             &store.paths().config_file(),
             "[appearance]\ntheme = \"mine\"\nfont_size = 17\n",
         );
-        let events = drain(&watcher, limit() + QUIET);
-        assert_eq!(events.len(), 1, "{backend:?}: {events:?}");
-        assert!(matches!(events[0], ConfigEvent::Changed(_)), "{events:?}");
+        let event = next_event(&watcher, EVENTUALLY)
+            .unwrap_or_else(|e| panic!("{backend:?}: no event within {EVENTUALLY:?}: {e}"));
+        assert!(matches!(event, ConfigEvent::Changed(_)), "{event:?}");
+        // And no ThemesChanged after it (a lower bound).
+        expect_quiet(&watcher, backend, "config.toml edit");
     }
 }
 
@@ -256,8 +344,8 @@ fn an_edit_of_config_toml_alone_is_no_themes_event() {
 fn the_watched_theme_file_follows_appearance_theme() {
     for backend in BACKENDS {
         let (_dir, store, watcher) = setup(backend, "mine");
-        write(&store.paths().config_file(), &config_doc("other"));
-        let event = watcher.recv_timeout(EVENTUALLY).expect("config change");
+        save(&store.paths().config_file(), &config_doc("other"));
+        let event = next_event(&watcher, EVENTUALLY).expect("config change");
         assert!(matches!(event, ConfigEvent::Changed(_)), "{event:?}");
         assert_eq!(background(&store), "#202020");
         assert!(drain(&watcher, QUIET).is_empty(), "{backend:?}");
@@ -268,7 +356,7 @@ fn the_watched_theme_file_follows_appearance_theme() {
         for (n, delay_ms) in [0_u64, 130, 370].into_iter().enumerate() {
             std::thread::sleep(Duration::from_millis(delay_ms));
             let colour = format!("#2{n}2{n}2{n}");
-            write(
+            save(
                 &store.paths().themes_dir().join("other.toml"),
                 &theme_doc("Other", &colour),
             );
@@ -290,7 +378,7 @@ fn creating_the_file_of_the_theme_in_use_is_reported() {
     for backend in BACKENDS {
         let (_dir, store, watcher) = setup(backend, "Dracula");
         assert_eq!(background(&store), "#282a36");
-        write(
+        save(
             &store.paths().themes_dir().join("dracula.toml"),
             &theme_doc("Dracula", "#000001"),
         );
@@ -298,7 +386,7 @@ fn creating_the_file_of_the_theme_in_use_is_reported() {
         assert_eq!(background(&store), "#000001");
         // And that file is now followed for in-place writes.
         assert!(drain(&watcher, QUIET).is_empty(), "{backend:?}");
-        write(
+        save(
             &store.paths().themes_dir().join("dracula.toml"),
             &theme_doc("Dracula", "#000002"),
         );
@@ -315,10 +403,10 @@ fn a_removed_and_recreated_themes_directory_is_followed() {
         expect_themes_changed(&watcher, backend, "directory removed");
         assert_eq!(background(&store), "#000000", "{backend:?}: default theme");
         std::fs::create_dir(&themes).unwrap();
-        write(&themes.join("mine.toml"), &theme_doc("Mine", "#141414"));
+        save(&themes.join("mine.toml"), &theme_doc("Mine", "#141414"));
         expect_themes_changed(&watcher, backend, "directory recreated");
         assert!(drain(&watcher, QUIET).is_empty(), "{backend:?}");
-        write(&themes.join("mine.toml"), &theme_doc("Mine", "#151515"));
+        save(&themes.join("mine.toml"), &theme_doc("Mine", "#151515"));
         expect_themes_changed(&watcher, backend, "write in the recreated directory");
         assert_eq!(background(&store), "#151515", "{backend:?}");
     }
@@ -334,17 +422,13 @@ fn every_watcher_of_a_store_sees_a_themes_change_once() {
                 ..Default::default()
             })
             .unwrap();
-        write(
+        save(
             &store.paths().themes_dir().join("mine.toml"),
             &theme_doc("Mine", "#161616"),
         );
         for (n, watcher) in [&first, &second].into_iter().enumerate() {
-            let events = drain(watcher, limit() + QUIET);
-            assert_eq!(events.len(), 1, "{backend:?}: watcher {n}: {events:?}");
-            assert!(
-                matches!(events[0], ConfigEvent::ThemesChanged),
-                "{events:?}"
-            );
+            expect_themes_changed(watcher, backend, &format!("watcher {n}"));
+            expect_quiet(watcher, backend, &format!("watcher {n}"));
         }
     }
 }
@@ -360,7 +444,7 @@ fn an_edit_right_after_the_watch_starts_is_seen() {
     for backend in BACKENDS {
         for round in 0..15 {
             let (_dir, store, watcher) = setup(backend, "mine");
-            write(
+            save(
                 &store.paths().themes_dir().join("mine.toml"),
                 &theme_doc("Mine", "#171717"),
             );
@@ -389,15 +473,15 @@ fn a_broken_theme_file_stays_watched_until_it_is_fixed() {
             if file == "keyed.toml" {
                 // The configuration names it already; found by `name` key
                 // once it exists.
-                write(&path, &theme_doc("Keyed Theme", "#181818"));
+                save(&path, &theme_doc("Keyed Theme", "#181818"));
                 expect_themes_changed(&watcher, backend, "keyed theme created");
                 drain(&watcher, QUIET);
                 assert_eq!(background(&store), "#181818");
             }
-            write(&path, "name = \"half a theme\"\nforeground = ");
+            save(&path, "name = \"half a theme\"\nforeground = ");
             expect_themes_changed(&watcher, backend, &format!("{file}: broken save"));
             assert!(drain(&watcher, QUIET).is_empty(), "{backend:?}: {file}");
-            write(
+            save(
                 &path,
                 &theme_doc(
                     if file == "mine.toml" {
@@ -434,7 +518,7 @@ fn a_theme_file_broken_from_the_start_is_followed_by_its_stem() {
             })
             .unwrap();
         assert!(drain(&watcher, QUIET).is_empty(), "{backend:?}");
-        write(&mine, &theme_doc("Mine", "#1e1e1e"));
+        save(&mine, &theme_doc("Mine", "#1e1e1e"));
         expect_themes_changed(
             &watcher,
             backend,
@@ -491,7 +575,7 @@ fn a_keyed_theme_created_empty_then_filled_is_applied() {
         switch_theme(&store, &watcher, "Keyed Theme", "create-empty");
         write(&keyed, "");
         drain(&watcher, QUIET);
-        write(&keyed, &theme_doc("Keyed Theme", "#1d1d1d"));
+        save(&keyed, &theme_doc("Keyed Theme", "#1d1d1d"));
         expect_theme_applied(
             &watcher,
             &store,
@@ -507,7 +591,7 @@ fn a_keyed_theme_removed_then_recreated_is_applied() {
     for backend in BACKENDS {
         let (_dir, store, watcher) = setup(backend, "mine");
         let keyed = store.paths().themes_dir().join("keyed.toml");
-        write(&keyed, &theme_doc("Keyed Theme", "#1c1c1c"));
+        save(&keyed, &theme_doc("Keyed Theme", "#1c1c1c"));
         drain(&watcher, QUIET);
         switch_theme(&store, &watcher, "Keyed Theme", "rm-then-recreate");
         assert_eq!(background(&store), "#1c1c1c", "{backend:?}");
@@ -515,7 +599,7 @@ fn a_keyed_theme_removed_then_recreated_is_applied() {
         drain(&watcher, QUIET);
         write(&keyed, "");
         drain(&watcher, QUIET);
-        write(&keyed, &theme_doc("Keyed Theme", "#1e1e1e"));
+        save(&keyed, &theme_doc("Keyed Theme", "#1e1e1e"));
         expect_theme_applied(
             &watcher,
             &store,
@@ -539,7 +623,6 @@ fn a_keyed_theme_saved_in_chunks_around_the_switch_is_applied() {
         drain(&watcher, QUIET);
         switch_theme(&store, &watcher, "Keyed Theme", "chunked");
         {
-            use std::io::Write as _;
             let mut file = std::fs::OpenOptions::new()
                 .append(true)
                 .open(&keyed)
@@ -570,13 +653,22 @@ fn a_flood_of_unloadable_theme_files_is_followed_up_to_the_cap() {
     for i in 0..300 {
         write(&themes.join(format!("zz-broken-{i:03}.toml")), "name = ");
     }
+    // Each count is taken once the watcher has settled on state, not after
+    // a fixed wait that a starved watcher can still be settling in (#525:
+    // one count was 28 against 19). The save of the theme in use comes
+    // after every file of the flood, so the settle that applies it has
+    // listed them all.
+    save(&themes.join("mine.toml"), &theme_doc("Mine", "#1a1a1a"));
+    expect_theme_applied(&watcher, &store, "#1a1a1a", "the save after the flood");
     drain(&watcher, QUIET);
-    let before = open_descriptors();
+    let before = settled_descriptors();
     switch_theme(&store, &watcher, "Keyed Theme", "flood");
     let keyed = themes.join("keyed.toml");
     write(&keyed, "");
+    // Sent once the settle has registered what it follows.
+    expect_themes_changed(&watcher, WatchBackend::Native, "keyed.toml created empty");
     drain(&watcher, QUIET);
-    let after = open_descriptors();
+    let after = settled_descriptors();
     // `mine.toml` is no longer followed, up to eight unloadable files are,
     // and nothing else changed.
     assert!(
@@ -590,6 +682,21 @@ fn a_flood_of_unloadable_theme_files_is_followed_up_to_the_cap() {
 /// Descriptors open in this process.
 fn open_descriptors() -> usize {
     std::fs::read_dir("/dev/fd").unwrap().count()
+}
+
+/// The fewest [`open_descriptors`] of five samples 20 ms apart: a settle
+/// that the `$TMPDIR` traffic of other tests starts may hold a new
+/// registration open beside the old one for a moment.
+fn settled_descriptors() -> usize {
+    (0..5)
+        .map(|n| {
+            if n > 0 {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            open_descriptors()
+        })
+        .min()
+        .unwrap()
 }
 
 /// `WatchOptions::on_thread_start` runs on the watcher's thread (the core
@@ -616,7 +723,7 @@ fn the_thread_start_hook_runs_on_the_watcher_thread() {
                 ..Default::default()
             })
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + EVENTUALLY;
         while !RAN_ON_WATCHER.load(Ordering::SeqCst) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -628,14 +735,22 @@ fn the_thread_start_hook_runs_on_the_watcher_thread() {
 /// #287 (M4): a hostile local process that keeps renaming a FIFO over a
 /// broken theme file (followed while it does not load) and a regular file
 /// back must not hang the watcher thread in an `open` of the FIFO: after
-/// 20 rounds the watcher still reports the fix, and dropping it (which
-/// joins the thread) returns within 5 s. The FIFO and the regular file
-/// are one inode each, hard-linked into place, so a failing run can
-/// release a reader blocked on the FIFO before it panics. Only the native
+/// 20 rounds (or as many as `SWAP_BUDGET` allows) the watcher still
+/// reports the fix, and dropping it (which joins the thread) returns within
+/// [`EVENTUALLY`] (a hung `open` never returns; a starved thread can take
+/// seconds, #525). The FIFO and the regular file are one inode each,
+/// hard-linked into place, so a failing run can release a reader blocked
+/// on the FIFO before it panics. Only the native
 /// backend opens the files it watches. The race is real, so without the
 /// fix a run catches it about three times in five; the deterministic test
 /// is `a_fifo_raced_in_after_the_stat_does_not_block_the_registration`
 /// in `watch.rs`.
+///
+/// The swaps stop at `SWAP_BUDGET`: unloaded, the 20 rounds take about
+/// 5 s, but under `taskpolicy -b` the 16 000 links and renames are
+/// throttled I/O and one run took more than 180 s (#525). A loaded run
+/// races fewer times, so it can only miss the hang, never fail on a
+/// watcher that has none.
 #[cfg(unix)]
 #[test]
 fn a_fifo_renamed_over_a_broken_theme_file_does_not_hang_the_watcher() {
@@ -643,7 +758,9 @@ fn a_fifo_renamed_over_a_broken_theme_file_does_not_hang_the_watcher() {
     /// Swaps per round: each one gives the watcher a directory event,
     /// so it registers the file again while the next swap lands.
     const SWAPS: usize = 200;
-    const DROP_BOUND: Duration = Duration::from_secs(5);
+    const DROP_BOUND: Duration = EVENTUALLY;
+    /// Wall time after which no further round of swaps starts.
+    const SWAP_BUDGET: Duration = Duration::from_secs(20);
     let backend = WatchBackend::Native;
     let dir = tempfile::tempdir().unwrap();
     let side = tempfile::tempdir_in(dir.path()).unwrap();
@@ -679,7 +796,11 @@ fn a_fifo_renamed_over_a_broken_theme_file_does_not_hang_the_watcher() {
         });
         panic!("{backend:?}: {what}");
     };
-    for _ in 0..ROUNDS {
+    let swapping = Instant::now();
+    for round in 0..ROUNDS {
+        if round > 0 && swapping.elapsed() >= SWAP_BUDGET {
+            break;
+        }
         for _ in 0..SWAPS {
             for source in [&fifo, &regular] {
                 std::fs::hard_link(source, &staged).unwrap();
@@ -689,7 +810,7 @@ fn a_fifo_renamed_over_a_broken_theme_file_does_not_hang_the_watcher() {
         std::thread::sleep(Duration::from_millis(20));
     }
     drain(&watcher, QUIET);
-    write(&broken, &theme_doc("Broken", "#1d1d1d"));
+    save(&broken, &theme_doc("Broken", "#1d1d1d"));
     let deadline = Instant::now() + EVENTUALLY;
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
@@ -705,6 +826,6 @@ fn a_fifo_renamed_over_a_broken_theme_file_does_not_hang_the_watcher() {
         let _ = dropped.send(());
     });
     if done.recv_timeout(DROP_BOUND).is_err() {
-        release("dropping the watcher did not return within 5 s");
+        release("dropping the watcher did not return within EVENTUALLY");
     }
 }
