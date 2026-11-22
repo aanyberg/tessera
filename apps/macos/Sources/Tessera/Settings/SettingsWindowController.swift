@@ -52,10 +52,6 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     /// Called once the window has closed; the app delegate drops its
     /// reference to this controller.
     var onClose: (@MainActor () -> Void)?
-    /// Whether the event being handled is an Option-click on a close
-    /// button, which the app delegate turns into one Close All: this window
-    /// then waits for its answer, as the terminal windows do (ADR 0031).
-    var takesOptionClickOnCloseButton: (@MainActor () -> Bool)?
 
     /// `autosaveName` `nil` keeps the frame out of the user's defaults (for
     /// tests).
@@ -97,11 +93,6 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     @available(*, unavailable)
     required init?(coder: NSCoder) {
         fatalError("init(coder:) is not used")
-    }
-
-    /// Closes, but for an Option-click on a close button.
-    func windowShouldClose(_ sender: NSWindow) -> Bool {
-        takesOptionClickOnCloseButton?() != true
     }
 
     /// The tab view controller of the panes.

@@ -302,6 +302,89 @@ final class QuitAndCloseAllTests: XCTestCase {
         XCTAssertTrue(appDelegate.windowControllers.isEmpty)
     }
 
+    // MARK: AppKit's closeAll:
+
+    /// AppKit's own Close All, `closeAll:`, sent with no target as a menu
+    /// item sends it, over windows of [idle, busy] and [busy] tabs: the
+    /// application object (``TesseraApplication``), which answers it ahead
+    /// of its delegate, runs the single Close All, one application-modal
+    /// alert naming both jobs and no tab's sheet. Cancel closes nothing;
+    /// Close closes every tab and frees every controller.
+    func testAppKitsCloseAllThroughTheResponderChainAsksOnceForEveryWindow() async throws {
+        let first = try openTabs(2)
+        let second = try openTabs(1)
+        try await start("sleep 100", in: try controller(of: first[1]))
+        try await start("cat", in: try controller(of: second[0]))
+        presenter.modalAnswer = false
+
+        XCTAssertTrue(sendCloseAll(), "the responder chain answers closeAll:")
+
+        XCTAssertEqual(presenter.modals, [CloseConfirmation(scope: .allWindows, processNames: ["sleep", "cat"])])
+        XCTAssertTrue(presenter.sheets.isEmpty, "no tab asks on a sheet of its own")
+        XCTAssertEqual(NSApp.windows.reduce(0) { $0 + $1.sheets.count }, 0)
+        XCTAssertEqual(appDelegate.windowControllers.count, 3, "Cancel closes nothing")
+        XCTAssertTrue(appDelegate.windowControllers.allSatisfy { $0.pendingClose == nil }, "nothing asks on")
+
+        presenter.modalAnswer = true
+        var weakRefs: [WeakController] = appDelegate.windowControllers.map(WeakController.init)
+        autoreleasepool {
+            XCTAssertTrue(sendCloseAll())
+        }
+
+        XCTAssertEqual(presenter.modals.count, 2, "asked once more, once")
+        XCTAssertTrue(presenter.sheets.isEmpty, "and no tab asked")
+        XCTAssertTrue(appDelegate.windowControllers.isEmpty, "Close closes every tab of every window")
+        XCTAssertFalse((first + second).contains { $0.isVisible })
+        try? await waitUntil("the closed tabs' controllers are freed") { weakRefs.allSatisfy { $0.value == nil } }
+        XCTAssertEqual(weakRefs.filter { $0.value != nil }.count, 0, "every controller is freed")
+        weakRefs = []
+    }
+
+    /// `closeAll:` with a sheet up on the Settings window and a busy tab:
+    /// Cancel leaves Settings open with its sheet; Close ends the sheet as
+    /// Cancel, once, then closes Settings with the terminals.
+    func testAppKitsCloseAllEndsASheetOnSettingsOrLeavesSettingsOpen() async throws {
+        let controller = try appDelegate.newWindow()
+        try await start("sleep 100", in: controller)
+        appDelegate.openSettings(nil)
+        let settings = try XCTUnwrap(appDelegate.settingsWindowController?.window)
+        let sheet = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 200, height: 100), styleMask: [.titled], backing: .buffered,
+            defer: true)
+        sheet.isReleasedWhenClosed = false
+        var responses: [NSApplication.ModalResponse] = []
+        settings.beginSheet(sheet) { responses.append($0) }
+        try await waitUntil("the sheet is up") { settings.sheets.contains(sheet) }
+        presenter.modalAnswer = false
+
+        XCTAssertTrue(sendCloseAll())
+
+        XCTAssertEqual(presenter.modals, [CloseConfirmation(scope: .allWindows, processNames: ["sleep"])])
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertTrue(responses.isEmpty, "Cancel leaves the sheet")
+        XCTAssertTrue(settings.sheets.contains(sheet))
+        XCTAssertNotNil(appDelegate.settingsWindowController, "and Settings open")
+        XCTAssertEqual(appDelegate.windowControllers.count, 1)
+
+        presenter.modalAnswer = true
+        XCTAssertTrue(sendCloseAll())
+
+        try await waitUntil("the sheet answered") { !responses.isEmpty }
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(responses, [.cancel], "its Cancel path, once")
+        XCTAssertTrue(settings.sheets.isEmpty)
+        XCTAssertFalse(sheet.isVisible)
+        XCTAssertFalse(settings.isVisible)
+        XCTAssertNil(appDelegate.settingsWindowController)
+        XCTAssertTrue(appDelegate.windowControllers.isEmpty)
+    }
+
+    /// Sends AppKit's `closeAll:` with no target, through the responder
+    /// chain, as its menu item does.
+    private func sendCloseAll() -> Bool {
+        NSApp.sendAction(NSSelectorFromString("closeAll:"), to: nil, from: nil)
+    }
+
     // MARK: Option-click on a close button
 
     /// Clicks the window's close button as the mouse does, through
@@ -352,6 +435,74 @@ final class QuitAndCloseAllTests: XCTestCase {
         try await waitUntil("every window closes") { appDelegate.windowControllers.isEmpty }
         XCTAssertEqual(presenter.modals.count, 2, "asked once more, once")
         XCTAssertTrue(presenter.sheets.isEmpty)
+    }
+
+    /// Option-click on the close button of a window with tabs (AppKit's
+    /// tab-stack close, which offers every other tab its close before it
+    /// sends `closeAll:` at the end of that loop, in place of the clicked tab's
+    /// own close), the other tab busy,
+    /// beside an idle window: one Close All alert, after AppKit's round, and
+    /// no tab's sheet; Cancel closes nothing. Close then closes everything,
+    /// each tab once (adversarial #526c B1).
+    func testOptionClickOnATabbedWindowIsOneCloseAll() async throws {
+        let tabs = try openTabs(2)
+        let other = try openTabs(1)
+        try await start("sleep 100", in: try controller(of: tabs[0]))
+        let selected = try XCTUnwrap(tabs[0].tabGroup?.selectedWindow)
+        var closes: [ObjectIdentifier: Int] = [:]
+        let observer = NotificationCenter.default.addObserver(
+            forName: NSWindow.willCloseNotification, object: nil, queue: nil
+        ) { note in
+            guard let window = note.object as? NSWindow else { return }
+            MainActor.assumeIsolated { closes[ObjectIdentifier(window), default: 0] += 1 }
+        }
+        defer { NotificationCenter.default.removeObserver(observer) }
+        presenter.modalAnswer = false
+
+        var stacks: [String] = []
+        presenter.whileAskingModally = { stacks.append(Thread.callStackSymbols.joined(separator: "\n")) }
+
+        try clickCloseButton(of: selected, [.option])
+
+        try await waitUntil("Close All asks") { !presenter.modals.isEmpty }
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertEqual(presenter.modals, [CloseConfirmation(scope: .allWindows, processNames: ["sleep"])])
+        XCTAssertTrue(presenter.sheets.isEmpty, "no tab asks on a sheet of its own")
+        XCTAssertEqual(appDelegate.windowControllers.count, 3, "Cancel closes nothing")
+        XCTAssertTrue(closes.isEmpty, "no window closed")
+        XCTAssertEqual(stacks.count, 1)
+        XCTAssertFalse(
+            stacks.contains { $0.contains("attemptToCloseEntireStack") || $0.contains("_closeAllWindowsExceptItem") },
+            "Close All asks after AppKit has offered every tab its close, not inside that loop")
+
+        presenter.modalAnswer = true
+        try clickCloseButton(of: try XCTUnwrap(tabs[0].tabGroup?.selectedWindow), [.option])
+
+        try await waitUntil("every window closes") { appDelegate.windowControllers.isEmpty }
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertEqual(presenter.modals.count, 2, "asked once more, once")
+        XCTAssertTrue(presenter.sheets.isEmpty)
+        for window in tabs + other {
+            XCTAssertEqual(closes[ObjectIdentifier(window)], 1, "each tab closes once")
+        }
+    }
+
+    /// The same with both tabs idle and the other window busy: Cancel
+    /// closes neither idle tab.
+    func testOptionClickOnAnIdleTabbedWindowCancelClosesNothing() async throws {
+        let tabs = try openTabs(2)
+        let other = try openTabs(1)
+        try await start("sleep 100", in: try controller(of: other[0]))
+        let selected = try XCTUnwrap(tabs[0].tabGroup?.selectedWindow)
+        presenter.modalAnswer = false
+
+        try clickCloseButton(of: selected, [.option])
+
+        try await waitUntil("Close All asks") { !presenter.modals.isEmpty }
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertEqual(presenter.modals, [CloseConfirmation(scope: .allWindows, processNames: ["sleep"])])
+        XCTAssertEqual(appDelegate.windowControllers.count, 3, "Cancel closes nothing")
+        XCTAssertTrue(tabs.allSatisfy(\.isVisible), "both idle tabs stay")
     }
 
     /// With every session at its prompt the Option-click closes every
@@ -452,24 +603,6 @@ final class QuitAndCloseAllTests: XCTestCase {
         XCTAssertTrue(presenter.modals.isEmpty, "no Close All")
         presenter.sheets[0].answer(false)
         XCTAssertEqual(appDelegate.windowControllers.count, 2)
-    }
-
-    /// Only the release of an Option-click on the button itself counts:
-    /// Option elsewhere in the window (where a tab's own close button would
-    /// be) keeps AppKit's meaning.
-    func testOnlyAnOptionClickOnTheButtonCounts() throws {
-        let window = try XCTUnwrap(try openTabs(1).first)
-        let button = try XCTUnwrap(window.standardWindowButton(.closeButton))
-        let onButton = button.convert(NSPoint(x: button.bounds.midX, y: button.bounds.midY), to: nil)
-        let elsewhere = NSPoint(x: window.frame.width / 2, y: window.frame.height / 2)
-        func counts(_ type: NSEvent.EventType, _ at: NSPoint, _ modifiers: NSEvent.ModifierFlags) throws -> Bool {
-            AppDelegate.isOptionClickOnCloseButton(try mouseEvent(type, at: at, in: window, modifiers))
-        }
-        XCTAssertTrue(try counts(.leftMouseUp, onButton, [.option]))
-        XCTAssertFalse(try counts(.leftMouseUp, onButton, []), "no Option")
-        XCTAssertFalse(try counts(.leftMouseDown, onButton, [.option]), "the press, not the release")
-        XCTAssertFalse(try counts(.leftMouseUp, elsewhere, [.option]), "not on the button")
-        XCTAssertFalse(AppDelegate.isOptionClickOnCloseButton(nil))
     }
 
     // MARK: Quit's alternate

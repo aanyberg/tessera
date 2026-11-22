@@ -133,7 +133,7 @@ closes exactly as before:
 |---|---|---|
 | ⌘W, the tab's or window's close button (AppKit closes only the selected tab) | the tab's session runs a job | sheet on the tab, which is selected first: "Close this tab?" |
 | ⇧⌘W (`closeTabGroup`) | any tab of the window runs a job | one sheet on the current tab listing every busy tab's job (D4b) |
-| AppKit's own multi-tab closes (Close Other Tabs, Close Tabs to the Right, and `NSApplication`'s `closeAll:`, no longer in the menu since #464), which close each tab through `windowShouldClose` | that tab's session runs a job | idle tabs close at once; each busy tab asks on its own sheet, as for ⌘W |
+| AppKit's own multi-tab closes (Close Other Tabs, Close Tabs to the Right; `NSApplication`'s `closeAll:`, no longer in the menu since #464, is Close All since the 2026-11-22 amendment), which close each tab through `windowShouldClose` | that tab's session runs a job | idle tabs close at once; each busy tab asks on its own sheet, as for ⌘W |
 | Close All, ⌥⌘W (`closeAllWindows`, #464 amendment) | any session runs a job | one application-modal alert listing them all (D4b): "Close all windows?" |
 | ⌘Q, ⌥⌘Q (Quit's alternate, #464 amendment), the Dock's Quit, logging out (`applicationShouldTerminate`) | any session runs a job | one application-modal alert listing them all (D4b); a quit Apple event that arrives with a confirmation up: see the #458 amendment |
 
@@ -396,3 +396,34 @@ any other quit event asks to quit with the quit alert over Close All's
 - **Close All rebound to a key other than Close Tab's is an ordinary visible item.** AppKit pairs an alternate only
   with an item of the same key, so `MainMenu.apply` makes it one only while it has that key, and it is one again when
   the key map gives it back. Close All ends a sheet on Settings as Cancel before closing that window, as a quit does.
+
+## Amendment 2026-11-22: `closeAll:` is the single Close All (#526)
+
+`NSApplication` answers `closeAll:` itself, ahead of its delegate in the responder chain, by offering every window its
+close (`makeWindowsPerform:` with `_batchClose`, which reaches each tab's `windowShouldClose`), so every sender but the
+Option-click the 2026-11-18 amendment caught (a script, an accessibility client, AppKit's own Close All item should it
+come back) asked one sheet per busy tab. This replaces the #464 choice of "no `NSApplication` subclass, no override of
+`closeAll:`": the app object is `TesseraApplication`, an `NSApplication` created by `AppDelegate.main()` (not through
+`NSPrincipalClass`, which nothing reads), whose only change is `closeAll:`, overridden by selector because the SDK does
+not declare it. It runs `AppDelegate.closeAllWindows`: one application-modal alert for every busy session, and a sheet
+on Settings ended as Cancel before that window closes. Probed on macOS 27.2: AppKit sends `closeAll:` neither at
+launch nor on `terminate`.
+
+An Option-click on a window's close button reaches it two ways (probed on macOS 27.2):
+
+- **A window without tabs, or Settings:** the close widget sends `closeAll:` itself (`-[NSControl sendAction:to:]`,
+  then `-[NSApplication sendAction:to:from:]`), and no `windowShouldClose` runs.
+- **A window with tabs:** the widget's `_close:` becomes `_attemptToCloseAllTabs:`, `NSWindowStackController
+  attemptToCloseEntireStack:` and `_closeAllWindowsExceptItemAtIndex:`, which offers every other tab its close through
+  `windowShouldClose` and sends `closeAll:` (sender the stack controller) at the end of that loop, in place of the clicked
+  tab's own close. So each tab still
+  refuses its close for the release of an Option-click on a window's close button (checked against
+  `NSApp.currentEvent`, as in the 2026-11-18 amendment): without that, a busy tab asked on its own sheet, which then
+  held back Close All, and idle tabs closed, Cancel or not.
+
+For an Option-click, `closeAll:` runs `closeAllWindows` once, after AppKit's round, by a zero-delay `perform`, so
+nothing closes, and no alert's modal loop runs, inside AppKit's loop over the tabs; any other `closeAll:` runs it at
+once. The close buttons of the tab bar's tabs are other buttons: Option there stays AppKit's Close Other Tabs. The
+About panel is no longer closed by an Option-click: `closeAllWindows` closes the terminals and Settings only.
+`QuitAndCloseAllTests` sends `closeAll:` through `NSApp.sendAction` with no target, as a menu item does, and clicks
+the close buttons of windows with and without tabs, and of Settings, with Option through `NSApp.sendEvent`.

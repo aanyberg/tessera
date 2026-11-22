@@ -3,6 +3,24 @@ import TesseraKit
 import UniformTypeIdentifiers
 import os
 
+/// The application object: `NSApplication` but for AppKit's own Close All,
+/// `closeAll:`. `NSApplication` answers that action itself, ahead of its
+/// delegate in the responder chain, by offering every window its close in
+/// turn, so each busy tab asked on a sheet of its own. Here it is
+/// ``AppDelegate/closeAllWindows(_:)``, the single Close All (#526, ADR 0031):
+/// one question for every window, and a sheet on Settings ended first.
+/// The close button sends it on an Option-click, as would AppKit's own
+/// Close All item (Tessera's ⌥⌘W takes its place, #464), a script or an
+/// accessibility client; AppKit sends it neither at launch nor on quit.
+/// `closeAll:` is not in the SDK's headers, so this is an Objective-C
+/// override by selector.
+@MainActor
+final class TesseraApplication: NSApplication {
+    @objc(closeAll:) func closeAllWindows(_ sender: Any?) {
+        (delegate as? AppDelegate)?.closeAllFromAppKit(sender)
+    }
+}
+
 /// Entry point and application lifecycle: owns the core, the window
 /// registry and the signal handling. Each tab is a ``TerminalWindowController``
 /// running one session; ``SessionRouter`` delivers the core's events to them.
@@ -59,7 +77,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// its whole limit (#455).
     private var waitingSettingsTimer: SettingsTimer?
     /// An Option-click on a close button is waiting to run Close All
-    /// (``terminalWindowControllerTakesOptionClickOnCloseButton()``).
+    /// (``closeAllFromAppKit(_:)``).
     private var closeAllIsScheduled = false
     /// How long a closed Settings window's model waits for its add or
     /// delete at most. The watch applies an edit within about a second
@@ -172,8 +190,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// at launch, the tests open their own.
     static let isTestHost = ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
 
+    /// Creates the application object as a ``TesseraApplication``, before
+    /// anything else asks for `NSApp`; `NSPrincipalClass` is not read, as
+    /// nothing calls `NSApplicationMain`.
     static func main() {
-        let app = NSApplication.shared
+        let app = TesseraApplication.shared
         let delegate = AppDelegate()
         app.delegate = delegate
         app.setActivationPolicy(.regular)
@@ -429,9 +450,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// window asks nothing), and Cancel closes nothing. Ignored while a tab
     /// asks about itself, a pane or its window, as ⇧⌘W is. A termination
     /// signal or the system's quit while the alert asks ends it, and the
-    /// app quits without asking (``terminateWithoutAsking()``). An
-    /// Option-click on a window's close button comes here too
-    /// (``terminalWindowControllerTakesOptionClickOnCloseButton()``).
+    /// app quits without asking (``terminateWithoutAsking()``). AppKit's
+    /// own `closeAll:` comes here too, the Option-click on a window's close
+    /// button included (``closeAllFromAppKit(_:)``).
     @objc func closeAllWindows(_ sender: Any?) {
         guard !windowControllers.contains(where: { $0.pendingClose != nil }) else { return }
         if let presenter = closeConfirmationPresenter,
@@ -467,11 +488,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         controller.close()
     }
 
+    /// AppKit's `closeAll:` (``TesseraApplication``): Close All. For an
+    /// Option-click on a window's close button it runs once, after AppKit's
+    /// round: a window with tabs first offers every other tab its close
+    /// (each refuses, ``isOptionClickOnCloseButton(_:)``) and sends
+    /// `closeAll:` at the end of that loop (in place of the clicked tab's
+    /// own close), so nothing may close under
+    /// it. By a timer rather than the main queue: under a block of that
+    /// queue the alert's modal loop would run nothing else of it, signals
+    /// and session output included.
+    func closeAllFromAppKit(_ sender: Any?) {
+        guard Self.isOptionClickOnCloseButton(NSApp.currentEvent) else {
+            closeAllWindows(sender)
+            return
+        }
+        if !closeAllIsScheduled {
+            closeAllIsScheduled = true
+            perform(#selector(runScheduledCloseAll), with: nil, afterDelay: 0)
+        }
+    }
+
+    /// Runs the Close All an Option-click on a close button asked for.
+    @objc private func runScheduledCloseAll() {
+        closeAllIsScheduled = false
+        closeAllWindows(nil)
+    }
+
     /// Whether `event` lets go of an Option-click on a window's close
-    /// button. In full screen the button is in a window of AppKit's own, so
-    /// every window's button is compared with where the event happened.
-    /// The close buttons of the tab bar's tabs are other buttons: Option
-    /// there still means AppKit's Close Other Tabs.
+    /// button, which is Close All: every terminal tab refuses to close for
+    /// it in `windowShouldClose`, where AppKit's close of a window with tabs
+    /// offers each other tab its close. In full
+    /// screen the button is in a window of AppKit's own, so every window's
+    /// button is compared with where the event happened. The close buttons
+    /// of the tab bar's tabs are other buttons: Option there still means
+    /// AppKit's Close Other Tabs.
     static func isOptionClickOnCloseButton(_ event: NSEvent?) -> Bool {
         guard let event, event.type == .leftMouseUp, event.modifierFlags.contains(.option),
             let clicked = event.window
@@ -482,12 +532,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             return button.bounds.contains(button.convert(event.locationInWindow, from: nil))
         }
-    }
-
-    /// Runs the Close All an Option-click on a close button asked for.
-    @objc private func runScheduledCloseAll() {
-        closeAllIsScheduled = false
-        closeAllWindows(nil)
     }
 
     private static func profileName(of sender: Any?) -> String? {
@@ -541,9 +585,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.waitingSettingsTimer = model.clock.schedule(after: self.settingsWaitLimit) { [weak self] in
                 _ = self?.takeWaitingSettingsModel()
             }
-        }
-        controller.takesOptionClickOnCloseButton = { [weak self] in
-            self?.terminalWindowControllerTakesOptionClickOnCloseButton() ?? false
         }
         settingsWindowController = controller
         controller.showWindow(sender)
@@ -1075,22 +1116,6 @@ extension AppDelegate: NSMenuItemValidation {
 }
 
 extension AppDelegate: TerminalWindowControllerDelegate {
-    /// An Option-click on a close button is Close All: one question for
-    /// every window (ADR 0031). AppKit answers the click by offering each
-    /// window its close in turn, every tab and Settings through
-    /// `windowShouldClose`, which asks here: each is refused, and Close All
-    /// runs once, after AppKit's round. Later, by a timer rather than the
-    /// main queue: under a block of that queue the alert's modal loop would
-    /// run nothing else of it, signals and session output included.
-    func terminalWindowControllerTakesOptionClickOnCloseButton() -> Bool {
-        guard Self.isOptionClickOnCloseButton(NSApp.currentEvent) else { return false }
-        if !closeAllIsScheduled {
-            closeAllIsScheduled = true
-            perform(#selector(runScheduledCloseAll), with: nil, afterDelay: 0)
-        }
-        return true
-    }
-
     func terminalWindowControllerWantsNewTab(_ controller: TerminalWindowController) {
         do {
             try newTab(in: controller.window)
