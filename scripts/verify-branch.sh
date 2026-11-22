@@ -145,9 +145,20 @@ done
 # names several binaries, `package(x) & (binary(a) | binary(b))`, is one alternative: each binary is a target (#273).
 # An alternative with no binary(...) selects its package's lib, or its bins when the package has no src/lib.rs.
 # Prints "<package> <binary or empty>" per binary, or one line with an empty binary, per alternative of a filter line.
+# Only `package(=x)`, `binary(=x)` and bare glob-free names (the default matcher is glob) are read. A `~x`, `/re/` or
+# `#glob` matcher, a bare name with glob metacharacters, and a negated or differenced term (`!`, `not`, `a - b`) are not
+# evaluated: nothing is printed and it exits 2 with the reason on stderr, so a filter that selects more or fewer
+# targets than this reads is never taken for the one it reads (#561).
 filter_targets() {
     perl -e '
-        my $e = $ARGV[0]; my ($d, $cur, @alt) = (0, "");
+        my $e = $ARGV[0]; my ($d, $cur, @alt, @out) = (0, "");
+        my $bad = sub { print STDERR "unreadable nextest filter `$e`: $_[0]; verify-branch.sh reads only package(=x), " .
+            "binary(=x) and plain names. Rewrite the override in .config/nextest.toml in that form, or run the " .
+            "load check for this target by hand.\n"; exit 2 };
+        # Outside the arguments of a predicate only `&`, `|`, parentheses and predicates may appear.
+        (my $rest = $e) =~ s/\b[a-z_]+\([^)]*\)//g;
+        $bad->("negation") if $rest =~ /!|\bnot\b/;
+        $bad->("difference") if $rest =~ /-/;
         for my $c (split //, $e) {
             $d++ if $c eq "("; $d-- if $c eq ")";
             if ($c eq "|" && $d == 0) { push @alt, $cur; $cur = ""; next }
@@ -159,9 +170,15 @@ filter_targets() {
             my ($p) = $a =~ /package\(([^)]*)\)/ or next;
             my @b = $a =~ /binary\(([^)]*)\)/g;
             # Exact-match syntax `package(=x)` / `binary(=x)` names x; the `=` is not part of the name.
-            for ($p, @b) { s/^\s*=\s*//; s/^\s+|\s+$//g }
-            if (@b) { print "$p $_\n" for @b } else { print "$p \n" }
+            for ($p, @b) {
+                s/^\s+|\s+$//g;
+                if (s/^=\s*//) { next }
+                $bad->("matcher `$_` is not an exact name") if /^[~\/#]/ || /[*?\[\]{}\\]/;
+            }
+            for ($p, @b) { s/^\s+|\s+$//g }
+            if (@b) { push @out, "$p $_\n" for @b } else { push @out, "$p \n" }
         }
+        print @out;
     ' -- "$1"
 }
 if [[ -f .config/nextest.toml ]]; then
@@ -169,12 +186,13 @@ if [[ -f .config/nextest.toml ]]; then
         expr="${line#filter*=}"
         expr="${${expr## #}%% #}"
         expr="${expr#\'}" expr="${expr%\'}"
+        pairs="$(filter_targets "$expr")" || { print -u2 -r -- "verify-branch.sh: in .config/nextest.toml: $line"; exit 1; }
         while IFS=' ' read -r p b; do
             [[ -n "$p" && -n "${touched[$p]:-}" ]] || continue
             if [[ -n "$b" ]]; then targets[${p}:${b}]=1
             elif [[ -f "${pkgdir[$p]}/src/lib.rs" ]]; then targets[${p}:lib]=1
             else targets[${p}:bins]=1; fi
-        done < <(filter_targets "$expr")
+        done <<< "$pairs"
     done < <(grep '^filter' .config/nextest.toml)
 fi
 
