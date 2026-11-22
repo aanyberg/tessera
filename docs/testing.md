@@ -69,6 +69,19 @@ hangs, with exit **97** and a line starting `app-test watchdog: HANG` (or `FAILE
 It kills only the command's own process tree and the hosts under this run's `-derivedDataPath` that started after it
 did, so runs in other worktrees are untouched. `just app-test-watchdog-test` checks it with fake commands.
 
+## App tests that skip
+
+A hosted test that cannot exercise what it checks on this host skips with the reason in its `XCTSkip` message.
+
+- **The real-`NSSlider` tests in `SettingsTests`** (the ones that find the slider through `hostedOpacitySlider`, #564)
+  skip on CI and in any local build with Xcode 27. SwiftUI's `Slider` is an `NSSlider` only in an app linked against
+  the macOS 15 SDK (Xcode 16); linked against SDK 27, as CI and releases are since #584, it is SwiftUI's own control
+  with no AppKit control to drive. They stay as coverage of older-SDK builds (#583). The binding tests in the same
+  file drive the field's `doubleBinding` and `editingChanged` directly and cover the hold and hand-edit logic on every
+  SDK. On the macOS 15 runner most of them skipped too, because its synthetic drags did not move the knob.
+- **Tests that need a visible window or a full screen transition** (`FullScreenToggleTests`, `ResizeFootprintTests`)
+  skip on a locked console, where nothing is drawn and no transition finishes; CI runs them.
+
 ## Tests and the home directory
 
 Tests never read or write the real home directory. Tests that create an
