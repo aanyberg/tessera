@@ -4829,4 +4829,178 @@ font_size = 14.0
             "nothing redrawn"
         );
     }
+
+    /// An `App` with one fake session whose view (offscreen) shows a
+    /// `rows` x `cols` screen of text, for
+    /// `a_reload_capture_costs_about_a_plain_capture`; `None` when GPU
+    /// tests are skipped. Each row holds up to `cols - 8` cells of text
+    /// (the wide characters take two), so no row wraps.
+    fn screen_of_text(rows: u16, cols: u16) -> Option<(App, SessionId)> {
+        use unicode_width::UnicodeWidthChar;
+
+        let app = app();
+        let session = attach_fake(&app);
+        lock(&app.views).insert(session.id, offscreen(app.view_theme())?);
+        let mut cells = 0;
+        let row: String = "The quick brown fox e\u{301} 日本 😀 jumps "
+            .chars()
+            .cycle()
+            .take_while(|c| {
+                cells += c.width().unwrap_or(0);
+                cells <= usize::from(cols) - 8
+            })
+            .collect();
+        app.session(session.id).unwrap().with_terminal_mut(|term| {
+            term.resize(rows, cols);
+            for _ in 0..rows {
+                term.advance(format!("\r\n{row}").as_bytes());
+            }
+            assert!(
+                (0..rows).all(|r| term.grid().line(r).is_some_and(|line| !line.wrapped)),
+                "no row wraps"
+            );
+        });
+        Some((app, session.id))
+    }
+
+    /// #412 (#253 item 6): the capture a live re-theme leaves for the next
+    /// frame (`App::render_view`'s, under the terminal lock) costs about
+    /// what a plain capture of the same screen costs, and the capture after
+    /// an apply that draws nothing about what an idle one costs. A re-theme
+    /// only makes that capture compare the program's colours again
+    /// (`View::set_appearance`, and the theme colours the terminal falls
+    /// back to); it copies no row the screen did not change, so its extra
+    /// cost does not grow with the screen, and a reload that copied the
+    /// screen again, or captured twice, shows here.
+    ///
+    /// On an 80x24 and a 2048x1024 screen of text, with nothing printed in
+    /// between, three arms take turns within each sample: reload captures,
+    /// each after a re-theme (Dracula and Nord in turn); plain captures,
+    /// each after an apply that draws nothing (the theme name's case); and
+    /// idle captures, each after the same quiet apply made on a twin `App`
+    /// (same screen and view), so the measured view sees no apply but its
+    /// captures follow the same work (#412 r2 B1). A sample of an arm is the thread's CPU
+    /// time (#541) of `CAPTURES` captures, an arm's cost the fastest of
+    /// five samples. Reload is barred against plain (per size, below), and
+    /// plain against idle at 1.25x, so a cost every apply adds cannot hide
+    /// in both of the first two arms (#412 B1). Three attempts, as the other
+    /// release timing bars. Release only.
+    ///
+    /// Measured (release, Apple M-series; 200 captures, two CPU clock reads
+    /// of about 88 ns each included; 20 runs at load about 12): 80x24 idle
+    /// about 52 µs, plain 53 µs, reload 76 µs (reload/plain 1.34-1.51x,
+    /// plain/idle 0.98-1.06x); 2048x1024 idle 834 µs, plain 833 µs, reload
+    /// 863 µs (1.02-1.04x, 1.00-1.01x). Before the twin, whose applies warm
+    /// what the plain arm's warm, 80x24 plain/idle reached 1.13x at default
+    /// priority and 1.27-1.34x on efficiency cores (`taskpolicy -b`). There (10
+    /// runs at load about 11, captures 2-3x slower and noisier) a first
+    /// attempt measured 1.28-1.93x reload/plain and 0.74-1.47x plain/idle
+    /// at 80x24, 0.75-1.36x and 0.85-1.37x at 2048x1024; 7 of the 20 sizes
+    /// took a second attempt and all 10 runs passed. The 80x24 reload/plain
+    /// margin is thin there: passing attempts reached 1.73x against 1.75x
+    /// (1.67x in the #412 r2 review).
+    ///
+    /// The reload's extra is a constant about 110 ns a capture: about 50 ns
+    /// comparing the 1 KiB colour override table and about 60 ns of caches
+    /// the re-theme's own work cooled (1.21-1.27x with the colour comparison
+    /// cut out). That is 1.4x an idle 80x24 capture, so its bar is 1.75x;
+    /// the 2048x1024 one, where a copy of the screen would show, is 1.25x.
+    /// Mutants (#412): a reload that captures twice measured 2.08-2.10x and
+    /// 2.00x reload/plain; one that copies the screen again
+    /// (`set_appearance` dropping the snapshot's damage generation) 6.2-6.8x
+    /// and 412-450x; the same with every apply calling `set_appearance`
+    /// 6.2-6.4x and 448-467x plain/idle; every apply calling
+    /// `set_appearance` alone 1.44-1.47x plain/idle at 80x24.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "timing bar; run in release")]
+    fn a_reload_capture_costs_about_a_plain_capture() {
+        const SAMPLES: usize = 5;
+        const CAPTURES: usize = 200;
+        const ATTEMPTS: usize = 3;
+        const QUIET_BAR: f64 = 1.25;
+        let mut failures = Vec::new();
+        for (rows, cols, bar) in [(24_u16, 80_u16, 1.75), (1024, 2048, 1.25)] {
+            let Some((app, session)) = screen_of_text(rows, cols) else {
+                return;
+            };
+            let live = app.session(session).unwrap();
+            // The idle arm's twin: the same screen, view and quiet applies
+            // in another `App`, so the idle captures follow the same work
+            // (and caches it cools) without touching the measured view
+            // (#412 r2 B1).
+            let Some((twin, twin_session)) = screen_of_text(rows, cols) else {
+                return;
+            };
+            let capture = || {
+                let mut views = lock(&app.views);
+                let view = views.get_mut(&session).unwrap();
+                live.with_terminal(|term| {
+                    let started = crate::thread_cpu_time();
+                    std::hint::black_box(view.capture(term, 0));
+                    crate::thread_cpu_time().saturating_sub(started)
+                })
+            };
+            // The first capture copies the screen whole; later ones do not.
+            capture();
+            let retheme = [
+                (config("Dracula", 13.0, 1.0), bundled("Dracula")),
+                (config("Nord", 13.0, 1.0), bundled("Nord")),
+            ];
+            let quiet = [
+                (config("Nord", 13.0, 1.0), bundled("Nord")),
+                (config("nord", 13.0, 1.0), bundled("Nord")),
+            ];
+            // `None`: idle captures, after the quiet applies on the twin;
+            // else the applies and whether they re-theme.
+            let sample = |applies: Option<(&[(Config, tessera_config::Theme); 2], bool)>| {
+                let mut spent = Duration::ZERO;
+                for i in 0..CAPTURES {
+                    if let Some((applies, redraws)) = applies {
+                        let before = view_theme_of(&app, session);
+                        let (config, theme) = &applies[i % 2];
+                        app.apply_config(config, theme);
+                        assert_eq!(
+                            view_theme_of(&app, session) != before,
+                            redraws,
+                            "a re-theme changes the view's theme, a quiet apply does not"
+                        );
+                    } else {
+                        let (config, theme) = &quiet[i % 2];
+                        twin.apply_config(config, theme);
+                    }
+                    spent += capture();
+                }
+                spent
+            };
+            for attempt in 1..=ATTEMPTS {
+                let (mut reload, mut plain, mut idle) =
+                    (Duration::MAX, Duration::MAX, Duration::MAX);
+                for _ in 0..SAMPLES {
+                    reload = reload.min(sample(Some((&retheme, true))));
+                    plain = plain.min(sample(Some((&quiet, false))));
+                    idle = idle.min(sample(None));
+                }
+                let ratio = reload.as_secs_f64() / plain.as_secs_f64();
+                let quiet_ratio = plain.as_secs_f64() / idle.as_secs_f64();
+                eprintln!(
+                    "{cols}x{rows} attempt {attempt}: {CAPTURES} reload captures {reload:?}, \
+                     plain {plain:?} ({ratio:.3}x, bar {bar}x), idle {idle:?} \
+                     ({quiet_ratio:.3}x, bar {QUIET_BAR}x)"
+                );
+                if ratio <= bar && quiet_ratio <= QUIET_BAR {
+                    break;
+                }
+                if attempt == ATTEMPTS {
+                    failures.push(format!(
+                        "{cols}x{rows}: reload/plain {ratio:.3}x (bar {bar}x), \
+                         plain/idle {quiet_ratio:.3}x (bar {QUIET_BAR}x)"
+                    ));
+                }
+            }
+            drop(live);
+            app.close_session(session).unwrap();
+            twin.close_session(twin_session).unwrap();
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
 }
