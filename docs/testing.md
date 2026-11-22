@@ -38,7 +38,10 @@ runtime (`__tsan::SlotLock`) deadlocks the host. Every other thread that touches
 too, the font index's `close` in `Coverage::build` among them (#443): those threads are bystanders. In the watchdog's
 sample (`apps/macos/build/app-test-hang-sample.log`), look for the thread it reports as "forking" and for the thread
 that holds the atfork lock. In #443 that was AppKit's `NSPersistentUI` queue (`arc4random_buf` from
-`-[NSPersistentUIWindowInfo initWithWindowID:]`); other samples show a CoreSpotlight queue. Terminal windows are not
+`-[NSPersistentUIWindowInfo initWithWindowID:]`); other samples show a CoreSpotlight queue. On macOS 27 (CI run
+44917832924) the main thread waited in libobjc's atfork handler while 71 workqueue threads waited in the runtime's
+allocator (`__tsan::ProcCreate` and `__sanitizer::InternalAlloc` on an unfair lock), and the retry hung the same way;
+the watchdog classifies that shape too. Terminal windows are not
 restorable by AppKit (the window state store restores them), which removes the `NSPersistentUI` partner but not the
 others. `scripts/app-test-watchdog.sh` kills such a host and reruns the hung test once; the run fails anyway when
 another test failed in it. The watchdog does not see the same hang in a child copy of the host, so
