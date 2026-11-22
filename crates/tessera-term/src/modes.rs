@@ -104,7 +104,9 @@
 //! line, as the reference terminals keep it visible: the primary screen is
 //! cleared from the restored cursor to its end, and the alternate rows are
 //! moved there, cells, clusters, hyperlinks and soft wraps as they were
-//! (#489). Bracketed paste is left on
+//! (#489), from the first to the last row that shows text: a row of
+//! spaces and erased cells is blank whatever its colours (#556). Bracketed
+//! paste is left on
 //! (shells turn it on and off around each command themselves), and so is
 //! every other mode. Shells write the command end before their line editor
 //! turns its own modes back on, so those stay (ADR 0020, "Amendment: modes
@@ -112,7 +114,7 @@
 
 use std::mem;
 
-use tessera_grid::{Cell, EraseDisplay, EraseLine, Line};
+use tessera_grid::{Cell, CellFlags, EraseDisplay, EraseLine, Line, Style};
 use tracing::trace;
 
 use crate::keyboard::{KeyboardModes, KittyFlags, KittyFlagsMode, ModifyOtherKeys};
@@ -639,22 +641,28 @@ impl State {
 
     /// Puts `lines` (the alternate screen a command end left,
     /// [`State::take_alt_screen_lines`]) on the primary screen, from its
-    /// first to its last row showing anything, at most the screen's
-    /// height, so the dead program's last screen and the messages after it
-    /// (ssh's disconnect reason, a panic, the shell's job status) stay
-    /// above the next prompt and scroll into the scrollback like printed
-    /// text (ADR 0020, "modes a dead program left on").
+    /// first to its last row showing text ([`shows_text`]), at most the
+    /// screen's height, so the dead program's last screen and the messages
+    /// after it (ssh's disconnect reason, a panic, the shell's job status)
+    /// stay above the next prompt and scroll into the scrollback like
+    /// printed text (ADR 0020, "modes a dead program left on"). A row of
+    /// spaces and erased cells is blank whatever its colours (#556): the
+    /// coloured blank rows of a full-screen program drawn in a background
+    /// of its own (mc, vim with a colour scheme) are trimmed before and
+    /// after the text; those between text rows are kept.
     ///
     /// The primary screen is cleared from the restored cursor to its end
     /// first, so no stale row shows between or after the carried ones. The
     /// rows start at the start of the cursor's line, or of the next one
-    /// when the cursor is not at its start, and each takes a row of its
+    /// when the cursor is not at its start or its line continues a
+    /// soft-wrapped line above it (#556 M3: the carried text is no
+    /// continuation of the shell's line), and each takes a row of its
     /// own: its cells are moved, not printed again, so every cell keeps
     /// its character, cluster, hyperlink, style and place, and a
     /// soft-wrapped row (full, or padded where a wide character did not
     /// fit) stays wrapped unless it is the last one. A row's trailing
     /// blanks in the shell's background are trimmed to the shell's pen;
-    /// a blank in another background is not blank (a status bar's colour
+    /// a blank in another background is kept (a status bar's colour
     /// stays). Rows scrolled in take the shell's pen too, which the
     /// carry never changes. The cursor's row keeps its marks; a row below
     /// it loses the stale ones it held.
@@ -662,18 +670,22 @@ impl State {
         let pen = self.grid.pen();
         // Blank in the shell's background and no wide character's pad.
         let trims = |cell: &Cell| cell.is_blank() && cell.style.bg == pen.bg && !cell.is_pad();
-        let shows = |line: &Line| !line.cells.iter().all(trims);
-        let Some(first) = lines.iter().position(shows) else {
+        let Some(first) = lines.iter().position(shows_text) else {
             return;
         };
-        let last = lines.iter().rposition(shows).unwrap_or(first);
+        let last = lines.iter().rposition(shows_text).unwrap_or(first);
         lines.truncate(last + 1);
         let restored = self.grid.cursor().row;
         let cols = usize::from(self.grid.cols());
-        if self.grid.cursor().col != 0 || self.grid.pending_wrap() {
+        if self.grid.cursor().col != 0 || self.grid.pending_wrap() || self.continues_above(restored)
+        {
             // The rest of the cursor's line, unless its last cell is still
-            // to be wrapped after.
-            if !self.grid.pending_wrap() {
+            // to be wrapped after; either way the line ends here.
+            if self.grid.pending_wrap() {
+                if let Some(line) = self.grid.line_mut(restored) {
+                    line.wrapped = false;
+                }
+            } else {
                 self.grid.erase_in_line(EraseLine::ToEnd);
             }
             self.grid.carriage_return();
@@ -708,6 +720,21 @@ impl State {
         }
     }
 
+    /// True when the primary screen's `row` continues a soft-wrapped line
+    /// above it: the row above, or the newest scrollback line for the top
+    /// row, is wrapped. O(1).
+    fn continues_above(&self, row: u16) -> bool {
+        match row.checked_sub(1) {
+            Some(above) => self.grid.line(above).is_some_and(|line| line.wrapped),
+            None => self
+                .grid
+                .scrollback_len()
+                .checked_sub(1)
+                .and_then(|newest| self.grid.scrollback_line(newest))
+                .is_some_and(|line| line.wrapped),
+        }
+    }
+
     /// The mode part of RIS: every mode and both kitty stacks to their
     /// defaults, except [`Modes::allow_column_change`]; leaving 132-column
     /// mode asks the host for 80 columns (xterm), without resizing the
@@ -727,6 +754,24 @@ impl State {
         self.keyboard = KeyboardModes::default();
         self.kitty = KittyStacks::default();
     }
+}
+
+/// What a cell draws besides its background: an underline, a
+/// strikethrough or an overline also show on a space.
+const DRAWS_ON_A_SPACE: u16 = Style::UNDERLINE_STYLE_MASK | Style::STRIKETHROUGH | Style::OVERLINE;
+
+/// True when `line` shows text for the alternate-screen carry: a cell that
+/// is not a space, part of a cluster or a wide character, or a wide
+/// character's pad, or a space that draws a line. Spaces and erased cells
+/// show only colour, whatever their colours, inverse video included, and
+/// a colour alone is not text (#556, ADR 0020,
+/// "Which rows are carried").
+fn shows_text(line: &Line) -> bool {
+    line.cells.iter().any(|cell| {
+        cell.ch != ' '
+            || !cell.flags.difference(CellFlags::LINK).is_empty()
+            || cell.style.flags & DRAWS_ON_A_SPACE != 0
+    })
 }
 
 #[cfg(test)]
