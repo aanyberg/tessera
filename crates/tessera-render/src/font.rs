@@ -489,6 +489,11 @@ pub(crate) struct Inner {
     coverage: Arc<OnceLock<Coverage>>,
     color_faces: HashMap<FaceId, bool>,
     ink: HashMap<(FaceId, u16), GlyphInk>,
+    /// Resolutions handed out while the coverage index was building that
+    /// may change once it is ready (a `.notdef`, or a chain family's
+    /// synthetic bold the index may beat), counted (wrapping) so a shaper
+    /// can tell whether a line used one ([`Self::provisional`]).
+    provisional: u64,
 }
 
 /// The font database, fallback chain and rasteriser shared by a
@@ -619,6 +624,7 @@ impl Fonts {
             coverage: Arc::new(OnceLock::new()),
             color_faces: HashMap::new(),
             ink: HashMap::new(),
+            provisional: 0,
         };
         let regular = inner.styled_face(0, FontStyle::Regular).ok_or_else(|| {
             RenderError::NoFont(format!(
@@ -651,6 +657,21 @@ impl Fonts {
             epoch: Arc::new(AtomicU64::new(0)),
             coverage: self.coverage,
         }
+    }
+
+    /// [`Self::new`] without the background coverage index; tests land
+    /// it with [`Self::build_index_now`].
+    #[cfg(test)]
+    pub(crate) fn without_index(config: &FontConfig) -> Result<Self, RenderError> {
+        Self::with_system(FontSystem::new(), config, IndexBuild::Never)
+    }
+
+    /// Builds the coverage index on this thread and lands it, as the
+    /// background thread would.
+    #[cfg(test)]
+    pub(crate) fn build_index_now(&self) {
+        let index = Coverage::build(self.lock().system.db());
+        let _ = self.coverage.set(index);
     }
 
     pub(crate) fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -747,10 +768,14 @@ impl Fonts {
     /// is ready. Never goes back to `false`.
     ///
     /// Until then, a character that neither the primary family nor the
-    /// fallback chain covers shapes to the primary face's `.notdef`; once
-    /// it is ready, shaping the same cells again gives the covering face.
-    /// A renderer that caches shaped rows should re-shape the rows that
-    /// held `.notdef` glyphs (glyph id 0) when this flips to `true`.
+    /// fallback chain covers shapes to the primary face's `.notdef`, and a
+    /// bold character no chain family has a bold face for is a chain
+    /// family's regular face with synthetic bold, which a real bold found
+    /// through the index may beat; once it is ready, shaping the same
+    /// cells again gives the final face. A renderer that caches shaped
+    /// rows should re-shape the rows shaped with such a provisional face
+    /// when this flips to `true` (the renderer asks the shaper whether a
+    /// line used one).
     #[must_use]
     pub fn fallback_index_ready(&self) -> bool {
         self.coverage.get().is_some()
@@ -860,6 +885,7 @@ impl Inner {
         let (resolved, cacheable) = self.resolve_uncached(ch, style);
         if !cacheable {
             // The coverage index is still building; resolve again later.
+            self.provisional = self.provisional.wrapping_add(1);
             return resolved;
         }
         if self.char_faces.len() >= MAX_CHAR_FACES {
@@ -891,7 +917,20 @@ impl Inner {
         if !prefers_emoji(ch) {
             return self.resolve(ch, style);
         }
-        self.resolve_uncached_as(ch, style, false).0
+        let (resolved, settled) = self.resolve_uncached_as(ch, style, false);
+        if !settled {
+            self.provisional = self.provisional.wrapping_add(1);
+        }
+        resolved
+    }
+
+    /// How many resolutions so far may change once the coverage index is
+    /// ready (wrapping): a line shaped under one lock whose count moved
+    /// holds such a face and should be shaped again when
+    /// [`Fonts::fallback_index_ready`] turns `true`. Never moves once the
+    /// index is ready.
+    pub(crate) const fn provisional(&self) -> u64 {
+        self.provisional
     }
 
     /// The resolved face, and whether it is final (`false` while the
