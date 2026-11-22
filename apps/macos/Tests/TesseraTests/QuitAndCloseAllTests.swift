@@ -590,13 +590,8 @@ final class QuitAndCloseAllTests: XCTestCase {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
         try compileSleeper(to: dir.appendingPathComponent("z\u{202E}x\nq"))
-        let script = dir.appendingPathComponent("run.sh")
-        try "exec \"$(dirname \"$0\")\"/z*q\n".write(to: script, atomically: true, encoding: .utf8)
         let controller = try appDelegate.newWindow()
-        try controller.focusedPane.session.write(Array("sh \(script.path)\n".utf8))
-        let job = try await poll("the hostile sleeper runs") {
-            try controller.focusedPane.session.foregroundProcess().flatMap { $0.name.hasPrefix("z") ? $0 : nil }
-        }
+        let job = try await runSleeper(in: dir, session: controller.focusedPane.session, "the hostile sleeper runs")
         XCTAssertTrue(job.name.contains("\u{202E}") || job.name.contains("\n"), "the name is hostile: \(job.name)")
         presenter.modalAnswer = false
 

@@ -741,18 +741,31 @@ final class PluginsPaneTests: XCTestCase {
     /// The model a closed window left waiting is freed once its edit lands.
     /// As the app does it, on its core; on a manual clock, so only the
     /// apply can release it.
+    ///
+    /// Opened, shown for a pass of the run loop, then edited and closed,
+    /// each step in a pool of its own (as
+    /// ``testClosingTheWindowWhileHelloSettlesFreesTheControllerAndModel``).
+    /// Observed, not explained (#598): opened and closed in one pass, the
+    /// model sometimes outlived the 10 s wait, and 30 s more, under TSan
+    /// and load, with the controller, window list and waiting model all
+    /// gone. Something keeps the model alive until a run-loop turn passes
+    /// between open and close; the holder is not identified (see #604).
     func testTheKeptModelIsFreedOnceItsEditLands() async throws {
         appDelegate.settingsClock = ManualClock()
         let opened = try autoreleasepool {
             let controller = try openPlugins(config: "[plugins]\nenabled = []\n")
             controller.window?.contentView?.layoutSubtreeIfNeeded()
+            return Opened(controller: controller, model: controller.model, window: nil)
+        }
+        try await Task.sleep(for: .milliseconds(100))
+        try autoreleasepool {
+            let controller = try XCTUnwrap(opened.controller)
             controller.model.setPlugin(Self.hello, enabled: true)
             XCTAssertTrue(controller.model.pluginsChanging)
-            let opened = Opened(controller: controller, model: controller.model, window: nil)
             controller.close()
             XCTAssertTrue(appDelegate.waitingSettingsModel === controller.model, "kept while the edit waits")
-            return opened
         }
+        XCTAssertNotNil(opened.model, "kept while the edit waits")
         try await waitUntil("applied and let go") { appDelegate.waitingSettingsModel == nil }
         try await waitUntil("the model is freed") { autoreleasepool { opened.model == nil } }
         XCTAssertNil(opened.model, "nothing keeps it once its edit landed")

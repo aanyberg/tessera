@@ -254,21 +254,42 @@ final class MainMenuTests: XCTestCase {
     /// alternates and, with Stage Manager on, Remove Window from Set. The
     /// tiling and Stage Manager items run AppKit's private actions (an
     /// underscore; Tessera's never start with one); a submenu is AppKit's
-    /// when every item in it is.
-    private static func isAppKitItem(_ item: NSMenuItem) -> Bool {
+    /// when every item in it is, or when it is one of AppKit's tiling
+    /// submenus (``appKitSubmenuTitles``) and no submenu Tessera builds has
+    /// its title (`tesseraSubmenus`), whatever it holds: AppKit fills those
+    /// as they open, and CI's runner showed Move & Resize with nothing in
+    /// it yet (#597). The contents of AppKit's tiling submenus are no
+    /// longer checked: one of those titles is AppKit's by its title alone.
+    private static func isAppKitItem(
+        _ item: NSMenuItem, tesseraSubmenus: Set<String> = tesseraSubmenuTitles
+    ) -> Bool {
         let added: Set<String> = [
             "makeKeyAndOrderFront:", "orderFrontCharacterPalette:", "startDictation:",
             "toggleFullScreen:", "toggleTabOverview:", "miniaturizeAll:", "zoomAll:", "alternateArrangeInFront:",
         ]
         if let submenu = item.submenu, item.action == #selector(NSMenu.submenuAction(_:)) {
+            if appKitSubmenuTitles.contains(item.title), !tesseraSubmenus.contains(item.title) { return true }
             // A submenu its delegate fills as it opens is filled first.
             submenu.delegate?.menuNeedsUpdate?(submenu)
             let items = submenu.items.filter { !$0.isSeparatorItem }
-            return !items.isEmpty && items.allSatisfy(isAppKitItem)
+            return !items.isEmpty && items.allSatisfy { isAppKitItem($0, tesseraSubmenus: tesseraSubmenus) }
         }
         guard let action = item.action.map(NSStringFromSelector) else { return false }
         return added.contains(action) || action.hasPrefix("_")
     }
+
+    /// The titles of the tiling submenus AppKit adds to Window in an active
+    /// app (CI's runner).
+    private static let appKitSubmenuTitles: Set<String> = ["Move & Resize", "Full Screen Tile"]
+
+    /// The titles of every submenu Tessera's menu bar has, as
+    /// ``MainMenu/makeMenuBar()`` builds it, at any depth.
+    private static let tesseraSubmenuTitles: Set<String> = {
+        func titles(of menu: NSMenu) -> [String] {
+            menu.items.flatMap { item in item.submenu.map { [item.title] + titles(of: $0) } ?? [] }
+        }
+        return Set(titles(of: MainMenu.makeMenuBar().bar))
+    }()
 
     /// `menu`'s items but AppKit's (`isAppKitItem`), and but a separator
     /// that AppKit's left next to another: its tiling items come with one
@@ -356,6 +377,19 @@ final class MainMenuTests: XCTestCase {
         menu.addItem(item("Arrange in Front", "alternateArrangeInFront:", alternate: true))
         menu.addItem(item("Remove Window from Set", "_removeWindowFromStageManagerSet:"))
         XCTAssertEqual(menu.numberOfItems, Self.windowItems.count + 9, "the 19 items of CI's menu")
+        XCTAssertEqual(
+            Self.authoredItems(of: menu).map(Item.init).map(\.description), Self.windowItems.map(\.description))
+
+        // Move & Resize before AppKit fills it, as CI's runner showed it
+        // (#597): AppKit's by its title, which no submenu of Tessera's
+        // has; one Tessera built under that title would be its own.
+        let moveAndResize = try XCTUnwrap(menu.items.first { $0.title == "Move & Resize" })
+        moveAndResize.submenu?.removeAllItems()
+        XCTAssertTrue(Self.isAppKitItem(moveAndResize))
+        let tessera = Self.tesseraSubmenuTitles.union(["Move & Resize"])
+        XCTAssertFalse(Self.isAppKitItem(moveAndResize, tesseraSubmenus: tessera))
+        XCTAssertFalse(Self.isAppKitItem(submenu("Tiles", [])), "an empty submenu of another title")
+        XCTAssertTrue(Self.tesseraSubmenuTitles.isSuperset(of: ["Select Tab", "Find", "Select Pane"]))
         XCTAssertEqual(
             Self.authoredItems(of: menu).map(Item.init).map(\.description), Self.windowItems.map(\.description))
 
