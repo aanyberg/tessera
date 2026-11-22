@@ -169,6 +169,29 @@ impl GraphemeTable {
             .flat_map(|side| side.links.iter())
     }
 
+    /// Every run of cells of one hyperlink entity, as its columns and
+    /// link, by ascending column (adjacent runs are different entities).
+    pub(crate) fn link_runs(&self) -> impl Iterator<Item = (Range<usize>, &Hyperlink)> + '_ {
+        self.entries
+            .as_deref()
+            .into_iter()
+            .flat_map(|side| side.links.runs())
+    }
+
+    /// Runs in the link table, and runs it has room for (tests check the
+    /// run-length storage).
+    #[cfg(test)]
+    pub(crate) fn link_storage(&self) -> (usize, usize) {
+        self.entries
+            .as_deref()
+            .map_or((0, 0), |side| (side.links.len(), side.links.capacity()))
+    }
+
+    /// What breaks the link table's run invariants, if anything.
+    pub(crate) fn link_run_error(&self) -> Option<String> {
+        self.entries.as_deref()?.links.run_error()
+    }
+
     fn link_slice_eq(&self, other: &Self) -> bool {
         self.links().eq(other.links())
     }
@@ -187,11 +210,24 @@ impl GraphemeTable {
     }
 
     /// Stores `link` as the hyperlink at `col`, replacing any previous one.
-    pub(crate) fn set_link(&mut self, col: usize, link: Hyperlink) {
+    #[inline]
+    pub(crate) fn set_link(&mut self, col: usize, link: &Hyperlink) {
         self.entries
             .get_or_insert_with(Box::default)
             .links
             .set(col, link);
+    }
+
+    /// Stores `link` as the hyperlink of every column in `range`,
+    /// replacing the previous ones.
+    pub(crate) fn set_link_range(&mut self, range: Range<usize>, link: &Hyperlink) {
+        if range.is_empty() {
+            return;
+        }
+        self.entries
+            .get_or_insert_with(Box::default)
+            .links
+            .set_range(range, link);
     }
 
     /// Drops the cluster and the hyperlink at `col`, if any.
@@ -299,15 +335,15 @@ impl GraphemeTable {
             .map(|e| (usize::from(e.col), e.text))
     }
 
-    /// Removes every hyperlink and hands them out as `(column, link)`
-    /// pairs by ascending column; the clusters stay.
-    pub(crate) fn take_links(&mut self) -> impl Iterator<Item = (usize, Hyperlink)> + use<> {
+    /// Removes every hyperlink and hands them out as runs of columns of
+    /// one entity, by ascending column; the clusters stay.
+    pub(crate) fn take_links(&mut self) -> impl Iterator<Item = (Range<usize>, Hyperlink)> + use<> {
         let taken = self.entries.as_deref_mut().map(|side| side.links.take());
         self.drop_if_empty();
         taken
             .into_iter()
             .flatten()
-            .map(crate::hyperlink::Entry::into_parts)
+            .map(crate::hyperlink::Run::into_parts)
     }
 
     /// Frees the storage when nothing is left in it.

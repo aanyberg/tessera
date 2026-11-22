@@ -934,7 +934,7 @@ impl Grid {
                 line.set(base + 1, Cell::spacer(cell.style));
                 if let Some(link) = line.graphemes.link(base).cloned() {
                     // Both halves of a linked character are linked.
-                    line.set_link(base + 1, link);
+                    line.set_link(base + 1, &link);
                 }
                 line.cells[base].flags |= CellFlags::WIDE;
                 let end = self.line_end_from(u16::try_from(base).unwrap_or(u16::MAX));
@@ -980,8 +980,8 @@ impl Grid {
         );
         line.set(col + 1, Cell::spacer(cell.style));
         if let Some(link) = &self.active_link {
-            line.set_link(col, link.clone());
-            line.set_link(col + 1, link.clone());
+            line.set_link(col, link);
+            line.set_link(col + 1, link);
         }
         self.advance_to(col + 2, end);
     }
@@ -2737,6 +2737,9 @@ fn line_errors(at: LineAt<'_>, line: &Line, cols: u16, errors: &mut Vec<String>)
             None => errors.push(format!("{at}: cluster at column {col} past the end")),
         }
     }
+    if let Some(error) = line.graphemes.link_run_error() {
+        errors.push(format!("{at}: {error}"));
+    }
     for (col, _) in line.graphemes.links() {
         match cells.get(col) {
             Some(cell) if !cell.is_link() => {
@@ -2941,7 +2944,7 @@ fn put_over(line: &mut Line, col: usize, cell: Cell, pen: Style, open: Option<&H
     line.unpair(col, pen);
     line.set(col, cell);
     if let Some(link) = open {
-        line.set_link(col, link.clone());
+        line.set_link(col, link);
     }
 }
 
@@ -2963,10 +2966,9 @@ fn copy_span(lines: &mut [Line], src: usize, dst: usize, span: std::ops::Range<u
             to.graphemes.set(col, text.into());
         }
     }
-    for (col, link) in from.graphemes.links() {
-        if span.contains(&col) {
-            to.graphemes.set_link(col, link.clone());
-        }
+    for (cols, link) in from.graphemes.link_runs() {
+        let cols = cols.start.max(span.start)..cols.end.min(span.end);
+        to.graphemes.set_link_range(cols, link);
     }
 }
 
