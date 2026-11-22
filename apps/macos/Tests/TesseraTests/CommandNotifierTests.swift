@@ -461,7 +461,9 @@ final class CommandNotifierTests: XCTestCase {
         controller.focus(right)
         XCTAssertTrue(controller.markedSessionIDs.isEmpty)
         XCTAssertNil(controller.window?.tab.accessoryView)
-        XCTAssertEqual(poster.removed.last, [CommandNotification.identifier(for: right.session.id)])
+        XCTAssertEqual(
+            poster.removed,
+            [[CommandNotification.identifier(for: left.session.id)], [CommandNotification.identifier(for: right.session.id)]])
 
         // Closing a marked pane drops its mark.
         isActive = false
@@ -487,6 +489,54 @@ final class CommandNotifierTests: XCTestCase {
         XCTAssertTrue(controller.isCommandMarked(pane), "nothing has asked yet")
         controller.windowDidBecomeKey(Notification(name: NSWindow.didBecomeKeyNotification, object: controller.window))
         XCTAssertFalse(controller.isCommandMarked(pane))
+        XCTAssertEqual(poster.removed, [[CommandNotification.identifier(for: pane.session.id)]])
+    }
+
+    /// D10: every clear path, one after another (the pane focused, its
+    /// window made key, the app back in front, as a click on a key window
+    /// of an inactive app runs them), removes the notification once.
+    func testEveryClearPathInTurnRemovesTheNotificationOnce() throws {
+        let controller = try appDelegate.newWindow()
+        let (pane, _) = try split(controller)
+        isActive = false
+        _ = finish(pane, in: controller)
+        isActive = true
+        controller.focus(pane)
+        XCTAssertEqual(poster.removed.count, 1, "the focus cleared it")
+        controller.windowDidBecomeKey(Notification(name: NSWindow.didBecomeKeyNotification, object: controller.window))
+        NotificationCenter.default.post(name: NSApplication.didBecomeActiveNotification, object: NSApp)
+        controller.focus(pane)
+        XCTAssertFalse(controller.isCommandMarked(pane))
+        XCTAssertNil(controller.window?.tab.accessoryView)
+        XCTAssertEqual(poster.removed, [[CommandNotification.identifier(for: pane.session.id)]])
+    }
+
+    /// D10: a clear path that runs while another is reading the focus (the
+    /// first read of a window's tab group creates it, which fires the tab's
+    /// selection observer; the window becomes key and the app active
+    /// meanwhile) removes the notification once: only the clear that
+    /// unmarks the pane removes it.
+    func testAClearPathThatRunsWhileTheFocusIsReadRemovesTheNotificationOnce() throws {
+        let controller = try appDelegate.newWindow()
+        let window = try XCTUnwrap(controller.window)
+        let (pane, _) = try split(controller)
+        isActive = false
+        _ = finish(pane, in: controller)
+        isActive = true
+        var reads = 0
+        notifier.focus.isKeyWindow = { [unowned controller] window in
+            reads += 1
+            if reads == 1 {
+                window.tabGroup?.selectedWindow = window
+                controller.windowDidBecomeKey(Notification(name: NSWindow.didBecomeKeyNotification, object: window))
+                NotificationCenter.default.post(name: NSApplication.didBecomeActiveNotification, object: NSApp)
+            }
+            return true
+        }
+        controller.focus(pane)
+        XCTAssertGreaterThan(reads, 1, "the focus was read again while it was read")
+        XCTAssertFalse(controller.isCommandMarked(pane))
+        XCTAssertNil(window.tab.accessoryView)
         XCTAssertEqual(poster.removed, [[CommandNotification.identifier(for: pane.session.id)]])
     }
 

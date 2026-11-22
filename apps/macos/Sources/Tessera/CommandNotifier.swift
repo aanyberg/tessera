@@ -363,6 +363,11 @@ final class CommandNotifier {
     /// it now loses its mark and its delivered notification (D10, F10).
     func focusMayHaveChanged(in controller: TerminalWindowController) {
         for pane in controller.panes where controller.isCommandMarked(pane) && isFocused(pane, in: controller) {
+            // Reading the focus can run this again before it returns (the
+            // first read of a window's tab group creates the group, which
+            // fires the tab's selection observer): only the call that
+            // clears the mark removes the notification.
+            guard controller.isCommandMarked(pane) else { continue }
             controller.setCommandMark(false, for: pane)
             poster.removeDelivered(identifiers: [CommandNotification.identifier(for: pane.session.id)])
         }
