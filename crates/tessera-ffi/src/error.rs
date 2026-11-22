@@ -53,9 +53,10 @@ impl From<&CoreError> for Error {
         match error {
             CoreError::SessionNotFound(_) => Self::SessionNotFound,
             CoreError::Pty(pty) => match pty {
-                PtyError::Open(_) | PtyError::Spawn { .. } | PtyError::ArgumentsTooLong { .. } => {
-                    Self::SpawnFailed
-                }
+                PtyError::Open(_)
+                | PtyError::Spawn { .. }
+                | PtyError::ArgumentsTooLong { .. }
+                | PtyError::ProgramTimedOut { .. } => Self::SpawnFailed,
                 PtyError::InvalidSize(_) => Self::InvalidArgument,
                 PtyError::Resize(_) | PtyError::Io(_) => Self::Io,
             },
@@ -133,6 +134,10 @@ mod tests {
             ),
             (
                 CoreError::Pty(PtyError::ArgumentsTooLong { bytes: 2, max: 1 }),
+                Error::SpawnFailed,
+            ),
+            (
+                CoreError::Pty(PtyError::ProgramTimedOut { path_bytes: 1 }),
                 Error::SpawnFailed,
             ),
             (
