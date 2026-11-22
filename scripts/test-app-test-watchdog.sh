@@ -20,7 +20,8 @@
 #     killed; a run that starts no test within the limit is stopped, with the restarted host outside its group;
 #   - a TSan hang and a hang outside the runtime in one attempt fail without a rerun, in either order;
 #   - a process under the products path that predates the run survives a hang and a SIGINT to the watchdog's group;
-#   - a TSan hang, also in macOS 15's shape (the runtime yielding through libsystem_pthread), reruns only the hung
+#   - a TSan hang, also in macOS 15's shape (the runtime yielding through libsystem_pthread) and in macOS 27's (the
+#     main thread forking, workqueue threads waiting in the runtime's allocator), reruns only the hung
 #     test, once, with the other arguments kept and the run's -only-testing replaced
 #     ("TSan hang in ..., retried"), and passes when that rerun passes; a TSan hang plus another failure fails without
 #     a rerun; a second hang in the rerun fails, keeping both samples; a TSan hang that xcodebuild lists under no
@@ -184,7 +185,9 @@ EOF
 # background thread and a thread blocked in an interceptor (`__tsan::` frames, as in every TSan process); the main
 # thread hangs inside the runtime (`__tsan::SlotLock`) when FAKE_SAMPLE_TSAN gives this call 1, in a condition wait
 # otherwise; with 15 the main thread waits and another thread is stuck in the runtime as on macOS 15 (CI, PR #294),
-# yielding through libsystem_pthread's `cthread_yield`, while a third thread waits in fork's atfork handler (#443).
+# yielding through libsystem_pthread's `cthread_yield`, while a third thread waits in fork's atfork handler (#443);
+# with 27 the main thread itself forks and waits in libobjc's atfork handler while workqueue threads are stuck
+# creating their TSan state, on the runtime allocator's unfair lock (macOS 27.0.1, CI run 44917832924, #525).
 cat > "$work/bin/sample" <<'EOF'
 #!/bin/sh
 echo "$1" >> "$FAKE_WORK/sampled"
@@ -196,6 +199,36 @@ n=$(wc -l < "$FAKE_WORK/sampled" | tr -d " ")
 tsan="$(echo "${FAKE_SAMPLE_TSAN:-0}" | cut -d, -f"$n")"
 [ -n "$tsan" ] || tsan="$(echo "${FAKE_SAMPLE_TSAN:-0}" | awk -F, '{ print $NF }')"
 extra=""
+main="    +           900 wrap_pthread_cond_wait  (in libclang_rt.tsan_osx_dynamic.dylib) + 20  [0x0]"
+forks=""
+if [ "$tsan" = 27 ]; then
+    # macOS 27 (CI run 44917832924, AppAppearanceTests): the main thread spawns a shell and forks; libobjc's atfork
+    # handler waits on a lock while 71 workqueue threads wait in the runtime's allocator (two shown).
+    tsan=0 forks=1
+    main="    +           900 Command::spawn  (in FakeHost) + 560  [0x0]
+    +             900 wrap_fork  (in libclang_rt.tsan_osx_dynamic.dylib) + 128  [0x0]
+    +               900 fork  (in libsystem_c.dylib) + 36  [0x0]
+    +                 900 libSystem_atfork_prepare  (in libSystem.B.dylib) + 44  [0x0]
+    +                   900 _objc_atfork_prepare  (in libobjc.A.dylib) + 568  [0x0]
+    +                     900 wrap_os_unfair_lock_lock_with_options  (in libclang_rt.tsan_osx_dynamic.dylib) + 236  [0x0]
+    +                       900 _os_unfair_lock_lock_slow  (in libsystem_platform.dylib) + 172  [0x0]
+    +                         900 __ulock_wait2  (in libsystem_kernel.dylib) + 8  [0x0]"
+    for t in 4 5; do
+        extra="$extra${extra:+
+}    900 Thread_$t
+    + 900 start_wqthread  (in libsystem_pthread.dylib) + 8  [0x0]
+    +   900 _pthread_wqthread  (in libsystem_pthread.dylib) + 52  [0x0]
+    +     900 _pthread_wqthread_setup  (in libsystem_pthread.dylib) + 376  [0x0]
+    +       900 _pthread_introspection_hook_callout_thread_create  (in libsystem_pthread.dylib) + 88  [0x0]
+    +         900 __sanitizer::sanitizer_pthread_introspection_hook(unsigned int, _opaque_pthread_t*, void*, unsigned long)  (in libclang_rt.tsan_osx_dynamic.dylib) + 84  [0x0]
+    +           900 __tsan::ThreadCreateCallback(unsigned long, bool)  (in libclang_rt.tsan_osx_dynamic.dylib) + 68  [0x0]
+    +             900 __tsan::ThreadCreateCallback(unsigned long, bool) (.cold.2)  (in libclang_rt.tsan_osx_dynamic.dylib) + 28  [0x0]
+    +               900 __tsan::ProcCreate()  (in libclang_rt.tsan_osx_dynamic.dylib) + 36  [0x0]
+    +                 900 __sanitizer::InternalAlloc(unsigned long, __sanitizer::SizeClassAllocator32LocalCache<__sanitizer::SizeClassAllocator32<__sanitizer::AP32>>*, unsigned long)  (in libclang_rt.tsan_osx_dynamic.dylib) + 148  [0x0]
+    +                   900 _os_unfair_lock_lock_slow  (in libsystem_platform.dylib) + 172  [0x0]
+    +                     900 __ulock_wait2  (in libsystem_kernel.dylib) + 8  [0x0]"
+    done
+fi
 if [ "$tsan" = 15 ]; then
     # macOS 15 (CI's PR #294 sample): the runtime semaphore yields through libsystem_pthread's cthread_yield.
     tsan=0
@@ -237,6 +270,9 @@ else
     +               900 _pthread_cond_wait  (in libsystem_pthread.dylib) + 980  [0x2]
     +                 900 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x3]"
 fi
+# The forking main thread waits in the atfork handler, not in a condition wait (a blank line would end the graph).
+[ -n "$forks" ] || main="$main
+$hang"
 cat > "$4" <<SAMPLE
 Analysis of sampling FakeHost (pid $1) every 1 millisecond
 Process:         FakeHost [$1]
@@ -248,8 +284,7 @@ Call graph:
     +     900 -[FakeTests.HangTests testHangs]  (in FakeTests) + 52  [0x0]
     +       900 TesseraSession.close()  (in FakeHost) + 52  [0x0]
     +         900 tessera_session_close  (in FakeHost) + 52  [0x0]
-    +           900 wrap_pthread_cond_wait  (in libclang_rt.tsan_osx_dynamic.dylib) + 20  [0x0]
-$hang
+$main
     900 Thread_2
     + 900 thread_start  (in libsystem_pthread.dylib) + 8  [0x0]
     +   900 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x0]
@@ -427,7 +462,10 @@ start_direct() {
     mkdir -p "$w/DerivedData/Build/Products/Debug"
     cp "$work/bin/FakeHost" "$w/DerivedData/Build/Products/Debug/FakeHost"
     (
-        local start=$SECONDS st=0
+        # Sub-second elapsed time: whole seconds round a 9.x s run down to 9 or 8.
+        typeset -F SECONDS
+        local -F start=$SECONDS
+        local st=0
         env FAKE_WORK="$w" FAKE_RUNS="$runs" FAKE_SAMPLE_TSAN=0 ${=envs} perl -e 'alarm shift; exec @ARGV' 120 \
             zsh "$watchdog" --sample-log "$w/sample.log" "$@" < /dev/null > "$w/out" 2> "$w/err" || st=$?
         print -r -- "$st $(( SECONDS - start ))" > "$w/result"
@@ -444,9 +482,15 @@ start_direct chatty "TESSERA_APP_TEST_IDLE_SECONDS=100 TESSERA_APP_TEST_HARD_SEC
 start_direct silent "TESSERA_APP_TEST_IDLE_SECONDS=6" - zsh -c 'echo begin; trap "" TERM; perl -e "setpgrp(0,0); exec q(sleep), 302" & echo $! > '"$work"'/silent-grandchild; sleep 303 & wait'
 start_direct fails "TESSERA_APP_TEST_IDLE_SECONDS=6" - zsh -c 'echo out-line; echo err-line >&2; exit 7'
 start_direct passes "TESSERA_APP_TEST_IDLE_SECONDS=6" - zsh -c 'echo fine'
-# One process spinning for 9 s without a byte of output: only its CPU time is progress (a bounded single process, no load generator).
-start_direct spinner "TESSERA_APP_TEST_IDLE_SECONDS=4" - perl -e '$t = time + 9; 1 while time < $t'
-start_direct slow-chat "TESSERA_APP_TEST_IDLE_SECONDS=6" - zsh -c 'for i in 1 2 3 4 5; do echo tick $i; sleep 2; done'
+# The idle limits of the spinner and slow-chat cases grow with the load (`slack`): the watchdog reads CPU time every 3 s
+# through `ps`, which a loaded machine slows. Each command still runs past its own limit.
+idle_scale=$(( slack / 10 ))
+spinner_idle=$(( 4 * idle_scale )) spinner_secs=$(( 4 * idle_scale + 5 ))
+chat_idle=$(( 6 * idle_scale )) chat_ticks=$(( 3 * idle_scale + 2 ))
+# One process spinning without a byte of output, past its idle limit: only its CPU time is progress (a bounded single
+# process, no load generator). Time::HiRes: the core `time` is whole seconds, which cuts the spin short by up to 1 s.
+start_direct spinner "TESSERA_APP_TEST_IDLE_SECONDS=$spinner_idle" - perl -MTime::HiRes=time -e '$t = time + shift; 1 while time < $t' "$spinner_secs"
+start_direct slow-chat "TESSERA_APP_TEST_IDLE_SECONDS=$chat_idle" - zsh -c 'for i in {1..'"$chat_ticks"'}; do echo tick $i; sleep 2; done'
 start_case pass pass 0
 start_case slow-results slow-results 0
 start_case hang hang,pass 0 user
@@ -463,6 +507,7 @@ start_case continue hang-continue 0
 start_case stuck hang-stuck 0
 start_case tsan-pass hang,pass 1
 start_case tsan-macos15 hang,pass 15
+start_case tsan-macos27 hang,pass 27
 start_case tsan-other hang-fail,pass 1
 start_case tsan-unlisted hang-unlisted,pass 1
 start_case tsan-stuck hang-stuck,pass 1
@@ -531,17 +576,17 @@ else
     not_ok "a passing command: exit $st: $out / $err"
 fi
 direct slow-chat
-if (( st == 0 && secs >= 9 )) && [[ "$err" != *HANG* ]]; then
+if (( st == 0 && secs >= 2 * chat_ticks - 1 && 2 * chat_ticks > chat_idle )) && [[ "$err" != *HANG* ]]; then
     ok "a command that outlasts the idle limit but keeps printing is not a hang"
 else
-    not_ok "a chatty command: exit $st after ${secs} s: $err"
+    not_ok "a chatty command: exit $st after ${secs} s (${chat_ticks} ticks, idle limit ${chat_idle} s): $err"
 fi
 
 direct spinner
-if (( st == 0 && secs >= 9 )) && [[ "$err" != *HANG* && "$out" != *HANG* ]]; then
+if (( st == 0 && secs >= spinner_secs && spinner_secs > spinner_idle )) && [[ "$err" != *HANG* && "$out" != *HANG* ]]; then
     ok "a silent command that keeps using CPU for longer than the idle limit is not a hang (CPU progress)"
 else
-    not_ok "a silent spinner: exit $st after ${secs} s: $out $err"
+    not_ok "a silent spinner: exit $st after ${secs} s (spin ${spinner_secs} s, idle limit ${spinner_idle} s): $out $err"
 fi
 
 # --- all tests pass
@@ -698,6 +743,16 @@ else
     not_ok "a macOS 15 TSan hang: exit $st, $(runs) runs: $out"
 fi
 check_no_strays "a macOS 15 TSan hang"
+
+load_case tsan-macos27
+if (( st == 0 )) && [[ "$(runs)" == 2 && "$tail" == *"TSan hang in -[FakeTests.HangTests testHangs] (#278), retried"* \
+    && "$out" == *"Thread_1"*"main-thread"*"is forking"*"_objc_atfork_prepare"* \
+    && "$out" == *"Thread_4 stuck in the TSan runtime"*"__sanitizer::InternalAlloc"* ]]; then
+    ok "a macOS 27 TSan hang (the main thread forking, threads waiting in the runtime's allocator) is classified TSan and rerun"
+else
+    not_ok "a macOS 27 TSan hang: exit $st, $(runs) runs: $out"
+fi
+check_no_strays "a macOS 27 TSan hang"
 
 load_case tsan-unlisted
 if (( st == 0 )) && [[ "$(runs)" == 2 && "$tail" == *"TSan hang in -[FakeTests.HangTests testHangs] (#278), retried"* ]]; then

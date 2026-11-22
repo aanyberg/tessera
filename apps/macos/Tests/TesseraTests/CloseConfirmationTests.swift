@@ -1330,6 +1330,14 @@ enum TerminationSignalChild {
 
     private static let sampleFile = "sample.txt"
 
+    /// How many lines of the call graph a ``diagnose(_:in:graph:)`` keeps
+    /// (#526: a 40-line cut hid a stalled launch). At least 200, the number
+    /// #526 asks for. The child is a copy of the test host, so its graph can
+    /// be as large as the host's: the watchdog's sample of the host in the
+    /// macOS 27 #278 hang (CI run 44917832924, 71 threads stuck in the
+    /// runtime) had a 986-line call graph.
+    static let callGraphLineLimit = 1000
+
     /// Samples the running `child` for a second (into ``sampleFile``) and
     /// returns every thread's stack: a stalled launch can sit deeper than
     /// the first screenful, or on another thread than the main one.
@@ -1346,7 +1354,7 @@ enum TerminationSignalChild {
             .split(separator: "\n", omittingEmptySubsequences: false)
         return text.drop { !$0.contains("Call graph:") }
             .prefix { !$0.contains("Total number in stack") }
-            .prefix(1000)
+            .prefix(callGraphLineLimit)
             .map(String.init)
     }
 
