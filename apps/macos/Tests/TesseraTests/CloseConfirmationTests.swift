@@ -137,13 +137,8 @@ final class CloseConfirmationTests: XCTestCase {
         try compileSleeper(to: dir.appendingPathComponent(hostile))
         // The shell cannot be sent the name as typed input (the line editor
         // would take the escape as a key), so a script `exec`s it.
-        let script = dir.appendingPathComponent("run.sh")
-        try "exec \"$(dirname \"$0\")\"/z*q\n".write(to: script, atomically: true, encoding: .utf8)
         let controller = try appDelegate.newWindow()
-        try controller.focusedPane.session.write(Array("sh \(script.path)\n".utf8))
-        let job = try await poll("the copied sleep runs") {
-            try controller.focusedPane.session.foregroundProcess().flatMap { $0.name.hasPrefix("z") ? $0 : nil }
-        }
+        let job = try await runSleeper(in: dir, session: controller.focusedPane.session, "the copied sleep runs")
         XCTAssertTrue(job.name.unicodeScalars.contains { $0.properties.generalCategory == .control }, job.name)
 
         controller.window?.performClose(nil)
@@ -601,6 +596,43 @@ func compileSleeper(to binary: URL) throws {
 
 struct PollTimedOut: Error, CustomStringConvertible {
     let description: String
+}
+
+/// Runs the sleeper ``compileSleeper(to:)`` built in `dir` (its name, which
+/// may hold anything, starts with "z" and ends with "q") in `session`, the
+/// way a user would, through a script that `exec`s it, and returns it once
+/// it is the session's foreground job.
+///
+/// The shell, the script and the exec take seconds on a loaded CI runner
+/// under TSan (#599), so it waits up to `timeout`; but it fails as soon as
+/// the script's shell (which wrote its pid before the exec) is gone without
+/// having become the sleeper.
+@MainActor
+func runSleeper(
+    in dir: URL, session: TesseraSession, _ description: String, timeout: Duration = .seconds(30)
+) async throws -> TesseraSession.ForegroundProcess {
+    let script = dir.appendingPathComponent("run.sh")
+    let pidFile = dir.appendingPathComponent("pid")
+    try #"""
+        d="$(dirname "$0")"
+        echo $$ > "$d/pid.tmp" && mv "$d/pid.tmp" "$d/pid"
+        exec "$d"/z*q
+
+        """#.write(to: script, atomically: true, encoding: .utf8)
+    try session.write(Array("sh \(script.path)\n".utf8))
+    let deadline = ContinuousClock.now + timeout
+    while true {
+        if let job = try session.foregroundProcess(), job.name.hasPrefix("z") { return job }
+        if let text = try? String(contentsOf: pidFile, encoding: .utf8),
+            let pid = Int32(text.trimmingCharacters(in: .whitespacesAndNewlines)), kill(pid, 0) != 0, errno == ESRCH
+        {
+            throw PollTimedOut(description: "the script's shell (\(pid)) exited before it ran: \(description)")
+        }
+        guard ContinuousClock.now < deadline else {
+            throw PollTimedOut(description: "timed out after \(timeout): \(description)")
+        }
+        try await Task.sleep(for: .milliseconds(20))
+    }
 }
 
 // MARK: - Termination signals with a confirmation up (#441)
