@@ -19,10 +19,12 @@ internal import TesseraCore
 /// delegate runs (`yes $'\a'`): one `Task` per event would grow the main
 /// queue without bound. Each callback records its event in the session's
 /// pending set (output: a flag; title, remote state and clipboard text: the
-/// latest value; bell: a flag; exit: the code and signal) and schedules a
-/// delivery only if none is queued for that session. The delivery takes the
-/// whole set and reports it in a fixed order: output, title, remote state,
-/// clipboard, bell, exit. The
+/// latest value; bell: a flag; command finished: the longest, the latest of equals, so a
+/// long command is not hidden by a short one after it (ADR 0048); exit: the code
+/// and signal) and schedules a delivery only if none is queued for that
+/// session. The delivery takes the whole set and reports it in a fixed
+/// order: output, title, remote state, clipboard, bell, command finished,
+/// exit. The
 /// clipboard text (OSC 52) goes to ``pasteboard``, not to the delegate,
 /// through one app-wide ``ClipboardThrottle`` (at most 10 writes a second,
 /// the latest held; ADR 0022 D-RATE52). So at most one delivery per session
@@ -142,6 +144,15 @@ final class CallbackBridge {
             },
             on_config_invalid: { userData in
                 CallbackBridge.from(userData)?.receiveInvalid()
+            },
+            on_session_command_finished: { userData, id, exitKnown, exitCode, durationMs in
+                let finish = TesseraCommandFinish(
+                    exitCode: exitKnown ? exitCode : nil, durationMilliseconds: durationMs)
+                CallbackBridge.from(userData)?.receive(for: id) { pending in
+                    if pending.commandFinished.map({ $0.durationMilliseconds <= durationMs }) ?? true {
+                        pending.commandFinished = finish
+                    }
+                }
             }
         )
     }
@@ -175,6 +186,7 @@ final class CallbackBridge {
         var remote: TesseraRemote?
         var clipboard: String?
         var bell = false
+        var commandFinished: TesseraCommandFinish?
         var exit: (code: Int32, signal: Int32)?
     }
 
@@ -283,6 +295,9 @@ final class CallbackBridge {
         }
         if events.bell, let (delegate, session) = target() {
             delegate.sessionDidRingBell(session)
+        }
+        if let finish = events.commandFinished, let (delegate, session) = target() {
+            delegate.session(session, didFinishCommand: finish)
         }
         if let exit = events.exit, let (delegate, session) = target() {
             delegate.session(session, didExitWithCode: exit.code, signal: exit.signal)

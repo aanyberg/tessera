@@ -377,6 +377,7 @@ impl Config {
         let mut warnings = Vec::new();
         normalize_appearance(&mut self.appearance, &mut warnings);
         self.selection.normalize(&mut warnings);
+        self.notifications.normalize(&mut warnings);
         crate::profile::cap_profiles(self, &mut warnings);
         for (i, profile) in self.profiles.iter_mut().enumerate() {
             if let Some(appearance) = profile.appearance.as_mut() {
@@ -419,7 +420,7 @@ impl Config {
 
 /// The top-level keys of [`Config`], as written in `config.toml`. A test
 /// checks them against the serialised defaults.
-const CONFIG_KEYS: [&str; 7] = [
+const CONFIG_KEYS: [&str; 8] = [
     "general",
     "appearance",
     "terminal",
@@ -427,6 +428,7 @@ const CONFIG_KEYS: [&str; 7] = [
     "plugins",
     "keys",
     "selection",
+    "notifications",
 ];
 
 /// The part of `document` the warnings look up, copied: every top-level
@@ -812,6 +814,27 @@ where
     Ok(lenient_bool(deserializer)?.unwrap_or(false))
 }
 
+/// Deserializes `notifications.command_finished` and fails closed (ADR
+/// 0048 D5): a string that is not exactly one of the names gives `off`,
+/// whatever the default, and [`invalid_lenient_values`] reports it; a
+/// value of another type fails the load, as a mistyped `u32` does.
+pub(crate) fn lenient_command_finished<'de, D>(
+    deserializer: D,
+) -> Result<crate::CommandFinishedMode, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize as _;
+
+    match toml::Value::deserialize(deserializer)? {
+        toml::Value::String(name) => Ok(named(&name).unwrap_or(crate::CommandFinishedMode::Off)),
+        other => Err(serde::de::Error::custom(format!(
+            "invalid type: {}, expected \"unfocused\" or \"off\"",
+            other.type_str()
+        ))),
+    }
+}
+
 /// A boolean, or `None` for a value of any other type.
 fn lenient_bool<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
 where
@@ -850,6 +873,32 @@ fn invalid_named<T: Named>(
                 written(text, value),
                 T::default().name(),
                 quoted_names::<T>(separator)
+            ),
+        },
+    ))
+}
+
+/// A `notifications.command_finished` string that names no mode (ADR 0048
+/// D5): it means off, with this warning.
+fn invalid_command_finished(text: &str, root: &toml::de::DeTable<'_>) -> Option<(usize, Warning)> {
+    let (at, value) = lookup(
+        root,
+        &[Step::Key("notifications"), Step::Key("command_finished")],
+    )?;
+    let toml::de::DeValue::String(name) = value.get_ref() else {
+        return None;
+    };
+    if named::<crate::CommandFinishedMode>(name).is_some() {
+        return None;
+    }
+    Some((
+        at,
+        Warning::OutOfRange {
+            path: "notifications.command_finished".into(),
+            detail: format!(
+                "{} replaced by \"off\" (expected {})",
+                written(text, value),
+                quoted_names::<crate::CommandFinishedMode>(" or ")
             ),
         },
     ))
@@ -953,6 +1002,7 @@ fn invalid_lenient_values(text: &str, root: &toml::de::DeTable<'_>) -> Vec<(usiz
         "remote_indicator",
         " or ",
     ));
+    warnings.extend(invalid_command_finished(text, root));
     if let Some((at, value)) = lookup(root, &[Step::Key("terminal"), Step::Key(CLIPBOARD)])
         && !matches!(value.get_ref(), DeValue::Boolean(_))
     {

@@ -1,6 +1,6 @@
 #!/usr/bin/env zsh
 # Builds tessera-ffi, compiles each C test in crates/tessera-ffi/tests/c
-# (lifecycle.c, input.c, keymap.c, scroll.c, clipboard.c, remote.c, selection.c, selection_rich.c, search.c, prompts.c, foreground.c, config.c, appearance.c, plugins.c, accessibility.c, then surface.c) against the generated TesseraCore.h
+# (lifecycle.c, input.c, keymap.c, scroll.c, clipboard.c, remote.c, selection.c, selection_rich.c, search.c, prompts.c, foreground.c, config.c, appearance.c, plugins.c, accessibility.c, notify.c, then surface.c) against the generated TesseraCore.h
 # and the static library, and runs it. surface.c draws into a bare
 # CAMetalLayer and skips itself when TESSERA_SKIP_GPU_TESTS is set.
 # Usage: scripts/ffi-c-test.sh [worktree-dir]   (defaults to the repo root)
@@ -49,7 +49,7 @@ esac
 config_dir="$(mktemp -d)"
 export TESSERA_CONFIG_DIR="$config_dir"
 
-for test in lifecycle input keymap scroll clipboard remote selection selection_rich search prompts foreground config appearance plugins accessibility surface; do
+for test in lifecycle input keymap scroll clipboard remote selection selection_rich search prompts foreground config appearance plugins accessibility notify surface; do
     "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -pedantic \
         -I "$include_dir" \
         "crates/tessera-ffi/tests/c/$test.c" \

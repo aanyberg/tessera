@@ -43,8 +43,8 @@ use tessera_app_core::{Remote, SessionEvent, SessionId, SessionObserver};
 /// # ABI
 ///
 /// Fields are only ever added at the end (`on_appearance_changed`,
-/// `on_session_clipboard`, `on_config_applied`, `on_session_remote` and
-/// `on_config_invalid` were). A host compiled against an older header
+/// `on_session_clipboard`, `on_config_applied`, `on_session_remote`,
+/// `on_config_invalid` and `on_session_command_finished` were). A host compiled against an older header
 /// passes a shorter table, which this core would read past: rebuild the
 /// host against the header that ships with the core it links. Initialise the table with designated
 /// initialisers (C) or every field (Swift), so a new field is `NULL`.
@@ -157,6 +157,25 @@ pub struct Callbacks {
     /// the file loads, clears `"load_error"`. Configuration watch's thread,
     /// under the rules of `on_config_applied`.
     pub on_config_invalid: Option<unsafe extern "C" fn(user_data: *mut c_void)>,
+    /// A command of the session finished (#470, ADR 0048): its prompt mark
+    /// D (OSC 133), or the next prompt or command that ended it without
+    /// one. `exit_known` is whether the shell reported an exit status, and
+    /// `exit_code` that status (0 when not known); `duration_ms` is how
+    /// long it ran from its C mark, in milliseconds (saturating at
+    /// `UINT64_MAX`). Carries no command text: the core records none. The
+    /// host decides with `tessera_app_command_finished_decision` whether
+    /// to mark the pane and post a notification. At most a few calls per
+    /// chunk of output however many marks it holds (S6); none for a
+    /// command still running when the session exits.
+    pub on_session_command_finished: Option<
+        unsafe extern "C" fn(
+            user_data: *mut c_void,
+            session_id: u64,
+            exit_known: bool,
+            exit_code: i32,
+            duration_ms: u64,
+        ),
+    >,
 }
 
 /// Most bytes of the host `on_session_remote` passes: the longest DNS name
@@ -254,8 +273,26 @@ impl SessionObserver for CallbackObserver {
                     unsafe { callback(user_data, id, kind as u8, ptr, len) };
                 }
             }
+            SessionEvent::CommandFinished {
+                exit_code,
+                duration,
+            } => {
+                if let Some(callback) = callbacks.on_session_command_finished {
+                    let duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+                    // SAFETY: host contract on `Callbacks`.
+                    unsafe {
+                        callback(
+                            user_data,
+                            id,
+                            exit_code.is_some(),
+                            exit_code.unwrap_or(0),
+                            duration_ms,
+                        );
+                    };
+                }
+            }
             // Internal to the core (ADR 0039, #45a): no host callback.
-            SessionEvent::CommandStarted | SessionEvent::CommandFinished { .. } => {}
+            SessionEvent::CommandStarted => {}
         }
     }
 
@@ -294,19 +331,23 @@ fn c_string_lossy(text: String) -> CString {
 mod tests {
     use super::*;
 
-    /// The table's C layout: ten pointers, `on_config_invalid` last,
-    /// right after `on_session_remote` (fields are only appended, S7).
+    /// The table's C layout: eleven pointers, `on_session_command_finished`
+    /// last, right after `on_config_invalid` (fields are only appended, S7).
     #[test]
-    fn the_config_invalid_callback_is_appended_last() {
+    fn the_command_finished_callback_is_appended_last() {
         use std::mem::{offset_of, size_of};
 
         let pointer = size_of::<*const c_void>();
-        assert_eq!(size_of::<Callbacks>(), 10 * pointer);
+        assert_eq!(size_of::<Callbacks>(), 11 * pointer);
         assert_eq!(offset_of!(Callbacks, on_appearance_changed), 5 * pointer);
         assert_eq!(offset_of!(Callbacks, on_session_clipboard), 6 * pointer);
         assert_eq!(offset_of!(Callbacks, on_config_applied), 7 * pointer);
         assert_eq!(offset_of!(Callbacks, on_session_remote), 8 * pointer);
         assert_eq!(offset_of!(Callbacks, on_config_invalid), 9 * pointer);
+        assert_eq!(
+            offset_of!(Callbacks, on_session_command_finished),
+            10 * pointer
+        );
     }
 
     static INVALID_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -320,6 +361,7 @@ mod tests {
     fn a_config_that_does_not_load_reaches_the_callback() {
         let observer = CallbackObserver::new(Callbacks {
             on_config_invalid: Some(record_invalid),
+            on_session_command_finished: None,
             ..empty()
         });
         observer.on_config_invalid();
@@ -340,6 +382,7 @@ mod tests {
             on_config_applied: None,
             on_session_remote: None,
             on_config_invalid: None,
+            on_session_command_finished: None,
         }
     }
 
@@ -375,6 +418,7 @@ mod tests {
             on_config_applied: None,
             on_session_remote: Some(record_remote),
             on_config_invalid: None,
+            on_session_command_finished: None,
         });
         let id = SessionId::from_raw(1);
         observer.on_session_event(id, SessionEvent::Remote(Remote::Host("far.example".into())));
@@ -392,6 +436,63 @@ mod tests {
         assert_eq!(RemoteKind::Host as u8, 1);
         assert_eq!(RemoteKind::Unnamed as u8, 2);
         assert_eq!(MAX_REMOTE_HOST_LEN, 253);
+    }
+
+    type FinishCall = (u64, bool, i32, u64);
+
+    static FINISH_CALLS: std::sync::Mutex<Vec<FinishCall>> = std::sync::Mutex::new(Vec::new());
+
+    unsafe extern "C" fn record_finish(
+        _user_data: *mut c_void,
+        session_id: u64,
+        exit_known: bool,
+        exit_code: i32,
+        duration_ms: u64,
+    ) {
+        FINISH_CALLS
+            .lock()
+            .unwrap()
+            .push((session_id, exit_known, exit_code, duration_ms));
+    }
+
+    /// #470: one call per `CommandFinished`, with its exit status and
+    /// duration (P12: `Duration::MAX` saturates); none for a start.
+    #[test]
+    fn command_finishes_reach_the_callback_once_each() {
+        use std::time::Duration;
+
+        let observer = CallbackObserver::new(Callbacks {
+            on_session_command_finished: Some(record_finish),
+            ..empty()
+        });
+        let id = SessionId::from_raw(7);
+        observer.on_session_event(id, SessionEvent::CommandStarted);
+        observer.on_session_event(
+            id,
+            SessionEvent::CommandFinished {
+                exit_code: Some(130),
+                duration: Duration::from_micros(2_345_678),
+            },
+        );
+        observer.on_session_event(
+            id,
+            SessionEvent::CommandFinished {
+                exit_code: None,
+                duration: Duration::MAX,
+            },
+        );
+        assert_eq!(
+            *FINISH_CALLS.lock().unwrap(),
+            [(7, true, 130, 2_345), (7, false, 0, u64::MAX)]
+        );
+        // A table without it ignores finishes.
+        CallbackObserver::new(empty()).on_session_event(
+            id,
+            SessionEvent::CommandFinished {
+                exit_code: Some(0),
+                duration: Duration::ZERO,
+            },
+        );
     }
 
     #[test]

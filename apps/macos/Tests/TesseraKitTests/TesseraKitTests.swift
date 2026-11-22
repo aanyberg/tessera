@@ -13,6 +13,7 @@ final class Recorder: TesseraAppDelegate {
         case title(String)
         case remote(TesseraRemote)
         case bell
+        case commandFinished(TesseraCommandFinish)
         case exit(code: Int32, signal: Int32)
     }
 
@@ -60,6 +61,9 @@ final class Recorder: TesseraAppDelegate {
         record(.remote(remote), session)
     }
     func sessionDidRingBell(_ session: TesseraSession) { record(.bell, session) }
+    func session(_ session: TesseraSession, didFinishCommand finish: TesseraCommandFinish) {
+        record(.commandFinished(finish), session)
+    }
     func session(_ session: TesseraSession, didExitWithCode code: Int32, signal: Int32) {
         record(.exit(code: code, signal: signal), session)
     }

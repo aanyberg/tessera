@@ -67,6 +67,7 @@ pub mod edit;
 mod import;
 mod keys;
 mod load;
+mod notifications;
 mod paths;
 mod profile;
 mod profile_files;
@@ -94,6 +95,7 @@ pub use load::{
     MAX_UNKNOWN_KEY_WARNINGS, MAX_WARNING_PATH_LEN, ParseError, Warning, escaped, load_file,
     write_atomic, write_default_if_missing,
 };
+pub use notifications::{CommandFinishedMode, Notifications};
 pub use paths::{APP_SUPPORT_DIR_NAME, CONFIG_FILE_NAME, ConfigPaths, SHELL_INTEGRATION_DIR_NAME};
 pub use profile::{
     BUILT_IN_PROFILE_NAME, MAX_PROFILE_NAME_LEN, MAX_PROFILES, ProfileAppearance, ProfileSource,
@@ -187,6 +189,8 @@ pub struct Config {
     pub plugins: Plugins,
     /// Smart selection on a double-click, and Copy's trailing blanks.
     pub selection: Selection,
+    /// System notifications when a long command finishes (ADR 0048).
+    pub notifications: Notifications,
     /// Key bindings: each entry maps a chord to a command, so
     /// `"cmd+shift+d" = "split_down"` (always quote the chord). An entry
     /// adds its chord to the command, ahead of its defaults: the menu item

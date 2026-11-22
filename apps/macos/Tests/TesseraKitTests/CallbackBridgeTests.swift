@@ -145,6 +145,49 @@ final class CallbackBridgeTests: XCTestCase {
             "a flood is one delivery, the latest state")
     }
 
+    /// #470 (E03, E05): a burst of finishes is one delivery with the longest
+    /// (the latest of equals), after the bell and before the exit; an unknown
+    /// exit status reads as `nil`, whatever the code argument says.
+    func testCommandFinishesAreCoalescedBeforeTheExit() async throws {
+        onReaderThread { callbacks in
+            callbacks.on_session_command_finished!(callbacks.user_data, 7, true, 130, 2_345)
+            callbacks.on_session_bell!(callbacks.user_data, 7)
+        }
+        let first = try await drained()
+        XCTAssertEqual(first, [.bell, .commandFinished(.init(exitCode: 130, durationMilliseconds: 2_345))])
+        onReaderThread { callbacks in
+            for index in 0..<100_000 {
+                callbacks.on_session_command_finished!(callbacks.user_data, 7, index.isMultiple(of: 2), 5, UInt64(index))
+            }
+            callbacks.on_session_command_finished!(callbacks.user_data, 7, false, 99, .max)
+            callbacks.on_session_exit!(callbacks.user_data, 7, 0, 0)
+        }
+        let flooded = try await drained()
+        XCTAssertEqual(
+            flooded.dropFirst(first.count),
+            [.commandFinished(.init(exitCode: nil, durationMilliseconds: .max)), .exit(code: 0, signal: 0)],
+            "a flood is one delivery, the longest finish, before the exit")
+    }
+
+    /// #470 (ADR 0048, where the decision runs): a long command's finish followed by a short one's
+    /// in the same delivery is the one delivered, so its notification is not
+    /// lost to the short command; of two equally long ones, the later wins.
+    func testTheLongestFinishOfADeliveryWins() async throws {
+        onReaderThread { callbacks in
+            callbacks.on_session_command_finished!(callbacks.user_data, 7, false, 0, 30_000)
+            callbacks.on_session_command_finished!(callbacks.user_data, 7, true, 3, 5)
+        }
+        let first = try await drained()
+        XCTAssertEqual(first, [.commandFinished(.init(exitCode: nil, durationMilliseconds: 30_000))])
+        onReaderThread { callbacks in
+            callbacks.on_session_command_finished!(callbacks.user_data, 7, true, 1, 40)
+            callbacks.on_session_command_finished!(callbacks.user_data, 7, true, 2, 40)
+        }
+        let second = try await drained()
+        XCTAssertEqual(
+            second.dropFirst(first.count), [.commandFinished(.init(exitCode: 2, durationMilliseconds: 40))])
+    }
+
     func testMalformedRemoteCallsReadSafely() {
         XCTAssertEqual(CallbackBridge.remote(kind: UInt8(TESSERA_REMOTE_KIND_HOST.rawValue), host: nil, len: 3), .unnamed)
         let long = Array(repeating: UInt8(ascii: "a"), count: Int(TESSERA_MAX_REMOTE_HOST_LEN) + 1)
@@ -209,6 +252,7 @@ final class CallbackBridgeTests: XCTestCase {
         onReaderThread { callbacks in
             callbacks.on_session_output!(callbacks.user_data, 7)
             callbacks.on_session_bell!(callbacks.user_data, 7)
+            callbacks.on_session_command_finished!(callbacks.user_data, 7, true, 0, 60_000)
         }
         bridge.shutDown()
         let events = try await drained()

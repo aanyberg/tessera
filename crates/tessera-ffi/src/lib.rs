@@ -46,6 +46,7 @@ mod config;
 mod error;
 mod input;
 mod keymap;
+mod notify;
 mod panic;
 mod plugins;
 mod prompts;
@@ -86,6 +87,11 @@ pub use input::{
     tessera_session_send_scroll, tessera_session_set_focus,
 };
 pub use keymap::tessera_app_keymap_json;
+pub use notify::{
+    COMMAND_FINISHED_MARK, COMMAND_FINISHED_MARK_AND_POST, COMMAND_FINISHED_NOTHING,
+    MAX_NOTIFICATION_TEXT_BYTES, MAX_NOTIFICATIONS_PER_MINUTE,
+    tessera_app_command_finished_decision,
+};
 #[cfg(feature = "test-hooks")]
 #[doc(hidden)]
 pub use panic::tessera_test_panic;

@@ -75,6 +75,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var settingsAutosaveName: String? = AppDelegate.isTestHost ? nil : SettingsWindowController.autosaveName
     /// Internal so tests can see which sessions it routes.
     let router = SessionRouter()
+    /// Marks and posts finished commands (#470, ADR 0048). Internal so
+    /// tests can give it a focus and a poster of their own.
+    let commandNotifier = CommandNotifier(poster: UserNotificationPoster(center: SystemNotificationCenter()))
+    /// The notification centre's delegate, installed at launch and held
+    /// here (the centre holds it weakly). Internal for tests.
+    private(set) lazy var notificationDelegate = NotificationDelegate { [weak self] sessionID in
+        self?.commandNotifier.open(sessionID: sessionID)
+    }
     private var terminationSignals: [any DispatchSourceSignal] = []
     /// Where the next standalone window's top-left corner goes.
     private var cascadePoint = NSPoint.zero
@@ -204,6 +212,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         MainMenu.install(in: NSApp)
+        installNotificationDelegate()
         terminateOnSignals()
         observeDisplayOptions()
         observeHiding()
@@ -274,8 +283,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return presenter.confirmApplicationModally(confirmation)
     }
 
+    /// The app came to the front (AppKit posts
+    /// `NSApplication.didBecomeActiveNotification`, which reaches its
+    /// delegate here): a marked pane that has the keyboard now loses its
+    /// mark and its notification (D10), also when the key window's
+    /// `windowDidBecomeKey` ran before the app read as active. Only the key
+    /// window's panes can have it, so asking every window is the same.
+    func applicationDidBecomeActive(_ notification: Notification) {
+        for controller in windowControllers {
+            commandNotifier.focusMayHaveChanged(in: controller)
+        }
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
+        commandNotifier.removeAllDelivered()
         core?.shutdown()
+    }
+
+    /// Wires the command notifier and installs the notification centre's
+    /// delegate before launching finishes, so a click on a notification
+    /// that launched the app reaches it (U02). Asks for no permission.
+    private func installNotificationDelegate() {
+        commandNotifier.controllerForSession = { [weak self] id in self?.router.controller(forSessionID: id) }
+        router.onCommandFinished = { [weak self] session, finish, controller in
+            guard let self, let core else { return }
+            commandNotifier.commandDidFinish(finish, of: session, in: controller) { duration, focused in
+                core.commandFinishedDecision(durationMilliseconds: duration, focused: focused)
+            }
+        }
+        (commandNotifier.poster as? UserNotificationPoster)?.install(notificationDelegate)
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -1084,6 +1120,10 @@ extension AppDelegate: TerminalWindowControllerDelegate {
         }
         windowControllers.removeAll { $0 === controller }
         scheduleWindowStateSave()
+    }
+
+    func terminalWindowControllerFocusMayHaveChanged(_ controller: TerminalWindowController) {
+        commandNotifier.focusMayHaveChanged(in: controller)
     }
 
     func terminalWindowControllerDidChangeLayout(_ controller: TerminalWindowController) {

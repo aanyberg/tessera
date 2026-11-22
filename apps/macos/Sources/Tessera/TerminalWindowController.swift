@@ -44,10 +44,14 @@ protocol TerminalWindowControllerDelegate: AnyObject {
     /// button, which the delegate turns into one Close All: the tab then
     /// neither closes nor asks.
     func terminalWindowControllerTakesOptionClickOnCloseButton() -> Bool
+    /// A pane of `controller`'s tab may have got the keyboard: a pane was
+    /// focused, the tab selected or its window made key (#470).
+    func terminalWindowControllerFocusMayHaveChanged(_ controller: TerminalWindowController)
 }
 
 extension TerminalWindowControllerDelegate {
     func terminalWindowControllerTakesOptionClickOnCloseButton() -> Bool { false }
+    func terminalWindowControllerFocusMayHaveChanged(_ controller: TerminalWindowController) {}
 }
 
 /// One terminal tab: one `NSWindow` whose panes each run a
@@ -115,6 +119,21 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, NSMe
     private(set) var pendingClose: CloseConfirmation.Scope?
     /// The pane a `.pane` confirmation asks about.
     private weak var pendingPane: Pane?
+    /// The sessions of this tab's panes whose command finished while they
+    /// did not have the keyboard (#470, ADR 0048 D8): the tab shows
+    /// ``commandMarkView`` while any is marked.
+    private(set) var markedSessionIDs: Set<UInt64> = []
+    /// The tab's mark: a dot in its tab (D11), the window's title untouched.
+    private(set) lazy var commandMarkView: NSView = {
+        let image = NSImage(systemSymbolName: "circle.fill", accessibilityDescription: "Command finished")
+        let view = NSImageView(image: image ?? NSImage())
+        view.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 7, weight: .regular)
+        view.contentTintColor = .controlAccentColor
+        view.toolTip = "A command finished"
+        return view
+    }()
+    /// Follows the selection of this window's tab (no notification says).
+    private var tabSelectionObservation: NSKeyValueObservation?
 
     /// - Parameters:
     ///   - session: The first pane's session.
@@ -140,6 +159,13 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, NSMe
         TerminalWindowContentView(paneContainer: paneContainer, frame: paneContainer.frame).install(in: window)
         super.init(window: window)
         window.delegate = self
+        // On the main thread, also for a window that joins a tab group later.
+        tabSelectionObservation = window.observe(\.tabGroup?.selectedWindow) { [weak self] _, _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.delegate?.terminalWindowControllerFocusMayHaveChanged(self)
+            }
+        }
         watchFocus(of: pane)
         window.initialFirstResponder = pane.view
         paneContainer.activePane = pane
@@ -196,6 +222,38 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, NSMe
         } else {
             pane.view.sessionDidExit(code: code, signal: signal)
         }
+    }
+
+    // MARK: Command marks (#470)
+
+    /// Marks or unmarks `pane` (one of this tab's) as having a finished
+    /// command its user has not seen; the tab shows the mark while any of
+    /// its panes is marked.
+    func setCommandMark(_ marked: Bool, for pane: Pane) {
+        guard marked ? panes.contains(pane) : markedSessionIDs.contains(pane.session.id) else { return }
+        if marked {
+            markedSessionIDs.insert(pane.session.id)
+        } else {
+            markedSessionIDs.remove(pane.session.id)
+        }
+        let accessory: NSView? = markedSessionIDs.isEmpty ? nil : commandMarkView
+        if window?.tab.accessoryView !== accessory {
+            window?.tab.accessoryView = accessory
+        }
+    }
+
+    /// Whether `pane` is marked.
+    func isCommandMarked(_ pane: Pane) -> Bool {
+        markedSessionIDs.contains(pane.session.id)
+    }
+
+    /// The title `pane`'s tab shows while `pane` is its focused pane, or
+    /// empty for one with no title of its own (the default title is not
+    /// repeated).
+    func tabTitle(of pane: Pane) -> String {
+        let remote = showsRemoteHost ? pane.remote : .local
+        guard !(pane.title.isEmpty && remote == .local) else { return "" }
+        return Self.title(pane.title, remote: remote)
     }
 
     // MARK: Panes
@@ -396,6 +454,7 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, NSMe
         // retains its view until it is deactivated.
         pane.view.inputContext?.deactivate()
         let wasFocused = pane === focusedPane
+        setCommandMark(false, for: pane)
         unzoom()
         paneContainer.remove(pane)
         closeSession(of: pane)
@@ -439,6 +498,7 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, NSMe
         window?.initialFirstResponder = pane.view
         paneContainer.activePane = pane
         updateTitle()
+        delegate?.terminalWindowControllerFocusMayHaveChanged(self)
     }
 
     private func updateTitle() {
@@ -692,12 +752,19 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, NSMe
         Self.resetCloseTitle()
     }
 
+    /// The window became key, also when the app comes back to the front:
+    /// its focused pane may have got the keyboard (#470).
+    func windowDidBecomeKey(_ notification: Notification) {
+        delegate?.terminalWindowControllerFocusMayHaveChanged(self)
+    }
+
     private static func resetCloseTitle() {
         MainMenu.item(forCommand: closeTabCommand, in: NSApp.mainMenu)?.title = PaneContainerView.closeTabTitle
     }
 
     func windowWillClose(_ notification: Notification) {
         Self.resetCloseTitle()
+        tabSelectionObservation = nil
         // A tab closing under its close sheet (its shell exited, or ⇧⌘W on
         // another tab closed it): the sheet answers Cancel, or the alert and
         // its modal session would outlive the tab.

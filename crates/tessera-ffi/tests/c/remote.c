@@ -4,8 +4,9 @@
  * another machine, wait (at most 5 s) for on_session_remote and check it
  * got TESSERA_REMOTE_KIND_HOST with exactly the host's bytes (ptr + len,
  * not NUL-terminated), once, for that session. Also checks the callback
- * follows on_config_applied and that on_config_invalid (#547) follows it
- * as the table's last field (S7).
+ * follows on_config_applied, that on_config_invalid (#547) follows it and
+ * that on_session_command_finished (#470) follows that as the table's last
+ * field (S7).
  */
 
 #include <pthread.h>
@@ -22,9 +23,12 @@ _Static_assert(offsetof(TesseraCallbacks, on_session_remote) ==
 _Static_assert(offsetof(TesseraCallbacks, on_config_invalid) ==
                    offsetof(TesseraCallbacks, on_session_remote) + sizeof(void (*)(void)),
                "on_config_invalid follows on_session_remote");
-_Static_assert(sizeof(TesseraCallbacks) ==
+_Static_assert(offsetof(TesseraCallbacks, on_session_command_finished) ==
                    offsetof(TesseraCallbacks, on_config_invalid) + sizeof(void (*)(void)),
-               "on_config_invalid is the last field");
+               "on_session_command_finished follows on_config_invalid");
+_Static_assert(sizeof(TesseraCallbacks) ==
+                   offsetof(TesseraCallbacks, on_session_command_finished) + sizeof(void (*)(void)),
+               "on_session_command_finished is the last field");
 _Static_assert(TESSERA_MAX_REMOTE_HOST_LEN == 253, "the longest DNS name");
 
 static const char expected[] = "far.example";
