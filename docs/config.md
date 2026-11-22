@@ -9,6 +9,7 @@ Defaults are written as TOML values; *unset* means the key is absent unless you 
 - [Top-level keys](#top-level-keys)
 - [`[appearance]`](#appearance)
 - [`[general]`](#general)
+- [`[notifications]`](#notifications)
 - [`[plugins]`](#plugins)
 - [`[[profiles]]`](#profiles)
   - [`[profiles.appearance]`](#profilesappearance)
@@ -48,6 +49,15 @@ Application-wide settings.
 | `confirm_close` | boolean | `true` | Confirm before closing a window with running jobs. |
 | `default_profile` | string | `"Default"` | The profile (a `[[profiles]]` entry or a file in `profiles/`) new tabs, windows and panes use when none is chosen (a pane split off another uses that pane's). When no profile has this name, the built-in one is used: `[appearance]` and the login shell (with a warning, unless the name is `"Default"`). |
 | `remote_indicator` | one of `"title"`, `"off"` | `"title"` | How a tab whose shell runs on another machine is marked: `"title"` puts `⇢ <host>: ` before its title, the host taken from the shell's working-directory report (OSC 7), or `⇢ ssh` when `ssh` runs with no such report; `"off"` shows titles unchanged. Applies to open tabs when the file changes. Any other value is reported with a warning and `"title"` is used. |
+
+## `[notifications]`
+
+System notifications when a long command finishes (ADR 0048).
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `command_finished` | one of `"unfocused"`, `"off"` | `"off"` | When a command that ran at least `command_finished_after` seconds finishes, `"unfocused"` posts a system notification and marks its tab, unless its pane has the keyboard (the app is active, its window is key, its tab selected and the pane focused); `"off"` does neither. Needs shell integration's prompt marks (OSC 133). The first notification asks macOS for permission. At most 10 are posted a minute; the tab is marked all the same. Set here only: no profile changes it. Any other value is reported with a warning and `"off"` is used. |
+| `command_finished_after` | integer | `10` | How long a command must run, in whole seconds (1 to 86400), before its finish notifies. A value outside the range is clamped to it with a warning. Set here only: no profile changes it. |
 
 ## `[plugins]`
 

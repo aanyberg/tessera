@@ -1,7 +1,8 @@
 import SwiftUI
 
 /// General: the profile new tabs start with, whether closing a busy window
-/// asks first, and whether a tab marks a remote shell in its title.
+/// asks first, whether a tab marks a remote shell in its title, and
+/// whether a long command that finishes out of sight notifies (#470).
 struct GeneralPane: View {
     let model: SettingsModel
 
@@ -19,6 +20,16 @@ struct GeneralPane: View {
                 SettingsField.Choice(value: "off", title: "Don’t show"),
             ]),
             note: "Tabs connected to another machine with ssh start their title with ⇢ and the host name."),
+        SettingsField(
+            key: "notifications.command_finished", title: "Notify when a command finishes",
+            control: .choice([
+                SettingsField.Choice(value: "unfocused", title: "When its pane is not in front"),
+                SettingsField.Choice(value: "off", title: "Never"),
+            ]),
+            note: "Posts a notification and marks the tab. Needs shell integration. The first one asks macOS for permission."),
+        SettingsField(
+            key: "notifications.command_finished_after", title: "Only for commands longer than (seconds)",
+            control: .integer, note: "1 to 86400."),
     ]
 
     var body: some View {

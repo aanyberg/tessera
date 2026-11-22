@@ -336,8 +336,11 @@ final class SettingsTests: XCTestCase {
         XCTAssertEqual(writer.calls, [.init(key: "profiles[1]", value: nil)])
     }
 
+    /// With the `[notifications]` table the core always reports: the General
+    /// pane's integer field would otherwise show 0 and write it on close.
     private static let threeProfiles = """
         {"general": {"default_profile": "one"}, "appearance": {"theme": "Tessera Dark"},
+         "notifications": {"command_finished": "off", "command_finished_after": 10},
          "profiles": [{"name": "one"}, {"name": "two", "command": "/bin/cat"}, {"name": "three"}]}
         """
 
@@ -765,6 +768,10 @@ final class SettingsTests: XCTestCase {
             Edit(key: "general.default_profile", value: .string("two"), line: #"default_profile = "two""#),
             Edit(key: "general.confirm_close", value: .bool(false), line: "confirm_close = false"),
             Edit(key: "general.remote_indicator", value: .string("off"), line: #"remote_indicator = "off""#),
+            Edit(
+                key: "notifications.command_finished", value: .string("unfocused"),
+                line: #"command_finished = "unfocused""#),
+            Edit(key: "notifications.command_finished_after", value: .integer(30), line: "command_finished_after = 30"),
             Edit(key: "appearance.app_appearance", value: .string("light"), line: #"app_appearance = "light""#),
             Edit(key: "appearance.theme", value: .string(theme), line: "theme = \"\(theme)\""),
             Edit(key: "appearance.font_family", value: .string(font), line: "font_family = \"\(font)\""),

@@ -61,12 +61,47 @@ public protocol TesseraAppDelegate: AnyObject {
     /// session starts ``TesseraRemote/local``. Several changes between two
     /// deliveries are reported once, with the latest. The default does nothing.
     func session(_ session: TesseraSession, didChangeRemote remote: TesseraRemote)
+    /// A command the shell marked with OSC 133 C finished (its D mark, or
+    /// the next prompt) (#470, ADR 0048). Ask
+    /// ``TesseraApp/commandFinishedDecision(durationMilliseconds:focused:)`` what to do
+    /// about it. Several between two deliveries are reported once, with the
+    /// longest (the latest of equals); a command still running when the child exits is not
+    /// reported. Delivered before the exit. The default does nothing.
+    func session(_ session: TesseraSession, didFinishCommand finish: TesseraCommandFinish)
 }
 
 extension TesseraAppDelegate {
     public func configurationDidApply(generation: UInt64) {}
     public func configurationDidNotLoad() {}
     public func session(_ session: TesseraSession, didChangeRemote remote: TesseraRemote) {}
+    public func session(_ session: TesseraSession, didFinishCommand finish: TesseraCommandFinish) {}
+}
+
+/// A finished command, as the core reports it
+/// (``TesseraAppDelegate/session(_:didFinishCommand:)``): never its text.
+public struct TesseraCommandFinish: Sendable, Hashable {
+    /// Its exit status from the shell's D mark, or `nil` when the mark
+    /// carried none.
+    public var exitCode: Int32?
+    /// From its C mark to its finish, in milliseconds (`UInt64.max` for
+    /// one too long to count).
+    public var durationMilliseconds: UInt64
+
+    public init(exitCode: Int32?, durationMilliseconds: UInt64) {
+        self.exitCode = exitCode
+        self.durationMilliseconds = durationMilliseconds
+    }
+}
+
+/// What to do about a finished command
+/// (``TesseraApp/commandFinishedDecision(durationMilliseconds:focused:)``).
+public enum TesseraCommandFinishedDecision: Sendable, Equatable {
+    /// Neither mark its pane nor post.
+    case nothing
+    /// Mark its pane; post nothing (the rate limit dropped it).
+    case mark
+    /// Mark its pane and post a notification.
+    case markAndPost
 }
 
 /// Where a session's shell runs, as the core reports it
@@ -273,6 +308,23 @@ public final class TesseraApp {
         var amount: Float = 0
         try TesseraCoreError.check(tessera_app_dim_inactive_panes(core.pointer, &amount))
         return amount
+    }
+
+    /// Most UTF-8 bytes of a tab title a notification shows (S3).
+    public nonisolated static let maxNotificationTextBytes = Int(TESSERA_MAX_NOTIFICATION_TEXT_BYTES)
+
+    /// What to do about a command that finished after `durationMilliseconds`
+    /// in a pane that did (`focused`) or did not have the keyboard (#470,
+    /// ADR 0048): decided by the core against `[notifications]` in effect
+    /// now and its app-wide rate limit, which this call counts, so ask once
+    /// per finish. ``TesseraCommandFinishedDecision/nothing`` after
+    /// ``shutdown()``.
+    public func commandFinishedDecision(durationMilliseconds: UInt64, focused: Bool) -> TesseraCommandFinishedDecision {
+        switch tessera_app_command_finished_decision(core.pointer, durationMilliseconds, focused) {
+        case UInt8(TESSERA_COMMAND_FINISHED_MARK_AND_POST): .markAndPost
+        case UInt8(TESSERA_COMMAND_FINISHED_MARK): .mark
+        default: .nothing
+        }
     }
 
     /// `[appearance] blur_radius` in effect (ADR 0045): the window's blur

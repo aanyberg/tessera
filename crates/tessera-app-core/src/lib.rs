@@ -37,6 +37,7 @@ pub mod commands;
 mod config_watch;
 pub mod input;
 mod mouse;
+pub mod notify;
 pub mod plugins;
 mod profile;
 pub mod remote;
@@ -54,7 +55,7 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tessera_pty::{NativePty, Pty, PtyEvents};
 use tessera_render::{FontConfig, Fonts, Gpu, Theme};
@@ -68,6 +69,9 @@ pub use commands::{
     MAX_PROMPT_SCAN_LINES, PROMPT_SCAN_LINES_PER_LOCK,
 };
 pub use input::{InputEvent, InputOutcome};
+pub use notify::{
+    MAX_NOTIFICATION_TEXT_BYTES, MAX_NOTIFICATIONS_PER_MINUTE, NotifyDecision, NotifyLimiter,
+};
 pub use plugins::{PluginInfo, PluginState};
 pub use remote::{MAX_REMOTE_HOST_BYTES, Remote, SSH_PROBE_INTERVAL};
 pub use rich_text::{FormattedText, MAX_RICH_COPY_LEN, MAX_RTF_COLORS, RichCopy};
@@ -278,6 +282,9 @@ pub struct App {
     /// The built-in plugin host (ADR 0047); looks on through the observer
     /// slot, which always holds a [`plugins::Tee`] while the `App` lives.
     plugins: Arc<plugins::PluginHost>,
+    /// The app-wide limit on command-finished notifications (ADR 0048,
+    /// S6): every session's finishes share it.
+    notify_limiter: Mutex<NotifyLimiter>,
 }
 
 impl App {
@@ -363,6 +370,7 @@ impl App {
             config_watch: Mutex::new(None),
             open_config: config_watch::OpenConfig::default(),
             plugins,
+            notify_limiter: Mutex::new(NotifyLimiter::new()),
         }
     }
 
@@ -2359,6 +2367,39 @@ impl App {
             .min(tessera_config::Appearance::MAX_BLUR_RADIUS)
     }
 
+    /// What the frontend does about a command that finished after
+    /// `duration` in a pane that had (`focused`) or did not have the
+    /// keyboard (ADR 0048): [`notify::should_notify`] against
+    /// `[notifications]` of the configuration in effect (read now, so an
+    /// edit applies to the next finish), then, only for a finish that
+    /// qualifies, the app-wide limit of
+    /// [`MAX_NOTIFICATIONS_PER_MINUTE`]. Never waits for a session.
+    pub fn command_finished_decision(&self, duration: Duration, focused: bool) -> NotifyDecision {
+        self.command_finished_decision_at(duration, focused, Instant::now())
+    }
+
+    /// [`App::command_finished_decision`] at `now`, for the limiter's clock.
+    #[doc(hidden)]
+    pub fn command_finished_decision_at(
+        &self,
+        duration: Duration,
+        focused: bool,
+        now: Instant,
+    ) -> NotifyDecision {
+        let config = self.config();
+        let facts = notify::CommandFinishedFacts {
+            duration,
+            started_seen: true,
+            focused,
+        };
+        notify::decide(
+            &facts,
+            &config.notifications,
+            &mut lock(&self.notify_limiter),
+            now,
+        )
+    }
+
     /// The app's own appearance: `[appearance] app_appearance` of the
     /// configuration in effect (#365), whether the host draws its windows,
     /// menus and settings dark, light or as the system's appearance says.
@@ -3095,6 +3136,107 @@ mod tests {
         assert_eq!(records.len(), 1, "one record for the last command");
         assert_eq!(records[0].exit_code, Some(0));
         fake.send(PtyEvent::Exited(ExitStatus::Exited(0)));
+    }
+
+    /// ADR 0048 (where the decision runs): a long command whose `D` shares a chunk with a short
+    /// command's `C` and `D` still reports its own finish, with its long
+    /// duration, before the short one's: coalescing keeps the last `C` and
+    /// `D`, and that `C` ends the running command (exit status unknown).
+    #[test]
+    fn a_long_finish_coalesced_with_a_short_command_keeps_its_duration() {
+        let app = app();
+        let events = observe(&app);
+        let (_, fake) = attach_fake(&app, false);
+        fake.send(PtyEvent::Output(b"\x1b]133;C\x07".to_vec()));
+        loop {
+            if matches!(next(&events), (_, SessionEvent::CommandStarted)) {
+                break;
+            }
+        }
+        let long = Duration::from_millis(50);
+        std::thread::sleep(long);
+        fake.send(PtyEvent::Output(
+            b"\x1b]133;D;0\x07\x1b]133;C\x07\x1b]133;D;3\x07".to_vec(),
+        ));
+        fake.send(PtyEvent::Output(b"\x07".to_vec()));
+        let mut finishes = Vec::new();
+        loop {
+            match next(&events) {
+                (_, SessionEvent::Bell) => break,
+                (
+                    _,
+                    SessionEvent::CommandFinished {
+                        exit_code,
+                        duration,
+                    },
+                ) => {
+                    finishes.push((exit_code, duration));
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(finishes.len(), 2, "{finishes:?}");
+        assert!(finishes[0].1 >= long, "{finishes:?}");
+        assert!(finishes[1].1 < long, "{finishes:?}");
+        assert_eq!(finishes[1].0, Some(3));
+        fake.send(PtyEvent::Exited(ExitStatus::Exited(0)));
+    }
+
+    /// C18, C19 (ADR 0048): the decision reads `[notifications]` of the
+    /// configuration in effect at each finish, so a live edit applies to
+    /// the next one; a new `App` limits its own posts.
+    #[test]
+    fn the_command_finished_decision_follows_the_applied_configuration() {
+        let app = app();
+        let theme = tessera_config::Theme::default();
+        let long = Duration::from_secs(5);
+        assert_eq!(
+            app.command_finished_decision(long, false),
+            NotifyDecision::Nothing,
+            "off by default"
+        );
+        let mut config = Config::default();
+        config.notifications.command_finished = tessera_config::CommandFinishedMode::Unfocused;
+        app.apply_config(&config, &theme);
+        assert_eq!(
+            app.command_finished_decision(long, false),
+            NotifyDecision::Nothing,
+            "under 10 s"
+        );
+        assert_eq!(
+            app.command_finished_decision(long, true),
+            NotifyDecision::Nothing,
+            "focused"
+        );
+        config.notifications.command_finished_after = 1;
+        app.apply_config(&config, &theme);
+        assert_eq!(
+            app.command_finished_decision(long, false),
+            NotifyDecision::MarkAndPost,
+            "C18"
+        );
+        config.notifications.command_finished = tessera_config::CommandFinishedMode::Off;
+        app.apply_config(&config, &theme);
+        assert_eq!(
+            app.command_finished_decision(long, false),
+            NotifyDecision::Nothing,
+            "C19"
+        );
+        config.notifications.command_finished = tessera_config::CommandFinishedMode::Unfocused;
+        app.apply_config(&config, &theme);
+        let now = Instant::now();
+        let decisions: Vec<_> = (0..12)
+            .map(|_| app.command_finished_decision_at(long, false, now))
+            .collect();
+        // One posted above, nine more here, then marks only.
+        assert_eq!(
+            decisions
+                .iter()
+                .filter(|&&d| d == NotifyDecision::MarkAndPost)
+                .count(),
+            9
+        );
+        assert_eq!(decisions[9..], [NotifyDecision::Mark; 3]);
     }
 
     #[test]

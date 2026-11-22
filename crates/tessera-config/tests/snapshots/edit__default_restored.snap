@@ -101,4 +101,12 @@ trim_trailing_whitespace = true
 # Plugin ids to enable.
 enabled = []
 
+[notifications]
+# When a command that ran at least command_finished_after seconds (1 to
+# 86400) finishes in a pane that does not have the keyboard: "unfocused"
+# posts a system notification and marks the tab (the first one asks macOS
+# for permission), "off" does neither. Needs shell integration.
+command_finished = "off"
+command_finished_after = 10
+
 [keys]
