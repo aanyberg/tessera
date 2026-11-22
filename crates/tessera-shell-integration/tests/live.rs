@@ -11,7 +11,7 @@
 //! a message.
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use tessera_grid::Mark;
@@ -199,6 +199,8 @@ struct Prepared {
     _temp: tempfile::TempDir,
     home: String,
     options: SpawnOptions,
+    /// Whether the injection changed anything.
+    injected: bool,
 }
 
 /// How a case loads the script.
@@ -275,13 +277,11 @@ fn prepare_via(case: &Case<'_>, route: Route) -> Prepared {
         Some(_) => Launch::Args(&user_args),
         None => Launch::Login,
     };
-    // Tessera does not inject bash yet; its rules are kept in `for_bash`,
-    // which these tests use so the bash script stays tested.
-    let injection = match (route, case.shell) {
-        (Route::ByHand, _) => Injection::default(),
-        (Route::Injected, Shell::Bash) => Injection::for_bash(&scripts, launch, user_env),
-        (Route::Injected, _) => Injection::for_shell(case.shell, &scripts, launch, user_env),
+    let injection = match route {
+        Route::ByHand => Injection::default(),
+        Route::Injected => Injection::for_shell(case.shell, &scripts, launch, user_env),
     };
+    let injected = !injection.is_empty();
 
     let mut options = SpawnOptions::command(&case.program, "live")
         .args(injection.args.clone().unwrap_or(user_args))
@@ -318,6 +318,7 @@ fn prepare_via(case: &Case<'_>, route: Route) -> Prepared {
         _temp: temp,
         home: home_str,
         options,
+        injected,
     }
 }
 
@@ -388,6 +389,7 @@ fn run_steps_via(case: &Case<'_>, steps: &[(Wait, &str)], route: Route) -> Obser
     let prepared = prepare_via(case, route);
     assert!(
         route == Route::ByHand
+            || prepared.injected
             || prepared
                 .options
                 .env
@@ -569,6 +571,20 @@ fn bashes() -> Vec<PathBuf> {
     }
     found
 }
+/// B1-B4 hold on both injected routes: each bash with the `--rcfile` route
+/// (`-i`, `.bashrc`) and the login route's loader (`.bash_profile`).
+fn bash_routes() -> Vec<(PathBuf, Option<&'static [&'static str]>, &'static str)> {
+    bashes()
+        .into_iter()
+        .flat_map(|bash| {
+            [
+                (bash.clone(), Some(&["-i"][..]), ".bashrc"),
+                (bash, None, ".bash_profile"),
+            ]
+        })
+        .collect()
+}
+
 const FISH: &[&str] = &[
     "/opt/homebrew/bin/fish",
     "/usr/local/bin/fish",
@@ -1388,21 +1404,6 @@ fn bash_prompt_sees_the_last_status() {
     }
 }
 
-/// Whether `bash` is 5.1 or later (runs every element of an array
-/// `PROMPT_COMMAND`).
-fn bash_runs_prompt_command_arrays(bash: &std::path::Path) -> bool {
-    let output = std::process::Command::new(bash)
-        .args(["-c", "echo ${BASH_VERSINFO[0]} ${BASH_VERSINFO[1]}"])
-        .output()
-        .expect("run bash");
-    let text = String::from_utf8_lossy(&output.stdout);
-    let mut parts = text
-        .split_whitespace()
-        .map(|n| n.parse::<u32>().unwrap_or(0));
-    let (major, minor) = (parts.next().unwrap_or(0), parts.next().unwrap_or(0));
-    major > 5 || (major == 5 && minor >= 1)
-}
-
 /// A bash started from an integrated one (both injection routes) sees no
 /// `PROMPT_COMMAND` of ours: no "command not found" for our functions, and
 /// its own DEBUG trap is left alone.
@@ -1473,67 +1474,6 @@ fn bash_keeps_the_last_argument() {
             assert!(text.contains("[lastarg_x]\r\n"), "{what}: {text:?}");
             assert!(text.contains("in=made\r\n"), "{what}: {text:?}");
         }
-    }
-}
-
-/// bash 5.1 and later run every element of an array `PROMPT_COMMAND`: the
-/// user's elements (set in `.bashrc`, or added at a prompt) keep running and
-/// ours stay around them, so every command gets exactly one C.
-#[test]
-fn bash_prompt_command_arrays() {
-    let arrays: Vec<PathBuf> = bashes()
-        .into_iter()
-        .filter(|bash| bash_runs_prompt_command_arrays(bash))
-        .collect();
-    if arrays.is_empty() {
-        eprintln!("skipped: no bash 5.1 or later installed (looked in {BASH5:?})");
-        return;
-    }
-    for bash in arrays {
-        let observed = run_steps(
-            &Case {
-                shell: Shell::Bash,
-                program: bash.clone(),
-                args: Some(&["-i"]),
-                files: &[(
-                    ".bashrc",
-                    "PROMPT_COMMAND=('pc_one=1')\nPROMPT_COMMAND+=('pc_two=2')\n",
-                )],
-                env: &[],
-            },
-            &[
-                (Wait::Prompts(1), "unset pc_one pc_two\r"),
-                (Wait::Prompts(2), "echo \"pc=$pc_one$pc_two\"\r"),
-                (Wait::Prompts(3), "PROMPT_COMMAND+=('pc_three=3')\r"),
-                (Wait::Prompts(4), "unset pc_three\r"),
-                (Wait::Prompts(5), "echo \"pc=$pc_three\"\r"),
-                (Wait::Prompts(6), "exit\r"),
-            ],
-        );
-        let text = String::from_utf8_lossy(&observed.output);
-        assert!(text.contains("pc=12\r\n"), "{}: {text:?}", bash.display());
-        assert!(text.contains("pc=3\r\n"), "{}: {text:?}", bash.display());
-        // Six commands, each A B C D;0 (the last, `exit`, without D): a
-        // user element running after ours would put its C before an A.
-        // The one exception: bash runs a copy of the array taken when the
-        // prompt starts, so at the prompt right after `PROMPT_COMMAND+=`
-        // the new element still runs after ours; the script does not arm
-        // its trap then, so that command (the fourth) has no C and ends
-        // with a bare D.
-        let mut want = Vec::new();
-        for command in 0..6 {
-            want.extend([Mark::PromptStart, Mark::CommandStart]);
-            if command == 3 {
-                want.push(Mark::CommandEnd { exit_code: None });
-                continue;
-            }
-            want.push(Mark::OutputStart);
-            if command < 5 {
-                want.push(Mark::CommandEnd { exit_code: Some(0) });
-            }
-        }
-        let got = marks(observed.payloads.iter().map(Vec::as_slice));
-        assert_eq!(got, want, "{}: {text:?}", bash.display());
     }
 }
 
@@ -1763,6 +1703,25 @@ fn fish_empty_line_is_a_bare_d() {
 
 /// The marks one successful command after another gives: `A B C D;0` each
 /// (`exit_codes[i]` for command i), the last (`exit`) `A B C`.
+/// [`marks_for`], but on the login route with a DEBUG trap set in
+/// `.bash_profile` bash 3.2's first command has no C and a bare D: the
+/// loader cannot arm the trap on the loading prompt there (ACCEPTED LIMIT,
+/// ADR 0021).
+fn marks_for_route(bash: &Path, startup: &str, bashrc: &str, exit_codes: &[i32]) -> Vec<Mark> {
+    let mut want = marks_for(exit_codes);
+    if bash == Path::new("/bin/bash") && startup == ".bash_profile" && bashrc.contains(" DEBUG") {
+        want.splice(
+            0..4,
+            [
+                Mark::PromptStart,
+                Mark::CommandStart,
+                Mark::CommandEnd { exit_code: None },
+            ],
+        );
+    }
+    want
+}
+
 fn marks_for(exit_codes: &[i32]) -> Vec<Mark> {
     let mut want = Vec::new();
     for &code in exit_codes {
@@ -1858,7 +1817,7 @@ fn command_marks(c: bool, code: Option<i32>) -> Vec<Mark> {
 /// terminal instead, also when standard error is redirected too. #538.
 #[test]
 fn bash_redirected_output_gets_no_marks() {
-    for bash in bashes() {
+    for (bash, args, startup) in bash_routes() {
         for functrace in [false, true] {
             let out = tempfile::tempdir().unwrap();
             let bashrc = format!(
@@ -1869,8 +1828,8 @@ fn bash_redirected_output_gets_no_marks() {
                 &Case {
                     shell: Shell::Bash,
                     program: bash.clone(),
-                    args: Some(&["-i"]),
-                    files: &[(".bashrc", &bashrc)],
+                    args,
+                    files: &[(startup, &bashrc)],
                     env: &[("OUT", out.path().to_str().unwrap())],
                 },
                 &[
@@ -1887,7 +1846,7 @@ fn bash_redirected_output_gets_no_marks() {
                 ],
             );
             let text = String::from_utf8_lossy(&observed.output);
-            let what = format!("{} functrace={functrace}", bash.display());
+            let what = format!("{} {startup} functrace={functrace}", bash.display());
             for (name, want) in [
                 ("group", "g\n"),
                 ("subshell", "s\n"),
@@ -2069,15 +2028,15 @@ fn bash_commands_inherit_no_mark_fd() {
 /// other number (11, which bash 4.1+ `{var}` once picked) gets its C.
 #[test]
 fn bash_compound_redirecting_a_mark_fd_keeps_its_data() {
-    for bash in bashes() {
+    for (bash, args, startup) in bash_routes() {
         let out = tempfile::tempdir().unwrap();
         std::fs::write(out.path().join("in"), "x\ny\n").unwrap();
         let observed = run_steps(
             &Case {
                 shell: Shell::Bash,
                 program: bash.clone(),
-                args: Some(&["-i"]),
-                files: &[(".bashrc", "")],
+                args,
+                files: &[(startup, "")],
                 env: &[("OUT", out.path().to_str().unwrap())],
             },
             &[
@@ -2093,7 +2052,7 @@ fn bash_compound_redirecting_a_mark_fd_keeps_its_data() {
             ],
         );
         let text = String::from_utf8_lossy(&observed.output);
-        let what = bash.display();
+        let what = format!("{} {startup}", bash.display());
         assert!(!text.contains("file descriptor"), "{what}: {text:?}");
         for (name, want) in [
             ("f59", "a\n"),
@@ -2127,15 +2086,15 @@ fn bash_compound_redirecting_a_mark_fd_keeps_its_data() {
 /// - DEBUG: command not found" around every command).
 #[test]
 fn bash_with_any_ifs() {
-    for bash in bashes() {
+    for (bash, args, startup) in bash_routes() {
         // Also with a user's DEBUG trap (chained after ours).
         for bashrc in ["", "trap 'n=1' DEBUG\n"] {
             let observed = run_steps(
                 &Case {
                     shell: Shell::Bash,
                     program: bash.clone(),
-                    args: Some(&["-i"]),
-                    files: &[(".bashrc", bashrc)],
+                    args,
+                    files: &[(startup, bashrc)],
                     env: &[],
                 },
                 &[
@@ -2149,10 +2108,11 @@ fn bash_with_any_ifs() {
                 ],
             );
             let text = String::from_utf8_lossy(&observed.output);
-            let what = format!("{} {bashrc:?}", bash.display());
+            let what = format!("{} {startup} {bashrc:?}", bash.display());
             assert!(!text.contains("not found"), "{what}: {text:?}");
             let got = marks(observed.payloads.iter().map(Vec::as_slice));
-            assert_eq!(got, marks_for(&[0, 0, 0, 1, 0, 0]), "{what}: {text:?}");
+            let want = marks_for_route(&bash, startup, bashrc, &[0, 0, 0, 1, 0, 0]);
+            assert_eq!(got, want, "{what}: {text:?}");
         }
     }
 }
@@ -2163,7 +2123,7 @@ fn bash_with_any_ifs() {
 /// `set -E` (errtrace) and a user's DEBUG trap.
 #[test]
 fn bash_err_trap_runs_for_the_users_commands_only() {
-    for bash in bashes() {
+    for (bash, args, startup) in bash_routes() {
         for bashrc in [
             "trap 'echo trap-err' ERR\n",
             "set -E\ntrap ': \"$_\"' DEBUG\ntrap 'echo trap-err' ERR\n",
@@ -2172,8 +2132,8 @@ fn bash_err_trap_runs_for_the_users_commands_only() {
                 &Case {
                     shell: Shell::Bash,
                     program: bash.clone(),
-                    args: Some(&["-i"]),
-                    files: &[(".bashrc", bashrc)],
+                    args,
+                    files: &[(startup, bashrc)],
                     env: &[],
                 },
                 &[
@@ -2183,14 +2143,18 @@ fn bash_err_trap_runs_for_the_users_commands_only() {
                 ],
             );
             let text = String::from_utf8_lossy(&observed.output);
-            let what = format!("{} {bashrc:?}", bash.display());
+            let what = format!("{} {startup} {bashrc:?}", bash.display());
             assert_eq!(
                 count(&observed.output, b"trap-err\r\n"),
                 1,
                 "{what}: {text:?}"
             );
             let got = marks(observed.payloads.iter().map(Vec::as_slice));
-            assert_eq!(got, marks_for(&[1, 0]), "{what}: {text:?}");
+            assert_eq!(
+                got,
+                marks_for_route(&bash, startup, bashrc, &[1, 0]),
+                "{what}: {text:?}"
+            );
         }
     }
 }
@@ -2199,14 +2163,14 @@ fn bash_err_trap_runs_for_the_users_commands_only() {
 /// integration (`false && true`) does not exit it through our hooks either.
 #[test]
 fn bash_with_errexit() {
-    for bash in bashes() {
+    for (bash, args, startup) in bash_routes() {
         for bashrc in ["set -e\n", "set -e\ntrap 'n=1' DEBUG\n"] {
             let observed = run_steps(
                 &Case {
                     shell: Shell::Bash,
                     program: bash.clone(),
-                    args: Some(&["-i"]),
-                    files: &[(".bashrc", bashrc)],
+                    args,
+                    files: &[(startup, bashrc)],
                     env: &[],
                 },
                 &[
@@ -2216,10 +2180,14 @@ fn bash_with_errexit() {
                 ],
             );
             let text = String::from_utf8_lossy(&observed.output);
-            let what = format!("{} {bashrc:?}", bash.display());
+            let what = format!("{} {startup} {bashrc:?}", bash.display());
             assert!(text.contains("alive-43\r\n"), "{what}: {text:?}");
             let got = marks(observed.payloads.iter().map(Vec::as_slice));
-            assert_eq!(got, marks_for(&[1, 0]), "{what}: {text:?}");
+            assert_eq!(
+                got,
+                marks_for_route(&bash, startup, bashrc, &[1, 0]),
+                "{what}: {text:?}"
+            );
         }
     }
 }

@@ -15,29 +15,33 @@
 //!   `-i`, or one told to skip startup files (`-f`, `--no-rcs`): it would
 //!   never put `ZDOTDIR` back, and programs it starts (tmux) would inherit
 //!   ours.
-//! - **bash**: not injected yet ([`Injection::for_shell`] leaves bash
-//!   alone; bash support is a follow-up, see ADR 0021: the login route's
-//!   `PROMPT_COMMAND` loader breaks under prompt tools that wrap the
-//!   existing `PROMPT_COMMAND`, such as starship). [`Injection::for_bash`]
-//!   keeps the rules, which the live tests use to test the bash script: an
-//!   interactive non-login shell would start as
+//! - **bash**: an interactive non-login shell starts as
 //!   `bash --rcfile <scripts>/bash/tessera.bash`, and the script sources
 //!   `~/.bashrc` (or the user's own `--rcfile`, carried in
 //!   `TESSERA_BASH_RCFILE`). A login shell ignores `--rcfile` and, as
 //!   Tessera's default shell, takes no arguments at all, so it (and a
 //!   `--posix` or `--norc` shell) instead gets an exported `PROMPT_COMMAND`
-//!   that sources the script at the first prompt. kitty's `ENV` plus
-//!   `--posix` does not work on the macOS `/bin/bash` 3.2. A shell running a
-//!   command (`-c`) or a script file is not touched.
+//!   ending in [`bash_loader`], which sources the script at the first
+//!   prompt; the loader carries the feature words and the path itself, so
+//!   no variable of ours is in that shell's environment. kitty's `ENV` plus
+//!   `--posix` does not work on the macOS `/bin/bash` 3.2. A startup file
+//!   that assigns `PROMPT_COMMAND` would remove the loader and leave its own
+//!   value exported to every child, so the files that shell would read are
+//!   checked first, without running them, and it is not touched when one
+//!   does, or when that cannot be ruled out. A shell running a command
+//!   (`-c`) or a script file is not touched.
 //! - **fish**: `<scripts>` goes first in `XDG_DATA_DIRS`, so fish loads
 //!   `<scripts>/fish/vendor_conf.d/tessera-shell-integration.fish`, which
 //!   takes it out again.
 //!
-//! Every injection sets [`ENABLED_VAR`] to [`FEATURES`].
+//! Every injection but bash's login route sets [`ENABLED_VAR`] to
+//! [`FEATURES`]; that route passes [`FEATURES`] in the loader text.
 
 use std::ffi::{OsStr, OsString};
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::Path;
+
+use crate::bash_startup::{self, Startup, Terminator};
 
 /// Environment variable that turns the scripts on and carries their feature
 /// words (`enabled`, `no-cwd`, `no-prompt-mark`); `0` or unset is off.
@@ -46,10 +50,54 @@ pub const ENABLED_VAR: &str = "TESSERA_SHELL_INTEGRATION";
 /// The value of [`ENABLED_VAR`] in an injection: every feature on.
 pub const FEATURES: &str = "enabled";
 
-/// The text of the `PROMPT_COMMAND` that loads the bash script at the first
-/// prompt. The script removes exactly this text again, so the two must
-/// match.
-pub const BASH_LOADER: &str = r#". "$TESSERA_BASH_SCRIPT""#;
+/// The start of [`bash_loader`]'s text: a guard that makes the loader a
+/// no-op once the script ran (`_tessera_si_loader` is set, not exported, by
+/// the script).
+pub const BASH_LOADER_GUARD: &str = r#"builtin [ -n "${_tessera_si_loader-}" ] || "#;
+
+/// The `PROMPT_COMMAND` text that loads the bash script at `script` at the
+/// first prompt: [`BASH_LOADER_GUARD`], then [`FEATURES`] and `script`
+/// single-quoted (a `'` written as `'\''`, bytes kept as they are):
+///
+/// ```text
+/// builtin [ -n "${_tessera_si_loader-}" ] || _tessera_si_load='enabled' . '<script>' 2>/dev/null
+/// ```
+///
+/// The script rebuilds this text (from the words and the path it was
+/// sourced as) and removes it from `PROMPT_COMMAND`, so the two must match.
+/// A prompt tool that keeps a copy of the text and runs it at every prompt
+/// (starship) runs the guard only. A shell that inherits the text after the
+/// script was removed (`exec tmux` in a startup file keeps it in the tmux
+/// server's environment, across an update that prunes this version) fails
+/// the `.` silently, which is what the redirection is for; the script's path
+/// appears once because bash-preexec's sanitizer on bash 3.2 slows down
+/// steeply with the text's length. The text is one list of simple commands,
+/// so `PROMPT_COMMAND="$PROMPT_COMMAND; cmd"` stays valid. `.`, not
+/// `builtin .`: bash 3.2 drops an assignment before `builtin` after the
+/// first command of the sourced file.
+#[must_use]
+pub fn bash_loader(script: &Path) -> OsString {
+    let mut text = BASH_LOADER_GUARD.as_bytes().to_vec();
+    text.extend_from_slice(b"_tessera_si_load=");
+    single_quoted(&mut text, FEATURES.as_bytes());
+    text.extend_from_slice(b" . ");
+    single_quoted(&mut text, script.as_os_str().as_bytes());
+    text.extend_from_slice(b" 2>/dev/null");
+    OsString::from_vec(text)
+}
+
+/// Appends `value` to `out` as one single-quoted shell word.
+fn single_quoted(out: &mut Vec<u8>, value: &[u8]) {
+    out.push(b'\'');
+    for &byte in value {
+        if byte == b'\'' {
+            out.extend_from_slice(b"'\\''");
+        } else {
+            out.push(byte);
+        }
+    }
+    out.push(b'\'');
+}
 
 /// A shell with integration scripts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -131,9 +179,24 @@ impl Injection {
     /// zsh for a `ZDOTDIR` set by `/etc/zshenv` in that case, which this
     /// does not).
     ///
-    /// Returns an empty injection when nothing should change: any bash (bash
-    /// support is a follow-up, see [`Injection::for_bash`]), a zsh running a
-    /// command (`-c`) or a script without `-i`, a zsh skipping
+    /// bash: an interactive non-login bash starts with `--rcfile` and our
+    /// script, which sources `~/.bashrc` (or the user's `--rcfile`); a login,
+    /// `--posix` or `--norc` bash gets an exported `PROMPT_COMMAND` that ends
+    /// in [`bash_loader`] (after the user's exported `PROMPT_COMMAND`, if
+    /// any) and no other variable. Before that, this reads what such a bash
+    /// would read (a login shell: the first of `~/.bash_profile`,
+    /// `~/.bash_login` and `~/.profile`, and `~/.bashrc`; `--posix`: `$ENV`,
+    /// and `~/.bashrc` unless `--norc`, which bash 3.2 reads instead; and
+    /// one level of `.`/`source` with a literal `~/`, `$HOME` or absolute
+    /// path). It runs nothing, opens regular files only, and waits for about
+    /// a second at most, on another thread.
+    ///
+    /// Returns an empty injection when nothing should change: a bash or zsh
+    /// running a command (`-c`) or a script without `-i`, a bash whose
+    /// startup files assign `PROMPT_COMMAND` without keeping its old value
+    /// (or whose files are over the scan's limits, unreadable, not regular
+    /// files or not read in time, or a login bash without an absolute
+    /// `HOME`), a zsh skipping
     /// its startup files (`-f`, `--no-rcs`, `-o norcs`), a fish whose
     /// `scripts_dir` contains `:` (it could not be listed in
     /// `XDG_DATA_DIRS`), or the zsh case above.
@@ -146,25 +209,9 @@ impl Injection {
     ) -> Self {
         match shell {
             Shell::Zsh => zsh(scripts_dir, launch, &user_env),
-            Shell::Bash => Self::default(),
+            Shell::Bash => bash(scripts_dir, launch, &user_env),
             Shell::Fish => fish(scripts_dir, &user_env),
         }
-    }
-
-    /// What injecting a bash would take; [`Injection::for_shell`] does not
-    /// use it (Tessera starts bash unchanged until bash support lands, see
-    /// ADR 0021). Kept so the bash script and these rules stay tested: an
-    /// interactive non-login bash starts with `--rcfile` and our script,
-    /// which sources `~/.bashrc` (or the user's `--rcfile`); a login,
-    /// `--posix` or `--norc` bash gets an exported `PROMPT_COMMAND` loader;
-    /// a bash running a command (`-c`) or a script without `-i` gets nothing.
-    #[must_use]
-    pub fn for_bash(
-        scripts_dir: &Path,
-        launch: Launch<'_>,
-        user_env: impl Fn(&str) -> Option<OsString>,
-    ) -> Self {
-        bash(scripts_dir, launch, &user_env)
     }
 }
 
@@ -294,11 +341,9 @@ fn zsh(
 struct BashArgs {
     /// Runs a command string (`-c`) or a script without `-i`: not touched.
     skip: bool,
-    /// Reads the login startup files (`-l`, `--login`), which never read an
-    /// `--rcfile`.
-    login: bool,
-    /// `--posix` or `--norc`: does not read `~/.bashrc` either.
-    no_rc: bool,
+    /// What decides the startup files. A login shell (`-l`, `--login`) never
+    /// reads an `--rcfile`, and neither does a `--posix` or `--norc` one.
+    startup: Startup,
     /// The file named by `--rcfile` or `--init-file`.
     rcfile: Option<OsString>,
     /// Indices of the `--rcfile`/`--init-file` arguments, removed when ours
@@ -306,11 +351,56 @@ struct BashArgs {
     remove: Vec<usize>,
 }
 
+/// bash's long options, which it also takes with one dash (`-norc`).
+const BASH_LONG_OPTIONS: [&[u8]; 18] = [
+    b"debug",
+    b"debugger",
+    b"dump-po-strings",
+    b"dump-strings",
+    b"help",
+    b"init-file",
+    b"login",
+    b"noediting",
+    b"noprofile",
+    b"norc",
+    b"posix",
+    b"pretty-print",
+    b"protected",
+    b"rcfile",
+    b"restricted",
+    b"verbose",
+    b"version",
+    b"wordexp",
+];
+
+/// The name of the long option `arg` gives: `--name`, or `-name` for one of
+/// [`BASH_LONG_OPTIONS`].
+fn bash_long_option(arg: &[u8]) -> Option<&[u8]> {
+    if let Some(name) = arg.strip_prefix(b"--") {
+        return (!name.is_empty()).then_some(name);
+    }
+    arg.strip_prefix(b"-")
+        .filter(|name| BASH_LONG_OPTIONS.contains(name))
+}
+
+/// Whether bash would start in POSIX mode from its environment alone:
+/// `POSIXLY_CORRECT` set, or `posix` among the `SHELLOPTS` it imports.
+fn posix_from_env(user_env: &dyn Fn(&str) -> Option<OsString>) -> bool {
+    user_env("POSIXLY_CORRECT").is_some()
+        || user_env("SHELLOPTS").is_some_and(|options| {
+            options
+                .as_encoded_bytes()
+                .split(|&byte| byte == b':')
+                .any(|option| option == b"posix")
+        })
+}
+
 /// Reads bash's arguments the way kitty's `setup_bash_env` does: long
-/// options only before the first short one, `-c` (even in `-ic`) means a
-/// command, a file operand without `-i` a script; `-s` and `--`/`-` end the
-/// options. Unlike kitty, `-o`/`+o` take an argument like `-O`/`+O`, and
-/// `-l`/`--login` are noted.
+/// options (also with one dash, as bash takes them) only before the first
+/// short one, `-c` (even in `-ic`) means a command, a file operand without
+/// `-i` a script; `-s` and `--`/`-` end the options. Unlike kitty, `-o`/`+o`
+/// take an argument like `-O`/`+O`, `-o posix` is noted, and so are
+/// `-l`/`--login`.
 fn parse_bash_args(args: &[OsString]) -> BashArgs {
     let mut parsed = BashArgs::default();
     let mut long_options = true;
@@ -332,13 +422,38 @@ fn parse_bash_args(args: &[OsString]) -> BashArgs {
             end_of_options = true;
             continue;
         }
-        if bytes.len() > 1 && (bytes[0] == b'-' || bytes[0] == b'+') && bytes[1] != b'-' {
+        let long = if long_options {
+            bash_long_option(bytes)
+        } else {
+            None
+        };
+        if let Some(name) = long {
+            match name {
+                b"login" => parsed.startup.login = true,
+                b"posix" => parsed.startup.posix = true,
+                b"norc" => parsed.startup.norc = true,
+                b"rcfile" | b"init-file" if i + 1 < args.len() => {
+                    parsed.rcfile = Some(args[i + 1].clone());
+                    parsed.remove.extend([i, i + 1]);
+                    skip_next = true;
+                }
+                _ => {}
+            }
+        } else if bytes.len() > 1 && (bytes[0] == b'-' || bytes[0] == b'+') && bytes[1] != b'-' {
             long_options = false;
             let mut options = &bytes[1..];
             // `-O name` / `-o name`: the rest of the cluster or the next
             // argument is the option name.
             if let Some(at) = options.iter().position(|&b| b == b'O' || b == b'o') {
                 skip_next = at + 1 == options.len();
+                let name = if skip_next {
+                    args.get(i + 1).map(|next| next.as_encoded_bytes())
+                } else {
+                    Some(&options[at + 1..])
+                };
+                if bytes[0] == b'-' && options[at] == b'o' && name == Some(b"posix") {
+                    parsed.startup.posix = true;
+                }
                 options = &options[..at];
             }
             if options.contains(&b'c') {
@@ -346,24 +461,13 @@ fn parse_bash_args(args: &[OsString]) -> BashArgs {
                 return parsed;
             }
             if options.contains(&b'l') {
-                parsed.login = true;
+                parsed.startup.login = true;
             }
             if options.contains(&b'i') {
                 interactive = true;
             }
             if options.contains(&b's') {
                 break;
-            }
-        } else if bytes.starts_with(b"--") && long_options {
-            match bytes {
-                b"--login" => parsed.login = true,
-                b"--posix" | b"--norc" => parsed.no_rc = true,
-                b"--rcfile" | b"--init-file" if i + 1 < args.len() => {
-                    parsed.rcfile = Some(args[i + 1].clone());
-                    parsed.remove.extend([i, i + 1]);
-                    skip_next = true;
-                }
-                _ => {}
             }
         } else {
             file_operand = true;
@@ -380,6 +484,11 @@ fn bash(
     user_env: &dyn Fn(&str) -> Option<OsString>,
 ) -> Injection {
     let script = scripts_dir.join("bash").join("tessera.bash");
+    let mut startup = Startup {
+        login: true,
+        posix: false,
+        norc: false,
+    };
     let rcfile_args = match launch {
         Launch::Login => None,
         Launch::Args(args) => {
@@ -387,7 +496,12 @@ fn bash(
             if parsed.skip {
                 return Injection::default();
             }
-            (!parsed.login && !parsed.no_rc).then(|| {
+            startup = parsed.startup;
+            // bash reads `--rcfile` only outside POSIX mode, and the macOS
+            // 3.2 and bash 5 disagree on what a POSIX-mode bash reads instead,
+            // so those take the loader, which leaves no variable behind.
+            startup.posix |= posix_from_env(user_env);
+            (!startup.login && !startup.posix && !startup.norc).then(|| {
                 let mut new_args: Vec<OsString> = vec!["--rcfile".into(), script.clone().into()];
                 new_args.extend(
                     args.iter()
@@ -399,9 +513,8 @@ fn bash(
             })
         }
     };
-    let mut env = vec![enabled()];
     if let Some((args, rcfile)) = rcfile_args {
-        env.push(("TESSERA_BASH_INJECT".into(), "rcfile".into()));
+        let mut env = vec![enabled(), ("TESSERA_BASH_INJECT".into(), "rcfile".into())];
         if let Some(rcfile) = rcfile {
             env.push(("TESSERA_BASH_RCFILE".into(), rcfile));
         }
@@ -410,21 +523,30 @@ fn bash(
             args: Some(args),
         };
     }
-    // Login (or --posix/--norc) shell: load from the first prompt. The
-    // loader goes last so it runs after the user's own entries (an
+    // Login (or --posix/--norc) shell: load from the first prompt, unless a
+    // startup file would replace the loader and leave its own value exported
+    // to every child.
+    // A POSIX-mode login bash reads `~/.profile` and `$ENV` instead.
+    startup.posix |= posix_from_env(user_env);
+    let Some(terminator) = bash_startup::loader_terminator(startup, user_env) else {
+        return Injection::default();
+    };
+    // The loader goes last so it runs after the user's own entries (an
     // exported PROMPT_COMMAND the shell inherits). The script stops
     // exporting PROMPT_COMMAND once loaded.
     let mut prompt_command = user_env("PROMPT_COMMAND").unwrap_or_default();
     if !prompt_command.is_empty() {
         prompt_command.push("\n");
     }
-    prompt_command.push(BASH_LOADER);
-    env.extend([
-        ("TESSERA_BASH_INJECT".into(), "prompt-command".into()),
-        ("TESSERA_BASH_SCRIPT".into(), script.into_os_string()),
-        ("PROMPT_COMMAND".into(), prompt_command),
-    ]);
-    Injection { env, args: None }
+    prompt_command.push(bash_loader(&script));
+    if terminator == Terminator::Newline {
+        // The startup files' appends land after the loader's last word.
+        prompt_command.push("\n");
+    }
+    Injection {
+        env: vec![("PROMPT_COMMAND".into(), prompt_command)],
+        args: None,
+    }
 }
 
 /// The XDG Base Directory default for an unset `XDG_DATA_DIRS`.
@@ -515,7 +637,7 @@ mod tests {
         assert!(parse_bash_args(&args(&["-ic", "true"])).skip);
         assert!(parse_bash_args(&args(&["script.sh"])).skip);
         assert!(!parse_bash_args(&args(&["-i", "script.sh"])).skip);
-        assert!(parse_bash_args(&args(&["-il"])).login);
+        assert!(parse_bash_args(&args(&["-il"])).startup.login);
         // `-O extglob` / `-o vi` take a name, not a file operand.
         assert!(!parse_bash_args(&args(&["-O", "extglob"])).skip);
         assert!(!parse_bash_args(&args(&["-o", "vi"])).skip);
@@ -535,5 +657,49 @@ mod tests {
         assert_eq!(parsed.remove, vec![0, 1]);
         // After a short option bash takes `--login` for a file operand.
         assert!(parse_bash_args(&args(&["-x", "--login"])).skip);
+    }
+
+    /// M10: bash takes its long options with one dash too, and `-o posix`.
+    #[test]
+    fn bash_single_dash_long_options_and_posix_mode() {
+        let startup = |list: &[&str]| parse_bash_args(&args(list)).startup;
+        assert!(startup(&["-norc"]).norc);
+        assert!(startup(&["--norc"]).norc);
+        assert!(startup(&["-posix"]).posix);
+        assert!(startup(&["-login"]).login);
+        assert!(startup(&["-o", "posix"]).posix);
+        assert!(startup(&["-o", "posix", "-i"]).posix);
+        assert!(startup(&["-oposix"]).posix);
+        assert!(startup(&["-io", "posix"]).posix);
+        assert!(!startup(&["+o", "posix"]).posix);
+        assert!(!startup(&["-o", "vi"]).posix);
+        assert!(!startup(&["-O", "posix"]).posix);
+        let parsed = parse_bash_args(&args(&["-rcfile", "/r", "-i"]));
+        assert_eq!(parsed.rcfile, Some("/r".into()));
+        assert_eq!(parsed.remove, vec![0, 1]);
+        // Not a long option: a cluster of short ones.
+        assert!(!startup(&["-nor"]).norc);
+    }
+
+    #[test]
+    fn bash_posix_mode_from_the_environment() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |key: &str| {
+                pairs
+                    .iter()
+                    .find(|(name, _)| *name == key)
+                    .map(|(_, value)| OsString::from(value))
+            }
+        };
+        assert!(!posix_from_env(&env(&[])));
+        assert!(posix_from_env(&env(&[("POSIXLY_CORRECT", "")])));
+        assert!(posix_from_env(&env(&[("POSIXLY_CORRECT", "1")])));
+        assert!(posix_from_env(&env(&[("SHELLOPTS", "braceexpand:posix")])));
+        assert!(posix_from_env(&env(&[("SHELLOPTS", "posix")])));
+        assert!(!posix_from_env(&env(&[(
+            "SHELLOPTS",
+            "braceexpand:posixx"
+        )])));
+        assert!(!posix_from_env(&env(&[("SHELLOPTS", "")])));
     }
 }

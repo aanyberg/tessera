@@ -3,11 +3,11 @@
 //! `XDG_DATA_DIRS` set.
 
 use std::collections::HashMap;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
-use tessera_shell_integration::inject::{BASH_LOADER, ENABLED_VAR, FEATURES};
-use tessera_shell_integration::scripts::SCRIPTS;
+use tessera_shell_integration::inject::{BASH_LOADER_GUARD, ENABLED_VAR, FEATURES, bash_loader};
 use tessera_shell_integration::{Injection, Launch, Shell};
 
 const SCRIPTS_DIR: &str = "/s/1";
@@ -32,35 +32,7 @@ fn vars(list: &[(&str, &str)]) -> Vec<(OsString, OsString)> {
 }
 
 fn inject(shell: Shell, launch: Launch<'_>, user: &[(&str, &str)]) -> Injection {
-    match shell {
-        // Not injected yet; the rules are kept (and tested) for later.
-        Shell::Bash => Injection::for_bash(Path::new(SCRIPTS_DIR), launch, env(user)),
-        _ => Injection::for_shell(shell, Path::new(SCRIPTS_DIR), launch, env(user)),
-    }
-}
-
-#[test]
-fn bash_is_not_injected_yet() {
-    for user_args in [
-        &[][..],
-        &["-i"][..],
-        &["-l"][..],
-        &["--rcfile", "/u/rc", "-i"][..],
-    ] {
-        let user_args = args(user_args);
-        for launch in [Launch::Args(&user_args), Launch::Login] {
-            assert!(
-                Injection::for_shell(
-                    Shell::Bash,
-                    Path::new(SCRIPTS_DIR),
-                    launch,
-                    env(&[("PROMPT_COMMAND", "x")])
-                )
-                .is_empty(),
-                "{launch:?}"
-            );
-        }
-    }
+    Injection::for_shell(shell, Path::new(SCRIPTS_DIR), launch, env(user))
 }
 
 #[test]
@@ -204,6 +176,36 @@ fn zsh_running_a_command_a_script_or_no_startup_files_is_left_alone() {
 
 const BASH_SCRIPT: &str = "/s/1/bash/tessera.bash";
 
+/// The loader for [`BASH_SCRIPT`], written out.
+const LOADER: &str = r#"builtin [ -n "${_tessera_si_loader-}" ] || _tessera_si_load='enabled' . '/s/1/bash/tessera.bash' 2>/dev/null"#;
+
+/// A home directory with no startup files, for a login bash's scan.
+const EMPTY_HOME: (&str, &str) = ("HOME", "/nonexistent/tessera-test-home");
+
+#[test]
+fn the_bash_loader_quotes_the_words_and_the_path_literally() {
+    assert_eq!(bash_loader(Path::new(BASH_SCRIPT)), OsString::from(LOADER));
+    assert!(LOADER.starts_with(BASH_LOADER_GUARD));
+    assert!(LOADER.contains(&format!("'{FEATURES}'")));
+    // A space needs nothing; a `'` ends the quotes, is escaped and reopens
+    // them. No variable is read, so none has to be in the environment.
+    let script = Path::new("/a b/it's/bash/tessera.bash");
+    assert_eq!(
+        bash_loader(script),
+        OsString::from(
+            r#"builtin [ -n "${_tessera_si_loader-}" ] || _tessera_si_load='enabled' . '/a b/it'\''s/bash/tessera.bash' 2>/dev/null"#
+        )
+    );
+    assert!(!LOADER.contains("TESSERA"), "{LOADER}");
+    // Bytes that are not UTF-8 are kept as they are.
+    let script = OsStr::from_bytes(b"/\xff/bash/tessera.bash");
+    assert!(
+        bash_loader(Path::new(script))
+            .as_bytes()
+            .ends_with(b" . '/\xff/bash/tessera.bash' 2>/dev/null")
+    );
+}
+
 #[test]
 fn bash_non_login_starts_with_our_rcfile() {
     for user_args in [
@@ -247,16 +249,13 @@ fn bash_carries_the_users_rcfile() {
 
 #[test]
 fn bash_login_posix_and_norc_shells_load_from_prompt_command() {
+    // The loader alone: no variable of ours to leak into what the startup
+    // files run, or to stay behind when they drop the loader.
     let expected = Injection {
-        env: vars(&[
-            (ENABLED_VAR, FEATURES),
-            ("TESSERA_BASH_INJECT", "prompt-command"),
-            ("TESSERA_BASH_SCRIPT", BASH_SCRIPT),
-            ("PROMPT_COMMAND", BASH_LOADER),
-        ]),
+        env: vars(&[("PROMPT_COMMAND", &format!("{LOADER}\n"))]),
         args: None,
     };
-    assert_eq!(inject(Shell::Bash, Launch::Login, &[]), expected);
+    assert_eq!(inject(Shell::Bash, Launch::Login, &[EMPTY_HOME]), expected);
     for user_args in [
         &["-l"][..],
         &["-il"][..],
@@ -264,12 +263,152 @@ fn bash_login_posix_and_norc_shells_load_from_prompt_command() {
         &["--posix"][..],
         &["--norc", "-i"][..],
         &["--login", "--rcfile", "/u/rc"][..],
+        // M10: bash does not read `--rcfile` in these, or 5.x does not.
+        &["-norc"][..],
+        &["-norc", "-i"][..],
+        &["-posix"][..],
+        &["-o", "posix"][..],
+        &["-o", "posix", "-i"][..],
+        &["-oposix"][..],
     ] {
         assert_eq!(
-            inject(Shell::Bash, Launch::Args(&args(user_args)), &[]),
+            inject(Shell::Bash, Launch::Args(&args(user_args)), &[EMPTY_HOME]),
             expected,
             "{user_args:?}"
         );
+    }
+}
+
+/// The route decides whether the startup files matter: only the loader can
+/// be lost to an assignment, and only the files that bash reads count.
+#[test]
+fn bash_startup_files_decide_the_loader_route_only() {
+    let home = tempfile::tempdir().unwrap();
+    let home_path = home.path().to_str().unwrap();
+    std::fs::write(home.path().join(".bash_profile"), "PROMPT_COMMAND=x\n").unwrap();
+    let user = [("HOME", home_path)];
+    assert_eq!(
+        inject(Shell::Bash, Launch::Login, &user),
+        Injection::default()
+    );
+    for login in [&["-l"][..], &["--login"][..], &["--norc", "-l"][..]] {
+        assert_eq!(
+            inject(Shell::Bash, Launch::Args(&args(login)), &user),
+            Injection::default(),
+            "{login:?}"
+        );
+    }
+    // In .bashrc: bash 3.2 reads it for --posix; --norc does not, and the
+    // rcfile route sources it before anything of ours depends on it.
+    let bashrc = home.path().join(".bashrc");
+    std::fs::rename(home.path().join(".bash_profile"), &bashrc).unwrap();
+    let posix = inject(Shell::Bash, Launch::Args(&args(&["--posix"])), &user);
+    assert_eq!(posix, Injection::default());
+    for no_rc in [&["--norc"][..], &["--posix", "--norc"][..]] {
+        let injection = inject(Shell::Bash, Launch::Args(&args(no_rc)), &user);
+        assert_eq!(
+            injection.env,
+            vars(&[("PROMPT_COMMAND", &format!("{LOADER}\n"))]),
+            "{no_rc:?}"
+        );
+    }
+    let rcfile = inject(Shell::Bash, Launch::Args(&[]), &user);
+    assert_eq!(rcfile.args, Some(args(&["--rcfile", BASH_SCRIPT])));
+    // `--posix` reads $ENV, also with --norc.
+    let posix = inject(
+        Shell::Bash,
+        Launch::Args(&args(&["--posix", "--norc"])),
+        &[("HOME", home_path), ("ENV", bashrc.to_str().unwrap())],
+    );
+    assert_eq!(posix, Injection::default());
+    // A login bash without a usable HOME cannot be checked.
+    assert_eq!(
+        inject(Shell::Bash, Launch::Login, &[]),
+        Injection::default()
+    );
+}
+
+/// M10: POSIX mode from the environment keeps bash off the rcfile route on
+/// every launch, so no variable of ours is left in the shell.
+#[test]
+fn bash_posix_mode_from_the_environment_takes_the_loader() {
+    for posix in [
+        ("POSIXLY_CORRECT", "1"),
+        ("POSIXLY_CORRECT", ""),
+        ("SHELLOPTS", "braceexpand:posix"),
+    ] {
+        for user_args in [&[][..], &["-i"][..], &["--noprofile"][..], &["-l"][..]] {
+            let injection = inject(
+                Shell::Bash,
+                Launch::Args(&args(user_args)),
+                &[EMPTY_HOME, posix],
+            );
+            assert_eq!(injection.args, None, "{posix:?} {user_args:?}");
+            assert_eq!(
+                injection.env,
+                vars(&[("PROMPT_COMMAND", &format!("{LOADER}\n"))]),
+                "{posix:?} {user_args:?}"
+            );
+        }
+    }
+    let injection = inject(
+        Shell::Bash,
+        Launch::Args(&[]),
+        &[EMPTY_HOME, ("SHELLOPTS", "braceexpand:vi")],
+    );
+    assert_eq!(injection.args, Some(args(&["--rcfile", BASH_SCRIPT])));
+}
+
+/// Tessera's own login launch counts posix mode from the environment too:
+/// such a bash reads `~/.profile` even when `~/.bash_profile` exists, so an
+/// assignment there leaves it to bash.
+#[test]
+fn a_posix_login_from_the_environment_scans_every_profile() {
+    let home = tempfile::tempdir().unwrap();
+    let home_path = home.path().to_str().unwrap();
+    std::fs::write(home.path().join(".bash_profile"), "").unwrap();
+    std::fs::write(home.path().join(".profile"), "PROMPT_COMMAND=__p\n").unwrap();
+    let injected = inject(Shell::Bash, Launch::Login, &[("HOME", home_path)]);
+    assert_eq!(
+        injected.env,
+        vars(&[("PROMPT_COMMAND", &format!("{LOADER}\n"))])
+    );
+    for posix in [("POSIXLY_CORRECT", "1"), ("SHELLOPTS", "braceexpand:posix")] {
+        let injection = inject(Shell::Bash, Launch::Login, &[("HOME", home_path), posix]);
+        assert!(injection.is_empty(), "{posix:?}: {injection:?}");
+    }
+}
+
+/// B5: the loader is followed by a newline unless every append in the
+/// startup files starts with a separator; with both kinds bash is left alone.
+#[test]
+fn bash_startup_appends_pick_what_follows_the_loader() {
+    let home = tempfile::tempdir().unwrap();
+    let home_path = home.path().to_str().unwrap();
+    let user = [("HOME", home_path), ("PROMPT_COMMAND", "history -a")];
+    let profile = home.path().join(".bash_profile");
+    for (text, expected) in [
+        (
+            "PROMPT_COMMAND+='echo x'\n",
+            Some(format!("history -a\n{LOADER}\n")),
+        ),
+        (
+            "PROMPT_COMMAND=\"$PROMPT_COMMAND; x\"\n",
+            Some(format!("history -a\n{LOADER}")),
+        ),
+        (
+            "PROMPT_COMMAND=\"$PROMPT_COMMAND; x\"\nPROMPT_COMMAND+=y\n",
+            None,
+        ),
+        ("PROMPT_COMMAND+=(x)\n", None),
+    ] {
+        std::fs::write(&profile, text).unwrap();
+        let injection = inject(Shell::Bash, Launch::Login, &user);
+        let expected = expected.map_or_else(Injection::default, |value| Injection {
+            env: vars(&[("PROMPT_COMMAND", &value)]),
+            args: None,
+        });
+        assert_eq!(injection, expected, "{text:?}");
     }
 }
 
@@ -278,24 +417,22 @@ fn bash_keeps_an_exported_prompt_command_before_the_loader() {
     let injection = inject(
         Shell::Bash,
         Launch::Login,
-        &[("PROMPT_COMMAND", "history -a")],
+        &[EMPTY_HOME, ("PROMPT_COMMAND", "history -a")],
     );
     assert_eq!(
         injection.env,
-        vars(&[
-            (ENABLED_VAR, FEATURES),
-            ("TESSERA_BASH_INJECT", "prompt-command"),
-            ("TESSERA_BASH_SCRIPT", BASH_SCRIPT),
-            ("PROMPT_COMMAND", &format!("history -a\n{BASH_LOADER}")),
-        ])
+        vars(&[("PROMPT_COMMAND", &format!("history -a\n{LOADER}\n"))])
     );
     // Set but empty: nothing to keep.
-    let injection = inject(Shell::Bash, Launch::Login, &[("PROMPT_COMMAND", "")]);
-    assert!(
-        injection
-            .env
-            .contains(&("PROMPT_COMMAND".into(), OsString::from(BASH_LOADER)))
+    let injection = inject(
+        Shell::Bash,
+        Launch::Login,
+        &[EMPTY_HOME, ("PROMPT_COMMAND", "")],
     );
+    assert!(injection.env.contains(&(
+        "PROMPT_COMMAND".into(),
+        OsString::from(format!("{LOADER}\n"))
+    )));
 }
 
 #[test]
@@ -314,19 +451,6 @@ fn bash_running_a_command_or_a_script_is_left_alone() {
             "{user_args:?}"
         );
     }
-}
-
-#[test]
-fn the_bash_loader_is_the_text_the_script_removes() {
-    let script = SCRIPTS
-        .iter()
-        .find(|script| script.path == "bash/tessera.bash")
-        .unwrap();
-    let removal = format!("PROMPT_COMMAND=${{PROMPT_COMMAND//'{BASH_LOADER}'/:}}");
-    assert!(
-        script.contents.contains(&removal),
-        "tessera.bash must remove {BASH_LOADER:?} from PROMPT_COMMAND"
-    );
 }
 
 // ---- fish ----

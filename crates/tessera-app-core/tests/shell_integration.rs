@@ -116,11 +116,11 @@ fn zsh_starts_with_the_zdotdir_redirect() {
 }
 
 #[test]
-fn bash_is_started_unchanged() {
-    // Bash support is a follow-up (ADR 0021).
+fn bash_starts_with_our_rcfile_or_a_prompt_command_loader() {
     let setup = setup();
     let app = app(&setup, ShellIntegration::Auto);
     let bash = setup.bin.join("bash");
+    let script = scripts(&setup).join("bash/tessera.bash");
     let options = SpawnOptions::command(&bash, "x").args(["--rcfile", "/u/rc", "-i"]);
     let got = spawn(&app, &setup, options, "bash");
     assert_eq!(
@@ -128,16 +128,30 @@ fn bash_is_started_unchanged() {
         [
             path(&bash),
             "--rcfile".to_owned(),
-            "/u/rc".to_owned(),
+            path(&script),
             "-i".to_owned()
         ]
     );
-    let options = SpawnOptions::login_shell("x").env("SHELL", &bash);
+    assert_eq!(got.env["TESSERA_SHELL_INTEGRATION"], "enabled");
+    assert_eq!(got.env["TESSERA_BASH_INJECT"], "rcfile");
+    assert_eq!(got.env["TESSERA_BASH_RCFILE"], "/u/rc");
+    assert!(script.is_file());
+    // A login shell gets the loader alone (an empty PROMPT_COMMAND
+    // requested, so an inherited one does not split the recorded line).
+    let options = SpawnOptions::login_shell("x")
+        .env("SHELL", &bash)
+        .env("PROMPT_COMMAND", "");
     let got = spawn(&app, &setup, options, "login-bash");
     assert_eq!(got.args, [path(&bash)]);
+    let prompt_command = &got.env["PROMPT_COMMAND"];
+    assert!(
+        prompt_command.ends_with(&format!(" . '{}' 2>/dev/null", path(&script))),
+        "{prompt_command}"
+    );
     for key in [
         "TESSERA_SHELL_INTEGRATION",
         "TESSERA_BASH_INJECT",
+        "TESSERA_BASH_RCFILE",
         "TESSERA_BASH_SCRIPT",
     ] {
         assert!(!got.env.contains_key(key), "{key}");

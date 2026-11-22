@@ -1,0 +1,182 @@
+# Bash with prompt tools: the OSC 133 marks Tessera's injection gives, by
+# spec task 158 (wave 24, 2026-11-17), section 5 table X and section 6 M1.
+# Read by tests/bash_tools.rs. Fields are separated by ` | `; `-` is empty.
+#
+# Mark rows: id | route | startup files (tests/fixtures/bash-tools/, sourced
+# in this order) | marks of the first prompt | marks of the first command |
+# the same two on bash 5.1 and later, where PROMPT_COMMAND can be an array:
+# `off` there (both fields) is a shell left as without Tessera, because its
+# PROMPT_COMMAND is an array (bash-preexec 0.6 and later and the stand-in
+# make one, oh-my-bash appends an element): no OSC 133, no error, every
+# command's output (ADR 0021, #613). bash-preexec 0.6 makes the array at its
+# first prompt, after the handshake and that prompt's OSC 7.
+# The route is `login` (`bash -l`: the PROMPT_COMMAND loader, files sourced
+# from .bash_profile) or `rcfile` (`bash -i`: `--rcfile`, from .bashrc);
+# `login-alone` rows are login shells the scan leaves to bash (B5h:
+# oh-my-bash's `PROMPT_COMMAND+=(...)`), not run.
+# Every row also holds, for 20 prompts: no error output, one handshake
+# before the first prompt, no D before the first A, no C but right after a
+# B, and from the second prompt on `D;<status>` for the last command, then
+# A B and C for the next one.
+#
+# X2/X3: starship rewrites PS1 after the loader ran (lead decision D3, 2026-11-17): the
+# first prompt and the first command are unmarked.
+# X5, X7, X14e on bash >= 5.1: oh-my-bash's array element runs after the loader,
+# or after bash-preexec's install entry, in the array bash copied for that
+# prompt, and rebuilds PS1: unmarked in the same way. (0.7.0 appends its entry
+# after oh-my-bash's, X6, so there the install runs last; 0.6.0 and 0.5.0 put
+# theirs into element 0.)
+mark | X1 | login | - | A B | C | A B | C
+mark | X2 | login | starship-init-1.27.bash | - | - | - | -
+mark | X3 | login | starship-init-master.bash | - | - | - | -
+mark | X4 | login | bash-preexec-install.sh | A B | C | off | off
+mark | X5 | login-alone | oh-my-bash-prompt.sh | A B | C | - | -
+mark | X6 | login-alone | oh-my-bash-prompt.sh bash-preexec-install.sh | A B | C | A B | C
+mark | X7 | login-alone | bash-preexec-install.sh oh-my-bash-prompt.sh | A B | C | - | -
+mark | X8a | rcfile | - | A B | C | A B | C
+mark | X8b | rcfile | starship-init-1.27.bash | A B | C | A B | C
+mark | X8c | rcfile | starship-init-master.bash | A B | C | A B | C
+mark | X8d | rcfile | bash-preexec-install.sh | A B | C | off | off
+mark | X8e | rcfile | oh-my-bash-prompt.sh | A B | C | off | off
+mark | X8f | rcfile | oh-my-bash-prompt.sh bash-preexec-install.sh | A B | C | off | off
+mark | X8g | rcfile | bash-preexec-install.sh oh-my-bash-prompt.sh | A B | C | off | off
+# bash-preexec with starship loaded after it (starship then uses its hook lists).
+mark | X9a | login | bash-preexec-install.sh starship-init-1.27.bash | A B | C | off | off
+mark | X9b | rcfile | bash-preexec-install.sh starship-init-1.27.bash | A B | C | off | off
+# bash-preexec 0.5.0 and 0.6.0: another install text than 0.7.0.
+mark | X14a | login | bash-preexec-0.6.sh | A B | C | off | off
+mark | X14b | rcfile | bash-preexec-0.6.sh | A B | C | off | off
+mark | X14c | login | bash-preexec-0.5.sh | A B | C | A B | C
+mark | X14d | rcfile | bash-preexec-0.5.sh | A B | C | A B | C
+mark | X14e | login-alone | oh-my-bash-prompt.sh bash-preexec-0.6.sh | A B | C | - | -
+mark | X14f | rcfile | bash-preexec-0.6.sh oh-my-bash-prompt.sh | A B | C | off | off
+# bash-preexec 0.7.0 on its DEBUG trap path (bash 5.1 and 5.2; 5.3 takes PS0).
+mark | X15a | login | bash-preexec-debug.sh | A B | C | off | off
+mark | X15b | rcfile | bash-preexec-debug.sh | A B | C | off | off
+mark | X15c | login-alone | oh-my-bash-prompt.sh bash-preexec-debug.sh | A B | C | A B | C
+mark | X15d | login-alone | bash-preexec-debug.sh oh-my-bash-prompt.sh | A B | C | - | -
+mark | X15e | rcfile | bash-preexec-debug.sh oh-my-bash-prompt.sh | A B | C | off | off
+# A theme's entry added after bash-preexec's install entry. Login on 3.2: both
+# are in the text bash is running when the loader runs, so the theme rebuilds
+# PS1 after the install. With an array the install is a later element.
+mark | X16a | login | bash-preexec-install.sh appended-theme.sh | - | - | off | off
+mark | X16b | rcfile | bash-preexec-install.sh appended-theme.sh | A B | C | off | off
+#
+# OSC 7 rows (M1): id | directory name (`\n` is a newline) | its encoding,
+# Terminal.app's rule: every byte outside [/._~A-Za-z0-9-] is %XX.
+osc7 | M1a | a b | a%20b
+osc7 | M1b | é | %C3%A9
+osc7 | M1c | 100% | 100%25
+osc7 | M1d | nl\nx | nl%0Ax
+osc7 | M1e | ~x.y_z-1 | ~x.y_z-1
+osc7 | M1f | Plain09 | Plain09
+
+# ---------------------------------------------------------------------------
+# Wave 27 rows (#158 and #540), from the spec-researcher's table of
+# 2026-11-22 (scratch/spec-researcher-158/bash_spec_wave27.txt; sources: the
+# GNU bash manual sections named per row, kitty.bash, ghostty.bash, and
+# measurements on /bin/bash 3.2.57 and Homebrew bash 5.3). Read by
+# tests/bash_rows.rs, one test per row. In these rows a command field holds
+# one line per Enter, separated by `\n`; `\|` is a pipe (` | ` separates
+# fields). `base`: the injected shell prints what the same bash prints
+# without the injection (every line that is not a prompt, errors included).
+# `base after N`: the same, past the first N such lines (the loading prompt,
+# B6b). `limit: a / b`: an ACCEPTED LIMIT (ADR 0021): the injected shell
+# prints exactly the lines a, b, which differ from base. `lines: a / b`:
+# the injected shell prints exactly a, b (B5: the user's entry runs at every
+# prompt; without the injection some of these appends are a syntax error).
+# `base ignoring W`: base once every line `W` is dropped, with at least as
+# many `W` lines as base (P17: the user's DEBUG trap also runs for the
+# hooks' first commands at each prompt, as on main; ACCEPTED LIMIT). The
+# pipestatus rows run on the rcfile and the login route, the pc rows (the
+# loader's) on the login route.
+#
+# PIPESTATUS (#540):
+# pipestatus | id | bashes | commands | expected
+pipestatus | P1 | 3.2 5.3 | true \| false \| true\necho "ps=${PIPESTATUS[*]} rc=$?" | base
+pipestatus | P2 | 3.2 5.3 | false \| true\necho "ps=${PIPESTATUS[*]} rc=$?" | base
+pipestatus | P3 | 3.2 5.3 | true \| true \| false \| true\necho "ps=${PIPESTATUS[*]} rc=$?" | base
+pipestatus | P4 | 3.2 5.3 | true \| false\necho "ps=${PIPESTATUS[*]} rc=$?" | base
+pipestatus | P5 | 3.2 5.3 | false\necho "ps=${PIPESTATUS[*]} rc=$?" | base
+pipestatus | P6 | 3.2 5.3 | echo a b LASTARG\necho "us=[$_]" | base
+pipestatus | P7 | 3.2 5.3 | echo a b LASTARG\ntrue \| false\necho "us=[$_] ps=${PIPESTATUS[*]}" | base
+pipestatus | P8 | 3.2 5.3 | set -o pipefail\nfalse \| true \| true\necho "ps=${PIPESTATUS[*]} rc=$?" | base
+pipestatus | P9 | 3.2 5.3 | ! false \| true\necho "ps=${PIPESTATUS[*]} rc=$?" | base
+pipestatus | P10 | 3.2 5.3 | true \| false \| true; echo "ps=${PIPESTATUS[*]}" | base
+pipestatus | P11 | 3.2 5.3 | IFS=,\ntrue \| false \| true\necho "ps=${PIPESTATUS[*]}" | base
+pipestatus | P12 | 3.2 5.3 | trap 'echo ERRTRAP' ERR\ntrue \| false \| true\necho "ps=${PIPESTATUS[*]}"\ntrue \| true \| false\necho "ps=${PIPESTATUS[*]}" | base
+pipestatus | P13 | 3.2 5.3 | set -e\ntrue \| false \| false \|\| true\necho "ps=${PIPESTATUS[*]}"\ntrue \| false \| false\necho alive | base
+pipestatus | P14 | 3.2 | shopt -s extdebug\ntrue \| false \| true\necho "ps=${PIPESTATUS[*]} rc=$?" | limit: ps=0 rc=0
+pipestatus | P15 | 3.2 | true \| true \| true \| true \| true \| true \| true \| true \| true \| false \| true\necho "ps=${PIPESTATUS[*]}" | limit: ps=0
+pipestatus | P15b | 3.2 5.3 | true \| true \| true \| true \| true \| true \| true \| false \| true\necho "ps=${PIPESTATUS[*]}" | base
+pipestatus | P16 | 3.2 5.3 | true \| false \| true\n\necho "ps=${PIPESTATUS[*]}" | base
+pipestatus | P17 | 3.2 5.3 | trap 'echo DBG' DEBUG\ntrue \| false \| true\necho "ps=${PIPESTATUS[*]}" | base ignoring DBG
+# The gate: only a command line naming PIPESTATUS gets it back on 3.2; a
+# function reading it at its start sees the hooks' one status.
+pipestatus | G1 | 3.2 | f() { echo "ps=${PIPESTATUS[*]}"; }\ntrue \| false \| true\nf | limit: ps=0
+pipestatus | G1b | 5.3 | f() { echo "ps=${PIPESTATUS[*]}"; }\ntrue \| false \| true\nf | base
+# P18 (bash 4+ keeps PIPESTATUS around the trap itself: no restore, no
+# fork) is tests/bash_rows.rs `p18_bash_4_restores_nothing`.
+#
+# Appends to PROMPT_COMMAND in .bash_profile, on the login route (B5, B6):
+# pc | id | bashes | .bash_profile | commands | expected
+pc | B5a | 3.2 5.3 | PROMPT_COMMAND+='echo USER_PC' | true\ntrue | lines: USER_PC / USER_PC / USER_PC
+pc | B5b | 3.2 5.3 | PROMPT_COMMAND+='echo USER_PC;' | true\ntrue | lines: USER_PC / USER_PC / USER_PC
+pc | B5c | 3.2 5.3 | PROMPT_COMMAND="${PROMPT_COMMAND}echo USER_PC;" | true\ntrue | lines: USER_PC / USER_PC / USER_PC
+pc | B5d | 3.2 5.3 | PROMPT_COMMAND="$PROMPT_COMMAND echo USER_PC" | true\ntrue | lines: USER_PC / USER_PC / USER_PC
+pc | B5e | 3.2 5.3 | PROMPT_COMMAND+=$'\\necho USER_PC' | true\ntrue | lines: USER_PC / USER_PC / USER_PC
+pc | B5f | 3.2 5.3 | PROMPT_COMMAND="${PROMPT_COMMAND:+$PROMPT_COMMAND;}echo USER_PC" | true\ntrue | lines: USER_PC / USER_PC / USER_PC
+pc | B5g | 3.2 5.3 | PROMPT_COMMAND="$PROMPT_COMMAND; echo USER_PC" | true\ntrue | lines: USER_PC / USER_PC / USER_PC
+pc | B5h | 3.2 5.3 | PROMPT_COMMAND+=("echo USER_PC") | true\ntrue | lines: USER_PC / USER_PC / USER_PC
+pc | B5i | 3.2 5.3 | PROMPT_COMMAND='history -a; echo USER_PC' | true\ntrue | lines: USER_PC / USER_PC / USER_PC
+# The scan's own choices (ADR 0021): blanks before a separator still lead
+# with the separator; a `$x` the scan cannot read counts as glued; `&&`
+# leads like `;`.
+pc | B5j | 3.2 5.3 | PROMPT_COMMAND="$PROMPT_COMMAND ; echo USER_PC" | true\ntrue | lines: USER_PC / USER_PC / USER_PC
+pc | B5k | 3.2 5.3 | x=echo; PROMPT_COMMAND="$PROMPT_COMMAND$x USER_PC" | true\ntrue | lines: USER_PC / USER_PC / USER_PC
+pc | B5l | 3.2 5.3 | PROMPT_COMMAND="$PROMPT_COMMAND && echo USER_PC" | true\ntrue | lines: USER_PC / USER_PC / USER_PC
+# Both kinds of append: no terminator serves both, bash is left alone.
+pc | B5m | 3.2 5.3 | PROMPT_COMMAND+='echo A1'\nPROMPT_COMMAND="$PROMPT_COMMAND; echo A2" | true\ntrue | lines: A1 / A2 / A1 / A2 / A1 / A2
+pc | B6a | 3.2 5.3 | rc() { return $1; }; __ps() { local e=$? p="${PIPESTATUS[*]}"; echo "PSEEN e=$e ps=$p"; }; PROMPT_COMMAND="${PROMPT_COMMAND:+$PROMPT_COMMAND;}__ps" | rc 7\ntrue\nrc 3\ntrue \| false \| true\ntrue | base after 1
+pc | B6c | 3.2 5.3 | rc() { return $1; }; __ps() { local e=$? p="${PIPESTATUS[*]}"; echo "PSEEN e=$e ps=$p"; }; PROMPT_COMMAND+=$'\\n__ps' | rc 7\ntrue\nrc 3\ntrue \| false \| true\ntrue | base after 1
+pc | B6e | 3.2 5.3 | rc() { return $1; }; __ps() { local e=$? p="${PIPESTATUS[*]}"; echo "PSEEN e=$e ps=$p"; }; PROMPT_COMMAND+=';__ps' | rc 7\ntrue\nrc 3\ntrue \| false \| true\ntrue | lines: PSEEN e=0 ps=0 / PSEEN e=7 ps=7 / PSEEN e=0 ps=0 / PSEEN e=3 ps=3 / PSEEN e=0 ps=0 1 0 / PSEEN e=0 ps=0
+#
+# B1-B4 on both injected routes, both bashes: the tests in tests/live.rs
+# named in the last field iterate `bash_routes()`.
+# hold | id | test
+hold | B1a | bash_redirected_output_gets_no_marks
+hold | B1d | bash_compound_redirecting_a_mark_fd_keeps_its_data
+hold | B2 | bash_with_any_ifs
+hold | B3 | bash_err_trap_runs_for_the_users_commands_only
+hold | B4 | bash_with_errexit
+#
+# The startup scan (B8, M2, S1-S5): unit tests in src/bash_startup.rs.
+# scan | id | test
+scan | S1 | a_fifo_with_a_one_shot_writer_is_left_to_bash
+scan | S2 | a_fifo_with_a_one_shot_writer_is_left_to_bash
+scan | S3 | a_link_to_a_device_or_a_directory_is_not_opened
+scan | S4 | a_flood_of_lines_is_scanned_within_the_wait
+scan | S5 | a_file_swapped_after_the_stat_is_not_read
+scan | M2 | a_mention_of_a_keeping_tool_does_not_exempt_a_file
+# The scan's own choices (ADR 0021): a POSIX-mode login reads every
+# profile (3.2 and 5.x differ); blanks then a separator lead with the
+# separator, an unread `$x` lead is glued (also live: pc B5j, B5k).
+scan | U1 | a_posix_login_shell_reads_every_profile
+scan | U2 | appends_are_told_apart_by_how_they_start
+scan | U3 | appends_are_told_apart_by_how_they_start
+#
+# M10: launches whose `--rcfile` bash 3.2 or 5.x does not read take the
+# loader, so no TESSERA_ variable is in the shell (tests/bash_rows.rs runs
+# `env` in each, on both bashes).
+# rcfile | id | environment (`-`: none) | arguments
+rcfile | R1 | - | --norc
+rcfile | R2 | - | -norc
+rcfile | R3 | - | --posix
+rcfile | R4 | - | -posix
+rcfile | R5 | - | -o posix
+rcfile | R6 | - | -o posix -i
+rcfile | R7 | POSIXLY_CORRECT=1 | -i
+rcfile | R8 | POSIXLY_CORRECT=1 | --noprofile
+rcfile | R9 | POSIXLY_CORRECT=1 | -norc
+rcfile | R10 | POSIXLY_CORRECT=1 | -l
+rcfile | R11 | SHELLOPTS=braceexpand:posix | -i
