@@ -78,16 +78,20 @@
 //! written below it does not clear the selection.
 
 use std::cmp::Reverse;
-use std::ops::Range;
+use std::ops::{ControlFlow, Range};
 use std::time::{Duration, Instant};
 
-use tessera_config::{CompiledRule, RuleCheck, SmartRules};
+use tessera_config::{CompiledRule, RuleCheck};
 pub use tessera_grid::Point;
 use tessera_grid::{Cell, Color, DamageRows, Grid, Line};
 use tessera_render::{Overlay, OverlayKind, Selection as Highlight};
 use tessera_term::ThemeColors;
 
 use crate::rich_text::{RunStyle, Styled};
+pub use crate::smart_engine::{
+    SMART_FALLBACK_UNITS, SMART_RULE_ATTEMPT_BOUND, SMART_RULE_CACHE_BYTES,
+};
+use crate::smart_engine::{Scanned, SmartEngines};
 use crate::url::{self, MAX_URL_LEN};
 
 /// The characters besides Unicode alphanumerics that a double-click
@@ -664,11 +668,10 @@ fn trim_url(text: &str, span: Range<usize>) -> Range<usize> {
 /// the first rule included. A rule not started within it is skipped, and
 /// one that has spent it stops at the match it found. Rules are bounded in
 /// count and size (S5); this bounds them in time: a click costs at most the
-/// budget plus one match attempt, which only [`SMART_SCAN_BYTES`] and
-/// [`tessera_config::SMART_RULE_SIZE_LIMIT`] bound: a rule with no match
-/// in the window searches all of it at once, about 1 s at worst, or about
-/// 3 s (more under load) for a rule with capture groups, with the terminal
-/// lock held (#433; bounding each attempt is a 0.3.0 follow-up).
+/// budget plus one match attempt, and an attempt at most
+/// [`SMART_RULE_ATTEMPT_BOUND`] (#518): the terminal and selection locks are
+/// held at most rules x (budget + attempt bound) per click, in practice the
+/// budget plus one attempt.
 pub const SMART_RULE_BUDGET: Duration = Duration::from_millis(50);
 
 #[cfg(test)]
@@ -720,15 +723,19 @@ fn rules_time(started: Instant, ran: usize, found: usize) -> Duration {
     elapsed.saturating_add(charged)
 }
 
-/// The cells of the best smart-selection match of `rules` covering the
-/// character at `pos` (see the module docs), or `None`: no rule matches
-/// there, or `pos` is past the end of its line's text or on padding.
+/// The cells of the best smart-selection match of the rules of `engines`
+/// covering the character at `pos` (see the module docs), or `None`: no
+/// rule matches there, or `pos` is past the end of its line's text or on
+/// padding.
 ///
 /// The rules share [`SMART_RULE_BUDGET`]: once it is spent, the rule
 /// running stops and the rules not yet started are skipped (one debug log
 /// with the counts, S8), and the best match found so far wins; with none
-/// the word is selected.
-fn smart_at(lines: &Lines<'_>, pos: Pos, rules: &SmartRules) -> Option<(Pos, Pos)> {
+/// the word is selected. Each rule's attempt is bounded on its own
+/// ([`SMART_RULE_ATTEMPT_BOUND`], #518): a rule that gives up or is over
+/// the fallback gate has no match for the click.
+fn smart_at(lines: &Lines<'_>, pos: Pos, engines: &SmartEngines) -> Option<(Pos, Pos)> {
+    let rules = engines.rules();
     if rules.is_empty() {
         return None;
     }
@@ -737,6 +744,7 @@ fn smart_at(lines: &Lines<'_>, pos: Pos, rules: &SmartRules) -> Option<(Pos, Pos
     let last = last.filter(|last| at <= *last)?;
     let window = ScanWindow::around(lines, at, last);
     let click = window.bytes(window.click);
+    let ascii = window.text.is_ascii();
     let mut best: Option<(Key, Range<usize>)> = None;
     let started = Instant::now();
     // Rules finished, and matches found.
@@ -747,20 +755,31 @@ fn smart_at(lines: &Lines<'_>, pos: Pos, rules: &SmartRules) -> Option<(Pos, Pos
             spent = true;
             break;
         }
-        for one in rule.regex().find_iter(&window.text) {
+        // This rule's best, kept only when the rule's scan stands.
+        let mut rule_best: Option<(Key, Range<usize>)> = None;
+        let scanned = engines.scan(index, &window.text, ascii, |one| {
             found += 1;
-            if one.start() >= click.end {
-                break;
+            if one.start >= click.end {
+                return ControlFlow::Break(());
             }
-            if let Some(candidate) = candidate(&window, rule, index, one.range(), &click)
-                && best.as_ref().is_none_or(|(best, _)| candidate.0 > *best)
+            if let Some(candidate) = candidate(&window, rule, index, one, &click)
+                && rule_best
+                    .as_ref()
+                    .is_none_or(|(best, _)| candidate.0 > *best)
             {
-                best = Some(candidate);
+                rule_best = Some(candidate);
             }
             if rules_time(started, ran, found) >= SMART_RULE_BUDGET {
                 spent = true;
-                break;
+                return ControlFlow::Break(());
             }
+            ControlFlow::Continue(())
+        });
+        if scanned == Scanned::Done
+            && let Some(candidate) = rule_best
+            && best.as_ref().is_none_or(|(best, _)| candidate.0 > *best)
+        {
+            best = Some(candidate);
         }
         ran += 1;
         if spent {
@@ -1096,7 +1115,7 @@ impl SelectionState {
         at: Point,
         granularity: Granularity,
         block: bool,
-        rules: &SmartRules,
+        rules: &SmartEngines,
     ) {
         let lines = Lines::of(grid);
         let pos = lines.clamped(offset, at);
@@ -1952,7 +1971,6 @@ fn link_of(lines: &Lines<'_>, offset: usize, cells: &[Pos]) -> Option<(Link, boo
 #[cfg(test)]
 mod tests {
     use proptest::prelude::*;
-    use std::sync::Arc;
     use tessera_config::{MAX_SMART_RULES, Precision};
     use tessera_term::Terminal;
 
@@ -1978,7 +1996,7 @@ mod tests {
             point(0, 0),
             Granularity::Char,
             false,
-            &SmartRules::default(),
+            &SmartEngines::default(),
         );
         state.extend(term.grid(), 0, point(0, 4));
         // A full repaint of the same text (ED 2 + rewrite) keeps it.
@@ -2008,7 +2026,7 @@ mod tests {
             point(0, 0),
             Granularity::Line,
             false,
-            &SmartRules::default(),
+            &SmartEngines::default(),
         );
         assert!(state.has_selection(term.grid()));
         term.advance(b"x\r\n");
@@ -2040,7 +2058,7 @@ mod tests {
             point(0, 0),
             Granularity::Word,
             false,
-            &SmartRules::default(),
+            &SmartEngines::default(),
         );
         term.advance(b"\x1b[?1049h");
         assert!(!state.has_selection(term.grid()));
@@ -2540,7 +2558,7 @@ mod tests {
                 point(0, 0),
                 Granularity::Char,
                 block,
-                &SmartRules::default(),
+                &SmartEngines::default(),
             );
             state.extend(term.grid(), 0, point(1, 1));
             assert_eq!(state.text(term.grid(), true).as_deref(), Some("l3\ns1\ns2"));
@@ -2558,7 +2576,7 @@ mod tests {
             point(0, 0),
             Granularity::Char,
             true,
-            &SmartRules::default(),
+            &SmartEngines::default(),
         );
         state.extend(term.grid(), 0, point(1, 1));
         term.advance(b"\r\nx\r\ny\r\nz");
@@ -2885,7 +2903,7 @@ mod tests {
             term.advance(setup.concat().as_bytes());
             let mut state = SelectionState::default();
             let grid = term.grid();
-            state.begin(grid, offset, point(from.0, from.1), Granularity::Char, block, &SmartRules::default());
+            state.begin(grid, offset, point(from.0, from.1), Granularity::Char, block, &SmartEngines::default());
             state.extend(grid, offset, point(to.0, to.1));
             let sel = state.sel.clone().expect("selected");
             let original = extract(&Lines::of(grid), &sel);
@@ -3063,7 +3081,7 @@ mod tests {
     /// written with a decomposed letter (`e` + U+0301) is selected whole.
     #[test]
     fn a_dotted_name_with_a_combining_mark_is_selected_whole() {
-        let rules = tessera_config::Selection::default().compiled_rules();
+        let rules = SmartEngines::new(tessera_config::Selection::default().compiled_rules());
         for (text, col, want) in [
             (
                 "see cafe\u{301}.module.name ok",
@@ -3097,7 +3115,7 @@ mod tests {
     }
 
     /// Rules made from `(pattern, precision)` pairs.
-    fn smart_rules(rules: &[(&str, Precision)]) -> Arc<SmartRules> {
+    fn smart_rules(rules: &[(&str, Precision)]) -> SmartEngines {
         let mut selection = tessera_config::Selection::default();
         selection.smart_rules = Some(
             rules
@@ -3105,7 +3123,7 @@ mod tests {
                 .map(|&(regex, precision)| tessera_config::SmartRule::new(regex, precision))
                 .collect(),
         );
-        selection.compiled_rules()
+        SmartEngines::new(selection.compiled_rules())
     }
 
     /// #351 m1: once the rules of a click have spent [`SMART_RULE_BUDGET`],
@@ -3190,7 +3208,7 @@ mod tests {
     fn sixty_four_slow_rules_stay_near_the_click_budget() {
         let slow = vec![("[a-z]+X|[a-z]", Precision::Normal); MAX_SMART_RULES];
         let rules = smart_rules(&slow);
-        assert_eq!(rules.len(), MAX_SMART_RULES);
+        assert_eq!(rules.rules().len(), MAX_SMART_RULES);
         let mut term = Terminal::new(2, 200);
         term.set_max_scrollback(1_000);
         term.advance("a".repeat(20_000).as_bytes());
@@ -3231,7 +3249,7 @@ mod tests {
             line: lines.base + 50,
             col: 100,
         };
-        let run = |lines: &Lines<'_>, at: Pos, rules: &SmartRules, cost: Duration| {
+        let run = |lines: &Lines<'_>, at: Pos, rules: &SmartEngines, cost: Duration| {
             MATCH_COST.with(|c| c.set(cost));
             let found = charged_only(|| smart_at(lines, at, rules));
             MATCH_COST.with(|c| c.set(Duration::ZERO));
@@ -3388,81 +3406,96 @@ mod tests {
         assert_eq!(smart_at(&lines, at, &rules), None);
     }
 
-    /// The hostile rules of #433, one at a time, on 20 000-character lines:
-    /// each is refused at load with a warning naming its index, or a click
-    /// in the middle of the line returns in bounded time (the fastest of
-    /// three): within 100 ms on ASCII where the rule matches at every
-    /// character (the budget stops it), within 10 s for a no-match rule
-    /// with capture groups (about 3 s at worst idle), otherwise within 3 s
-    /// (a rule that never matches costs one find over the whole window,
-    /// about 1 s at worst without captures). The bounds are on the thread's
-    /// CPU time, which leaves out preemption but not core speed: a thread
-    /// moved to an efficiency core runs these regexes 3-4 times slower.
-    /// Release builds only: the bound is for the shipped code.
+    /// The hostile rules of #433 and their `\b(?:...)` forms, each with
+    /// whether it can select anything on the texts of
+    /// `hostile_smart_rules_are_refused_or_bounded` (one that cannot gives
+    /// up its attempt or scans the window once).
+    fn hostile_rules() -> Vec<(String, bool)> {
+        use std::fmt::Write as _;
+        let cap = tessera_config::MAX_SMART_RULE_PATTERN_LEN;
+        let literals = |room: usize| {
+            let mut literals = String::from("(?:w000");
+            let mut n = 1;
+            while literals.len() + 5 + 2 <= room {
+                let _ = write!(literals, "|w{n:03}");
+                n += 1;
+            }
+            literals.push_str(")+");
+            literals
+        };
+        let at_cap = |room: usize| format!("{}XY|a", "a?".repeat((room - 4) / 2));
+        assert_eq!(at_cap(cap).len(), cap);
+        let rules = |room: usize| {
+            [
+                // The rule of #433 and nested counted repetition.
+                (r"(?:[^X]{0,50}){0,20}X|a".to_owned(), false),
+                (r"(?:[a-z]{0,50}){0,20}X|a".to_owned(), false),
+                (r"(?:(?:a|b){0,50}){0,20}X|a".to_owned(), false),
+                // An alternation of many literals.
+                (literals(room), true),
+                // A long Unicode class repetition (refused at load), and a
+                // short one.
+                (r"\p{L}{0,1000}X|a".to_owned(), true),
+                (r"\p{L}{0,20}X|a".to_owned(), true),
+                // Many tiny matches.
+                (".".to_owned(), true),
+                // A pattern at the length cap.
+                (at_cap(room), true),
+                // A rule that never matches the combining text (#433 round
+                // 1), and the same with capture groups (#433 adversarial
+                // F1).
+                (r"(?:[e\x{301}]{0,60}){0,20}[XY]".to_owned(), false),
+                (r"(?:(e?)(\x{301}?)){0,2560}[XY]".to_owned(), false),
+            ]
+        };
+        let mut all: Vec<(String, bool)> = rules(cap).into();
+        // `\b(?:` and `)` add 6 bytes: the rules built to the cap are built
+        // 6 bytes shorter for that form.
+        all.extend(
+            rules(cap - 6)
+                .into_iter()
+                .map(|(rule, matches)| (format!(r"\b(?:{rule})"), matches)),
+        );
+        all
+    }
+
+    /// The hostile rules of #433 and their `\b` forms ([`hostile_rules`]),
+    /// one at a time, on 20 000-character lines of seven texts: each is
+    /// refused at load with a warning naming its index, or a click in the
+    /// middle of the line takes, on the thread's CPU clock and the fastest
+    /// of three, at most [`SMART_RULE_BUDGET`] plus one attempt
+    /// ([`SMART_RULE_ATTEMPT_BOUND`], #518), and one attempt alone for a
+    /// rule that cannot select anything there. The CPU clock leaves out
+    /// preemption but not core speed. Release builds only: the bound is for
+    /// the shipped code.
     #[cfg(not(debug_assertions))]
     #[test]
     fn hostile_smart_rules_are_refused_or_bounded() {
-        use std::fmt::Write as _;
-        // One find over the whole window with no match took up to about
-        // 1 s (985 ms) in the round-1 review's probe, up to 768 ms here; the
-        // bar leaves room for a loaded machine.
-        const NO_MATCH_BAR: Duration = Duration::from_secs(3);
-        // The capture-group rule took 2.2-3.0 s idle and up to 6.2 s at load
-        // 14 in the adversarial probe, and 13.1 s of CPU time on an
-        // efficiency core under `taskpolicy -b` (#525): 3-4 times its cost
-        // on a performance core, so the bar is about six times the fast one.
-        const CAPTURES_BAR: Duration = Duration::from_secs(20);
-        let captures = r"(?:(e?)(\x{301}?)){0,2560}[XY]";
-        let cap = tessera_config::MAX_SMART_RULE_PATTERN_LEN;
-        let mut literals = String::from("(?:w000");
-        let mut n = 1;
-        while literals.len() + 5 + 2 <= cap {
-            let _ = write!(literals, "|w{n:03}");
-            n += 1;
-        }
-        literals.push_str(")+");
-        let at_cap = format!("{}XY|a", "a?".repeat(510));
-        assert_eq!(at_cap.len(), cap);
-        let rules = [
-            // The rule of #433 and nested counted repetition.
-            r"(?:[^X]{0,50}){0,20}X|a".to_owned(),
-            r"(?:[a-z]{0,50}){0,20}X|a".to_owned(),
-            r"(?:(?:a|b){0,50}){0,20}X|a".to_owned(),
-            // An alternation of many literals.
-            literals,
-            // A long Unicode class repetition, and a short one.
-            r"\p{L}{0,1000}X|a".to_owned(),
-            r"\p{L}{0,20}X|a".to_owned(),
-            // Many tiny matches.
-            ".".to_owned(),
-            // A pattern at the length cap.
-            at_cap,
-            // A rule that never matches the combining text: one find
-            // scans the whole window (#433 round 1).
-            r"(?:[e\x{301}]{0,60}){0,20}[XY]".to_owned(),
-            // The same with capture groups, about 3x slower a byte once the
-            // lazy DFA gives up (#433 adversarial F1).
-            r"(?:(e?)(\x{301}?)){0,2560}[XY]".to_owned(),
-        ];
         let heavy = format!("e{}", "\u{301}".repeat(31));
         let texts = [
-            ("a", 20_000, "ascii"),
-            ("\u{e9}", 20_000, "latin"),
-            ("\u{1F600}", 20_000, "emoji"),
-            (heavy.as_str(), 20_000, "combining"),
-            ("e\u{301}", 20_000, "decomposed"),
-            ("w001", 5_000, "literals"),
+            ("a".repeat(20_000), "ascii"),
+            ("\u{e9}".repeat(20_000), "latin"),
+            ("\u{1F600}".repeat(20_000), "emoji"),
+            (heavy.repeat(20_000), "combining"),
+            ("e\u{301}".repeat(20_000), "decomposed"),
+            ("w001".repeat(5_000), "literals"),
+            (
+                crate::smart_engine::multi_script(20_000, 0x5EED_0518),
+                "multi-script",
+            ),
         ];
         let terms: Vec<Terminal> = texts
             .iter()
-            .map(|&(cell, count, _)| {
+            .map(|(text, _)| {
                 let mut term = Terminal::new(2, 200);
                 term.set_max_scrollback(1_000);
-                term.advance(cell.repeat(count).as_bytes());
+                term.advance(text.as_bytes());
                 term
             })
             .collect();
-        for (index, rule) in rules.iter().enumerate() {
+        let cap = tessera_config::MAX_SMART_RULE_PATTERN_LEN;
+        let mut refused = Vec::new();
+        for (index, (rule, can_match)) in hostile_rules().iter().enumerate() {
             assert!(rule.len() <= cap, "rule {index}: {} bytes", rule.len());
             let toml = format!("[[selection.smart_rules]]\nregex = '''{rule}'''\n");
             let loaded = tessera_config::Config::from_toml_lenient(&toml).unwrap();
@@ -3477,10 +3510,11 @@ mod tests {
                     loaded.warnings
                 );
                 eprintln!("rule {index}: refused at load");
+                refused.push(index);
                 continue;
             }
-            let every_char = compiled.rules()[0].regex().is_match("a");
-            for (term, &(_, _, text)) in terms.iter().zip(&texts) {
+            let engines = SmartEngines::new(compiled);
+            for (term, (_, text)) in terms.iter().zip(&texts) {
                 let lines = Lines::of(term.grid());
                 let mid = Pos {
                     line: lines.base + (lines.last() - lines.base) / 2,
@@ -3489,26 +3523,239 @@ mod tests {
                 let mut fastest = Duration::MAX;
                 for _ in 0..3 {
                     let started = crate::thread_cpu_time();
-                    let _ = smart_at(&lines, mid, &compiled);
+                    let _ = smart_at(&lines, mid, &engines);
                     fastest = fastest.min(crate::thread_cpu_time().saturating_sub(started));
                 }
                 eprintln!("rule {index} on {text}: {fastest:?}");
-                // A rule with a match at every character stops at the
-                // budget; one without a match scans the window in one
-                // find, whose cost only the window and the program bound.
-                let bar = if text == "ascii" && every_char {
-                    Duration::from_millis(100)
-                } else if rule == captures {
-                    CAPTURES_BAR
+                let bar = if *can_match {
+                    SMART_RULE_BUDGET + SMART_RULE_ATTEMPT_BOUND
                 } else {
-                    NO_MATCH_BAR
+                    SMART_RULE_ATTEMPT_BOUND
                 };
                 assert!(
-                    fastest < bar,
+                    fastest <= bar,
                     "rule {index} on {text}: fastest click {fastest:?}, over {bar:?}"
                 );
             }
         }
+        // `\p{L}{0,1000}X|a` in both forms, and nothing else.
+        assert_eq!(refused, [4, 14]);
+    }
+
+    /// The thread CPU time of the first double-click after rules load:
+    /// building their bounded engines ([`SmartEngines::new`], #518) and the
+    /// click, on a 2048-column ASCII line of things the built-in rules
+    /// select; the fastest of three, each on new engines.
+    #[cfg(not(debug_assertions))]
+    fn first_click_cpu(rules: &std::sync::Arc<tessera_config::SmartRules>) -> Duration {
+        let unit = "see https://example.com/a/b?q=1 ~/src/x.rs user@example.com 192.168.1.20 ";
+        let mut line = unit.repeat(2048 / unit.len() + 1);
+        line.truncate(2048);
+        let term = term(1, 2048, line.as_bytes());
+        let lines = Lines::of(term.grid());
+        let at = Pos {
+            line: lines.base,
+            col: 10,
+        };
+        let mut fastest = Duration::MAX;
+        for _ in 0..3 {
+            let started = crate::thread_cpu_time();
+            let engines = SmartEngines::new(std::sync::Arc::clone(rules));
+            assert!(smart_at(&lines, at, &engines).is_some(), "the URL");
+            fastest = fastest.min(crate::thread_cpu_time().saturating_sub(started));
+        }
+        fastest
+    }
+
+    /// #518: the first click after the built-in rules load builds their
+    /// engines and still takes under 10 ms of the thread's CPU time, the
+    /// fastest of three (release builds; the one-time cost of the bound).
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn hostile_smart_rules_aside_a_first_click_with_the_default_rules_takes_under_10_ms() {
+        let rules = tessera_config::Selection::default().compiled_rules();
+        assert_eq!(rules.len(), 15);
+        let fastest = first_click_cpu(&rules);
+        eprintln!("first click, 15 rules: {fastest:?}");
+        assert!(fastest < Duration::from_millis(10), "{fastest:?}");
+    }
+
+    /// #518: the first click after 64 rules load (the built-in rules and
+    /// 49 variants `(?:default)(?:#i)?`), engines built: recorded, no bar
+    /// (release builds).
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn hostile_smart_rules_aside_a_first_click_with_64_rules_is_recorded() {
+        let defaults = tessera_config::DEFAULT_SMART_RULES;
+        let mut rules: Vec<tessera_config::SmartRule> = defaults
+            .iter()
+            .map(|&(pattern, precision)| tessera_config::SmartRule::new(pattern, precision))
+            .collect();
+        for i in 0..(64 - defaults.len()) {
+            let (pattern, precision) = defaults[i % defaults.len()];
+            rules.push(tessera_config::SmartRule::new(
+                format!("(?:{pattern})(?:#{i})?"),
+                precision,
+            ));
+        }
+        let mut selection = tessera_config::Selection::default();
+        selection.smart_rules = Some(rules);
+        let rules = selection.compiled_rules();
+        assert_eq!(rules.len(), 64);
+        eprintln!("first click, 64 rules: {:?}", first_click_cpu(&rules));
+    }
+
+    /// #518: every rule the regex crate accepts at today's limits also
+    /// builds a bounded DFA: the built-in rules, the hostile rules of #433
+    /// and their `\b` forms (those loaded), and the fixture's tricky
+    /// patterns that load (one that matches the empty string does not).
+    #[test]
+    fn every_rule_that_loads_builds_a_bounded_engine() {
+        let mut patterns: Vec<String> = tessera_config::DEFAULT_SMART_RULES
+            .iter()
+            .map(|&(p, _)| p.to_owned())
+            .collect();
+        patterns.extend(hostile_rules().into_iter().map(|(rule, _)| rule));
+        patterns.extend(
+            [
+                r"\b",
+                r"(?-u)\b\w",
+                r"(?i)k+",
+                r"(?i)ſ+",
+                r"\b{start}\w+",
+                r"\w+\b{end}",
+                r"\<\w+",
+                r"\w+\>",
+                r"\B\w+\B",
+                r"\w+@\w+\.\w{2,6}",
+                r"\S{1,200}",
+                r"[ab]{1000}",
+            ]
+            .map(str::to_owned),
+        );
+        let mut built = 0;
+        for pattern in &patterns {
+            let engines = smart_rules(&[(pattern, Precision::Normal)]);
+            if engines.rules().is_empty() {
+                // Refused at load (`\p{L}{0,1000}X|a` in both forms).
+                assert!(pattern.contains(r"\p{L}{0,1000}"), "{pattern} refused");
+                continue;
+            }
+            assert!(engines.has_dfa(0), "{pattern} builds no DFA");
+            built += 1;
+        }
+        assert_eq!(built, patterns.len() - 2);
+    }
+
+    /// #518 L1: a built-in rule with a Unicode `\b` on a window that is not
+    /// ASCII (an accented word next to an IPv4 address) still selects
+    /// through the regex crate, its fallback.
+    #[test]
+    fn an_ipv4_address_next_to_an_accented_word_is_found_through_the_fallback() {
+        let (ipv4, precision) = tessera_config::DEFAULT_SMART_RULES[11];
+        assert!(ipv4.starts_with(r"\b(?:(?:25[0-5]"), "{ipv4}");
+        let rules = smart_rules(&[(ipv4, precision)]);
+        let term = term(2, 40, "caf\u{e9} 192.168.1.20 ok".as_bytes());
+        let lines = Lines::of(term.grid());
+        let at = Pos {
+            line: lines.base,
+            col: 8,
+        };
+        crate::smart_engine::FALLBACK_RUNS.with(|runs| runs.set(0));
+        assert_eq!(
+            smart_at(&lines, at, &rules),
+            Some((
+                Pos {
+                    line: lines.base,
+                    col: 5
+                },
+                Pos {
+                    line: lines.base,
+                    col: 16
+                }
+            ))
+        );
+        assert_eq!(
+            crate::smart_engine::FALLBACK_RUNS.with(std::cell::Cell::get),
+            1
+        );
+        assert!(!rules.warned(0));
+    }
+
+    /// #518 L3: a rule that finds a match over the click and then gives up
+    /// on a later search selects nothing for that click: the match it found
+    /// first is dropped with the rest, so a give-up never selects a partial
+    /// answer.
+    #[test]
+    fn a_rule_that_gives_up_after_a_match_drops_that_match() {
+        let rules = smart_rules(&[(r"zz|(?:[^X]{0,50}){0,20}X", Precision::Normal)]);
+        let mut long = Terminal::new(2, 200);
+        long.set_max_scrollback(1_000);
+        // The blank keeps `zz` out of the run at the window's edge.
+        long.advance(format!("zz {}", "a".repeat(8_000)).as_bytes());
+        let lines = Lines::of(long.grid());
+        let at = Pos {
+            line: lines.base,
+            col: 0,
+        };
+        assert_eq!(smart_at(&lines, at, &rules), None);
+        assert!(rules.warned(0));
+        // On a short line the same rule selects its `zz`.
+        let short = term(2, 40, b"zz ok");
+        let lines = Lines::of(short.grid());
+        let at = Pos {
+            line: lines.base,
+            col: 1,
+        };
+        assert_eq!(
+            smart_at(&lines, at, &rules),
+            Some((
+                Pos {
+                    line: lines.base,
+                    col: 0
+                },
+                at
+            ))
+        );
+    }
+
+    /// #518 L1, L2: a hostile rule led by a Unicode `\b` on a window that
+    /// is not ASCII would need more of the regex crate's work than
+    /// [`SMART_FALLBACK_UNITS`]: it selects nothing at once (under 1 ms of
+    /// CPU time in release builds), without running the fallback, and warns
+    /// once for its index.
+    #[test]
+    fn hostile_smart_rules_over_the_fallback_gate_select_nothing_at_once() {
+        let rules = smart_rules(&[(r"\b(?:(?:[^X]{0,50}){0,20}X|a)", Precision::Normal)]);
+        let mut term = Terminal::new(2, 200);
+        term.set_max_scrollback(1_000);
+        term.advance("\u{e9}a ".repeat(6_000).as_bytes());
+        let lines = Lines::of(term.grid());
+        let mid = Pos {
+            line: lines.base + (lines.last() - lines.base) / 2,
+            col: 100,
+        };
+        let (_, last) = lines.text_end(mid.line);
+        let window = ScanWindow::around(&lines, mid, last.unwrap());
+        let units = rules.fallback_units(0, window.text.len()).unwrap();
+        assert!(units > SMART_FALLBACK_UNITS, "{units} units");
+        crate::smart_engine::FALLBACK_RUNS.with(|runs| runs.set(0));
+        crate::smart_engine::WARNINGS.with(|warnings| warnings.set(0));
+        let mut fastest = Duration::MAX;
+        for _ in 0..3 {
+            let started = crate::thread_cpu_time();
+            assert_eq!(smart_at(&lines, mid, &rules), None);
+            fastest = fastest.min(crate::thread_cpu_time().saturating_sub(started));
+        }
+        assert_eq!(
+            crate::smart_engine::FALLBACK_RUNS.with(std::cell::Cell::get),
+            0
+        );
+        assert_eq!(crate::smart_engine::WARNINGS.with(std::cell::Cell::get), 1);
+        assert!(rules.warned(0));
+        eprintln!("over the gate: {fastest:?}");
+        #[cfg(not(debug_assertions))]
+        assert!(fastest < Duration::from_millis(1), "{fastest:?}");
     }
 
     /// SS-C5: a match running past the scan window where its logical line
@@ -3517,7 +3764,7 @@ mod tests {
     /// characters.
     #[test]
     fn the_scan_window_is_bounded_and_cut_matches_are_dropped() {
-        let rules = tessera_config::Selection::default().compiled_rules();
+        let rules = SmartEngines::new(tessera_config::Selection::default().compiled_rules());
         let mut term = Terminal::new(2, 200);
         term.set_max_scrollback(1_000);
         let line = "a/".repeat(50_000);
@@ -3653,7 +3900,7 @@ mod tests {
             if all {
                 state.select_all(grid);
             } else {
-                state.begin(grid, offset, point(from.0, from.1), Granularity::Char, block, &SmartRules::default());
+                state.begin(grid, offset, point(from.0, from.1), Granularity::Char, block, &SmartEngines::default());
                 state.extend(grid, offset, point(to.0, to.1));
             }
             let sel = state.sel.clone().expect("selected");

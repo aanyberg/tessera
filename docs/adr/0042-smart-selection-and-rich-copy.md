@@ -329,3 +329,108 @@ A rule whose pattern compiles past `SMART_RULE_SIZE_LIMIT`
 too large once compiled, usually from counted repetition of a Unicode class,
 and suggests ASCII classes or `(?-u)`. Any other compile failure keeps the
 existing warning. Neither quotes the pattern (S8).
+
+## Amendment: each rule attempt bounded by construction (#518, 2026-11-22)
+
+The #433 budget stopped a click between matches, but one match attempt of
+the regex crate was bounded only by the window and the program size: about
+1 s for a rule with no match in the window, 3 s and more with capture
+groups. Each attempt's memory is now bounded by construction (one cache
+fill at most); its time follows from that only empirically:
+`SMART_RULE_ATTEMPT_BOUND` is the worst attempt measured with a margin, not
+a proven bound.
+
+**Engine.** `tessera-app-core` (`smart_engine.rs`) builds, per rule, a lazy
+DFA of `regex-automata` (`hybrid::regex::Regex`, the engine the regex crate
+is built on, a workspace dependency with no new package) from
+`rule.regex().as_str()`, with the nest and NFA size limits of the rule
+compiler, a 1 MiB cache per direction (`SMART_RULE_CACHE_BYTES`,
+`skip_cache_capacity_check`), `unicode_word_boundary` and the literal
+prefilter the regex crate would use, and searched with
+`util::iter::Searcher::try_advance`. It is told to give up the first time
+its cache would be cleared (`minimum_cache_clear_count(Some(0))`), so one
+search costs at most one cache fill: `SMART_RULE_ATTEMPT_BOUND` (50 ms) is
+that bound with a 2x margin over the worst attempt observed under load.
+The `regex::Regex` of `tessera-config` stays the judge of what loads and is
+the fallback; every rule that loads also builds a DFA (tested). The engine
+table is built by the first click (of any granularity) after a load that
+changed the rules; a reload whose rules are the same patterns, precisions
+and checks in the same order keeps the engines and their warm caches
+(tested), so an unrelated configuration edit costs no rebuild. No thread is
+added.
+
+**Fallback.** The DFA cannot decide a Unicode `\b` on non-ASCII text: it
+quits. A rule with a Unicode word boundary on a window that is not ASCII
+skips the DFA, and a DFA that quits goes on, and both run the regex
+crate's `find_iter` (the matches already reported left out), but only when
+the captures-on NFA's states times the window's bytes stay within
+`SMART_FALLBACK_UNITS` (8 000 000, measured at most 22 ms). Over the gate
+the rule has no match for that click. Without a fallback 8 of the 15
+built-in rules would stop working on any line that is not ASCII.
+
+**Warm caches.** A cold cache per click costs about 6x on the 64-rule
+click, so each rule keeps its cache between clicks behind a leaf mutex
+locked for the attempt only. A search that gives up on a used cache resets
+it and retries once, cold; a cold give-up is the rule's answer for that
+click. A warm cache never has more room than a cold one, so a search's
+outcome is the same whatever ran before: the same click on the same text
+gives the same selection on a fresh app and after other clicks (tested).
+These caches hold at most 64 rules x 2 directions x 1 MiB = 128 MiB, the
+same ceiling the regex crate's cache pool had. That is not the whole worst
+case: a rule that takes the fallback also keeps the regex crate's own cache
+in its pool, one per thread that clicks, about 0.6 MiB per `\b` rule
+measured. Its ceiling is that crate's limits: its lazy DFA 1 MiB per
+direction (`dfa_size_limit`), the bounded backtracker's 256 KiB and a PikeVM
+cache linear in the program's states (the program within 1 MiB,
+`size_limit`), estimated at most about 4 MiB per rule, not measured. With
+64 fallback rules and one clicking thread the worst case is then about
+128 + 64 x 4 = 384 MiB.
+
+**Behaviour change.** A rule whose search gives up (its cache would
+thrash) or whose fallback is over the gate selects nothing for that click,
+instead of selecting late; the other rules and the word selection still
+apply. It is logged once per rule index, at warn level, the index and the
+reason only (S8), never again for that index while the configuration
+stands.
+
+**Bounds.** A click holds the terminal and selection locks at most
+`SMART_RULE_BUDGET` plus one attempt, and never more than rules x
+(`SMART_RULE_BUDGET` + `SMART_RULE_ATTEMPT_BOUND`), for a single caller: the
+Swift main thread is the only one that clicks today. Each rule's cache lock
+is shared by every session, so concurrent clicks from several threads
+serialise on it while each holds its own session's locks: 16 threads on one
+thrashing rule measured p99 243 ms, max 315 ms (one thread 12 ms), and the
+wait also spends the click's wall budget, so later rules are skipped. The hostile test of
+#433 now loads its rules through `tessera-config` and asserts, on the
+thread's CPU clock in release builds, at most 100 ms per click for every
+rule and 50 ms for the rules that cannot match, over seven texts including
+random text in nine scripts; its 3 s and 20 s bars are gone. A rule over
+the gate selects nothing in under 1 ms. A differential test and a proptest
+compare the DFA with `find_iter` for the built-in rules and 36 tricky
+patterns over ASCII, Latin, CJK and emoji, combining and random windows.
+
+**First click.** The engines are built once per set of rules, by the
+first click after the rules change, outside the session's locks: one
+parse per rule, then the forward and reverse programs and DFAs from it,
+about 1.1 M instructions per rule. Over main, the first click costs 15-18 M
+instructions more with the 15 built-in rules (CJK lines included, where
+the fallback's captures program is compiled at first use) and 72-76 M with
+64 rules; on the thread's CPU clock (release, fastest of 3) 1.05 ms and
+9.4 ms. A release test holds the built-in rules' first click under 10 ms
+and another records the 64-rule one. After it, clicks run on warm caches.
+
+**Known limits.** The fallback gate also drops ordinary rules, not only
+hostile ones: a Unicode-`\w` rule such as
+`\b[\w.+-]+@[\w-]+\.[\w.-]+\b` (962 states) is over the gate on a
+window of more than about 8 KB that is not ASCII, so on a long CJK line
+(a mail address followed by 1000 x `日本語 `) a double-click selects the
+word, `user`, not the address; at 500 repetitions it still selects the
+address. Concurrent clicks from more than one thread serialise on the
+rules' cache locks (see Bounds).
+
+**A/B.** Measured on steady state by lead decision: one warm-up click,
+then 2000 to 12 000 clicks per process (enough to clear `cargo xtask ab`'s
+size floor), instructions, three fresh probes, bar 1.10, the warm-up click
+counted. At a load of 7-8, head/base: 64 rules on a 2048-column `/a` line
+1.053-1.054, the 15 built-in rules on an ASCII line 1.011-1.012 and on a
+2048-column `日/` line 1.003, checksums equal.

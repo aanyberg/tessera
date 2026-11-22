@@ -46,6 +46,7 @@ pub mod search;
 pub mod selection;
 pub mod session;
 mod shell_integration;
+mod smart_engine;
 pub mod url;
 pub mod view;
 
@@ -285,6 +286,11 @@ pub struct App {
     /// The app-wide limit on command-finished notifications (ADR 0048,
     /// S6): every session's finishes share it.
     notify_limiter: Mutex<NotifyLimiter>,
+    /// The bounded engines of the smart-selection rules in effect (#518),
+    /// built by the first double-click after the rules change, with their
+    /// DFA caches kept across clicks. A leaf lock: held only to look the
+    /// engines up or rebuild them.
+    smart_engines: Mutex<Arc<smart_engine::SmartEngines>>,
 }
 
 impl App {
@@ -363,6 +369,7 @@ impl App {
             observers: Arc::new(RwLock::new(Some(tee))),
             bindings,
             views: Arc::new(Mutex::new(HashMap::new())),
+            smart_engines: Mutex::default(),
             gpu: Mutex::new(None),
             fonts: Mutex::new(None),
             theme,
@@ -1621,12 +1628,26 @@ impl App {
         granularity: Granularity,
         block: bool,
     ) -> Result<()> {
-        // Compiled when the configuration was loaded, not per click.
-        let rules = self.config().selection.compiled_rules();
+        // Compiled when the configuration was loaded; their bounded engines
+        // built at the first click after that, outside the session's locks.
+        let rules = self.smart_engines();
         self.session(id)?.with_selection(|selection, term, offset| {
             selection.begin(term.grid(), offset, at, granularity, block, &rules);
         });
         Ok(())
+    }
+
+    /// The engines of the smart-selection rules in effect, built once per
+    /// set of rules (at the first click after the configuration loads a
+    /// changed one; a reload that changed no rule keeps them).
+    fn smart_engines(&self) -> Arc<smart_engine::SmartEngines> {
+        let rules = self.config().selection.compiled_rules();
+        let mut held = self
+            .smart_engines
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *held = held.for_rules(rules);
+        Arc::clone(&held)
     }
 
     /// Extends session `id`'s selection to view-relative cell `at` (a
@@ -5698,6 +5719,43 @@ mod tests {
         // Output after the resize is anchored again.
         output(&fake, &events, b"a\r\nb\r\n");
         assert_eq!(app.scroll_offset(id).unwrap(), top - 28);
+    }
+
+    /// #518: a configuration whose smart-selection rules changed rebuilds
+    /// the engines at the next click, which selects by the new rules; a
+    /// reload that changed no rule (parsed again, so compiled again) keeps
+    /// the engines, caches and all.
+    #[test]
+    fn engines_are_rebuilt_only_when_the_smart_rules_change() {
+        let loaded = |pattern: &str| {
+            let text = format!("[[selection.smart_rules]]\nregex = '{pattern}'\n");
+            Config::from_toml_lenient(&text).unwrap().config
+        };
+        let theme = tessera_config::Theme::default();
+        let app = app();
+        let id = app.spawn_test_session(PtySize::new(2, 20)).unwrap();
+        app.feed_for_test(id, b"ab-cd-ef").unwrap();
+        let double_click = || {
+            app.select_begin(id, Point::new(0, 4), Granularity::Word, false)
+                .unwrap();
+            app.selection_text(id).unwrap()
+        };
+
+        app.apply_config(&loaded("ab-cd"), &theme);
+        assert_eq!(double_click().as_deref(), Some("ab-cd"));
+        let first = app.smart_engines();
+
+        app.apply_config(&loaded("ab-cd"), &theme);
+        assert_eq!(double_click().as_deref(), Some("ab-cd"));
+        let reloaded = app.smart_engines();
+        assert!(reloaded.shares_engines_with(&first), "an unchanged set");
+
+        app.apply_config(&loaded("cd-ef"), &theme);
+        assert_eq!(double_click().as_deref(), Some("cd-ef"));
+        assert!(
+            !app.smart_engines().shares_engines_with(&first),
+            "a changed set"
+        );
     }
 
     /// ADR 0041: `accessible_text` reads the rows the view shows, at its
