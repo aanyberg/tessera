@@ -56,8 +56,9 @@ pub(crate) struct Row {
     pub spans: Vec<Span>,
     /// Cells in the row when it was shaped.
     pub len: usize,
-    /// The row drew a `.notdef` glyph while the fallback index was still
-    /// building (ADR 0007), so it is shaped again once the index is ready.
+    /// The row was shaped with a provisional face while the fallback index
+    /// was still building (a `.notdef`, or a synthetic bold the index may
+    /// beat; ADR 0007), so it is shaped again once the index is ready.
     pub pending_fallback: bool,
 }
 
