@@ -14,25 +14,21 @@ import TesseraKit
 extension SettingsModel {
     /// The key path the toggles write, and the key of their message.
     static let pluginsKey = "plugins.enabled"
-    /// The most ids of `[plugins] enabled` the plugin host reads: it
-    /// ignores the rest, with a warning. Mirrors `MAX_ENABLED_PLUGINS` in
-    /// tessera-app-core (`crates/tessera-app-core/src/plugins.rs`), which
-    /// the FFI does not export yet; change both together.
-    static let maxEnabledPlugins = 64
     /// At most this many ids this version does not have are listed under
     /// the plugins, and a line for the rest (S5).
     static let maxUnknownPluginsShown = 16
     /// An unknown id is shown in at most this many characters.
     static let maxPluginIDShown = 80
-    /// The host's warning for the ids past ``maxEnabledPlugins``, in its
-    /// words (tessera-app-core logs it; the FFI does not pass it on).
+    /// The warning for the ids past `TesseraPlugin.maxEnabled`, as the pane
+    /// shows it (the core's configuration loader logs its own; the FFI does
+    /// not pass it on).
     static let pluginsSkippedWarning =
-        "[plugins] enabled lists more than \(maxEnabledPlugins) ids; the rest are ignored"
-    /// Why a toggle turned on at ``maxEnabledPlugins`` ids or more did
+        "[plugins] enabled lists more than \(TesseraPlugin.maxEnabled) ids; the rest are ignored"
+    /// Why a toggle turned on at `TesseraPlugin.maxEnabled` ids or more did
     /// nothing; true of any number of them.
     static let pluginsFullRefusal =
-        "[plugins] enabled is full: Tessera reads its first \(maxEnabledPlugins) ids. "
-        + "To turn this plugin on, list fewer than \(maxEnabledPlugins) in config.toml."
+        "[plugins] enabled is full: Tessera reads its first \(TesseraPlugin.maxEnabled) ids. "
+        + "To turn this plugin on, list fewer than \(TesseraPlugin.maxEnabled) in config.toml."
     /// How many characters of a shortened id's end are kept.
     private static let pluginIDTailShown = 20
 
@@ -41,9 +37,9 @@ extension SettingsModel {
         value(Self.pluginsKey)?.array?.compactMap(\.string) ?? []
     }
 
-    /// The ids the host reads, as shown: the first ``maxEnabledPlugins``.
+    /// The ids the host reads, as shown: the first `TesseraPlugin.maxEnabled`.
     private var enabledPluginIDs: ArraySlice<String> {
-        listedPluginIDs.prefix(Self.maxEnabledPlugins)
+        listedPluginIDs.prefix(TesseraPlugin.maxEnabled)
     }
 
     /// Whether `[plugins] enabled` lists `id` among the ids the host reads,
@@ -68,14 +64,14 @@ extension SettingsModel {
     /// reads, with how many it ignores; `nil` otherwise.
     var pluginsSkipWarning: String? {
         let count = listedPluginIDs.count
-        guard count > Self.maxEnabledPlugins else { return nil }
-        let ignored = count - Self.maxEnabledPlugins
+        guard count > TesseraPlugin.maxEnabled else { return nil }
+        let ignored = count - TesseraPlugin.maxEnabled
         return "\(Self.pluginsSkippedWarning) (\(ignored) \(ignored == 1 ? "id" : "ids") ignored)."
     }
 
     /// Lists `id` in `[plugins] enabled` (at the end, unless the host reads
     /// it already), or takes every copy of it out. Nothing while
-    /// ``pluginsChanging``; at ``maxEnabledPlugins`` ids, turning one on is
+    /// ``pluginsChanging``; at `TesseraPlugin.maxEnabled` ids, turning one on is
     /// refused with ``pluginsFullRefusal`` and writes nothing (the host
     /// would ignore the id).
     func setPlugin(_ id: String, enabled: Bool) {
@@ -84,7 +80,7 @@ extension SettingsModel {
         let entry = TesseraConfigValue.string(id)
         if enabled {
             guard !isPluginEnabled(id) else { return }
-            guard listed.count < Self.maxEnabledPlugins else {
+            guard listed.count < TesseraPlugin.maxEnabled else {
                 show(Self.pluginsFullRefusal, for: Self.pluginsKey)
                 pluginsRefusedAt = listed
                 return

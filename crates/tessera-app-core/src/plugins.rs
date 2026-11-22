@@ -49,9 +49,10 @@ use crate::config_watch::Applied;
 use crate::session::{SessionEvent, SessionId, SessionObserver, lock, run_thread_start_hook};
 use tessera_term::shown_in_title;
 
-/// Plugin ids read from `[plugins] enabled`; later ones are ignored with
-/// one warning that gives their count.
-pub const MAX_ENABLED_PLUGINS: usize = 64;
+/// Plugin ids read from `[plugins] enabled`; later ones are ignored. The
+/// configuration loader warns of them, once per load (tessera-config owns
+/// the cap so that it can); the host does not warn again.
+pub use tessera_config::MAX_ENABLED_PLUGINS;
 /// Longest plugin id, in bytes, read from `[plugins] enabled`; a longer
 /// one is ignored with a warning that gives its length only.
 pub const MAX_PLUGIN_ID_LEN: usize = 128;
@@ -451,11 +452,14 @@ impl PluginHost {
     }
 
     /// Which linked plugins `ids` lists, logging (when `warn`) one escaped
-    /// warning per id past a cap or unknown, and one for the ids past
-    /// [`MAX_ENABLED_PLUGINS`] (S3, S5, S8).
+    /// warning per id past the length cap or unknown (S3, S5, S8). The ids
+    /// past [`MAX_ENABLED_PLUGINS`] are ignored without a warning here: the
+    /// configuration loader gives the one warning for them.
     fn listed(&self, ids: &[String], warn: bool) -> Vec<bool> {
         let board = self.shared.board();
         let mut listed = vec![false; board.len()];
+        // Truncated as the loader's warning says (`Plugins::warn_past_cap`
+        // in tessera-config).
         for id in ids.iter().take(MAX_ENABLED_PLUGINS) {
             if id.len() > MAX_PLUGIN_ID_LEN {
                 if warn {
@@ -474,12 +478,6 @@ impl PluginHost {
                 ),
                 None => {}
             }
-        }
-        if warn && ids.len() > MAX_ENABLED_PLUGINS {
-            tracing::warn!(
-                ignored = ids.len() - MAX_ENABLED_PLUGINS,
-                "[plugins] enabled lists more than {MAX_ENABLED_PLUGINS} ids; the rest are ignored"
-            );
         }
         listed
     }

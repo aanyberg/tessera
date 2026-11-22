@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use tessera_config::edit::{ConfigEditor, EditError, KeyPathError, MAX_KEY_PATH_LEN};
-use tessera_config::{Config, Warning};
+use tessera_config::{Config, MAX_ENABLED_PLUGINS, Warning};
 
 fn open(text: &str) -> (tempfile::TempDir, PathBuf, ConfigEditor) {
     let dir = tempfile::tempdir().unwrap();
@@ -403,4 +403,87 @@ fn a_new_profile_name_avoids_written_and_loaded_names() {
     let failing = "[appearance]\nopacity = \"x\"\n[[profiles]]\nname = \"C\"\n";
     let (_dir, _path, editor) = open(failing);
     assert_eq!(editor.unused_profile_name("C"), "C 2");
+}
+
+/// `[plugins] enabled` as TOML with `count` ids.
+fn plugin_list(count: usize) -> String {
+    let ids: Vec<String> = (0..count).map(|i| format!("\"p.{i}\"")).collect();
+    format!("[plugins]\nenabled = [{}]\n", ids.join(", "))
+}
+
+/// The loader's warnings about `plugins.enabled`.
+fn plugin_warnings(warnings: &[Warning]) -> Vec<&Warning> {
+    warnings
+        .iter()
+        .filter(|w| matches!(w, Warning::OutOfRange { path, .. } if path == "plugins.enabled"))
+        .collect()
+}
+
+/// #560 (S5, S8): a `[plugins] enabled` past [`MAX_ENABLED_PLUGINS`] gets
+/// one warning that names the cap and no id, however long the list; the
+/// list is kept whole for the host and the editor. At the cap, none.
+#[test]
+fn a_plugin_list_past_the_cap_is_one_warning_and_kept_whole() {
+    for count in [0, 1, MAX_ENABLED_PLUGINS - 1, MAX_ENABLED_PLUGINS] {
+        let loaded = Config::from_toml_lenient(&plugin_list(count)).unwrap();
+        assert_eq!(loaded.warnings, [], "{count}");
+    }
+    let mut seen = Vec::new();
+    for count in [MAX_ENABLED_PLUGINS + 1, MAX_ENABLED_PLUGINS + 2, 100_000] {
+        let loaded = Config::from_toml_lenient(&plugin_list(count)).unwrap();
+        assert_eq!(loaded.config.plugins.enabled.len(), count);
+        assert_eq!(loaded.warnings.len(), 1, "{count}: {:?}", loaded.warnings);
+        let [warning] = plugin_warnings(&loaded.warnings)[..] else {
+            panic!("{count}: {:?}", loaded.warnings);
+        };
+        let text = warning.to_string();
+        assert!(
+            text.contains(&format!("more than {MAX_ENABLED_PLUGINS} ids")),
+            "{text}"
+        );
+        assert!(!text.contains("p."), "no id: {text}");
+        seen.push(warning.clone());
+    }
+    // The same warning for any list past the cap, so an edit that keeps a
+    // list past it adds no new one.
+    assert!(seen.windows(2).all(|w| w[0] == w[1]), "{seen:?}");
+}
+
+/// #560: the Plugins toggle's set of `plugins.enabled` that takes a list
+/// at the cap past it is refused with the loader's warning; one that
+/// shortens a list past the cap (a toggle turned off while the file lists
+/// more than the host reads) is written, also when it stays past the cap.
+#[test]
+fn a_plugin_list_edit_is_refused_only_when_it_crosses_the_cap() {
+    let names = |count: usize| -> Vec<String> { (0..count).map(|i| format!("p.{i}")).collect() };
+
+    let (_dir, _path, mut editor) = open(&plugin_list(MAX_ENABLED_PLUGINS));
+    let past = names(MAX_ENABLED_PLUGINS + 1);
+    match editor.set("plugins.enabled", ids_value(&past)) {
+        Err(EditError::Refused { warnings, .. }) => {
+            assert_eq!(plugin_warnings(&warnings).len(), 1, "{warnings:?}");
+        }
+        other => panic!("{other:?}"),
+    }
+
+    for (from, to) in [
+        (MAX_ENABLED_PLUGINS + 3, MAX_ENABLED_PLUGINS + 2),
+        (MAX_ENABLED_PLUGINS + 1, MAX_ENABLED_PLUGINS),
+    ] {
+        let (_dir, path, mut editor) = open(&plugin_list(from));
+        let shorter = names(from)[1..].to_vec();
+        assert_eq!(shorter.len(), to);
+        editor
+            .set("plugins.enabled", ids_value(&shorter))
+            .unwrap_or_else(|e| panic!("{from} -> {to}: {e:?}"));
+        assert!(editor.save().unwrap());
+        let saved = std::fs::read_to_string(&path).unwrap();
+        let loaded = Config::from_toml_lenient(&saved).unwrap();
+        assert_eq!(loaded.config.plugins.enabled, shorter);
+    }
+}
+
+/// `ids` as a TOML array of strings.
+fn ids_value(ids: &[String]) -> toml::Value {
+    toml::Value::Array(ids.iter().map(|id| s(id)).collect())
 }

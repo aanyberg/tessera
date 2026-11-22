@@ -803,3 +803,21 @@ old value in a later press is written. Synthetic events in hosted tests
 never reach the window server, so the tests set the press
 (`leftMousePress`). Steppers do not get the rule: a stepper's step from
 a hand edit can land on the value from before it, and is a real step.
+
+## Amendment: the plugin cap comes from the core (#560, 2026-11-22)
+
+This replaces "The FFI does not export the cap" and the last two sentences
+of "The host's 64 ids" in the #489 amendment.
+
+- **One cap.** `MAX_ENABLED_PLUGINS` (64) lives in tessera-config, next to
+  `[plugins]`; tessera-app-core's plugin host re-exports it and the C ABI
+  exports it as `TESSERA_MAX_ENABLED_PLUGINS`, tied to the host's by a
+  test. The pane reads it as `TesseraPlugin.maxEnabled` (TesseraKit) and
+  keeps no copy.
+- **The warning.** The config loader, not the host, warns of a list past
+  the cap: one warning per load that names the cap, never an id or how
+  many are listed (S8). The pane still shows its own line past 64, with
+  how many ids are ignored. Because the loader's warning reads the same
+  for any list past the cap, an edit that takes a list at 64 past it is
+  refused by the core (the pane refuses it first, as before), while
+  turning one off in a list still past the cap is written.

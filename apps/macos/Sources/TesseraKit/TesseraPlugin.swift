@@ -99,6 +99,11 @@ public struct TesseraPlugin: Sendable, Equatable, Decodable, Identifiable {
         enabled ? state == .disabled : state == .active || state == .failed
     }
 
+    /// The most ids of `[plugins] enabled` the plugin host reads
+    /// (`TESSERA_MAX_ENABLED_PLUGINS`): it ignores the rest, and the core's
+    /// configuration loader logs one warning about them.
+    public static let maxEnabled = Int(TESSERA_MAX_ENABLED_PLUGINS)
+
     /// Decodes the core's JSON (`tessera_app_plugins_json`).
     static func decode(_ json: [UInt8]) throws -> [TesseraPlugin] {
         try JSONDecoder().decode([TesseraPlugin].self, from: Data(json))

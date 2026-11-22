@@ -7,6 +7,13 @@ use crate::error::Error;
 use crate::panic::ffi_guard;
 use crate::selection::copy_out;
 
+/// Most ids of `[plugins] enabled` the plugin host reads; it ignores the
+/// rest, and the configuration loader warns of them once per load. A
+/// frontend's Plugins pane refuses to list another id at it. Equal to
+/// `tessera_app_core::plugins::MAX_ENABLED_PLUGINS` (a literal here, so
+/// that cbindgen can export it; a test ties the two).
+pub const MAX_ENABLED_PLUGINS: usize = 64;
+
 /// One status item as JSON.
 fn item_json(item: &StatusItem) -> serde_json::Value {
     serde_json::json!({
@@ -85,4 +92,19 @@ pub unsafe extern "C" fn tessera_app_plugins_json(
         // SAFETY: `len` and `buf` per the contract.
         unsafe { copy_out(&json, buf, cap, len) }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #560: the exported cap is the host's.
+    #[test]
+    fn the_exported_cap_is_the_hosts() {
+        assert_eq!(
+            MAX_ENABLED_PLUGINS,
+            tessera_app_core::plugins::MAX_ENABLED_PLUGINS
+        );
+        assert_eq!(MAX_ENABLED_PLUGINS, tessera_config::MAX_ENABLED_PLUGINS);
+    }
 }
