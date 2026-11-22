@@ -666,6 +666,9 @@ rule now runs at the release.
   more action with the knob's value. SwiftUI takes that for a new edit if
   the binding has already moved, and it would write the old value over the
   hand edit.
+  *Note (2026-11-22, #583):* since #584 CI and releases link against SDK
+  27, where `Slider` is not an `NSSlider`; the handling stays for
+  older-SDK builds.
 - **Limits.** After more than 32 unseen writes (the watch 3 s behind), an
   older value applied counts as a hand edit: the control shows it from the
   release until the newer values apply. In a press that made a step, a hand

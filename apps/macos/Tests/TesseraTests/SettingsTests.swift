@@ -4276,9 +4276,11 @@ extension SettingsTests {
     }
 
     /// The real opacity slider where it is an `NSSlider`: in an app linked
-    /// against the macOS 15 SDK, which is what CI and releases build. An
-    /// app linked against a later SDK gets SwiftUI's own slider, and the
-    /// test is skipped.
+    /// against the macOS 15 SDK (Xcode 16). Linked against SDK 27, as CI
+    /// and releases are since #584, SwiftUI's Slider is its own control with
+    /// no AppKit control to drive, and the test is skipped: the tests on
+    /// this slider stay as coverage of older-SDK builds, and the binding
+    /// tests cover the hold and hand-edit logic on every SDK (#583).
     private func hostedOpacitySlider(
         _ context: SettingsFieldContext
     ) async throws -> (KeyControlledWindow, NSSlider) {
@@ -4298,14 +4300,19 @@ extension SettingsTests {
         }
         window.contentView = nil
         window.close()
-        throw XCTSkip("Slider is not an NSSlider when linked against this SDK")
+        throw XCTSkip(
+            """
+            Slider is not an NSSlider when linked against this SDK (as on SDK 27): SwiftUI's own slider has \
+            no AppKit control to drive; the binding tests cover the hold and hand-edit logic
+            """)
     }
 
     /// Forwards a control's action to the target SwiftUI gave it, and
     /// keeps the control's value at each one. An action alone proves
     /// nothing: the press itself sends one with the knob where it was (the
-    /// CI runner, macOS 15, sent that and no more). An action with a value
-    /// well away from the one at the press means AppKit moved the knob.
+    /// macOS 15 CI runner, before #584, sent that and no more). An action
+    /// with a value well away from the one at the press means AppKit moved
+    /// the knob.
     @MainActor
     private final class ActionCounter: NSObject {
         let target: AnyObject?
@@ -4419,7 +4426,7 @@ extension SettingsTests {
         model.reload()
     }
 
-    /// The adversarial case of #517, on the `NSSlider` CI and releases get:
+    /// The adversarial case of #517, on the `NSSlider` of an older-SDK build:
     /// the knob is dragged and held, a hand edit applies, and the slider is
     /// let go without moving. Its final mouse-up action must not start a
     /// write of the stale knob value over the edit.
@@ -4449,7 +4456,7 @@ extension SettingsTests {
         XCTAssertEqual(model.value(key), .float(0.3))
     }
 
-    /// #534 on the `NSSlider` CI and releases get: a value off the step,
+    /// #534 on the `NSSlider` of an older-SDK build: a value off the step,
     /// clicked on the knob with no drag. Where AppKit sends no action for
     /// the click the press did not reach the slider, and the test is
     /// skipped; otherwise nothing is written and the file's value stays.
@@ -4573,9 +4580,9 @@ extension SettingsTests {
 
     /// Skips a test whose press dragged `actions`' slider without moving it
     /// (no action 0.05 or more from the value at the press): the press then
-    /// writes nothing, and the product was not exercised. The CI runner,
-    /// macOS 15, does this, as ``pressKnob`` records; a drag that moved the
-    /// knob runs every check of the test.
+    /// writes nothing, and the product was not exercised. The macOS 15 CI
+    /// runner, before #584, did this, as ``pressKnob`` records; a drag that
+    /// moved the knob runs every check of the test.
     private func skipUnlessTheDragMoved(_ actions: ActionCounter) throws {
         guard !actions.moved(0.05) else { return }
         let system = ProcessInfo.processInfo.operatingSystemVersionString
@@ -4606,7 +4613,7 @@ extension SettingsTests {
         return nil
     }
 
-    /// #564: a hand edit applies while the `NSSlider` CI and releases get is
+    /// #564: a hand edit applies while the `NSSlider` of an older-SDK build is
     /// held without moving, and the hold is cancelled (as AppKit does when
     /// the window server moves the window). The slider then sends the value
     /// under the pointer, the one from before the edit, inside the press;
@@ -4921,7 +4928,7 @@ extension SettingsTests {
         }
     }
 
-    /// #564: the same on the `NSSlider` CI and releases get: a drag, let go,
+    /// #564: the same on the `NSSlider` of an older-SDK build: a drag, let go,
     /// a second press that is down when the first one's write applies and
     /// drags back. The second press's move is written.
     func testAMoveBackInAQuickNSSliderRepressAfterTheFirstPressAppliesIsWritten() async throws {

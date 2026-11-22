@@ -27,6 +27,9 @@ swapchain image or a headless texture. Four things needed deciding:
 It also needed a test that catches regressions in all of that headlessly
 on the `macos-15` CI runner, whose macOS differs from developers'.
 
+*Note (2026-11-22, #583):* since #584 CI runs on the `xcode-27` image
+(macOS 27, Xcode 27.1), where the golden tests pass.
+
 ## Decision
 
 ### Frame input: rows of cells, not a grid

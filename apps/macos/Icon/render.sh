@@ -3,8 +3,9 @@
 # - Resources/AppIcon.icon, the Icon Composer document (Liquid Glass) that
 #   Xcode 26 or later compiles, with its own flat fallback for macOS 15;
 # - the PNGs in Resources/Assets.xcassets/AppIcon.appiconset, the same design
-#   as Icon Composer renders it, for toolchains older than Xcode 26 (CI and release pin Xcode 27.1),
-#   which ignores the .icon. Both are named AppIcon; Xcode 26 prefers the .icon.
+#   as Icon Composer renders it, for Xcode 16 (the README's minimum), which
+#   ignores the .icon. Both are named AppIcon; Xcode 26 and later, as CI and
+#   releases use (Xcode 27.1), prefer the .icon.
 # Needs python3, rsvg-convert (`brew install librsvg`) and Xcode 26 or later
 # (Icon Composer's ictool). The layout is seeded, so the output is reproducible
 # for a given ictool and rsvg-convert; other versions may differ in a few bytes.

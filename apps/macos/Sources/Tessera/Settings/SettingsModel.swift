@@ -185,9 +185,10 @@ final class SettingsModel {
     /// Per key whose press was let go with a hand edit applied during it
     /// and no step after it (``endChange(_:)``), a timer that ends with the
     /// events of that release: until it fires, ``change(_:_:)`` writes
-    /// nothing (#550). The `NSSlider` of the macOS 15 SDK sends the knob's
-    /// value once more on mouse-up, in a press of its own, after the
-    /// release; that is no step, whatever the label shows (the dim
+    /// nothing (#550). The `NSSlider` of the macOS 15 SDK (SDK 27, which
+    /// CI and releases link against since #584, has SwiftUI's own slider)
+    /// sends the knob's value once more on mouse-up, in a press of its own,
+    /// after the release; that is no step, whatever the label shows (the dim
     /// slider's knob sits on 35 % for a hand-typed 33 %), and a knob not
     /// moved to the hand edit sends the value from before it.
     @ObservationIgnored private var handEditReleases: [String: SettingsTimer] = [:]
