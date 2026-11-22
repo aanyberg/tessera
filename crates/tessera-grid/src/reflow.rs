@@ -16,6 +16,7 @@
 //! any content.
 
 use std::cmp::Ordering;
+use std::ops::Range;
 
 use crate::line::MarkAnchors;
 use crate::{Cell, GraphemeTable, Hyperlink, Line, Mark, Point, Scrollback, Style};
@@ -474,9 +475,9 @@ struct Rewrapper {
     /// Its clusters: index into `joined` and text, by ascending index
     /// (reused).
     clusters: Vec<(usize, Box<str>)>,
-    /// Its hyperlinks: index into `joined` and link, by ascending index
-    /// (reused).
-    links: Vec<(usize, Hyperlink)>,
+    /// Its hyperlinks: runs of indices into `joined` of one link, by
+    /// ascending index (reused).
+    links: Vec<(Range<usize>, Hyperlink)>,
     /// Marks of its rows: index into `joined` of the row's first cell, the
     /// row's marks and their columns ([`MarkAnchors`]), by ascending index
     /// (reused).
@@ -611,12 +612,11 @@ impl Rewrapper {
                     .filter(|&(col, _)| col < len)
                     .map(|(col, text)| (base + col, text)),
             );
-            self.links.extend(
-                row.graphemes
-                    .take_links()
-                    .filter(|&(col, _)| col < len)
-                    .map(|(col, link)| (base + col, link)),
-            );
+            self.links
+                .extend(row.graphemes.take_links().filter_map(|(run, link)| {
+                    let end = run.end.min(len);
+                    (run.start < end).then(|| (base + run.start..base + end, link))
+                }));
             if !row.marks.is_empty() {
                 self.row_marks.push((
                     base,
@@ -901,8 +901,9 @@ impl Rewrapper {
         // emptied vector goes back afterwards to be reused.
         let mut entries = std::mem::take(&mut self.clusters);
         let mut clusters = entries.drain(..).peekable();
-        let mut link_entries = std::mem::take(&mut self.links);
-        let mut links = link_entries.drain(..).peekable();
+        let mut links = std::mem::take(&mut self.links);
+        // Index of the first run of `links` not wholly before `p`.
+        let mut next_link = 0;
         let mut p = 0;
         while p < end {
             let mut cell = self.joined[p];
@@ -922,7 +923,7 @@ impl Rewrapper {
             debug_assert!(!cell.is_pad(), "padding reached the split");
             while clusters.next_if(|&(at, _)| at < p).is_some() {}
             let cluster = clusters.next_if(|&(at, _)| at == p).map(|(_, text)| text);
-            let link = take_link(&mut links, p);
+            let link = link_at(&links, &mut next_link, p);
             let holds_cursor = cursor_offset.is_some_and(|offset| (p..p + width).contains(&offset));
             let holds_top = TOP && (p..p + width).contains(&top_offset);
             if width > cols {
@@ -975,7 +976,7 @@ impl Rewrapper {
             row.cells.push(cell);
             if width == 2 {
                 let mut spacer = self.joined[p + 1];
-                match take_link(&mut links, p + 1) {
+                match link_at(&links, &mut next_link, p + 1) {
                     Some(link) if spacer.is_link() => row.graphemes.set_link(col + 1, link),
                     _ => spacer.flags = spacer.flags.difference(crate::CellFlags::LINK),
                 }
@@ -984,9 +985,10 @@ impl Rewrapper {
             p += width;
         }
         drop(clusters);
-        drop(links);
+        // The links are in the output rows now: let go of these holds.
+        links.clear();
         self.clusters = entries;
-        self.links = link_entries;
+        self.links = links;
         let last_len = row.cells.len();
         row.cells.resize(cols, Cell::BLANK);
         self.push_row(row);
@@ -1038,15 +1040,21 @@ impl Rewrapper {
     }
 }
 
-/// The link at index `at` of the joined line, skipping the ones before it
-/// (their cells were dropped).
-fn take_link(
-    links: &mut std::iter::Peekable<std::vec::Drain<'_, (usize, Hyperlink)>>,
+/// The link at index `at` of the joined line, given `links` from run
+/// `*next` on; moves `*next` past the runs that end at or before `at`
+/// (indices only grow, so each run is passed once).
+#[inline]
+fn link_at<'a>(
+    links: &'a [(Range<usize>, Hyperlink)],
+    next: &mut usize,
     at: usize,
-) -> Option<Hyperlink> {
-    while links.next_if(|&(index, _)| index < at).is_some() {}
+) -> Option<&'a Hyperlink> {
+    while links.get(*next).is_some_and(|(run, _)| run.end <= at) {
+        *next += 1;
+    }
     links
-        .next_if(|&(index, _)| index == at)
+        .get(*next)
+        .filter(|(run, _)| run.start <= at)
         .map(|(_, link)| link)
 }
 

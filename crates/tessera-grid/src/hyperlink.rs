@@ -365,35 +365,72 @@ fn has_control(uri: &str) -> bool {
         })
 }
 
-/// One link: its column and entity.
+/// `v` as a column. Every caller passes a column or length already known
+/// to fit (inside a run, or checked against `u16::MAX` on entry).
+fn col16(v: usize) -> u16 {
+    u16::try_from(v).unwrap_or(u16::MAX)
+}
+
+/// One run of linked cells: `len` columns from `col`, all of one entity.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Entry {
+pub(crate) struct Run {
     col: u16,
+    /// At least 1.
+    len: u16,
     link: Hyperlink,
 }
 
-impl Entry {
-    /// The column and link, by value.
-    pub(crate) fn into_parts(self) -> (usize, Hyperlink) {
-        (usize::from(self.col), self.link)
+impl Run {
+    /// The first column.
+    fn start(&self) -> usize {
+        usize::from(self.col)
+    }
+
+    /// One past the last column.
+    fn end(&self) -> usize {
+        usize::from(self.col) + usize::from(self.len)
+    }
+
+    /// The columns of the run.
+    fn cols(&self) -> Range<usize> {
+        self.start()..self.end()
+    }
+
+    /// The columns and link, by value.
+    pub(crate) fn into_parts(self) -> (Range<usize>, Hyperlink) {
+        (self.cols(), self.link)
     }
 }
 
-/// The hyperlinks of a line's [`CellFlags::LINK`] cells, sorted by column:
-/// the link half of the line's [`GraphemeTable`], which keeps it consistent
-/// with the cells.
+/// The hyperlinks of a line's [`CellFlags::LINK`] cells: the link half of
+/// the line's [`GraphemeTable`], which keeps it consistent with the cells.
+///
+/// Run-length (#411): one [`Run`] per stretch of adjacent cells of one
+/// entity, sorted by column, never overlapping, and never two adjacent runs
+/// of the same entity (every edit merges them), so a line linked from end
+/// to end by one link is one 16-byte entry whatever its width. A table
+/// holds at most one run per column of its line (one per cell when every
+/// cell has a different link, the old per-cell cost), so it stays bounded
+/// by the line's width (S5). Lookups are a binary search over the runs.
 ///
 /// [`CellFlags::LINK`]: crate::CellFlags::LINK
 /// [`GraphemeTable`]: crate::GraphemeTable
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct LinkColumns(Vec<Entry>);
+pub(crate) struct LinkColumns(Vec<Run>);
 
 impl LinkColumns {
+    /// Index of the run that holds `col`.
+    fn find(&self, col: usize) -> Option<usize> {
+        let i = self
+            .0
+            .partition_point(|r| r.start() <= col)
+            .checked_sub(1)?;
+        (col < self.0[i].end()).then_some(i)
+    }
+
     /// The link at `col`.
     pub(crate) fn get(&self, col: usize) -> Option<&Hyperlink> {
-        let col = u16::try_from(col).ok()?;
-        let i = self.0.binary_search_by_key(&col, |e| e.col).ok()?;
-        Some(&self.0[i].link)
+        self.find(col).map(|i| &self.0[i].link)
     }
 
     /// True when no cell has a link.
@@ -401,103 +438,349 @@ impl LinkColumns {
         self.0.is_empty()
     }
 
-    /// Number of linked cells.
+    /// Number of runs.
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.0.len()
     }
 
-    /// Every `(column, link)` pair, by ascending column.
+    /// Runs the storage has room for.
+    #[cfg(test)]
+    pub(crate) fn capacity(&self) -> usize {
+        self.0.capacity()
+    }
+
+    /// Every `(column, link)` pair, by ascending column: one per linked
+    /// cell.
     pub(crate) fn iter(&self) -> impl Iterator<Item = (usize, &Hyperlink)> + '_ {
-        self.0.iter().map(|e| (usize::from(e.col), &e.link))
+        self.0
+            .iter()
+            .flat_map(|r| r.cols().map(move |col| (col, &r.link)))
+    }
+
+    /// Every run as its columns and link, by ascending column.
+    pub(crate) fn runs(&self) -> impl Iterator<Item = (Range<usize>, &Hyperlink)> + '_ {
+        self.0.iter().map(|r| (r.cols(), &r.link))
     }
 
     /// Stores `link` as the link at `col`, replacing any previous one.
-    pub(crate) fn set(&mut self, col: usize, link: Hyperlink) {
-        let Ok(col) = u16::try_from(col) else {
+    #[inline]
+    pub(crate) fn set(&mut self, col: usize, link: &Hyperlink) {
+        self.set_range(col..col.saturating_add(1), link);
+    }
+
+    /// Stores `link` as the link of every column in `range`, replacing the
+    /// previous ones. A range reaching past column `u16::MAX` is ignored
+    /// (no line is that wide).
+    #[inline]
+    pub(crate) fn set_range(&mut self, range: Range<usize>, link: &Hyperlink) {
+        if range.is_empty() || range.end > usize::from(u16::MAX) {
             return;
+        }
+        // Text is written left to right: the cell after the last run, or
+        // further right, is the common case.
+        match self.0.last_mut() {
+            Some(last) if range.start >= last.end() => {
+                if range.start == last.end() && last.link.same_link(link) {
+                    last.len = col16(range.end - last.start());
+                } else {
+                    self.0.push(Run {
+                        col: col16(range.start),
+                        len: col16(range.len()),
+                        link: link.clone(),
+                    });
+                }
+            }
+            Some(_) => self.set_inside(range, link),
+            None => self.0.push(Run {
+                col: col16(range.start),
+                len: col16(range.len()),
+                link: link.clone(),
+            }),
+        }
+    }
+
+    /// [`LinkColumns::set_range`] for a range that does not start after
+    /// the last run. Out of line: the append stays small.
+    #[inline(never)]
+    fn set_inside(&mut self, range: Range<usize>, link: &Hyperlink) {
+        let (start, end) = (range.start, range.end);
+        if let Some(i) = self.find(start) {
+            let run = &self.0[i];
+            if run.end() >= end && run.link.same_link(link) {
+                // Already this link (text rewritten in place).
+                return;
+            }
+        }
+        self.remove_range(range);
+        let i = self.0.partition_point(|r| r.start() < start);
+        let joins_prev = i > 0 && {
+            let prev = &self.0[i - 1];
+            prev.end() == start && prev.link.same_link(link)
         };
-        match self.0.binary_search_by_key(&col, |e| e.col) {
-            Ok(i) => self.0[i].link = link,
-            Err(i) => self.0.insert(i, Entry { col, link }),
+        let joins_next = self
+            .0
+            .get(i)
+            .is_some_and(|next| next.start() == end && next.link.same_link(link));
+        match (joins_prev, joins_next) {
+            (true, true) => {
+                let next_end = self.0[i].end();
+                let prev = &mut self.0[i - 1];
+                prev.len = col16(next_end - prev.start());
+                self.0.remove(i);
+            }
+            (true, false) => {
+                let prev = &mut self.0[i - 1];
+                prev.len = col16(end - prev.start());
+            }
+            (false, true) => {
+                let next = &mut self.0[i];
+                next.len = col16(next.end() - start);
+                next.col = col16(start);
+            }
+            (false, false) => self.0.insert(
+                i,
+                Run {
+                    col: col16(start),
+                    len: col16(end - start),
+                    link: link.clone(),
+                },
+            ),
         }
     }
 
     /// Drops the link at `col`, if any.
     #[inline]
     pub(crate) fn remove(&mut self, col: usize) {
-        if self.0.is_empty() {
+        // Writing past the linked text, the common case, finds nothing.
+        if self.0.last().is_none_or(|last| col >= last.end()) {
             return;
         }
-        let Ok(col) = u16::try_from(col) else {
+        self.remove_range(col..col + 1);
+    }
+
+    /// Drops the link of every column in `range`, splitting a run that
+    /// `range` cuts.
+    pub(crate) fn remove_range(&mut self, range: Range<usize>) {
+        if self.0.is_empty() || range.is_empty() {
+            return;
+        }
+        let (start, end) = (range.start, range.end);
+        // The runs `i..j` overlap `range`.
+        let i = self.0.partition_point(|r| r.end() <= start);
+        let j = i + self.0[i..].partition_point(|r| r.start() < end);
+        if i == j {
+            return;
+        }
+        let head = self.0[i].start() < start;
+        let tail = self.0[j - 1].end() > end;
+        if head && tail && i + 1 == j {
+            // `range` lies inside one run: it splits in two.
+            let run = &mut self.0[i];
+            let rest = Run {
+                col: col16(end),
+                len: col16(run.end() - end),
+                link: run.link.clone(),
+            };
+            run.len = col16(start - run.start());
+            self.0.insert(i + 1, rest);
+            return;
+        }
+        let (mut lo, mut hi) = (i, j);
+        if head {
+            let run = &mut self.0[i];
+            run.len = col16(start - run.start());
+            lo += 1;
+        }
+        if tail {
+            let run = &mut self.0[j - 1];
+            run.len = col16(run.end() - end);
+            run.col = col16(end);
+            hi -= 1;
+        }
+        self.0.drain(lo..hi);
+    }
+
+    /// Ends a run at `col`: a run that holds `col` past its first column
+    /// is split in two there.
+    fn split_at(&mut self, col: usize) {
+        let Some(i) = self.find(col) else {
             return;
         };
-        if let Ok(i) = self.0.binary_search_by_key(&col, |e| e.col) {
-            self.0.remove(i);
-        }
-    }
-
-    /// Keeps the links whose column `keep` accepts.
-    pub(crate) fn retain_cols(&mut self, keep: &mut impl FnMut(usize) -> bool) {
-        self.0.retain(|e| keep(usize::from(e.col)));
-    }
-
-    /// Drops every link whose column lies in `range`.
-    #[inline]
-    pub(crate) fn remove_range(&mut self, range: Range<usize>) {
-        if self.0.is_empty() {
+        let run = &mut self.0[i];
+        if run.start() == col {
             return;
         }
-        let start = self.0.partition_point(|e| usize::from(e.col) < range.start);
-        let end = start + self.0[start..].partition_point(|e| usize::from(e.col) < range.end);
-        self.0.drain(start..end);
+        let rest = Run {
+            col: col16(col),
+            len: col16(run.end() - col),
+            link: run.link.clone(),
+        };
+        run.len = col16(col - run.start());
+        self.0.insert(i + 1, rest);
+    }
+
+    /// Joins every two adjacent runs of one entity.
+    fn merge_adjacent(&mut self) {
+        self.0.dedup_by(|next, prev| {
+            let joins = prev.end() == next.start() && prev.link.same_link(&next.link);
+            if joins {
+                prev.len = col16(next.end() - prev.start());
+            }
+            joins
+        });
+    }
+
+    /// Keeps the links whose column `keep` accepts (asked once per linked
+    /// column, by ascending column).
+    pub(crate) fn retain_cols(&mut self, keep: &mut impl FnMut(usize) -> bool) {
+        // Nothing moves until the first column `keep` refuses.
+        let mut first = None;
+        'runs: for (i, run) in self.0.iter().enumerate() {
+            for col in run.cols() {
+                if !keep(col) {
+                    first = Some((i, col));
+                    break 'runs;
+                }
+            }
+        }
+        let Some((i, refused)) = first else {
+            return;
+        };
+        let rest = self.0.split_off(i);
+        // Pushes the pieces of `run` from column `from` on that `keep`
+        // accepts.
+        let mut kept = |runs: &mut Vec<Run>, run: &Run, from: usize| {
+            let mut piece = None;
+            for col in from..run.end() {
+                match (keep(col), piece) {
+                    (true, None) => piece = Some(col),
+                    (false, Some(start)) => {
+                        runs.push(Run {
+                            col: col16(start),
+                            len: col16(col - start),
+                            link: run.link.clone(),
+                        });
+                        piece = None;
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(start) = piece {
+                runs.push(Run {
+                    col: col16(start),
+                    len: col16(run.end() - start),
+                    link: run.link.clone(),
+                });
+            }
+        };
+        let mut rest = rest.iter();
+        if let Some(run) = rest.next() {
+            if refused > run.start() {
+                self.0.push(Run {
+                    col: run.col,
+                    len: col16(refused - run.start()),
+                    link: run.link.clone(),
+                });
+            }
+            kept(&mut self.0, run, refused + 1);
+        }
+        for run in rest {
+            kept(&mut self.0, run, run.start());
+        }
     }
 
     /// Moves the links at columns `from..end` right by `n` (insertion of
     /// `n` cells at `from` that shifts cells up to `end`), dropping those
     /// that land at or past `end`. Links at `end` and beyond stay.
     pub(crate) fn shift_right(&mut self, from: usize, n: usize, end: usize) {
-        self.0.retain_mut(|e| {
-            let col = usize::from(e.col);
-            if col < from || col >= end {
+        if self.0.is_empty() || n == 0 || from >= end {
+            return;
+        }
+        // Every run then lies wholly before `from`, inside `from..end` or
+        // from `end` on.
+        self.split_at(from);
+        self.split_at(end);
+        self.0.retain_mut(|r| {
+            let start = r.start();
+            if start < from || start >= end {
                 return true;
             }
-            match u16::try_from(col + n) {
-                Ok(moved) if col + n < end => {
-                    e.col = moved;
-                    true
-                }
-                _ => false,
+            let moved = start + n;
+            if moved >= end {
+                return false;
             }
+            // Cut at `end`: `moved < end`, so some of it is left.
+            r.len = col16((r.end() + n).min(end) - moved);
+            r.col = col16(moved);
+            true
         });
+        self.merge_adjacent();
     }
 
     /// Removes the links at columns `at..at + n` and moves the ones after
     /// them, up to `end`, left by `n` (deletion of `n` cells at `at` that
     /// shifts cells up to `end`). Links at `end` and beyond stay.
     pub(crate) fn delete(&mut self, at: usize, n: usize, end: usize) {
-        self.0.retain_mut(|e| {
-            let col = usize::from(e.col);
-            if col < at || col >= end {
+        if self.0.is_empty() || n == 0 || at >= end {
+            return;
+        }
+        let cut = at.saturating_add(n).min(end);
+        self.split_at(at);
+        self.split_at(cut);
+        self.split_at(end);
+        self.0.retain_mut(|r| {
+            let start = r.start();
+            if start < at || start >= end {
                 true
-            } else if col < at + n {
+            } else if start < cut {
                 false
             } else {
-                // `col - n >= at >= 0` and it was a `u16` before.
-                e.col = u16::try_from(col - n).unwrap_or(e.col);
+                // `start - n >= at`: `start >= cut = at + n` here.
+                r.col = col16(start - n);
                 true
             }
         });
+        self.merge_adjacent();
     }
 
-    /// Removes every link and hands them out, by ascending column.
-    pub(crate) fn take(&mut self) -> Vec<Entry> {
+    /// Removes every run and hands them out, by ascending column.
+    pub(crate) fn take(&mut self) -> Vec<Run> {
         std::mem::take(&mut self.0)
     }
 
-    /// Shrinks the storage to the entries.
+    /// Shrinks the storage to the runs.
     pub(crate) fn shrink_to_fit(&mut self) {
         self.0.shrink_to_fit();
+    }
+
+    /// What breaks the run invariants (sorted, non-empty, not
+    /// overlapping, no two adjacent runs of one entity), for
+    /// [`Grid::check_invariants`].
+    ///
+    /// [`Grid::check_invariants`]: crate::Grid::check_invariants
+    pub(crate) fn run_error(&self) -> Option<String> {
+        if let Some(run) = self.0.iter().find(|r| r.len == 0) {
+            return Some(format!("empty link run at column {}", run.col));
+        }
+        self.0.windows(2).find_map(|pair| {
+            let [a, b] = pair else { return None };
+            if a.end() > b.start() {
+                Some(format!(
+                    "link runs {:?} and {:?} overlap",
+                    a.cols(),
+                    b.cols()
+                ))
+            } else if a.end() == b.start() && a.link.same_link(&b.link) {
+                Some(format!(
+                    "link runs {:?} and {:?} not merged",
+                    a.cols(),
+                    b.cols()
+                ))
+            } else {
+                None
+            }
+        })
     }
 }
 
@@ -512,18 +795,13 @@ mod tests {
     fn table(pool: &mut LinkPool, cols: &[usize]) -> LinkColumns {
         let mut t = LinkColumns::default();
         for &col in cols {
-            t.set(col, open(pool, &format!("https://a.bc/{col}")));
+            t.set(col, &open(pool, &format!("https://a.bc/{col}")));
         }
         t
     }
 
     fn cols(t: &LinkColumns) -> Vec<usize> {
         t.iter().map(|(c, _)| c).collect()
-    }
-
-    #[test]
-    fn entry_is_16_bytes() {
-        assert_eq!(size_of::<Entry>(), 16);
     }
 
     #[test]
@@ -888,7 +1166,7 @@ mod tests {
         assert_eq!(t.get(5).map(Hyperlink::uri), Some("https://a.bc/5"));
         assert_eq!(t.get(2), None);
         assert_eq!(t.get(usize::MAX), None);
-        t.set(5, open(&mut pool, "https://a.bc/new"));
+        t.set(5, &open(&mut pool, "https://a.bc/new"));
         assert_eq!(t.get(5).map(Hyperlink::uri), Some("https://a.bc/new"));
         assert_eq!(t.len(), 2);
         t.remove(1);
@@ -927,9 +1205,333 @@ mod tests {
     fn take_empties_the_table_in_column_order() {
         let mut pool = LinkPool::new();
         let mut t = table(&mut pool, &[4, 1]);
-        let taken: Vec<usize> = t.take().into_iter().map(|e| e.into_parts().0).collect();
-        assert_eq!(taken, [1, 4]);
+        let taken: Vec<_> = t.take().into_iter().map(|r| r.into_parts().0).collect();
+        assert_eq!(taken, [1..2, 4..5]);
         assert!(t.is_empty());
         assert_eq!(t.take().len(), 0);
+    }
+
+    #[test]
+    fn run_is_16_bytes() {
+        assert_eq!(size_of::<Run>(), 16);
+    }
+
+    #[test]
+    fn one_link_over_a_whole_line_is_one_run_and_edits_split_and_merge_it() {
+        let mut pool = LinkPool::new();
+        let a = open(&mut pool, "https://a.bc/a");
+        let b = open(&mut pool, "https://a.bc/b");
+        let mut t = LinkColumns::default();
+        for col in 0..2048 {
+            t.set(col, &a);
+        }
+        assert_eq!(t.len(), 1);
+        assert_eq!(
+            t.runs().map(|(r, _)| (r.start, r.end)).collect::<Vec<_>>(),
+            [(0, 2048)]
+        );
+        t.set(1000, &b);
+        assert_eq!(t.len(), 3, "a cell of another link splits the run");
+        t.set(1000, &a);
+        assert_eq!(t.len(), 1, "and writing the first link back merges it");
+        t.remove(5);
+        assert_eq!(t.len(), 2);
+        t.set(5, &a);
+        assert_eq!(t.len(), 1);
+        t.delete(10, 3, 2048);
+        assert_eq!(
+            t.runs().map(|(r, _)| (r.start, r.end)).collect::<Vec<_>>(),
+            [(0, 2045)]
+        );
+        t.shift_right(100, 7, 2048);
+        assert_eq!(
+            t.runs().map(|(r, _)| r).collect::<Vec<_>>(),
+            [0..100, 107..2048]
+        );
+        t.set_range(100..107, &a);
+        assert_eq!(t.len(), 1, "filling the gap merges both sides");
+        t.retain_cols(&mut |col| col % 1024 != 7);
+        assert_eq!(
+            t.runs().map(|(r, _)| r).collect::<Vec<_>>(),
+            [0..7, 8..1031, 1032..2048]
+        );
+        assert_eq!(t.run_error(), None);
+        drop(t);
+        drop((a, b));
+        assert_eq!(pool.live(), 0, "the runs held the links, and let go");
+    }
+
+    /// The per-cell model of a [`LinkColumns`] of `WIDTH` columns: the
+    /// index of each cell's link.
+    const WIDTH: usize = 40;
+
+    #[derive(Debug, Clone)]
+    enum Op {
+        Set(usize, usize),
+        SetRange(usize, usize, usize),
+        Remove(usize),
+        RemoveRange(usize, usize),
+        Retain(u64),
+        ShiftRight(usize, usize, usize),
+        Delete(usize, usize, usize),
+        Take,
+    }
+
+    fn op() -> impl proptest::strategy::Strategy<Value = Op> {
+        use proptest::prelude::*;
+        let col = 0..WIDTH + 2;
+        let link = 0usize..3;
+        prop_oneof![
+            8 => (col.clone(), link.clone()).prop_map(|(c, l)| Op::Set(c, l)),
+            3 => (col.clone(), 0usize..12, link).prop_map(|(c, n, l)| Op::SetRange(c, n, l)),
+            3 => col.clone().prop_map(Op::Remove),
+            2 => (col.clone(), 0usize..12).prop_map(|(c, n)| Op::RemoveRange(c, n)),
+            1 => any::<u64>().prop_map(Op::Retain),
+            2 => (col.clone(), 0usize..6, col.clone())
+                .prop_map(|(c, n, e)| Op::ShiftRight(c, n, e)),
+            2 => (col.clone(), 0usize..6, col).prop_map(|(c, n, e)| Op::Delete(c, n, e)),
+            1 => Just(Op::Take),
+        ]
+    }
+
+    /// Applies `op` to the model, the per-cell table the run table
+    /// replaced (#411): `None` or the index of a cell's link.
+    fn apply_model(model: &mut [Option<usize>], op: &Op) {
+        let width = model.len();
+        match *op {
+            Op::Set(c, l) => {
+                if c < width {
+                    model[c] = Some(l);
+                }
+            }
+            Op::SetRange(c, n, l) => {
+                for cell in model.iter_mut().take(c + n).skip(c) {
+                    *cell = Some(l);
+                }
+            }
+            Op::Remove(c) => {
+                if c < width {
+                    model[c] = None;
+                }
+            }
+            Op::RemoveRange(c, n) => {
+                for cell in model.iter_mut().take(c + n).skip(c) {
+                    *cell = None;
+                }
+            }
+            Op::Retain(mask) => {
+                for (c, cell) in model.iter_mut().enumerate() {
+                    if mask >> (c % 64) & 1 == 0 {
+                        *cell = None;
+                    }
+                }
+            }
+            Op::ShiftRight(from, n, end) => {
+                let end = end.min(width);
+                if from < end {
+                    let old = model.to_vec();
+                    for (c, cell) in model.iter_mut().enumerate().take(end).skip(from) {
+                        *cell = c.checked_sub(n).filter(|&s| s >= from).and_then(|s| old[s]);
+                    }
+                }
+            }
+            Op::Delete(at, n, end) => {
+                let end = end.min(width);
+                if at < end {
+                    let old = model.to_vec();
+                    for (c, cell) in model.iter_mut().enumerate().take(end).skip(at) {
+                        *cell = old.get(c + n).copied().flatten().filter(|_| c + n < end);
+                    }
+                }
+            }
+            Op::Take => model.fill(None),
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(2000))]
+
+        /// The run table agrees cell for cell with the per-cell table it
+        /// replaced, through any chain of edits, and stays canonical: one
+        /// run per maximal stretch of one link.
+        #[test]
+        fn runs_agree_with_the_per_cell_model(
+            ops in proptest::collection::vec(op(), 1..60),
+        ) {
+            let mut pool = LinkPool::new();
+            let links: Vec<Hyperlink> =
+                (0..3).map(|i| open(&mut pool, &format!("https://a.bc/{i}"))).collect();
+            let mut t = LinkColumns::default();
+            let mut model = vec![None; WIDTH];
+            for op in &ops {
+                match *op {
+                    Op::Set(c, l) => {
+                        if c < WIDTH {
+                            t.set(c, &links[l]);
+                        }
+                    }
+                    Op::SetRange(c, n, l) => t.set_range(c..(c + n).min(WIDTH), &links[l]),
+                    Op::Remove(c) => t.remove(c),
+                    Op::RemoveRange(c, n) => t.remove_range(c..c + n),
+                    Op::Retain(mask) => t.retain_cols(&mut |c| mask >> (c % 64) & 1 == 1),
+                    Op::ShiftRight(from, n, end) => {
+                        let end = end.min(WIDTH);
+                        if from < end {
+                            t.shift_right(from, n, end);
+                        }
+                    }
+                    Op::Delete(at, n, end) => {
+                        let end = end.min(WIDTH);
+                        if at < end {
+                            t.delete(at, n, end);
+                        }
+                    }
+                    Op::Take => drop(t.take()),
+                }
+                apply_model(&mut model, op);
+                let cells: Vec<Option<usize>> = (0..WIDTH)
+                    .map(|c| t.get(c).map(|l| links.iter().position(|k| k.same_link(l)).unwrap()))
+                    .collect();
+                proptest::prop_assert_eq!(&cells, &model, "after {:?}", op);
+                let per_cell: Vec<(usize, usize)> = t
+                    .iter()
+                    .map(|(c, l)| (c, links.iter().position(|k| k.same_link(l)).unwrap()))
+                    .collect();
+                let expected: Vec<(usize, usize)> = model
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(c, l)| l.map(|l| (c, l)))
+                    .collect();
+                proptest::prop_assert_eq!(per_cell, expected);
+                proptest::prop_assert_eq!(t.run_error(), None, "after {:?}", op);
+                let stretches = model
+                    .iter()
+                    .enumerate()
+                    .filter(|&(c, l)| l.is_some() && (c == 0 || model[c - 1] != *l))
+                    .count();
+                proptest::prop_assert_eq!(t.len(), stretches, "after {:?}", op);
+            }
+        }
+    }
+
+    /// Runs and room in the link table of screen row `row`.
+    fn storage(grid: &crate::Grid, row: u16) -> (usize, usize) {
+        grid.line(row).expect("row").graphemes.link_storage()
+    }
+
+    #[test]
+    fn a_fully_linked_line_holds_one_run_at_80_and_2048_columns() {
+        for cols in [80u16, 2048] {
+            let mut grid = crate::Grid::new(2, cols);
+            grid.begin_hyperlink("https://a.bc/", None).unwrap();
+            grid.put_str(&"x".repeat(usize::from(cols)));
+            let line = grid.line(0).unwrap();
+            assert!((0..usize::from(cols)).all(|c| line.hyperlink(c).is_some()));
+            assert_eq!(storage(&grid, 0).0, 1, "{cols} columns");
+            // Wide characters link both halves, still one run.
+            grid.carriage_return();
+            grid.line_feed();
+            grid.put_str(&"\u{4e16}".repeat(usize::from(cols) / 2));
+            assert_eq!(storage(&grid, 1).0, 1, "{cols} columns, wide");
+            // In history, compacted: one entry of room, 16 bytes.
+            grid.line_feed();
+            grid.line_feed();
+            let kept = grid.scrollback_line(grid.scrollback_len() - 1).unwrap();
+            assert_eq!(kept.graphemes.link_storage(), (1, 1), "{cols} columns");
+        }
+    }
+
+    #[test]
+    fn retain_asks_each_linked_column_once_in_order() {
+        let mut pool = LinkPool::new();
+        let (a, b) = (
+            open(&mut pool, "https://a.bc/"),
+            open(&mut pool, "https://b.cd/"),
+        );
+        let mut t = LinkColumns::default();
+        t.set_range(2..9, &a);
+        t.set_range(9..12, &b);
+        t.set(20, &a);
+        let mut asked = Vec::new();
+        t.retain_cols(&mut |col| {
+            asked.push(col);
+            col != 4 && col != 10
+        });
+        let expected: Vec<usize> = (2..12).chain([20]).collect();
+        assert_eq!(asked, expected);
+        assert_eq!(
+            t.runs().map(|(r, _)| (r.start, r.end)).collect::<Vec<_>>(),
+            [(2, 4), (5, 9), (9, 10), (11, 12), (20, 21)]
+        );
+    }
+
+    #[test]
+    fn a_flood_of_new_links_over_one_line_stays_capped_by_its_columns() {
+        // S5: 200 000 cells, each under a link of its own, written at
+        // scattered columns of one line with inserts and deletes mixed in.
+        // The table never holds more than one run per column, and its room
+        // never more than twice that.
+        let cols = 80u16;
+        let mut grid = crate::Grid::new(1, cols);
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut peak = (0, 0);
+        for n in 0..200_000u32 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let col = u16::try_from(seed % u64::from(cols)).unwrap();
+            grid.goto(0, col);
+            match seed >> 60 {
+                0 => grid.insert_chars(1 + u16::try_from(seed >> 56 & 3).unwrap()),
+                1 => grid.delete_chars(1 + u16::try_from(seed >> 56 & 3).unwrap()),
+                _ => {
+                    let id = n.to_string();
+                    grid.begin_hyperlink("https://a.bc/", Some(id.as_str()))
+                        .unwrap();
+                    // A wide character at the last column would wrap and scroll.
+                    let wide = seed & 1 == 1 && col + 1 < cols;
+                    grid.put_str(if wide { "\u{4e16}" } else { "x" });
+                }
+            }
+            let (len, room) = storage(&grid, 0);
+            peak = (peak.0.max(len), peak.1.max(room));
+            assert!(len <= usize::from(cols), "{len} runs on {cols} columns");
+            assert!(room <= 2 * usize::from(cols), "room for {room} runs");
+        }
+        grid.check_invariants();
+        assert!(
+            peak.0 > usize::from(cols) / 2,
+            "the flood fills the line: {peak:?}"
+        );
+        // Links that no cell shows are gone, so the flood never fills the
+        // live-link table either.
+        assert_eq!(grid.scrollback_len(), 0);
+        assert!(grid.live_hyperlinks() <= usize::from(cols) + 1);
+    }
+
+    #[test]
+    fn alternating_links_hold_one_run_each() {
+        for (cols, every) in [(80u16, 1usize), (80, 3), (2048, 1), (2048, 5)] {
+            let mut grid = crate::Grid::new(2, cols);
+            let mut written = 0;
+            let mut k = 0;
+            while written < usize::from(cols) {
+                // Two `id`s alternate: each open of one finds the live
+                // entity, so the stretches alternate between two links.
+                grid.begin_hyperlink("https://a.bc/", Some(["a", "b"][k % 2]))
+                    .unwrap();
+                let n = every.min(usize::from(cols) - written);
+                grid.put_str(&"x".repeat(n));
+                written += n;
+                k += 1;
+            }
+            assert_eq!(grid.live_hyperlinks(), 2);
+            assert_eq!(
+                storage(&grid, 0).0,
+                usize::from(cols).div_ceil(every),
+                "{cols} columns, a new link every {every}"
+            );
+            grid.check_invariants();
+        }
     }
 }

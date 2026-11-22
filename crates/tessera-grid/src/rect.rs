@@ -29,6 +29,8 @@
 //! destination is the source's top-left corner) returns before any of
 //! this: it costs nothing and allocates nothing.
 
+use std::ops::Range;
+
 use crate::{Cell, CellFlags, Grid, Hyperlink, Style};
 
 /// A rectangle of screen cells, all four edges inclusive and 0-based:
@@ -197,10 +199,11 @@ impl Grid {
         // written; rows are visited so no row is written before it is read.
         let mut cells: Vec<Cell> = Vec::with_capacity(width);
         let mut clusters: Vec<(usize, Box<str>)> = Vec::new();
-        let mut links: Vec<(usize, Hyperlink)> = Vec::new();
+        // Runs of columns (offsets into the span) of one link.
+        let mut links: Vec<(Range<usize>, Hyperlink)> = Vec::new();
         // The destination row's own entries while the copy is merged in.
         let mut old_clusters: Vec<(usize, Box<str>)> = Vec::new();
-        let mut old_links: Vec<(usize, Hyperlink)> = Vec::new();
+        let mut old_links: Vec<(Range<usize>, Hyperlink)> = Vec::new();
         let down = dst_top > src.top;
         for i in 0..height {
             let i = if down { height - 1 - i } else { i };
@@ -227,11 +230,10 @@ impl Grid {
                         .filter(|&off| cells[off].is_cluster())
                         .map(|off| (off, text.into()))
                 }));
-                links.extend(from.graphemes.links().filter_map(|(col, link)| {
-                    at(col)
-                        .filter(|&off| cells[off].is_link())
-                        .map(|off| (off, link.clone()))
-                }));
+                for (run, link) in from.graphemes.link_runs() {
+                    let run = run.start.max(sl) - sl..run.end.min(sl + width).saturating_sub(sl);
+                    linked_pieces(&cells, run, |piece| links.push((piece, link.clone())));
+                }
             }
             let Some(to) = self.line_mut(dst_top + i) else {
                 continue;
@@ -261,16 +263,39 @@ impl Grid {
             if !links.is_empty() {
                 old_links.clear();
                 old_links.extend(to.graphemes.take_links());
-                let split = old_links.partition_point(|&(col, _)| col < dl);
-                let copied = links.drain(..).map(|(off, link)| (dl + off, link));
+                // No old run overlaps the span (removed above).
+                let split = old_links.partition_point(|(run, _)| run.start < dl);
+                let copied = links
+                    .drain(..)
+                    .map(|(run, link)| (dl + run.start..dl + run.end, link));
                 let mut old = old_links.drain(..);
-                for (col, link) in old.by_ref().take(split).chain(copied) {
-                    to.graphemes.set_link(col, link);
+                for (run, link) in old.by_ref().take(split).chain(copied) {
+                    to.graphemes.set_link_range(run, &link);
                 }
-                for (col, link) in old {
-                    to.graphemes.set_link(col, link);
+                for (run, link) in old {
+                    to.graphemes.set_link_range(run, &link);
                 }
             }
         }
+    }
+}
+
+/// Hands `piece` the stretches of `run` (offsets into `cells`) whose cells
+/// are still linked: the copy blanks a cut wide character at either edge,
+/// and a blank is not linked.
+fn linked_pieces(cells: &[Cell], run: Range<usize>, mut piece: impl FnMut(Range<usize>)) {
+    let mut start = None;
+    for off in run.clone() {
+        match (cells[off].is_link(), start) {
+            (true, None) => start = Some(off),
+            (false, Some(from)) => {
+                piece(from..off);
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(from) = start {
+        piece(from..run.end);
     }
 }

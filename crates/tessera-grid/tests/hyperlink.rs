@@ -7,7 +7,7 @@
 use proptest::prelude::*;
 use tessera_grid::{
     EraseDisplay, EraseLine, Grid, Hyperlink, LinkRefused, MAX_ID_BYTES, MAX_LINK_TABLE_BYTES,
-    MAX_LIVE_LINKS, MAX_URI_BYTES,
+    MAX_LIVE_LINKS, MAX_URI_BYTES, Rect,
 };
 
 /// The link URI of each cell of row `row`.
@@ -146,6 +146,69 @@ fn rectangular_scrolls_move_links_with_their_text() {
         grid.reset_margins();
         grid.check_invariants();
     }
+}
+
+#[test]
+fn a_rectangle_copy_that_cuts_wide_characters_links_only_what_it_keeps() {
+    // DECCRA from columns 1..=8 of a line of linked wide characters: both
+    // edges cut a character in half, and the cut halves land as unlinked
+    // blanks between the linked whole ones.
+    let mut grid = Grid::new(4, 12);
+    grid.begin_hyperlink("https://a.bc/", None).unwrap();
+    grid.put_str("\u{65e5}\u{672c}\u{8a9e}\u{6f22}\u{5b57}");
+    grid.end_hyperlink();
+    let src = Rect {
+        top: 0,
+        left: 1,
+        bottom: 0,
+        right: 8,
+    };
+    let clip = Rect {
+        top: 0,
+        left: 0,
+        bottom: 3,
+        right: 11,
+    };
+    grid.copy_rect(src, 2, 2, clip, tessera_grid::Style::default());
+    grid.check_invariants();
+    assert_eq!(linked(&grid, 2), [3, 4, 5, 6, 7, 8]);
+    let line = grid.line(2).unwrap();
+    assert!(
+        [2, 9].iter().all(|&c| line.cells[c].ch == ' '),
+        "cut halves blank"
+    );
+    let first = grid.line(0).unwrap().hyperlink(0).unwrap();
+    assert!((3..9).all(|c| line.hyperlink(c).unwrap().same_link(first)));
+    // Whole characters up to the edge of the copy keep their links to it.
+    let src = Rect {
+        top: 0,
+        left: 0,
+        bottom: 0,
+        right: 3,
+    };
+    grid.copy_rect(src, 3, 0, clip, tessera_grid::Style::default());
+    grid.check_invariants();
+    assert_eq!(linked(&grid, 3), [0, 1, 2, 3]);
+}
+
+#[test]
+fn equal_links_opened_apart_stay_apart() {
+    // Two opens of one URI without an `id` are two links that compare
+    // equal: adjacent cells under them still tell them apart.
+    let mut grid = Grid::new(2, 10);
+    grid.begin_hyperlink("https://a.bc/", None).unwrap();
+    grid.put_str("ab");
+    grid.begin_hyperlink("https://a.bc/", None).unwrap();
+    grid.put_str("cd");
+    grid.end_hyperlink();
+    let line = grid.line(0).unwrap();
+    let (b, c) = (line.hyperlink(1).unwrap(), line.hyperlink(2).unwrap());
+    assert_eq!(b, c);
+    assert!(!b.same_link(c));
+    assert!(line.hyperlink(0).unwrap().same_link(b));
+    assert!(line.hyperlink(3).unwrap().same_link(c));
+    assert_eq!(grid.live_hyperlinks(), 2);
+    grid.check_invariants();
 }
 
 #[test]

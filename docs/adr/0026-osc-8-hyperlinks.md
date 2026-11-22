@@ -100,10 +100,10 @@ URI and `id`.
   same 65 536 links took 261.9 MB (all created) and the churn 477.7 MB, so
   the link entities and their text now take about 25 MB at most instead
   of the 150 MB this ADR first estimated (which was also low). The
-  per-cell entries come on top and are not capped by the table: 16 bytes
-  per linked cell, so one link over all of a 10 000 x 200 history adds
-  about 32 MB, and that grows with the scrollback cap until run-length
-  entries land (below).
+  line entries come on top and are not capped by the table: first 16 bytes
+  per linked cell, so one link over all of a 10 000 x 200 history added
+  about 32 MB; since #411 16 bytes per run of one link, so the same history
+  adds about 160 KB (amendment below).
 - Holders keep links alive, so **history can starve new links**: a
   program that leaves 65 536 links or 16 MiB of link text in scrollback
   gets every new link refused (the text still prints, unlinked) until
@@ -114,8 +114,8 @@ URI and `id`.
   link opened on either counts against the same caps, and dropping the
   clone gives its holders' counts back. Nothing in the product clones a
   live grid; tests and snapshots that do see one table.
-- Entries stay one per column (no run-length entries); a run-length
-  table is a 0.2.0 issue.
+- Entries were one per column at first; since #411 they are run-length
+  (amendment below).
 
 ### The open link, and what ends it
 
@@ -214,7 +214,8 @@ until it is hovered with Command held.
   bytes and the corpus cost 1.2 to 4 % more instructions (above).
 - **A run-length table (start, end, link).** Smaller for long links, but
   every edit splits and merges ranges; the per-column table mirrors the
-  cluster table's proven shift and delete code.
+  cluster table's proven shift and delete code. Adopted later (#411,
+  amendment below).
 - **A global intern table with reference counts per link id.** Needs
   explicit retain and release at every edit; the `Arc` with a drop-time
   counter makes the counts follow the cells for free.
@@ -268,3 +269,54 @@ U+2029, which a tooltip or a pasted link would break a line at. The code
 already refused them (`tessera-grid`'s `hyperlink.rs`, tested there);
 only this record and `tessera-term`'s `osc.rs` documentation lagged
 (#430 20.3 m3). No behaviour changes.
+
+## Amendment: run-length link entries (#411, 2026-11-22)
+
+A line's link table now holds runs instead of one entry per column: each
+entry is (first column, length, link), 16 bytes, for a stretch of adjacent
+cells under one link entity (`same_link`; two equal links opened apart stay
+two runs). Runs are sorted, never empty, never overlap, and two adjacent
+runs never share an entity; `Grid::check_invariants` checks this. A lookup
+stays a binary search, O(log runs). Printing appends to or extends the last
+run, the common case; writing inside a run splits it, and the edits that move
+cells (ICH, DCH, the erases and protected erases, DECCRA, copies between
+lines, reflow) split runs at their edges and merge neighbours they bring
+together. A line under one link is one entry at any width, and the worst
+case (a new link every cell) is one entry per column, as before.
+
+- Memory: one link over all of a 10 000 x 200 history now costs 16 bytes
+  of entries per line, about 160 KB, instead of 16 bytes per cell, about
+  32 MB (Decision, above). Measured (`/usr/bin/time -l`, best of 7,
+  release, a 200x50 terminal with 10 000 lines of soft-wrapped ASCII in
+  history): 47.1 MB without a link on both sides; with every cell under one
+  link 89.7 MB before and 48.4 MB after, so the link costs 1.3 MB instead
+  of 42.6 MB (the entries, each line's link table allocation and the
+  allocator's rounding).
+- Speed, `cargo xtask ab` against the merge base, an 80x24 terminal fed in
+  4 KiB chunks, each corpus line plus CRLF repeated 60 000 to 120 000 times,
+  plain and inside one OSC 8 link; retired instructions head/base and wall
+  time head/base, best of 15 interleaved pairs: 
+
+  | line | plain instr | plain wall | linked instr | linked wall |
+  | --- | --- | --- | --- | --- |
+  | ascii | 1.000 | 0.999 | 0.650 | 0.524 |
+  | latin | 1.000 | 1.000 | 0.658 | 0.575 |
+  | cjk | 0.973 | 0.961 | 0.667 | 0.499 |
+  | box | 1.000 | 0.998 | 0.696 | 0.603 |
+  | hebrew | 1.000 | 1.007 | 0.664 | 0.599 |
+  | arabic | 1.000 | 1.005 | 0.678 | 0.610 |
+  | punctuation | 1.000 | 1.000 | 0.650 | 0.521 |
+  | braille | 1.000 | 1.001 | 0.675 | 0.579 |
+  | emoji | 0.986 | 0.977 | 0.795 | 0.731 |
+  | sgr | 1.000 | 1.001 | 0.774 | 0.739 |
+  | combining | 1.000 | 1.003 | 0.919 | 0.894 |
+
+  The worst case, a new `id`'d link for every cell (1 MiB of OSC 8): 1.002
+  instructions printed across fresh lines, 1.075 when every cell of one line
+  is rewritten under a new link (a removal and an insertion per cell where
+  the per-column table did one of each in place)..
+- 20 000 seeds of random edit sequences with OSC 8 opens and closes (every
+  edit listed above, resizes, the alternate screen, RIS, margins) give the
+  same link at every cell, the same live-link count and the same grid on
+  both sides.
+- `copy_span`, DECCRA and reflow now move links a run at a time.

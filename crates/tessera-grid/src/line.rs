@@ -377,7 +377,8 @@ impl Line {
     }
 
     /// Makes the cell at `col` (if in range) part of `link`.
-    pub(crate) fn set_link(&mut self, col: usize, link: Hyperlink) {
+    #[inline]
+    pub(crate) fn set_link(&mut self, col: usize, link: &Hyperlink) {
         if let Some(cell) = self.cells.get_mut(col) {
             cell.flags |= CellFlags::LINK;
             self.graphemes.set_link(col, link);
