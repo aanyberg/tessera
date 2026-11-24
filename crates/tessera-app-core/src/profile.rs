@@ -96,7 +96,7 @@ fn os_error(text: &str) -> Option<i32> {
 
 /// The `errno` values [`spawn_errno`] maps `portable-pty`'s and
 /// `tessera-pty`'s own messages to (the same on every Unix Tessera builds
-/// for), and the one a refused
+/// for, but for `ETIMEDOUT`), and the one a refused
 /// [`tessera_pty::PtyError::ArgumentsTooLong`] stands for.
 pub(crate) mod errno {
     /// `Argument list too long`.
@@ -106,6 +106,14 @@ pub(crate) mod errno {
     pub(super) const ENOEXEC: i32 = 8;
     pub(super) const EACCES: i32 = 13;
     pub(super) const EISDIR: i32 = 21;
+    /// `Operation timed out`, for a pty open that gave no answer in time
+    /// ([`tessera_pty::PtyError::OpenTimedOut`], #568). Unlike the others
+    /// its number differs between Unix systems: 60 on macOS and the BSDs.
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) const ETIMEDOUT: i32 = 60;
+    /// `Connection timed out`, as Linux words `ETIMEDOUT`.
+    #[cfg(target_os = "linux")]
+    pub(crate) const ETIMEDOUT: i32 = 110;
 }
 
 /// The line written into a session that started on the built-in profile

@@ -245,6 +245,14 @@ pub enum PtyError {
         /// Bytes in the program's path as given.
         path_bytes: usize,
     },
+    /// Opening the PTY pair gave no answer within 5 s, or four earlier
+    /// opens are still without one (#568): on macOS `grantpt(3)` can, very
+    /// rarely, spin in the kernel and never return while other ptys are
+    /// opened and closed at the same time. Nothing was forked; a stuck open
+    /// is left on its helper thread, and should it return, the pty it
+    /// opened is closed there.
+    #[error("failed to open pty: no answer in time")]
+    OpenTimedOut,
     /// A window-size update was rejected by the kernel.
     #[error("failed to resize pty: {0}")]
     Resize(String),
