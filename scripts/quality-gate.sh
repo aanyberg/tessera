@@ -151,16 +151,18 @@ ffi_c_tests_step() {
     exit 1
 }
 
-# Timing bars that only run in release builds (#114, #175): the reader lock hold, the view metrics under an output
-# flood, scrolling through a long history, captures under a flood while scrolled back, the scrollback search bars, the
-# accessible-text lock hold, the smart-selection latency and a click with each hostile smart rule of #433, the plugin
-# host throughput, the `b02_*` cost bars of the rectangular area operations (tessera-term, tests/rect.rs; the
-# `#[ignore]`d one-MiB run stays out) with the two cluster bars of tests/rect_fixes.rs, and the config edit among
-# 20 000 mark-like lines (tessera-config, tests/edit.rs). They are in the `timing` test group of .config/nextest.toml
-# (one at a time). Also the alternate-screen carry's cost bar (tests/stuck_modes.rs, a ratio of interleaved runs) and
-# the ten-million-case DECFRA differential (tests/rect_fixes.rs, no clock), outside that group (#556). A failure under
-# load (1-min load average >= the core count) is retried once; a second failure, any failure below that load and any
-# failure of the build (`--no-run`) fail the gate.
+# Timing bars that only run in release builds (#114, #175), one filter term each: the reader lock hold, the view
+# metrics under an output flood, scrolling through a long history, captures under a flood while scrolled back, the
+# scrollback search lock hold, the million-line scans (`a_million_lines_`), the search step bound under a slow pattern,
+# the accessible-text lock hold, a click with each hostile smart rule of #433 (`hostile_smart_rules_`), the
+# smart-selection latency, the `b02_*` cost bars of the rectangular area operations (tessera-term, tests/rect.rs; the
+# `#[ignore]`d one-MiB run stays out), the two cluster bars of tests/rect_fixes.rs, the config edit among 20 000
+# mark-like lines (tessera-config, tests/edit.rs), the plugin host throughput, the reload capture against a plain one
+# (`a_reload_capture_costs_`, #412), the alternate-screen carry's cost bar (tests/stuck_modes.rs, a ratio of interleaved
+# runs) and the ten-million-case DECFRA differential (tests/rect_fixes.rs, no clock). Every one of them is in the
+# `timing` test group of .config/nextest.toml (one at a time; #603). A failure under load (1-min load average >= the
+# core count) is retried once; a second failure, any failure below that load and any failure of the build (`--no-run`)
+# fail the gate.
 timing_stub=(${(s:,:)${TESSERA_GATE_TEST_TIMING_RESULTS:-}})
 release_timing() {
     if [[ -n "$selftest" && -n "${TESSERA_GATE_TEST_TIMING_RESULTS:-}" ]]; then

@@ -102,6 +102,18 @@ test-group = 'timing'
 filter = '(package(tessera-term) & binary(=rect) & test(b02_)) | (package(tessera-term) & binary(=rect_fixes) & (test(a_self_copy_of_a_screen_of_clusters_) | test(a_shifted_partial_copy_over_clusters_))) | (package(tessera-config) & binary(=edit) & test(=an_edit_among_many_mark_like_lines_is_fast))'
 test-group = 'timing'
 
+# Release-only cost ratios, also run by the gate's release timing step: a reload capture against a plain one (#412),
+# the alternate-screen carry of a full screen (#556, interleaved runs); and the ten-million-case DECFRA differential
+# (#556, no clock bar, but it holds one core for 14-27 s beside the bars).
+[[profile.default.overrides]]
+filter = '(package(tessera-app-core) & kind(lib) & test(a_reload_capture_costs_)) | (package(tessera-term) & binary(=stuck_modes) & test(=the_carry_of_a_full_screen_costs_a_tenth_more_at_most)) | (package(tessera-term) & binary(=rect_fixes) & test(=decfra_fills_like_printing_for_random_charset_states))'
+test-group = 'timing'
+
+# OZ01's linear-time bar on an OSC 4 query flood (#617): a 10N/N ratio of the thread's CPU time, as the DECSCUSR flood.
+[[profile.default.overrides]]
+filter = 'package(tessera-term) & binary(=osc_color) & test(=a_flood_of_queries_is_answered_in_linear_time)'
+test-group = 'timing'
+
 # The search cap test (#447, #489): a pass with a late piece keeps no copy, so under load it asserted on a stall rather
 # than on the cap (it failed 33 of 200 runs at load 35 before it fixed its budget); it still runs alone.
 [[profile.default.overrides]]

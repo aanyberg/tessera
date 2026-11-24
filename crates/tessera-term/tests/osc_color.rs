@@ -590,38 +590,67 @@ fn every_name_row() {
     check_fixture(NAMES_FIXTURE_NAME, NAMES_FIXTURE, 70, 3);
 }
 
-/// The quickest of three runs of `f`.
-fn best_of_three(mut f: impl FnMut()) -> Duration {
-    (0..3)
-        .map(|_| {
-            let start = Instant::now();
-            f();
-            start.elapsed()
-        })
-        .min()
-        .unwrap_or_default()
-}
-
-/// OZ01's "linear time": a million queries take about ten times as long
-/// as a hundred thousand (the bound, 30, leaves room for a loaded
-/// machine and is far below the hundredfold of a quadratic queue).
+/// OZ01's "linear time": ten times the queries cost about ten times as
+/// much.
+///
+/// The cost is the thread's CPU time (time spent preempted does not count,
+/// so a loaded machine cannot fail the bar the way it failed the wall
+/// clock, #617: 31x at load 78), and the two sizes are taken in turn, the
+/// small one the best of three, within each attempt. Linear cost reads
+/// about 10; the bar is 30, far below the hundredfold of a quadratic queue:
+/// a reply path that rescans the queued replies per query reads 100 or
+/// more and fails every attempt. The large run is fed `SMALL` queries at
+/// a time without taking the replies (so a rescan still sees all of them)
+/// and stops once it is over budget, so such a mutant fails in seconds. A
+/// large run that lands on a slower core than the small one can still read
+/// high, so up to five attempts are made and every ratio is printed.
 #[test]
 fn a_flood_of_queries_is_answered_in_linear_time() {
-    let unit = b"\x1b]4;1;?\x07";
-    let run = |n: usize| {
-        let bytes = unit.repeat(n);
-        best_of_three(|| {
-            let mut term = Terminal::new(24, 80);
-            term.advance(&bytes);
-            assert_eq!(term.take_requests().len(), n);
-        })
+    /// Queries in the small run, and in each piece of the large one.
+    const SMALL: usize = 5_000;
+    /// The large run's pieces: it holds ten times the small run's queries.
+    const PIECES: usize = 10;
+    const MAX_RATIO: u32 = 30;
+    const ATTEMPTS: usize = 5;
+    let piece = b"\x1b]4;1;?\x07".repeat(SMALL);
+    // Feeds up to `pieces` pieces to a fresh terminal, stopping once the
+    // CPU time passes `budget`, and takes the replies of a whole run: the
+    // CPU time used and the pieces fed.
+    let run = |pieces: usize, budget: Duration| {
+        let mut term = Terminal::new(24, 80);
+        let start = common::thread_cpu_time();
+        for fed in 1..=pieces {
+            term.advance(&piece);
+            if fed < pieces && common::thread_cpu_time().saturating_sub(start) > budget {
+                return (common::thread_cpu_time().saturating_sub(start), fed);
+            }
+        }
+        let replies = term.take_requests();
+        let took = common::thread_cpu_time().saturating_sub(start);
+        assert_eq!(replies.len(), pieces * SMALL);
+        (took, pieces)
     };
-    let small = run(100_000);
-    let large = run(1_000_000);
-    eprintln!("OSC 4 queries x 100 000: {small:?}, x 1 000 000: {large:?}");
-    assert!(
-        large < small * 30,
-        "1,000,000 queries took {large:?}, 100,000 took {small:?}"
+    let mut ratios = Vec::new();
+    for _ in 0..ATTEMPTS {
+        let small = (0..3)
+            .map(|_| run(1, Duration::MAX).0)
+            .min()
+            .expect("three runs");
+        let budget = small * MAX_RATIO;
+        let (large, fed) = run(PIECES, budget);
+        // A lower bound when the run stopped early.
+        let ratio = large.as_secs_f64() / small.as_secs_f64().max(f64::MIN_POSITIVE);
+        eprintln!(
+            "OSC 4 queries x {SMALL}: {small:?}, {fed} of {PIECES} pieces of them: {large:?}, ratio {ratio:.2}"
+        );
+        if fed == PIECES && large <= budget {
+            return;
+        }
+        ratios.push(ratio);
+    }
+    panic!(
+        "{} queries cost more than {MAX_RATIO}x {SMALL} in every attempt (at least): {ratios:.2?}",
+        PIECES * SMALL
     );
 }
 
