@@ -2960,16 +2960,7 @@ fn copy_span(lines: &mut [Line], src: usize, dst: usize, span: std::ops::Range<u
         (&tail[0], &mut head[dst])
     };
     to.cells[span.clone()].copy_from_slice(&from.cells[span.clone()]);
-    to.graphemes.remove_range(span.clone());
-    for (col, text) in from.graphemes.iter() {
-        if span.contains(&col) {
-            to.graphemes.set(col, text.into());
-        }
-    }
-    for (cols, link) in from.graphemes.link_runs() {
-        let cols = cols.start.max(span.start)..cols.end.min(span.end);
-        to.graphemes.set_link_range(cols, link);
-    }
+    to.graphemes.copy_span(&from.graphemes, span);
 }
 
 /// Turns a line that left the screen into a blank line of `cols` cells
