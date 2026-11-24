@@ -293,8 +293,53 @@ if [[ $- == *i* && -n "${TESSERA_SHELL_INTEGRATION-}" && "${TESSERA_SHELL_INTEGR
     # the same file; otherwise it writes no C and leaves the user's
     # descriptor alone. Plain `exec`: 3.2 drops the redirections of
     # `builtin exec` when it returns.
+    #
+    # A stat of /dev/fd/N fails now and then (EBADF) while another process
+    # stats its own N: XNU shares one fdesc node per number, and every
+    # integrated shell uses 59 and 58 (#611: under load, a command lost its
+    # C). So whether a descriptor is open is a dup (`: >&N`), not `-e`, and
+    # the copies count as different only when `-ef` says so 8 times running
+    # (about one try in 50 failed with 16 processes on one number).
     _tessera_si_out=
     _tessera_si_out2=
+    _tessera_si_same_out() {
+        builtin local try
+        for try in 1 2 3 4 5 6 7 8; do
+            [[ /dev/fd/$_tessera_si_out -ef /dev/fd/$_tessera_si_out2 ]] && builtin return 0
+        done
+        builtin return 1
+    }
+    # The probes below redirect, and bash 3.2 keeps a redirection whose
+    # saved copy of the descriptor it cannot make (it takes the lowest
+    # free one from 10 up; EMFILE): `{ : >&N; } 2>/dev/null` then left
+    # standard output on N and standard error on /dev/null for good (#611).
+    # So the copies are taken only while two of 10 to 19 are free, which
+    # covers those saves (two at a time at most); free is closed for `-e`
+    # 8 times running, as a stat fails now and then for an open one too,
+    # and below the soft limit (`ulimit -n 11` leaves 11 closed but not
+    # usable). Reading the limit takes a fork (+12% per prompt), so each
+    # of the two is dup'd onto instead: the first in plain sight (an error
+    # shows only when the limit is at most that number), the second with
+    # standard error on /dev/null: closed first, so that its saved copy
+    # lands on the first and /dev/null on 2 (`2>/dev/null` opens before it
+    # saves, and could take the first), then opened there (a message
+    # written to a closed standard error stays in bash's buffer and comes
+    # out with the next one).
+    _tessera_si_two_free() {
+        builtin local fd try first=
+        for fd in 10 11 12 13 14 15 16 17 18 19; do
+            for try in 1 2 3 4 5 6 7 8; do
+                [[ -e /dev/fd/$fd ]] && builtin continue 2
+            done
+            if [[ -n "$first" ]]; then
+                { exec 2>/dev/null; builtin eval "builtin : $fd>&1"; } 2>&-
+                builtin return
+            fi
+            builtin eval "builtin : $fd>&1" || builtin return 1
+            first=$fd
+        done
+        builtin return 1
+    }
     _tessera_si_close_out() {
         if [[ -n "$_tessera_si_out" ]]; then
             builtin eval "exec $_tessera_si_out>&- $_tessera_si_out2>&-"
@@ -304,9 +349,10 @@ if [[ $- == *i* && -n "${TESSERA_SHELL_INTEGRATION-}" && "${TESSERA_SHELL_INTEGR
     }
     _tessera_si_open_out() {
         _tessera_si_close_out
+        _tessera_si_two_free || builtin return 0
         builtin local fd first=
         for fd in 59 58 57 56 55 54 53 52 51 50; do
-            [[ -e /dev/fd/$fd ]] && continue
+            { builtin : >&"$fd"; } 2>/dev/null && continue
             { builtin eval "exec $fd>&1"; } 2>/dev/null || continue
             if [[ -z "$first" ]]; then
                 first=$fd
@@ -730,7 +776,7 @@ builtin eval "$_tessera_si_prev_trap" && _tessera_si_nop'
         # No `cmdline=`: the command line is the user's data (ADR 0021).
         if [[ -z "$_tessera_si_out" ]]; then
             builtin printf '\033]133;C\007'
-        elif [[ /dev/fd/$_tessera_si_out -ef /dev/fd/$_tessera_si_out2 ]]; then
+        elif _tessera_si_same_out; then
             builtin printf '\033]133;C\007' >&"$_tessera_si_out"
             _tessera_si_close_out
         fi

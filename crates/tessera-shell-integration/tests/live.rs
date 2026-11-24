@@ -355,9 +355,6 @@ fn wait_exit(pty: &mut NativePty, events: &PtyEvents, out: &mut Output) {
 enum Wait {
     /// Once this many prompts (OSC 133 A) have been drawn.
     Prompts(usize),
-    /// Once the shell has a child process with this name (so a signal
-    /// reaches it, not the shell between `C` and the fork).
-    Child(&'static str),
 }
 
 /// Whether the process `pid` has a child named `name`.
@@ -366,6 +363,25 @@ fn has_child(pid: u32, name: &str) -> bool {
         .args(["-P", &pid.to_string(), "-x", name])
         .output()
         .is_ok_and(|output| output.status.success())
+}
+
+/// Pumps output until the shell `pid` has a child named `name` (so a
+/// signal reaches it, not the shell between `C` and the fork). False after
+/// [`STEP_TIMEOUT`].
+fn pump_until_child(
+    pid: u32,
+    name: &str,
+    pty: &mut NativePty,
+    events: &PtyEvents,
+    out: &mut Output,
+) -> bool {
+    let deadline = Instant::now() + STEP_TIMEOUT;
+    while !has_child(pid, name) && Instant::now() < deadline {
+        while let Ok(PtyEvent::Output(bytes)) = events.recv_timeout(Duration::from_millis(20)) {
+            out.push(pty, &bytes);
+        }
+    }
+    has_child(pid, name)
 }
 
 /// Runs the case, typing [`INPUT`] one prompt (one OSC 133 A) at a time.
@@ -403,23 +419,10 @@ fn run_steps_via(case: &Case<'_>, steps: &[(Wait, &str)], route: Route) -> Obser
         answered: [0; ANSWERS.len()],
     };
     for &(wait, input) in steps {
-        let ready = match wait {
-            Wait::Prompts(n) => pump(&mut pty, &events, &mut out, |out| {
-                count(out, b"\x1b]133;A") >= n
-            }),
-            Wait::Child(name) => {
-                let pid = pty.child_pid().expect("the shell's pid");
-                let deadline = Instant::now() + STEP_TIMEOUT;
-                while !has_child(pid, name) && Instant::now() < deadline {
-                    while let Ok(PtyEvent::Output(bytes)) =
-                        events.recv_timeout(Duration::from_millis(20))
-                    {
-                        out.push(&mut pty, &bytes);
-                    }
-                }
-                has_child(pid, name)
-            }
-        };
+        let Wait::Prompts(n) = wait;
+        let ready = pump(&mut pty, &events, &mut out, |out| {
+            count(out, b"\x1b]133;A") >= n
+        });
         assert!(
             ready,
             "no {wait:?} within {STEP_TIMEOUT:?}; output so far: {:?}",
@@ -990,20 +993,46 @@ fn fish_sourcing_the_script_again_installs_one_hook_set() {
     check(&observed, "LZ", Shell::Fish, false);
 }
 
+/// Whether the process `pid` is asleep (`ps` state `S`, or `I` for a sleep
+/// of more than about 20 s): a shell that drew its whole prompt is then
+/// blocked reading the terminal.
+fn asleep(pid: u32) -> bool {
+    std::process::Command::new("/bin/ps")
+        .args(["-o", "state=", "-p", &pid.to_string()])
+        .output()
+        .is_ok_and(|output| matches!(output.stdout.first(), Some(b'S' | b'I')))
+}
+
+/// Pumps output until the shell `pid` is asleep with nothing new written
+/// in between (so it is blocked reading the terminal: a prompt's last mark
+/// can arrive before the shell reads, and zsh 5.9 loses a Ctrl-C that
+/// lands there, #615). False after [`STEP_TIMEOUT`].
+fn pump_until_reading(pid: u32, pty: &mut NativePty, events: &PtyEvents, out: &mut Output) -> bool {
+    let deadline = Instant::now() + STEP_TIMEOUT;
+    while Instant::now() < deadline {
+        let before = out.bytes.len();
+        while let Ok(PtyEvent::Output(bytes)) = events.recv_timeout(Duration::from_millis(10)) {
+            out.push(pty, &bytes);
+        }
+        if asleep(pid) && out.bytes.len() == before {
+            return true;
+        }
+    }
+    false
+}
+
 /// Fixture rows LY, C1-C3, C5, C6 and S9: an empty line and Ctrl-C at the
 /// prompt each close the prompt with a bare D (zsh reports 130 and bash 3.2
 /// the previous status there; the bare D hides the difference), and a
 /// command interrupted with Ctrl-C ends with D;130.
+///
+/// Each input goes in once the marks before it are all there (checked at
+/// every step) and the shell is reading the terminal: zsh 5.9 checks for
+/// an interrupt before its blocking read of the first key, so a Ctrl-C
+/// sent between the two is lost (#615).
 #[test]
 fn empty_lines_and_ctrl_c_close_with_a_bare_d() {
     use Mark::{CommandEnd, CommandStart, OutputStart, PromptStart};
-    let steps = [
-        (Wait::Prompts(1), "\r"),
-        (Wait::Prompts(2), "\x03"),
-        (Wait::Prompts(3), "sleep 20\r"),
-        (Wait::Child("sleep"), "\x03"),
-        (Wait::Prompts(4), "exit\r"),
-    ];
     let bare = CommandEnd { exit_code: None };
     let interrupted = CommandEnd {
         exit_code: Some(130),
@@ -1023,6 +1052,14 @@ fn empty_lines_and_ctrl_c_close_with_a_bare_d() {
         CommandStart,
         OutputStart,
     ];
+    // (marks before the input, wait for this child first, input)
+    let steps: [(usize, Option<&str>, &str); 5] = [
+        (2, None, "\r"),
+        (5, None, "\x03"),
+        (8, None, "sleep 20\r"),
+        (9, Some("sleep"), "\x03"),
+        (12, None, "exit\r"),
+    ];
     let mut cases = vec![(Shell::Zsh, PathBuf::from(ZSH), ".zshrc")];
     cases.extend(
         bashes()
@@ -1030,18 +1067,50 @@ fn empty_lines_and_ctrl_c_close_with_a_bare_d() {
             .map(|bash| (Shell::Bash, bash, ".bashrc")),
     );
     for (shell, program, rc) in cases {
-        let observed = run_steps(
-            &Case {
-                shell,
-                program: program.clone(),
-                args: Some(&["-i"]),
-                files: &[(rc, "")],
-                env: &[],
-            },
-            &steps,
+        let what = format!("{shell:?} {program:?}");
+        let prepared = prepare(&Case {
+            shell,
+            program: program.clone(),
+            args: Some(&["-i"]),
+            files: &[(rc, "")],
+            env: &[],
+        });
+        let (mut pty, events) = NativePty::spawn(&prepared.options).expect("spawn the shell");
+        let pid = pty.child_pid().expect("the shell's pid");
+        let mut out = Output {
+            bytes: Vec::new(),
+            answered: [0; ANSWERS.len()],
+        };
+        let marks_so_far = |bytes: &[u8]| marks(osc_payloads(bytes).iter().map(Vec::as_slice));
+        for (before, child, input) in steps {
+            let arrived = pump(&mut pty, &events, &mut out, |bytes| {
+                marks_so_far(bytes).len() >= before
+            });
+            let text = String::from_utf8_lossy(&out.bytes).into_owned();
+            assert!(
+                arrived,
+                "{what}: no {before} marks before {input:?}: {text:?}"
+            );
+            assert_eq!(
+                marks_so_far(&out.bytes),
+                want[..before],
+                "{what}: before {input:?}: {text:?}"
+            );
+            let ready = match child {
+                Some(name) => pump_until_child(pid, name, &mut pty, &events, &mut out),
+                None => pump_until_reading(pid, &mut pty, &events, &mut out),
+            };
+            assert!(ready, "{what}: not ready for {input:?}: {text:?}");
+            pty.write(input.as_bytes()).expect("type an input");
+        }
+        wait_exit(&mut pty, &events, &mut out);
+        let got = marks_so_far(&out.bytes);
+        assert_eq!(
+            got,
+            want,
+            "{what}: {:?}",
+            String::from_utf8_lossy(&out.bytes)
         );
-        let got = marks(observed.payloads.iter().map(Vec::as_slice));
-        assert_eq!(got, want, "{shell:?} {program:?}");
     }
 }
 
@@ -1811,6 +1880,176 @@ fn command_marks(c: bool, code: Option<i32>) -> Vec<Mark> {
     marks
 }
 
+/// Processes that keep running `[[ -e ]]` and `-ef` on /dev/fd/59 to 57
+/// of their own, at the lowest priority; dropped, they are killed and
+/// reaped. Each stops by itself once the test process is gone (`nice`
+/// execs bash, so `$PPID` is the test process), so a killed test leaves
+/// no spinning orphans behind. It looks every 100 rounds: a look every
+/// round left too few stats at the lowest priority to catch a single
+/// `-ef` try.
+struct FdStatters(Vec<std::process::Child>);
+
+impl FdStatters {
+    fn start(count: usize) -> Self {
+        let text = "exec 59>/dev/null 58>/dev/null 57>/dev/null
+                    while kill -0 $PPID 2>/dev/null; do
+                        for i in {1..100}; do
+                            [[ -e /dev/fd/59 ]]; [[ /dev/fd/58 -ef /dev/fd/57 ]]
+                        done
+                    done";
+        Self(
+            (0..count)
+                .map(|_| {
+                    std::process::Command::new("/usr/bin/nice")
+                        .args(["-n", "20", "/bin/bash", "-c", text])
+                        .stdin(std::process::Stdio::null())
+                        .spawn()
+                        .expect("start a statter")
+                })
+                .collect(),
+        )
+    }
+}
+
+impl Drop for FdStatters {
+    fn drop(&mut self) {
+        for child in &mut self.0 {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// #611: a stat of /dev/fd/N fails now and then (EBADF) while another
+/// process stats its own N (XNU shares one fdesc node per number; every
+/// integrated shell uses the same numbers). With processes doing that all
+/// the time, every command still gets its C (the copies were taken for a
+/// redirection, 1 command in 20 lost its C), and a descriptor of the
+/// user's is never taken for a free one (it was replaced and then closed).
+#[test]
+fn bash_marks_hold_while_other_processes_stat_the_same_descriptors() {
+    const COMMANDS: usize = 200;
+    let mut inputs = vec!["true\r"; COMMANDS];
+    inputs.push("echo kept-$((6*7)) >&59; /usr/bin/sed 's/^/file:/' \"$HOME/kept\"\r");
+    inputs.push("exit\r");
+    let steps: Vec<(Wait, &str)> = inputs
+        .iter()
+        .enumerate()
+        .map(|(i, input)| (Wait::Prompts(i + 1), *input))
+        .collect();
+    let _statters = FdStatters::start(10);
+    for bash in bashes() {
+        let observed = run_steps(
+            &Case {
+                shell: Shell::Bash,
+                program: bash.clone(),
+                args: Some(&["-i"]),
+                files: &[(".bashrc", "exec 59>\"$HOME/kept\"\n")],
+                env: &[],
+            },
+            &steps,
+        );
+        let text = String::from_utf8_lossy(&observed.output);
+        let what = bash.display();
+        assert!(
+            text.contains("file:kept-42\r\n"),
+            "{what}: the user's descriptor 59 was lost: {text:?}"
+        );
+        let got = marks(observed.payloads.iter().map(Vec::as_slice));
+        assert_eq!(got, marks_for(&[0; COMMANDS + 1]), "{what}: {text:?}");
+    }
+}
+
+/// #611 adversarial B1: with every descriptor from 10 up to the limit
+/// open (EMFILE), bash 3.2 cannot save standard output and error for a
+/// redirection and keeps the redirection for good, so a probe of a
+/// descriptor (`{ : >&50; } 2>/dev/null`) left the shell writing to the
+/// user's file at 50 with no prompt shown. At a limit of 64 and of 256
+/// (10 to 254: 255 is bash's terminal), and with only 10 free (one save
+/// at a time, the probe needs two), the shell's output stays on the
+/// terminal, every command gets its marks, and the user's file holds only
+/// what the user wrote to it. So they do after `ulimit -n 11` (10 and 11
+/// look free, but only 10 is below the limit), also with 5 to 9 open
+/// (#611 adversarial cycle 2). (Each prompt still prints bash's
+/// "cannot duplicate fd" twice, from the forked `trap -p` reader, as on
+/// main; that changes no descriptor of the shell.)
+#[test]
+fn bash_marks_hold_with_no_free_descriptor_from_ten_up() {
+    let user = "exec 50>>\"$HOME/userfile\"; echo user-line >&50";
+    let mut cases = Vec::new();
+    for (limit, ten) in [
+        (64, "exec 10</dev/null"),
+        (256, "exec 10</dev/null"),
+        (64, ":"),
+    ] {
+        let top = limit.min(255);
+        cases.push((
+            format!("a limit of {limit} ({ten})"),
+            format!("ulimit -n {limit}; {user}\r"),
+            format!(
+                "for ((i = 5; i < {top}; i++)); do [[ $i == 50 || $i == 10 ]] || \
+                 eval \"exec $i</dev/null\"; done 2>/dev/null; {ten}\r"
+            ),
+            format!(
+                "for ((i = 5; i < {top}; i++)); do [[ $i == 50 ]] || eval \"exec $i<&-\"; done\r"
+            ),
+        ));
+    }
+    for (fill, close) in [
+        ("", ":"),
+        (
+            "for i in 5 6 7 8 9; do eval \"exec $i</dev/null\"; done 2>/dev/null; ",
+            "for i in 5 6 7 8 9; do eval \"exec $i<&-\"; done",
+        ),
+    ] {
+        cases.push((
+            format!("ulimit -n 11 after {fill:?}"),
+            format!("{user}\r"),
+            format!("{fill}ulimit -n 11\r"),
+            format!("{close}\r"),
+        ));
+    }
+    for (label, open, fill, close) in &cases {
+        let inputs = [
+            open.as_str(),
+            fill.as_str(),
+            "echo visible-$((6*7))\r",
+            close.as_str(),
+            "while IFS= read -r l; do echo \"kept:$l\"; done < \"$HOME/userfile\"\r",
+            "exit\r",
+        ];
+        let steps: Vec<(Wait, &str)> = inputs
+            .iter()
+            .enumerate()
+            .map(|(i, input)| (Wait::Prompts(i + 1), *input))
+            .collect();
+        for bash in bashes() {
+            let observed = run_steps(
+                &Case {
+                    shell: Shell::Bash,
+                    program: bash.clone(),
+                    args: Some(&["-i"]),
+                    files: &[],
+                    env: &[],
+                },
+                &steps,
+            );
+            let text = String::from_utf8_lossy(&observed.output);
+            let what = format!("{} at {label}", bash.display());
+            assert!(text.contains("visible-42\r\n"), "{what}: {text:?}");
+            assert!(!text.contains("Bad file descriptor"), "{what}: {text:?}");
+            assert_eq!(
+                text.matches("kept:").count() - text.matches("kept:$l").count(),
+                1,
+                "{what}: the user's file got the shell's output: {text:?}"
+            );
+            assert!(text.contains("kept:user-line\r\n"), "{what}: {text:?}");
+            let got = marks(observed.payloads.iter().map(Vec::as_slice));
+            assert_eq!(got, marks_for(&[0; 5]), "{what}: {text:?}");
+        }
+    }
+}
+
 /// Output redirected to a file is byte for byte the command's: the C mark
 /// (written from the DEBUG trap, which fires inside the redirection of a
 /// compound command, and inside a subshell's under `set -T`) goes to the
@@ -1918,7 +2157,7 @@ fn bash_session_through_tee_gets_d_after_the_output() {
         got.truncate(10);
         let mut want = marks_for(&[0, 0]);
         want.truncate(10);
-        assert_eq!(got, want, "{what}");
+        assert_eq!(got, want, "{what}: {text:?}");
     }
 }
 
@@ -1979,7 +2218,7 @@ fn bash_pasted_lines_through_tee_keep_c_after_the_output() {
         got.truncate(10);
         let mut want = marks_for(&[0, 0]);
         want.truncate(10);
-        assert_eq!(got, want, "{what}");
+        assert_eq!(got, want, "{what}: {text:?}");
     }
 }
 
