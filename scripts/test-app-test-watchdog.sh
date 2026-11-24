@@ -49,13 +49,18 @@ cleanup() {
     local pids
     pids=($(ps -A -o pid=,args= | awk -v p="$work/" 'index($0, p) && $2 != "awk" { print $1 }'))
     (( ${#pids} )) && kill -KILL $pids 2>/dev/null
-    pids=($(cat "$work"/*/sleeps 2>/dev/null))
+    pids=($(cat "$work"/*/sleeps "$work"/*/hosts "$work"/*/user "$work"/silent-grandchild 2>/dev/null) ${bystander:-})
     (( ${#pids} )) && kill -KILL $pids 2>/dev/null
     rm -rf "$work"
 }
 trap cleanup EXIT
+# A signal to the self-test itself (Ctrl-C, a timeout) runs the EXIT trap too, so no fake host or UserTessera outlives it.
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 failures=0
+sec() { printf '%.1f' "$1"; }
 ok() { print -r -- "ok   $1"; }
 not_ok() { print -r -- "FAIL $1"; failures=$((failures + 1)); }
 
@@ -205,14 +210,16 @@ if [ "$tsan" = 27 ]; then
     # macOS 27 (CI run 44917832924, AppAppearanceTests): the main thread spawns a shell and forks; libobjc's atfork
     # handler waits on a lock while 71 workqueue threads wait in the runtime's allocator (two shown).
     tsan=0 forks=1
-    main="    +           900 Command::spawn  (in FakeHost) + 560  [0x0]
-    +             900 wrap_fork  (in libclang_rt.tsan_osx_dynamic.dylib) + 128  [0x0]
-    +               900 fork  (in libsystem_c.dylib) + 36  [0x0]
-    +                 900 libSystem_atfork_prepare  (in libSystem.B.dylib) + 44  [0x0]
-    +                   900 _objc_atfork_prepare  (in libobjc.A.dylib) + 568  [0x0]
-    +                     900 wrap_os_unfair_lock_lock_with_options  (in libclang_rt.tsan_osx_dynamic.dylib) + 236  [0x0]
-    +                       900 _os_unfair_lock_lock_slow  (in libsystem_platform.dylib) + 172  [0x0]
-    +                         900 __ulock_wait2  (in libsystem_kernel.dylib) + 8  [0x0]"
+    main="    +           900 AppDelegate.newWindow  (in FakeHost) + 100  [0x0]
+    +             900 TesseraApp.spawn  (in FakeHost) + 200  [0x0]
+    +               900 Command::spawn  (in FakeHost) + 560  [0x0]
+    +                 900 wrap_fork  (in libclang_rt.tsan_osx_dynamic.dylib) + 128  [0x0]
+    +                   900 fork  (in libsystem_c.dylib) + 36  [0x0]
+    +                     900 libSystem_atfork_prepare  (in libSystem.B.dylib) + 44  [0x0]
+    +                       900 _objc_atfork_prepare  (in libobjc.A.dylib) + 568  [0x0]
+    +                         900 wrap_os_unfair_lock_lock_with_options  (in libclang_rt.tsan_osx_dynamic.dylib) + 236  [0x0]
+    +                           900 _os_unfair_lock_lock_slow  (in libsystem_platform.dylib) + 172  [0x0]
+    +                             900 __ulock_wait2  (in libsystem_kernel.dylib) + 8  [0x0]"
     for t in 4 5; do
         extra="$extra${extra:+
 }    900 Thread_$t
@@ -346,7 +353,8 @@ limit=$TESSERA_APP_TEST_HANG_SECONDS
 # (`set -o pipefail; ... 2>&1 | tee <log> | tail -5 || { ...; exit 1 }`). An alarm ends a watchdog that has not
 # returned after 120 s; its monitor then stops the fake on its own. The cases run at once, each with its own hosts.
 # $4 holds options: `user` starts a UserTessera under the case's products path first, in a process group of its own;
-# `fork` makes the host a ForkHost and `ps` slow; `ps` puts the fake `ps` on the watchdog's PATH; `samplehang` makes `sample` hang.
+# `scaled` gives the run a hang limit that grows with the load (`scaled_limit`: the TSan rerun rows do more work per
+# attempt than the limit alone covers on a loaded machine); `fork` makes the host a ForkHost and `ps` slow; `ps` puts the fake `ps` on the watchdog's PATH; `samplehang` makes `sample` hang.
 start_case() {
     local w="$work/$1" opts=" ${4:-} " case_path="$PATH"
     mkdir -p "$w/DerivedData/Build/Products/Debug"
@@ -354,12 +362,13 @@ start_case() {
     [[ "$opts" != *" fork "* ]] || cp "$work/bin/ForkHost" "$w/DerivedData/Build/Products/Debug/FakeHost"
     [[ "$opts" != *" user "* ]] || start_user "$w"
     [[ "$opts" != *" ps "* ]] || case_path="$work/psbin:$PATH"
-    local hang_sample="" pause="" ps_delay="" sample_secs=60
+    local hang_sample="" pause="" ps_delay="" sample_secs=60 hang_secs="$TESSERA_APP_TEST_HANG_SECONDS"
+    [[ "$opts" != *" scaled "* ]] || hang_secs="$scaled_limit"
     [[ "$opts" != *" samplehang "* ]] || { hang_sample=1; sample_secs=3; }
     [[ "$opts" != *" fork "* ]] || { pause=0.2; ps_delay=0.2; }
     (
         local start=$SECONDS st=0
-        FAKE_WORK="$w" FAKE_RUNS="$2" FAKE_SAMPLE_TSAN="$3" FAKE_SAMPLE_HANG="$hang_sample" FAKE_SAMPLE_PAUSE="$pause" FAKE_PS_DELAY="$ps_delay" TESSERA_APP_TEST_SAMPLE_SECONDS="$sample_secs" PATH="$case_path" zsh -cu "set -o pipefail; perl -e 'alarm shift; exec @ARGV' 120 \
+        FAKE_WORK="$w" FAKE_RUNS="$2" FAKE_SAMPLE_TSAN="$3" FAKE_SAMPLE_HANG="$hang_sample" FAKE_SAMPLE_PAUSE="$pause" FAKE_PS_DELAY="$ps_delay" TESSERA_APP_TEST_SAMPLE_SECONDS="$sample_secs" TESSERA_APP_TEST_HANG_SECONDS="$hang_secs" PATH="$case_path" zsh -cu "set -o pipefail; perl -e 'alarm shift; exec @ARGV' 120 \
             zsh ${(q)watchdog} --sample-log ${(q)w}/sample.log xcodebuild test -scheme Fake -only-testing:FakeTests -skip-testing:FakeTests/SlowTests -derivedDataPath ${(q)w}/DerivedData \
             2>&1 | tee ${(q)w}/out | tail -5 || { echo 'xcodebuild test failed' >&2; exit 1 }" > "$w/tail" 2>&1 || st=$?
         print -r -- "$st $(( SECONDS - start ))" > "$w/result"
@@ -486,6 +495,8 @@ start_direct passes "TESSERA_APP_TEST_IDLE_SECONDS=6" - zsh -c 'echo fine'
 # through `ps`, which a loaded machine slows. Each command still runs past its own limit.
 idle_scale=$(( slack / 10 ))
 spinner_idle=$(( 4 * idle_scale )) spinner_secs=$(( 4 * idle_scale + 5 ))
+# At most 25 s: the rerun rows run two attempts, and each case has a 120 s alarm.
+scaled_limit=$(( limit * idle_scale > 25 ? 25 : limit * idle_scale ))
 chat_idle=$(( 6 * idle_scale )) chat_ticks=$(( 3 * idle_scale + 2 ))
 # One process spinning without a byte of output, past its idle limit: only its CPU time is progress (a bounded single
 # process, no load generator). Time::HiRes: the core `time` is whole seconds, which cuts the spin short by up to 1 s.
@@ -505,15 +516,15 @@ start_case sample-hang hang,pass 0 samplehang
 start_case reuse hang,pass 0 "user ps"
 start_case continue hang-continue 0
 start_case stuck hang-stuck 0
-start_case tsan-pass hang,pass 1
-start_case tsan-macos15 hang,pass 15
-start_case tsan-macos27 hang,pass 27
-start_case tsan-other hang-fail,pass 1
-start_case tsan-unlisted hang-unlisted,pass 1
-start_case tsan-stuck hang-stuck,pass 1
-start_case tsan-twice hang,hang 1
-start_case mixed hang-hang,pass 1,0
-start_case mixed-reversed hang-hang,pass 0,1
+start_case tsan-pass hang,pass 1 scaled
+start_case tsan-macos15 hang,pass 15 scaled
+start_case tsan-macos27 hang,pass 27 scaled
+start_case tsan-other hang-fail,pass 1 scaled
+start_case tsan-unlisted hang-unlisted,pass 1 scaled
+start_case tsan-stuck hang-stuck,pass 1 scaled
+start_case tsan-twice hang,hang 1 scaled
+start_case mixed hang-hang,pass 1,0 scaled
+start_case mixed-reversed hang-hang,pass 0,1 scaled
 wait
 
 # --- hangs below the test level: exit 97, a one-line message saying HANG, a diagnostic, only this run's processes killed
@@ -524,7 +535,7 @@ direct dead
 if (( st == 97 && secs <= 2 * limit + slack )) && [[ "$err" == *"FAILED: -[FakeTests.HangTests testHangs] ran longer than 5 s"* ]]; then
     ok "a test host that died mid-test (xcodebuild waits silently) is caught by the test clock: exit 97 within twice the limit"
 else
-    not_ok "a dead host mid-test: exit $st after ${secs} s: $err"
+    not_ok "a dead host mid-test: exit $st after $(sec "$secs") s: $err"
 fi
 check_no_strays "a dead host mid-test"
 
@@ -535,7 +546,7 @@ if (( st == 97 && secs <= 6 + slack )) && [[ "$err" == *"HANG: no output and no 
     && grep -q "== sample of pid" "$w/sample.log"; then
     ok "a host that died before any test started is caught by the idle limit: exit 97, one HANG line, sample and last output lines kept"
 else
-    not_ok "a dead host before the first test: exit $st after ${secs} s: $err; log: $(cat "$w/sample.log" 2>/dev/null)"
+    not_ok "a dead host before the first test: exit $st after $(sec "$secs") s: $err; log: $(cat "$w/sample.log" 2>/dev/null)"
 fi
 check_no_strays "a dead host before the first test"
 
@@ -543,7 +554,7 @@ direct chatty
 if (( st == 97 && secs <= 6 + slack )) && [[ "$err" == *"HANG: the run lasted more than 6 s (TESSERA_APP_TEST_HARD_SECONDS)"* ]]; then
     ok "a run that keeps printing is ended by the hard limit: exit 97"
 else
-    not_ok "the hard limit: exit $st after ${secs} s: $err"
+    not_ok "the hard limit: exit $st after $(sec "$secs") s: $err"
 fi
 check_no_strays "the hard limit"
 
@@ -554,7 +565,7 @@ if (( st == 97 && secs <= 6 + slack )) && [[ "$err" == *"HANG: no output and no 
     && ! alive "$gc" && [[ -z "$(ps -A -o args= | grep -E '^sleep 30[23]$')" ]]; then
     ok "a silent command that ignores SIGTERM, with a grandchild in its own process group, is killed with all its processes"
 else
-    not_ok "a silent command: exit $st after ${secs} s, grandchild $gc alive=$(alive "$gc" && echo yes || echo no): $err"
+    not_ok "a silent command: exit $st after $(sec "$secs") s, grandchild $gc alive=$(alive "$gc" && echo yes || echo no): $err"
 fi
 if alive "$bystander" && ps -o args= -p "$bystander" | grep -q "sleep 301"; then
     ok "an unrelated process running at the same time is left alone"
@@ -576,17 +587,17 @@ else
     not_ok "a passing command: exit $st: $out / $err"
 fi
 direct slow-chat
-if (( st == 0 && secs >= 2 * chat_ticks - 1 && 2 * chat_ticks > chat_idle )) && [[ "$err" != *HANG* ]]; then
+if (( st == 0 && secs >= 2 * chat_ticks - 1 && secs > chat_idle )) && [[ "$err" != *HANG* && "$out" == *"tick $chat_ticks"* ]]; then
     ok "a command that outlasts the idle limit but keeps printing is not a hang"
 else
-    not_ok "a chatty command: exit $st after ${secs} s (${chat_ticks} ticks, idle limit ${chat_idle} s): $err"
+    not_ok "a chatty command: exit $st after $(sec "$secs") s (${chat_ticks} ticks, idle limit ${chat_idle} s): $err"
 fi
 
 direct spinner
-if (( st == 0 && secs >= spinner_secs && spinner_secs > spinner_idle )) && [[ "$err" != *HANG* && "$out" != *HANG* ]]; then
+if (( st == 0 && secs >= spinner_secs && secs > spinner_idle )) && [[ "$err" != *HANG* && "$out" != *HANG* ]]; then
     ok "a silent command that keeps using CPU for longer than the idle limit is not a hang (CPU progress)"
 else
-    not_ok "a silent spinner: exit $st after ${secs} s (spin ${spinner_secs} s, idle limit ${spinner_idle} s): $out $err"
+    not_ok "a silent spinner: exit $st after $(sec "$secs") s (spin ${spinner_secs} s, idle limit ${spinner_idle} s): $out $err"
 fi
 
 # --- all tests pass
@@ -601,15 +612,15 @@ load_case slow-results
 if (( st == 0 && secs >= 7 )) && [[ ! -e "$w/sample.log" && "$out" != *watchdog* ]]; then
     ok "the clock stops at the run's last suite result: writing the results for longer than the limit is no hang"
 else
-    not_ok "results written after the limit: exit $st after ${secs} s: $out"
+    not_ok "results written after the limit: exit $st after $(sec "$secs") s: $out"
 fi
 
 # --- a hang outside the TSan runtime: killed, named, sampled, not retried
 load_case hang
 if (( st != 0 && secs <= limit + slack )); then
-    ok "a hang that ignores SIGTERM ends within the limit + ${slack} s (${secs} s, exit $st)"
+    ok "a hang that ignores SIGTERM ends within the limit + ${slack} s ($(sec "$secs") s, exit $st)"
 else
-    not_ok "a hang: exit $st after ${secs} s (limit ${limit} s + ${slack} s)"
+    not_ok "a hang: exit $st after $(sec "$secs") s (limit ${limit} s + ${slack} s)"
 fi
 if [[ "$tail" == *"FAILED: -[FakeTests.HangTests testHangs] ran longer than 5 s"*"TESSERA_APP_TEST_HANG_SECONDS=5"* ]]; then
     ok "the recipe fails and its tail names the hung test and the limit"
@@ -633,9 +644,9 @@ check_user_survives "a hang"
 # --- Ctrl-C: the hosts are killed, a process that predates the run is not
 load_case interrupt
 if (( st != 0 && secs <= limit + slack )) && [[ "$(hosts)" == 1 ]]; then
-    ok "SIGINT to the watchdog's process group ends the run (exit $st, ${secs} s)"
+    ok "SIGINT to the watchdog's process group ends the run (exit $st, $(sec "$secs") s)"
 else
-    not_ok "SIGINT: exit $st after ${secs} s, $(hosts) hosts: $out"
+    not_ok "SIGINT: exit $st after $(sec "$secs") s, $(hosts) hosts: $out"
 fi
 check_no_strays "SIGINT"
 check_user_survives "SIGINT"
@@ -646,9 +657,9 @@ for pair in INT:130 TERM:143 HUP:129 ALRM:142; do
     load_case "sig-$sig"
     leftover=("$w"/tmp/*(N))
     if (( st == code && secs <= limit + slack )) && [[ "$(hosts)" == 1 && ${#leftover} == 0 ]]; then
-        ok "SIG$sig to the wrapper alone exits $code, kills the host and removes the state directory (${secs} s)"
+        ok "SIG$sig to the wrapper alone exits $code, kills the host and removes the state directory ($(sec "$secs") s)"
     else
-        not_ok "SIG$sig: exit $st (want $code) after ${secs} s, $(hosts) hosts, left in TMPDIR: ${leftover}: $out"
+        not_ok "SIG$sig: exit $st (want $code) after $(sec "$secs") s, $(hosts) hosts, left in TMPDIR: ${leftover}: $out"
     fi
     check_no_strays "SIG$sig to the wrapper alone"
 done
@@ -658,9 +669,9 @@ load_case hang-after
 if (( st != 0 && secs <= limit + slack )) && [[ "$(runs)" == 1 && "$out" != *retried* && "$out" != *rerunning* \
     && "$tail" == *"FAILED: the test host kept running for more than 5 s after the run's last test result (TESSERA_APP_TEST_HANG_SECONDS=5)"* ]] \
     && grep -q "Analysis of sampling FakeHost (pid $(head -1 "$w/hosts"))" "$w/sample.log"; then
-    ok "a host still alive more than the limit after the last suite line is sampled and killed, and the run fails (${secs} s)"
+    ok "a host still alive more than the limit after the last suite line is sampled and killed, and the run fails ($(sec "$secs") s)"
 else
-    not_ok "a host that outlives the run: exit $st after ${secs} s, $(runs) runs: $out"
+    not_ok "a host that outlives the run: exit $st after $(sec "$secs") s, $(runs) runs: $out"
 fi
 check_no_strays "a host that outlives the run"
 
@@ -679,9 +690,9 @@ load_case sample-hang
 sample_pid="$(head -1 "$w/sample-pids" 2>/dev/null)"
 if (( st != 0 && secs <= limit + 3 + slack )) && [[ -n "$sample_pid" ]] && ! kill -0 "$sample_pid" 2>/dev/null \
     && grep -q "sample timed out after 3 s" "$w/sample.log" && [[ "$tail" == *"FAILED: -[FakeTests.HangTests testHangs] ran longer than 5 s"* ]]; then
-    ok "a sample that does not return is killed after 3 s and the log says so (${secs} s)"
+    ok "a sample that does not return is killed after 3 s and the log says so ($(sec "$secs") s)"
 else
-    not_ok "a hanging sample: exit $st after ${secs} s, sample pid '$sample_pid': $out"
+    not_ok "a hanging sample: exit $st after $(sec "$secs") s, sample pid '$sample_pid': $out"
 fi
 check_no_strays "a hanging sample"
 
@@ -702,7 +713,7 @@ if (( st != 0 && secs <= limit + 6 + slack )) && [[ "$(runs)" == 1 && "$(hosts)"
     && "$out" != *"no test started"* ]]; then
     ok "after the kill xcodebuild's restarted run goes on past the limit to its end, and the run fails naming the hang"
 else
-    not_ok "a hang then a restarted run: exit $st after ${secs} s, $(runs) runs, $(hosts) hosts: $out"
+    not_ok "a hang then a restarted run: exit $st after $(sec "$secs") s, $(runs) runs, $(hosts) hosts: $out"
 fi
 check_no_strays "a hang then a restarted run"
 
@@ -710,9 +721,9 @@ check_no_strays "a hang then a restarted run"
 load_case stuck
 if (( st != 0 && secs <= 2 * limit + slack )) && [[ "$(hosts)" == 2 \
     && "$out" == *"no test started within 5 s after the host was killed"*"FAILED: -[FakeTests.HangTests testHangs]"* ]]; then
-    ok "a run that starts no test after the kill is stopped within twice the limit + ${slack} s (${secs} s)"
+    ok "a run that starts no test after the kill is stopped within twice the limit + ${slack} s ($(sec "$secs") s)"
 else
-    not_ok "a run stuck after the kill: exit $st after ${secs} s, $(hosts) hosts: $out"
+    not_ok "a run stuck after the kill: exit $st after $(sec "$secs") s, $(hosts) hosts: $out"
 fi
 check_no_strays "a run stuck after the kill"
 
@@ -781,7 +792,7 @@ check_no_strays "a TSan hang whose run is stopped"
 
 load_case tsan-twice
 if (( st != 0 )) && [[ "$(runs)" == 2 \
-    && "$tail" == *"FAILED: TSan hang in -[FakeTests.HangTests testHangs] (#278), retried, and -[FakeTests.HangTests testHangs] ran longer than 5 s"* ]] \
+    && "$tail" == *"FAILED: TSan hang in -[FakeTests.HangTests testHangs] (#278), retried, and -[FakeTests.HangTests testHangs] ran longer than ${scaled_limit} s"* ]] \
     && [[ "$(grep -c '^=== .* attempt [12]:' "$w/sample.log")" == 2 ]]; then
     ok "a second TSan hang, in the rerun, fails, keeping both samples"
 else
@@ -792,7 +803,7 @@ check_no_strays "two TSan hangs"
 # --- a TSan hang and a hang outside the runtime in one attempt: each is classified on its own sample
 load_case mixed
 if (( st != 0 )) && [[ "$(runs)" == 1 && "$out" != *retried* && "$out" != *rerunning* \
-    && "$tail" == *"FAILED: -[FakeTests.HangTests testHangsToo] ran longer than 5 s (TESSERA_APP_TEST_HANG_SECONDS=5)"* ]]; then
+    && "$tail" == *"FAILED: -[FakeTests.HangTests testHangsToo] ran longer than ${scaled_limit} s (TESSERA_APP_TEST_HANG_SECONDS=${scaled_limit})"* ]]; then
     ok "a TSan hang then a hang outside the runtime fails without a rerun, naming the second"
 else
     not_ok "a TSan hang then another hang: exit $st, $(runs) runs: $out"
@@ -801,7 +812,7 @@ check_no_strays "a TSan hang then another hang"
 
 load_case mixed-reversed
 if (( st != 0 )) && [[ "$(runs)" == 1 && "$out" != *rerunning* \
-    && "$tail" == *"FAILED: -[FakeTests.HangTests testHangs] ran longer than 5 s (TESSERA_APP_TEST_HANG_SECONDS=5)"* ]]; then
+    && "$tail" == *"FAILED: -[FakeTests.HangTests testHangs] ran longer than ${scaled_limit} s (TESSERA_APP_TEST_HANG_SECONDS=${scaled_limit})"* ]]; then
     ok "a hang outside the runtime then a TSan hang fails without a rerun, naming the first"
 else
     not_ok "another hang then a TSan hang: exit $st, $(runs) runs: $out"
