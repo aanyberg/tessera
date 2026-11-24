@@ -91,7 +91,7 @@ use crate::rich_text::{RunStyle, Styled};
 pub use crate::smart_engine::{
     SMART_FALLBACK_UNITS, SMART_RULE_ATTEMPT_BOUND, SMART_RULE_CACHE_BYTES,
 };
-use crate::smart_engine::{Scanned, SmartEngines};
+use crate::smart_engine::{Scanned, SearchCost, SmartEngines};
 use crate::url::{self, MAX_URL_LEN};
 
 /// The characters besides Unicode alphanumerics that a double-click
@@ -664,15 +664,27 @@ fn trim_url(text: &str, span: Range<usize>) -> Range<usize> {
 }
 
 /// The wall time one double-click gives its smart-selection rules (#351
-/// m1, #433): checked before each rule and after each match a rule finds,
-/// the first rule included. A rule not started within it is skipped, and
-/// one that has spent it stops at the match it found. Rules are bounded in
-/// count and size (S5); this bounds them in time: a click costs at most the
-/// budget plus one match attempt, and an attempt at most
-/// [`SMART_RULE_ATTEMPT_BOUND`] (#518): the terminal and selection locks are
-/// held at most rules x (budget + attempt bound) per click, in practice the
-/// budget plus one attempt.
+/// m1, #433): checked before each rule, the first rule included, and after
+/// a match a rule finds when its search may have been costly (the first on
+/// a cold DFA cache, one that reset its cache, or the fallback's) or it is
+/// the click's [`SMART_CLOCK_STRIDE`]th, 2 x [`SMART_CLOCK_STRIDE`]th, ...
+/// match. A rule not started within it is skipped, and one that has spent
+/// it stops at the match where it reads that. Rules are bounded in count and size
+/// (S5); this bounds them in time: a click costs at most the budget plus
+/// one match attempt, at most [`SMART_RULE_ATTEMPT_BOUND`] (#518), plus
+/// fewer than [`SMART_CLOCK_STRIDE`] searches on cached DFA states (a pass
+/// over the window each, microseconds): the terminal and selection locks
+/// are held at most rules x (budget + attempt bound) per click, in practice
+/// the budget plus one attempt.
 pub const SMART_RULE_BUDGET: Duration = Duration::from_millis(50);
+
+/// How many matches of a click's smart-selection rules may pass between
+/// two reads of the clock for [`SMART_RULE_BUDGET`] (#557), when their
+/// searches ran on cached DFA states, none costly: a rule that
+/// matches at every character stops within the budget plus this many
+/// matches, and a click reads the clock about once per this many matches
+/// rather than after each one.
+pub const SMART_CLOCK_STRIDE: usize = 16;
 
 #[cfg(test)]
 thread_local! {
@@ -690,11 +702,15 @@ thread_local! {
     /// Test hook: how many matches the rules of the last [`smart_at`] on
     /// this thread found.
     static MATCHES_SEEN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Test hook: how many times [`rules_time`] ran on this thread.
+    static CLOCK_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// The time the rules of a click have taken: since `started`, plus in tests
 /// the charged cost of the `ran` rules finished and the `found` matches.
 fn rules_time(started: Instant, ran: usize, found: usize) -> Duration {
+    #[cfg(test)]
+    CLOCK_READS.with(|reads| reads.set(reads.get() + 1));
     #[cfg(test)]
     let elapsed = if WALL_CLOCK.with(std::cell::Cell::get) {
         started.elapsed()
@@ -728,10 +744,11 @@ fn rules_time(started: Instant, ran: usize, found: usize) -> Duration {
 /// rule matches there, or `pos` is past the end of its line's text or on
 /// padding.
 ///
-/// The rules share [`SMART_RULE_BUDGET`]: once it is spent, the rule
-/// running stops and the rules not yet started are skipped (one debug log
-/// with the counts, S8), and the best match found so far wins; with none
-/// the word is selected. Each rule's attempt is bounded on its own
+/// The rules share [`SMART_RULE_BUDGET`], its clock read every
+/// [`SMART_CLOCK_STRIDE`] matches and after each costly search: once it is
+/// spent, the rule running stops and the rules not yet started are skipped
+/// (one debug log with the counts, S8), and the best match found so far
+/// wins; with none the word is selected. Each rule's attempt is bounded on its own
 /// ([`SMART_RULE_ATTEMPT_BOUND`], #518): a rule that gives up or is over
 /// the fallback gate has no match for the click.
 fn smart_at(lines: &Lines<'_>, pos: Pos, engines: &SmartEngines) -> Option<(Pos, Pos)> {
@@ -757,7 +774,7 @@ fn smart_at(lines: &Lines<'_>, pos: Pos, engines: &SmartEngines) -> Option<(Pos,
         }
         // This rule's best, kept only when the rule's scan stands.
         let mut rule_best: Option<(Key, Range<usize>)> = None;
-        let scanned = engines.scan(index, &window.text, ascii, |one| {
+        let scanned = engines.scan(index, &window.text, ascii, |one, cost| {
             found += 1;
             if one.start >= click.end {
                 return ControlFlow::Break(());
@@ -769,7 +786,9 @@ fn smart_at(lines: &Lines<'_>, pos: Pos, engines: &SmartEngines) -> Option<(Pos,
             {
                 rule_best = Some(candidate);
             }
-            if rules_time(started, ran, found) >= SMART_RULE_BUDGET {
+            if (cost == SearchCost::Costly || found % SMART_CLOCK_STRIDE == 0)
+                && rules_time(started, ran, found) >= SMART_RULE_BUDGET
+            {
                 spent = true;
                 return ControlFlow::Break(());
             }
@@ -3235,10 +3254,13 @@ mod tests {
         assert!(ran < MAX_SMART_RULES, "{ran} rules ran in {fastest:?}");
     }
 
-    /// #433: the budget is checked after each match a rule finds, the
-    /// first rule included, so a rule with a match at every character
-    /// stops at the budget instead of running to the click. The cost of
-    /// each match is charged through the test hook.
+    /// #433, #557: the budget is checked after the matches a rule finds,
+    /// the first rule included, so a rule with a match at every character
+    /// stops within the budget plus [`SMART_CLOCK_STRIDE`] matches instead
+    /// of running to the click: on cached DFA states at the first
+    /// [`SMART_CLOCK_STRIDE`]th match past it, and at once after a costly
+    /// search (the first on a cold cache, or any of the fallback's). The
+    /// cost of each match is charged through the test hook.
     #[test]
     fn a_rule_with_many_matches_stops_at_the_budget() {
         let mut term = Terminal::new(2, 200);
@@ -3266,13 +3288,24 @@ mod tests {
             run(&lines, mid, &tiny, Duration::ZERO),
             (None, 1, SMART_SCAN_BEFORE + 2)
         );
-        // The first rule stops at the budget, at its tenth match.
+        // The cache is warm now. The budget is spent at the tenth match,
+        // and the first rule stops at the first read of the clock at or
+        // past it, within the stride.
+        let read_at = |spent: usize| spent.div_ceil(SMART_CLOCK_STRIDE) * SMART_CLOCK_STRIDE;
+        assert!(read_at(10) < 10 + SMART_CLOCK_STRIDE);
         assert_eq!(
             run(&lines, mid, &tiny, SMART_RULE_BUDGET / 10),
-            (None, 1, 10)
+            (None, 1, read_at(10))
         );
         assert_eq!(
             run(&lines, mid, &tiny, SMART_RULE_BUDGET * 10),
+            (None, 1, SMART_CLOCK_STRIDE)
+        );
+        // On a cold cache the first search is costly: the clock is read
+        // after its match, which spends the budget there.
+        let cold = smart_rules(&[("[a-z]", Precision::Normal)]);
+        assert_eq!(
+            run(&lines, mid, &cold, SMART_RULE_BUDGET * 10),
             (None, 1, 1)
         );
         // A later rule stops likewise, and the rules after it are skipped.
@@ -3283,7 +3316,26 @@ mod tests {
         ]);
         assert_eq!(
             run(&lines, mid, &later, SMART_RULE_BUDGET / 10),
-            (None, 2, 10)
+            (None, 2, read_at(10))
+        );
+        // Every match of the fallback (a Unicode `\B` on a window that is
+        // not ASCII) is costly: the rule stops at the tenth.
+        let mut term = Terminal::new(2, 200);
+        term.set_max_scrollback(1_000);
+        term.advance("\u{e9}".repeat(20_000).as_bytes());
+        let latin = Lines::of(term.grid());
+        let at = Pos {
+            line: latin.base + 50,
+            col: 100,
+        };
+        let fallback = smart_rules(&[(r"\x{e9}\B", Precision::Normal)]);
+        assert_eq!(
+            run(&latin, at, &fallback, Duration::ZERO).2,
+            SMART_SCAN_BEFORE + 2
+        );
+        assert_eq!(
+            run(&latin, at, &fallback, SMART_RULE_BUDGET / 10),
+            (None, 1, 10)
         );
         // The best match found before the budget ran out still wins.
         let mut term = Terminal::new(2, 40);
@@ -3312,6 +3364,33 @@ mod tests {
             (Some(path), 2, 2),
             "one match each"
         );
+    }
+
+    /// #557: on cached DFA states a click reads the clock once before each
+    /// rule and once every [`SMART_CLOCK_STRIDE`] matches, not after each
+    /// match; the first search on a cold cache adds one read.
+    #[test]
+    fn the_budget_clock_is_read_once_every_stride_matches() {
+        let mut term = Terminal::new(2, 200);
+        term.set_max_scrollback(1_000);
+        term.advance("a".repeat(20_000).as_bytes());
+        let lines = Lines::of(term.grid());
+        let mid = Pos {
+            line: lines.base + 50,
+            col: 100,
+        };
+        let every = smart_rules(&[(".", Precision::Normal)]);
+        let reads = || {
+            CLOCK_READS.with(|reads| reads.set(0));
+            let _ = charged_only(|| smart_at(&lines, mid, &every));
+            (
+                CLOCK_READS.with(std::cell::Cell::get),
+                MATCHES_SEEN.with(std::cell::Cell::get),
+            )
+        };
+        let matches = SMART_SCAN_BEFORE + 2;
+        assert_eq!(reads(), (2 + matches / SMART_CLOCK_STRIDE, matches), "cold");
+        assert_eq!(reads(), (1 + matches / SMART_CLOCK_STRIDE, matches), "warm");
     }
 
     /// #433, S5: the scan window holds at most [`SMART_SCAN_BYTES`] bytes,
@@ -3406,11 +3485,8 @@ mod tests {
         assert_eq!(smart_at(&lines, at, &rules), None);
     }
 
-    /// The hostile rules of #433 and their `\b(?:...)` forms, each with
-    /// whether it can select anything on the texts of
-    /// `hostile_smart_rules_are_refused_or_bounded` (one that cannot gives
-    /// up its attempt or scans the window once).
-    fn hostile_rules() -> Vec<(String, bool)> {
+    /// The hostile rules of #433 and their `\b(?:...)` forms.
+    fn hostile_rules() -> Vec<String> {
         use std::fmt::Write as _;
         let cap = tessera_config::MAX_SMART_RULE_PATTERN_LEN;
         let literals = |room: usize| {
@@ -3428,33 +3504,33 @@ mod tests {
         let rules = |room: usize| {
             [
                 // The rule of #433 and nested counted repetition.
-                (r"(?:[^X]{0,50}){0,20}X|a".to_owned(), false),
-                (r"(?:[a-z]{0,50}){0,20}X|a".to_owned(), false),
-                (r"(?:(?:a|b){0,50}){0,20}X|a".to_owned(), false),
+                r"(?:[^X]{0,50}){0,20}X|a".to_owned(),
+                r"(?:[a-z]{0,50}){0,20}X|a".to_owned(),
+                r"(?:(?:a|b){0,50}){0,20}X|a".to_owned(),
                 // An alternation of many literals.
-                (literals(room), true),
+                literals(room),
                 // A long Unicode class repetition (refused at load), and a
                 // short one.
-                (r"\p{L}{0,1000}X|a".to_owned(), true),
-                (r"\p{L}{0,20}X|a".to_owned(), true),
+                r"\p{L}{0,1000}X|a".to_owned(),
+                r"\p{L}{0,20}X|a".to_owned(),
                 // Many tiny matches.
-                (".".to_owned(), true),
+                ".".to_owned(),
                 // A pattern at the length cap.
-                (at_cap(room), true),
+                at_cap(room),
                 // A rule that never matches the combining text (#433 round
                 // 1), and the same with capture groups (#433 adversarial
                 // F1).
-                (r"(?:[e\x{301}]{0,60}){0,20}[XY]".to_owned(), false),
-                (r"(?:(e?)(\x{301}?)){0,2560}[XY]".to_owned(), false),
+                r"(?:[e\x{301}]{0,60}){0,20}[XY]".to_owned(),
+                r"(?:(e?)(\x{301}?)){0,2560}[XY]".to_owned(),
             ]
         };
-        let mut all: Vec<(String, bool)> = rules(cap).into();
+        let mut all: Vec<String> = rules(cap).into();
         // `\b(?:` and `)` add 6 bytes: the rules built to the cap are built
         // 6 bytes shorter for that form.
         all.extend(
             rules(cap - 6)
                 .into_iter()
-                .map(|(rule, matches)| (format!(r"\b(?:{rule})"), matches)),
+                .map(|rule| format!(r"\b(?:{rule})")),
         );
         all
     }
@@ -3464,10 +3540,18 @@ mod tests {
     /// refused at load with a warning naming its index, or a click in the
     /// middle of the line takes, on the thread's CPU clock and the fastest
     /// of three, at most [`SMART_RULE_BUDGET`] plus one attempt
-    /// ([`SMART_RULE_ATTEMPT_BOUND`], #518), and one attempt alone for a
-    /// rule that cannot select anything there. The CPU clock leaves out
-    /// preemption but not core speed. Release builds only: the bound is for
-    /// the shipped code.
+    /// ([`SMART_RULE_ATTEMPT_BOUND`], #518) when the rule finds matches on
+    /// that text, and one attempt alone when it finds none (it gives up its
+    /// attempt or scans the window once): each row's bar comes from the
+    /// matches its clicks found (#557). The CPU clock leaves out preemption
+    /// but not core speed. Release builds only: the bound is for the
+    /// shipped code. Measured on a 4+6-core M-series laptop (#557): every
+    /// row at most about 4 ms idle (rule 0 on ASCII 3.8 ms); under
+    /// `taskpolicy -b` (efficiency cores), full runs of all 125 rows took
+    /// at most 11.2 ms a row at a 1-minute load around 100 and 15.8 ms at
+    /// loads of 45-187, under a third of the 50 ms bar. No current row
+    /// exercises the bar choice (`matches > 0`): every row is far under
+    /// both bars.
     #[cfg(not(debug_assertions))]
     #[test]
     fn hostile_smart_rules_are_refused_or_bounded() {
@@ -3495,7 +3579,7 @@ mod tests {
             .collect();
         let cap = tessera_config::MAX_SMART_RULE_PATTERN_LEN;
         let mut refused = Vec::new();
-        for (index, (rule, can_match)) in hostile_rules().iter().enumerate() {
+        for (index, rule) in hostile_rules().iter().enumerate() {
             assert!(rule.len() <= cap, "rule {index}: {} bytes", rule.len());
             let toml = format!("[[selection.smart_rules]]\nregex = '''{rule}'''\n");
             let loaded = tessera_config::Config::from_toml_lenient(&toml).unwrap();
@@ -3521,17 +3605,19 @@ mod tests {
                     col: 100,
                 };
                 let mut fastest = Duration::MAX;
+                let mut matches = 0;
                 for _ in 0..3 {
                     let started = crate::thread_cpu_time();
                     let _ = smart_at(&lines, mid, &engines);
                     fastest = fastest.min(crate::thread_cpu_time().saturating_sub(started));
+                    matches = matches.max(MATCHES_SEEN.with(std::cell::Cell::get));
                 }
-                eprintln!("rule {index} on {text}: {fastest:?}");
-                let bar = if *can_match {
+                let bar = if matches > 0 {
                     SMART_RULE_BUDGET + SMART_RULE_ATTEMPT_BOUND
                 } else {
                     SMART_RULE_ATTEMPT_BOUND
                 };
+                eprintln!("rule {index} on {text}: {fastest:?}, {matches} matches, bar {bar:?}");
                 assert!(
                     fastest <= bar,
                     "rule {index} on {text}: fastest click {fastest:?}, over {bar:?}"
@@ -3615,7 +3701,7 @@ mod tests {
             .iter()
             .map(|&(p, _)| p.to_owned())
             .collect();
-        patterns.extend(hostile_rules().into_iter().map(|(rule, _)| rule));
+        patterns.extend(hostile_rules());
         patterns.extend(
             [
                 r"\b",
