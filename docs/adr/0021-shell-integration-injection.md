@@ -395,7 +395,7 @@ compound command's redirection, so `{ echo hi; } > f` ran it with `f` as
 standard output and the `C` mark landed in `f`. So the prompt hook, where
 standard output is the session's own stream, keeps two copies of it on
 private descriptors, the first two of 59 down to 50 that are not open
-(checked with `/dev/fd/N`; 63 and down are bash's process substitutions
+(checked with `/dev/fd/N`, a dup since #611, see below; 63 and down are bash's process substitutions
 and 255 its terminal descriptor; not bash 4.1's `{var}>&1`, which 3.2
 lacks and which picks 10 or above, the numbers users redirect). The trap
 writes `C` to the first copy and closes both before the user's command
@@ -433,6 +433,24 @@ counting as a failed command. bash 3.2 resets `PIPESTATUS` in any `DEBUG`
 trap, ours included (4 and later restore it): restoring it would take a
 pipeline of forked subshells before every command, so it is a documented
 limit of the script.
+
+**#611 (2026-11-24).** A stat of `/dev/fd/N` fails now and then (`EBADF`)
+while another process stats its own `N`: XNU shares one fdesc node per
+number, and every integrated shell uses the same numbers, so under load a
+free descriptor looked open or the two copies looked like different files
+and the line lost its `C`. Whether a descriptor is open is now a dup
+(`: >&N`) instead of `-e /dev/fd/N`, and the trap counts the copies as
+different files only when `-ef` says so on 8 tries running. A dup
+redirects, and bash 3.2 keeps a redirection whose saved copy it cannot
+make (no free descriptor from 10 up, EMFILE), which left standard output
+on the probed descriptor for good; so the copies are taken only while two
+of 10 to 19 are free (closed for `-e` 8 tries running), and otherwise `C`
+goes to standard output. Free also means below the soft limit (`ulimit -n
+11` left 11 closed but unusable, and standard output went to the user's
+descriptor 50). Reading the limit takes a fork in 3.2 (+12% per prompt), so
+each of the two is proven by a dup onto it instead, the second with standard
+error on `/dev/null`; a limit at or below the first free one from 10 still
+shows bash's error at each prompt.
 
 ## Amendment: bash keeps the user's DEBUG trap however the script is loaded (#542, 2026-11-19)
 
