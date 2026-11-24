@@ -147,14 +147,19 @@ done
 # Prints "<package> <binary or empty>" per binary, or one line with an empty binary, per alternative of a filter line.
 # Only `package(=x)`, `binary(=x)` and bare glob-free names (the default matcher is glob) are read. A `~x`, `/re/` or
 # `#glob` matcher, a bare name with glob metacharacters, and a negated or differenced term (`!`, `not`, `a - b`) are not
-# evaluated: nothing is printed and it exits 2 with the reason on stderr, so a filter that selects more or fewer
-# targets than this reads is never taken for the one it reads (#561).
+# evaluated: nothing is printed and the script exits 1 with the reason on stderr, so a filter that selects more or fewer
+# targets than this reads is never taken for the one it reads (#561). Any predicate other than package, binary, test
+# and kind (`deps(...)`, `rdeps(...)`, `all()`, ...) is refused the same way, naming the predicate (#590).
 filter_targets() {
     perl -e '
         my $e = $ARGV[0]; my ($d, $cur, @alt, @out) = (0, "");
         my $bad = sub { print STDERR "unreadable nextest filter `$e`: $_[0]; verify-branch.sh reads only package(=x), " .
             "binary(=x) and plain names. Rewrite the override in .config/nextest.toml in that form, or run the " .
             "load check for this target by hand.\n"; exit 2 };
+        # A predicate this reader does not model (deps, rdeps, all, ...) would widen or narrow the selection silently.
+        for my $name ($e =~ /\b([A-Za-z_]+)\s*\(/g) {
+            $bad->("predicate `$name(...)` is not read") unless $name =~ /^(?:package|binary|test|kind)$/;
+        }
         # Outside the arguments of a predicate only `&`, `|`, parentheses and predicates may appear.
         (my $rest = $e) =~ s/\b[a-z_]+\([^)]*\)//g;
         $bad->("negation") if $rest =~ /!|\bnot\b/;

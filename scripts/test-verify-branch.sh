@@ -181,6 +181,10 @@ unreadable_filters=(
     'package(tessera-grid) & not binary(edit)'
     'package(tessera-grid) - binary(edit)'
     '(package(=tessera-pty) & binary(=plugins)) | (package(tessera-grid) & binary(e?it))'
+    'deps(package(=tessera-grid)) & binary(=edit)'
+    'rdeps(package(=tessera-grid)) & binary(=edit)'
+    'package(=tessera-grid) & all()'
+    'package(=tessera-grid) & platform(host)'
 )
 n=0
 for f in "${unreadable_filters[@]}"; do
@@ -262,7 +266,9 @@ unreadable() {
     done
 }
 n=0
+what_count=0
 while IFS='|' read -r what; do
+    what_count=$((what_count + 1))
     n=$((n + 1))
     # The nth filter: the arrays differ in base under bash and zsh, so read it by position with sed.
     text="$(printf '%s\n' "${unreadable_filters[@]}" | sed -n "${n}p")"
@@ -277,7 +283,13 @@ a negated term (!)
 a negated term (not)
 a differenced term (a - b)
 one unreadable alternative among readable ones
+a deps() predicate
+an rdeps() predicate
+an all() predicate
+an unknown platform() predicate
 EOF2
+if [ "$what_count" -eq "${#unreadable_filters[@]}" ]; then ok "every unreadable filter has a label ($what_count)"
+else not_ok "unreadable labels ($what_count) differ from unreadable_filters (${#unreadable_filters[@]})"; fi
 list real-toml
 real_targets="tessera-app-core:lib${nl}tessera-app-core:plugins${nl}tessera-app-core:smart_selection${nl}tessera-app-core:theme${nl}tessera-config:edit${nl}tessera-config:reload${nl}tessera-config:watch_themes${nl}tessera-devtool:theme${nl}tessera-devwin:lib${nl}tessera-ffi:lifecycle${nl}tessera-ffi:surface${nl}tessera-pty:close${nl}tessera-render:device_loss${nl}tessera-render:shaping${nl}tessera-term:decscusr${nl}tessera-term:rect${nl}tessera-term:rect_fixes${nl}tessera-term:wide"
 expect 'the repository nextest.toml yields its exact targets' "$header${nl}$real_targets" --list-targets
