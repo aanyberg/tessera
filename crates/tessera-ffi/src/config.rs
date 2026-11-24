@@ -134,6 +134,7 @@ fn failure(function: &'static str, key: &str, error: &EditError) -> Failure {
         EditError::Invalid { .. } => (Error::Refused, "rejected by the loader"),
         EditError::Conflict => (Error::Conflict, "config.toml changed on disk"),
         EditError::ThemeExists { .. } => (Error::Conflict, "the theme file exists"),
+        EditError::NoSuchProfile { .. } => (Error::NoSuchProfile, "no profile of that name"),
         EditError::File(_) => (Error::Io, "file error"),
         _ => (Error::Io, "edit failed"),
     };
@@ -157,6 +158,19 @@ fn failure(function: &'static str, key: &str, error: &EditError) -> Failure {
 enum Change {
     Set(TomlValue),
     Remove,
+}
+
+/// What an edit is addressed to: a key path of the whole file, or a key
+/// path within the `[[profiles]]` entry of a name, the one of an ordinal
+/// among the entries of that name (#565).
+#[derive(Clone, Copy)]
+enum Target<'a> {
+    Key(&'a str),
+    InProfile {
+        name: &'a str,
+        ordinal: usize,
+        key: &'a str,
+    },
 }
 
 /// Held across every edit of `config.toml` from this process: two edits
@@ -185,7 +199,12 @@ pub(crate) fn open_config(app: &App) -> Result<PathBuf, String> {
 /// Opens `config.toml` (creating it and starting the watch when needed),
 /// applies `change` at `key`, checks the key map, and saves, holding
 /// [`EDIT_LOCK`].
-fn edit(function: &'static str, app: &App, key: &str, change: Change) -> Result<(), Failure> {
+fn edit(
+    function: &'static str,
+    app: &App,
+    target: Target<'_>,
+    change: Change,
+) -> Result<(), Failure> {
     let _edit = EDIT_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -195,7 +214,17 @@ fn edit(function: &'static str, app: &App, key: &str, change: Change) -> Result<
     // first watch may apply a newer one). A file deleted, moved or broken
     // since then would leave the index one past the editor's entries, and
     // the edit an append to `config.toml` (#312 B1): an index that names a
-    // file's profile in the applied configuration is refused too.
+    // file's profile in the applied configuration is refused too. A
+    // profile's key by name is looked up in the file being edited.
+    let key = match target {
+        Target::Key(key) => key,
+        Target::InProfile { name, ordinal, key } => {
+            return edit_locked(function, app, key, |editor| match change {
+                Change::Set(value) => editor.set_in_profile(name, ordinal, key, value),
+                Change::Remove => editor.remove_in_profile(name, ordinal, key).map(|_| ()),
+            });
+        }
+    };
     if let Ok(path) = key.parse::<KeyPath>()
         && let [Step::Key(first), Step::Index(index), ..] = path.steps()
         && first == "profiles"
@@ -277,11 +306,13 @@ fn edit_locked<T>(
 ///
 /// # Safety
 ///
-/// As for `tessera_config_set`.
+/// As for `tessera_config_set`; `profile`, when given, as for
+/// `tessera_config_set_profile`.
 #[expect(clippy::too_many_arguments, reason = "the C signature")]
 unsafe fn edit_export(
     function: &'static str,
     app: *mut App,
+    profile: Option<(*const u8, usize, usize)>,
     key: *const u8,
     key_len: usize,
     value: Option<(*const u8, usize)>,
@@ -309,6 +340,30 @@ unsafe fn edit_export(
                 "key path is not UTF-8",
             ));
         };
+        let name = match profile {
+            None => None,
+            Some((name, name_len, ordinal)) => {
+                // A loaded name is at most this long, so a longer one names
+                // no profile (S5).
+                if name_len > MAX_PROFILE_NAME_LEN {
+                    return Err(Failure::new(
+                        Error::InvalidArgument,
+                        "profile name too long",
+                    ));
+                }
+                // SAFETY: `name` is NULL or valid for `name_len` bytes.
+                let Some(name) = (unsafe { input(name, name_len) }) else {
+                    return Err(Failure::new(Error::NullPointer, "name is NULL"));
+                };
+                let Ok(name) = std::str::from_utf8(name) else {
+                    return Err(Failure::new(
+                        Error::InvalidArgument,
+                        "profile name is not UTF-8",
+                    ));
+                };
+                Some((name, ordinal))
+            }
+        };
         let change = match value {
             None => Change::Remove,
             Some((value, value_len)) => {
@@ -331,7 +386,11 @@ unsafe fn edit_export(
                 }
             }
         };
-        edit(function, app, key, change)
+        let target = match name {
+            None => Target::Key(key),
+            Some((name, ordinal)) => Target::InProfile { name, ordinal, key },
+        };
+        edit(function, app, target, change)
     })();
     match outcome {
         Ok(()) => Error::Ok,
@@ -506,6 +565,7 @@ pub unsafe extern "C" fn tessera_config_set(
             edit_export(
                 "tessera_config_set",
                 app,
+                None,
                 key,
                 key_len,
                 Some((value_json, value_len)),
@@ -548,6 +608,116 @@ pub unsafe extern "C" fn tessera_config_remove(
             edit_export(
                 "tessera_config_remove",
                 app,
+                None,
+                key,
+                key_len,
+                None,
+                msg,
+                msg_cap,
+                msg_len,
+            )
+        }
+    })
+}
+
+/// Sets the key path `key` (UTF-8, `key_len` bytes, at most 1024) within
+/// the `[[profiles]]` entry of `config.toml` named `name` (UTF-8, `name_len`
+/// bytes, at most `TESSERA_MAX_PROFILE_NAME_LEN`), the `ordinal`-th of
+/// the entries of that name in `tessera_config_json`'s `profiles` as the
+/// caller listed them, to the JSON value
+/// `value_json`, and saves the file (#565). `key` is a key path as after
+/// `profiles[N].` in `tessera_config_set` (`command`, `appearance.theme`).
+///
+/// The profile is looked up in the file as this call reads it, not in the
+/// configuration applied: an edit made before a hand edit of the file that
+/// added, removed or moved profiles is applied still lands on the profile
+/// it was made for. The entry edited is the `ordinal`-th (from 0, in file
+/// order) of the entries with the name, the caller counting the ones it
+/// listed before it, so of two entries with one name a hand edit of
+/// another profile does not move the edit onto the other one. Names
+/// compare byte for byte with the `name` of each entry, as written and as
+/// `tessera_config_json` lists it (`"Default"` for an entry without one).
+///
+/// Returns `TESSERA_ERROR_NO_SUCH_PROFILE` when fewer than `ordinal + 1`
+/// entries have the name (it was renamed or removed): nothing is written.
+/// `TESSERA_ERROR_INVALID_ARGUMENT` also for a name that is too long or
+/// not UTF-8, an empty `key`, or a name only a profile of `profiles/` has
+/// (`tessera_config_json`'s `"source"` is that file). Everything else as
+/// for `tessera_config_set`, including the other codes and the message.
+///
+/// Any thread (the app's background write queue), serialised with every
+/// other edit of `config.toml`.
+///
+/// # Safety
+///
+/// As for `tessera_config_set`; `name` must be `NULL` or valid for
+/// `name_len` bytes of reads.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tessera_config_set_profile(
+    app: *mut App,
+    name: *const u8,
+    name_len: usize,
+    ordinal: usize,
+    key: *const u8,
+    key_len: usize,
+    value_json: *const u8,
+    value_len: usize,
+    msg: *mut u8,
+    msg_cap: usize,
+    msg_len: *mut usize,
+) -> Error {
+    ffi_guard!("tessera_config_set_profile", {
+        // SAFETY: forwarded under the same contract.
+        unsafe {
+            edit_export(
+                "tessera_config_set_profile",
+                app,
+                Some((name, name_len, ordinal)),
+                key,
+                key_len,
+                Some((value_json, value_len)),
+                msg,
+                msg_cap,
+                msg_len,
+            )
+        }
+    })
+}
+
+/// Removes the key path `key` within the `[[profiles]]` entry named
+/// `name` of that `ordinal` from `config.toml`, or with an empty `key`
+/// (`key_len` 0) the entry itself, the later ones moving down, and saves
+/// the file (#565);
+/// `Ok` when the entry has nothing at `key` (then nothing is written).
+/// The profile is looked up as for `tessera_config_set_profile`, with
+/// its `TESSERA_ERROR_NO_SUCH_PROFILE`; everything else as for
+/// `tessera_config_remove`.
+///
+/// Any thread (the app's background write queue), as for
+/// `tessera_config_set_profile`.
+///
+/// # Safety
+///
+/// As for `tessera_config_set_profile`, without `value_json`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tessera_config_remove_profile(
+    app: *mut App,
+    name: *const u8,
+    name_len: usize,
+    ordinal: usize,
+    key: *const u8,
+    key_len: usize,
+    msg: *mut u8,
+    msg_cap: usize,
+    msg_len: *mut usize,
+) -> Error {
+    ffi_guard!("tessera_config_remove_profile", {
+        // SAFETY: forwarded under the same contract.
+        unsafe {
+            edit_export(
+                "tessera_config_remove_profile",
+                app,
+                Some((name, name_len, ordinal)),
                 key,
                 key_len,
                 None,
@@ -1015,7 +1185,8 @@ mod tests {
             ),
         };
         let value = || Change::Set(TomlValue::String("new_tab".into()));
-        let failure = edit("test", &app, "keys.\"cmd+\u{200B}\"", value()).unwrap_err();
+        let failure =
+            edit("test", &app, Target::Key("keys.\"cmd+\u{200B}\""), value()).unwrap_err();
         assert_eq!(failure.code, Error::Refused, "{}", failure.message);
         assert!(
             failure
@@ -1027,7 +1198,7 @@ mod tests {
         );
         // Refused by the key map (an unknown command), the same way.
         let bogus = Change::Set(TomlValue::String("bogus".into()));
-        let failure = edit("test", &app, "keys.\"cmd+j\"", bogus).unwrap_err();
+        let failure = edit("test", &app, Target::Key("keys.\"cmd+j\""), bogus).unwrap_err();
         assert_eq!(failure.code, Error::Refused, "{}", failure.message);
         assert!(
             failure.message.starts_with("`keys.\"cmd+j\"` refused: ")
@@ -1143,7 +1314,7 @@ mod tests {
         let config_before = std::fs::read(paths.config_file()).unwrap();
         let file_before = std::fs::read(&file).unwrap();
         let set = || Change::Set(TomlValue::String("/bin/sh".into()));
-        let failure = edit("test", &app, "profiles[1].command", set()).unwrap_err();
+        let failure = edit("test", &app, Target::Key("profiles[1].command"), set()).unwrap_err();
         // An edit the editor does not make, as for any unsupported one.
         assert_eq!(failure.code, Error::InvalidArgument, "{}", failure.message);
         assert!(
@@ -1155,8 +1326,27 @@ mod tests {
         );
         assert_eq!(std::fs::read(paths.config_file()).unwrap(), config_before);
         assert_eq!(std::fs::read(&file).unwrap(), file_before);
+        // By name too (#565): the file's profile is refused, not missing.
+        let by_name = Target::InProfile {
+            name: "work",
+            ordinal: 0,
+            key: "command",
+        };
+        for change in [set(), Change::Remove] {
+            let failure = edit("test", &app, by_name, change).unwrap_err();
+            assert_eq!(failure.code, Error::InvalidArgument, "{}", failure.message);
+            assert!(
+                failure
+                    .message
+                    .contains(tessera_config::edit::FILE_PROFILE_REFUSED),
+                "{}",
+                failure.message
+            );
+        }
+        assert_eq!(std::fs::read(paths.config_file()).unwrap(), config_before);
+        assert_eq!(std::fs::read(&file).unwrap(), file_before);
 
-        if let Err(failure) = edit("test", &app, "profiles[0].command", set()) {
+        if let Err(failure) = edit("test", &app, Target::Key("profiles[0].command"), set()) {
             panic!("{}", failure.message);
         }
         let saved = std::fs::read_to_string(paths.config_file()).unwrap();
@@ -1186,7 +1376,8 @@ mod tests {
         let before = std::fs::read(paths.config_file()).unwrap();
         let set = || Change::Set(TomlValue::String("/bin/meant-for-file".into()));
         for change in [set(), Change::Remove] {
-            let failure = edit("test", &app, "profiles[1].command", change).unwrap_err();
+            let failure =
+                edit("test", &app, Target::Key("profiles[1].command"), change).unwrap_err();
             assert_eq!(failure.code, Error::InvalidArgument, "{}", failure.message);
             assert!(
                 failure
@@ -1196,11 +1387,11 @@ mod tests {
                 failure.message
             );
         }
-        let failure = edit("test", &app, "profiles[1]", Change::Remove).unwrap_err();
+        let failure = edit("test", &app, Target::Key("profiles[1]"), Change::Remove).unwrap_err();
         assert_eq!(failure.code, Error::InvalidArgument, "{}", failure.message);
         assert_eq!(std::fs::read(paths.config_file()).unwrap(), before);
         // The entry itself is still edited.
-        if let Err(failure) = edit("test", &app, "profiles[0].command", set()) {
+        if let Err(failure) = edit("test", &app, Target::Key("profiles[0].command"), set()) {
             panic!("{}", failure.message);
         }
     }
@@ -1312,7 +1503,7 @@ mod tests {
         let refused = edit(
             "test",
             &app,
-            "profiles[1].name",
+            Target::Key("profiles[1].name"),
             Change::Set(TomlValue::String("Work Copy".into())),
         )
         .unwrap_err();

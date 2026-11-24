@@ -73,7 +73,8 @@ pub use app::{
 pub use callbacks::{Callbacks, MAX_REMOTE_HOST_LEN, RemoteKind};
 pub use config::{
     MAX_ADDED_PROFILE_KEYS, MAX_CONFIG_VALUE_LEN, MAX_THEME_PATH_LEN, THEME_ID_LEN,
-    tessera_config_add_profile, tessera_config_json, tessera_config_remove, tessera_config_set,
+    tessera_config_add_profile, tessera_config_json, tessera_config_remove,
+    tessera_config_remove_profile, tessera_config_set, tessera_config_set_profile,
     tessera_theme_import, tessera_theme_list,
 };
 pub use error::Error;

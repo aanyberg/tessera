@@ -319,6 +319,13 @@ public struct TesseraConfigEditError: Error, Sendable, Equatable {
         /// saved it), or an imported theme's file exists: nothing was
         /// written, the other change stays. `TESSERA_ERROR_CONFLICT`.
         case conflict
+        /// An edit addressed by a profile's name
+        /// (``TesseraConfigWriter/setProfile(named:ordinal:_:to:)``) found
+        /// no `[[profiles]]` entry of that name and ordinal in
+        /// `config.toml` as the edit read it (a hand edit renamed or
+        /// removed it): nothing was written.
+        /// `TESSERA_ERROR_NO_SUCH_PROFILE`.
+        case noSuchProfile
         /// A key path or value that does not parse, or an edit the editor
         /// does not make; for an import, a file that is not a colour
         /// scheme. `TESSERA_ERROR_INVALID_ARGUMENT`.
@@ -349,6 +356,7 @@ public struct TesseraConfigEditError: Error, Sendable, Equatable {
             switch status {
             case TESSERA_ERROR_REFUSED: .refused
             case TESSERA_ERROR_CONFLICT: .conflict
+            case TESSERA_ERROR_NO_SUCH_PROFILE: .noSuchProfile
             case TESSERA_ERROR_INVALID_ARGUMENT: .invalidArgument
             case TESSERA_ERROR_IO: .io
             default: .core(TesseraCoreError(status) ?? .unknown(rawValue: status.rawValue))
@@ -401,6 +409,43 @@ public final class TesseraConfigWriter: Sendable {
     /// - Throws: ``TesseraConfigEditError`` with the core's message.
     public func remove(_ key: String) throws(TesseraConfigEditError) {
         try edit(key: key, json: nil)
+    }
+
+    /// Sets `key`, a key path within a profile (`command`,
+    /// `appearance.theme`), of the `[[profiles]]` entry named `name`, the
+    /// `ordinal`-th (from 0) of the snapshot's profiles of that name, to
+    /// `value` and saves the file (`tessera_config_set_profile`). The
+    /// profile is looked up in `config.toml` as the core reads it for this
+    /// edit, under the lock every edit holds, so an edit made before a hand
+    /// edit inserted or removed another profile ahead of it still lands on
+    /// its profile (#565), and of two entries with one name the one shown.
+    ///
+    /// - Throws: ``TesseraConfigEditError``: `.noSuchProfile` when fewer
+    ///   than `ordinal + 1` entries have the name, `.invalidArgument` for
+    ///   a name past `TESSERA_MAX_PROFILE_NAME_LEN` bytes, a negative
+    ///   ordinal or a profile of `profiles/`, otherwise as ``set(_:to:)``.
+    public func setProfile(
+        named name: String, ordinal: Int, _ key: String, to value: TesseraConfigValue
+    ) throws(TesseraConfigEditError) {
+        guard let json = value.json else {
+            throw TesseraConfigEditError(.invalidArgument, message: "This value cannot be written.")
+        }
+        try edit(profile: name, ordinal: ordinal, key: key, json: json)
+    }
+
+    /// Removes `key`, a key path within the profile named `name`, so its
+    /// default applies again; an empty `key` removes the profile's entry
+    /// itself and moves the later ones down
+    /// (`tessera_config_remove_profile`). The profile, of that `ordinal`,
+    /// is looked up as for ``setProfile(named:ordinal:_:to:)``; nothing
+    /// happens when the key is not there.
+    ///
+    /// - Throws: ``TesseraConfigEditError``: `.noSuchProfile` as for
+    ///   ``setProfile(named:ordinal:_:to:)``, otherwise as ``remove(_:)``.
+    public func removeProfile(
+        named name: String, ordinal: Int, _ key: String
+    ) throws(TesseraConfigEditError) {
+        try edit(profile: name, ordinal: ordinal, key: key, json: nil)
     }
 
     /// Adds a profile to `config.toml` with `keys` set in it, in one edit
@@ -501,6 +546,42 @@ public final class TesseraConfigWriter: Sendable {
                         tessera_config_remove(
                             app, key.baseAddress, key.count, messageBuffer.baseAddress, messageBuffer.count,
                             &messageLength)
+                    }
+                }
+            }
+        }
+        guard status == TESSERA_ERROR_OK else {
+            throw TesseraConfigEditError(status, message: Self.text(message, messageLength))
+        }
+    }
+
+    private func edit(
+        profile name: String, ordinal: Int, key: String, json: String?
+    ) throws(TesseraConfigEditError) {
+        guard ordinal >= 0 else {
+            throw TesseraConfigEditError(.invalidArgument, message: "No such profile.")
+        }
+        let name = Array(name.utf8)
+        let key = Array(key.utf8)
+        let value = json.map { Array($0.utf8) }
+        var message = [UInt8](repeating: 0, count: Self.messageCapacity)
+        var messageLength = 0
+        let status = core.call { app in
+            name.withUnsafeBufferPointer { name in
+                key.withUnsafeBufferPointer { key in
+                    message.withUnsafeMutableBufferPointer { messageBuffer in
+                        if let value {
+                            value.withUnsafeBufferPointer { value in
+                                tessera_config_set_profile(
+                                    app, name.baseAddress, name.count, ordinal, key.baseAddress,
+                                    key.count, value.baseAddress, value.count, messageBuffer.baseAddress,
+                                    messageBuffer.count, &messageLength)
+                            }
+                        } else {
+                            tessera_config_remove_profile(
+                                app, name.baseAddress, name.count, ordinal, key.baseAddress,
+                                key.count, messageBuffer.baseAddress, messageBuffer.count, &messageLength)
+                        }
                     }
                 }
             }

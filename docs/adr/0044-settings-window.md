@@ -759,11 +759,9 @@ a profile's edit is unwritten (queued, running or waiting) the closed
 window keeps it (2 s after the close at most, as for an add or delete),
 so Settings opened again edits on with it rather than beside it.
 
-Not covered: the core reports `Conflict` only when the file changes during
-the edit call itself. Any profile's edit made after a hand save and before
-the watch applies it (the watch's debounce and its event latency) meets no
-conflict, so it still goes by index. Closing that needs the core to take
-the profile's identity with the edit.
+The limit this amendment named (an edit made after a hand save and before
+the watch applies it meets no conflict and went by index) is gone: the
+#565 amendment writes every profile's edit by the profile's name.
 
 ## Amendment: a held slider that sends the value from before a hand edit (#564, 2026-11-19)
 
@@ -821,3 +819,67 @@ of "The host's 64 ids" in the #489 amendment.
   for any list past the cap, an edit that takes a list at 64 past it is
   refused by the core (the pane refuses it first, as before), while
   turning one off in a list still past the cap is written.
+
+## Amendment: a profile's edit goes by its name (#565, 2026-11-24)
+
+This replaces the "Not covered" paragraph of the #549 amendment.
+
+- **The core finds the profile.** `ConfigEditor::set_in_profile(name,
+  ordinal, key, value)` and `remove_in_profile(name, ordinal, key)`
+  (tessera-config) take the profile's name, its ordinal among the
+  profiles of that name as the window listed them (0 for the first) and a
+  key path within the profile, and look the profile up in `config.toml`
+  as the edit reads it, under the lock every edit holds, so a hand edit
+  saved after the window listed the profiles and before the watch applied
+  it cannot move the edit to another profile. The entry edited is the
+  `ordinal`-th, in file order, of the entries whose written or loaded name
+  matches; an entry without a name counts as "Default", the name the
+  loader gives it and the window lists, also while the file does not
+  load. So of two entries named alike (a hand edit can write them) the
+  one shown is edited, also when a hand edit added or removed another
+  profile ahead of them, which an index would not survive (#565
+  adversarial cycle 1: the edit, or the delete, of the second landed on
+  the first). Only a hand edit that adds, removes or reorders entries of
+  that same name can still move it to its twin, which no address the
+  window holds tells apart. An empty key removes the entry. A name no
+  entry has, or fewer entries of it than the ordinal, is
+  `EditError::NoSuchProfile` and writes nothing; a profile of
+  `profiles/` of that name is refused as before (the core edits only
+  `config.toml`). The error's name passes through the S3 sanitiser of
+  other messages, and the FFI logs only its kind (S8).
+- **The C ABI.** New functions only: `tessera_config_set_profile` and
+  `tessera_config_remove_profile` take the name as bytes (at most
+  `TESSERA_MAX_PROFILE_NAME_LEN`, 128, UTF-8, checked before the file is
+  read, S5) and the ordinal, and follow `tessera_config_set` and
+  `_remove` otherwise (the key's bounds, the message buffer, S7). A
+  missing name is the new `TESSERA_ERROR_NO_SUCH_PROFILE` (11). TesseraKit
+  wraps them as `TesseraConfigWriter.setProfile(named:ordinal:_:to:)` and
+  `removeProfile(named:ordinal:_:)`, with `TesseraConfigEditError.Kind`
+  `.noSuchProfile`.
+- **Settings writes no profile by its index.** Every profile's edit (a
+  field, a rename, a delete, a retry of the #549 amendment, an edit queued
+  behind another on the write queue) is sent with the name the window
+  shows at its index when it is queued, a rename queued before it
+  included, since the queue writes that first, and with its ordinal: how
+  many rows before it have that name, those renames included. An edit
+  written again after a conflict keeps the name it was queued with (a
+  rename's own new name is pending by then), its ordinal counted again at
+  the row it is placed at. The key still names the
+  index, for the value shown and the message by the row until the
+  configuration applies, so the #549 wait still places a conflicted edit's
+  value at its profile's new row. An edit whose name the file no longer
+  has (a hand edit renamed or removed it) is dropped: for a value the
+  list shows the notice that the profile is no longer in `config.toml`,
+  and no message goes by the row at the old index, which may be another
+  profile's; a delete has nothing left to do and says nothing.
+- **A failed rename.** An edit queued behind a rename of its profile
+  addresses the new name, which a hand edit may have given another
+  profile. The write queue keeps the new names of the renames that failed
+  (until a rename to that name is written), and such an edit fails
+  unsent with its rename's error: a refusal shows by its row; a conflict
+  sends it to the #549 wait with the rename, which is written again first
+  (#565 critic round 1); if the rename applied while it waited, it is
+  placed by the new name (round 2). The same holds for a rename of an
+  earlier row whose old or new name is the edit's: the edit's ordinal
+  counted it, so once it failed the ordinal could be another profile's
+  of that name (adversarial cycle 2).

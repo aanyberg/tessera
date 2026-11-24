@@ -3303,6 +3303,7 @@ extension SettingsTests {
             sources.append(source)
             let model = SettingsModel(source: source, clock: clock)
             writer.respond = { call, _ in file.respond(call) }
+            writer.resolveProfile = { file.index(named: $0, ordinal: $1) }
             func apply() throws {
                 source.snapshot = TesseraConfigSnapshot(
                     generation: source.snapshot.generation + 1, config: try Self.json(file.json()))
@@ -3368,6 +3369,336 @@ extension SettingsTests {
                     "seed \(seed), \(profile.name):\n  " + (notes + file.log).joined(separator: "\n  "))
             }
         }
+    }
+
+    /// #565: an edit of a profile queued while an earlier one is on the
+    /// write queue, which meets a hand edit that inserts a profile first
+    /// (a `Conflict`), runs before that conflict comes back and before the
+    /// hand edit applies: it lands on its own profile by name, not on the
+    /// one now at its old index; the conflicted edit lands on its profile
+    /// once the hand edit applies, and no other profile is written.
+    func testAProfileEditQueuedBehindAConflictLandsOnItsProfileByName() async throws {
+        let file = HandEditedProfiles((0..<3).map { .init(name: "p\($0)", command: "/bin/orig\($0)") })
+        let clock = ManualClock()
+        let (model, source, writer) = try fakeModel(file.json(), clock: clock)
+        writer.respond = { call, _ in file.respond(call) }
+        writer.resolveProfile = { file.index(named: $0, ordinal: $1) }
+        file.arm(2)
+        // Both queued in one main-actor turn: the second is on the write
+        // queue before the first's conflict reaches the model.
+        model.set("profiles[1].command", .string("/bin/a"))
+        model.set("profiles[2].command", .string("/bin/b"))
+        try await waitUntil("both edits ran") { writer.calls.count == 2 }
+        XCTAssertEqual(
+            file.log,
+            ["hand edit: insert h1", "conflict: profiles[1].command = /bin/a", "written: profiles[3].command = /bin/b"],
+            "p2 is at index 3 after the hand edit")
+        XCTAssertEqual(file.profiles.map(\.command), [nil, "/bin/orig0", "/bin/orig1", "/bin/b"])
+        XCTAssertEqual(writer.profileNames, ["p1", "p2"])
+        // The hand edit applies: the conflicted edit is written again, at
+        // p1's new place.
+        try await Task.sleep(for: .milliseconds(30))
+        source.snapshot = TesseraConfigSnapshot(generation: 1, config: try Self.json(file.json()))
+        model.reload()
+        try await waitUntil("the retry ran") { writer.calls.count == 3 }
+        try await waitUntil("written") { !model.isWriting }
+        XCTAssertEqual(file.profiles.map(\.name), ["h1", "p0", "p1", "p2"])
+        XCTAssertEqual(file.profiles.map(\.command), [nil, "/bin/orig0", "/bin/a", "/bin/b"])
+        XCTAssertEqual(writer.profileNames, ["p1", "p2", "p1"])
+        source.snapshot = TesseraConfigSnapshot(generation: 2, config: try Self.json(file.json()))
+        model.reload()
+        clock.advance(by: .seconds(3))
+        XCTAssertEqual(model.value("profiles[2].command"), .string("/bin/a"))
+        XCTAssertEqual(model.value("profiles[3].command"), .string("/bin/b"))
+        XCTAssertNil(model.message(SettingsModel.profilesKey))
+        XCTAssertNil(model.message("profiles[2].command"))
+    }
+
+    /// #565: a profile's edit whose name the file no longer has (a hand
+    /// edit renamed or removed it, not applied yet) writes nothing, shows
+    /// the list's notice and not a message on the row at its index (now
+    /// perhaps another profile's), and the row shows the configuration's
+    /// value again; a delete of it has nothing left to do and says nothing.
+    func testAProfileEditWhoseNameIsGoneShowsTheListsNotice() async throws {
+        let (model, _, writer) = try fakeModel(Self.fakeConfig)
+        writer.resolveProfile = { name, _ in name == "one" ? 0 : nil }
+        model.set("profiles[1].command", .string("/bin/zsh"))
+        try await waitUntil("written") { !model.isWriting }
+        XCTAssertEqual(writer.calls, [.init(key: FakeWriter.missingKey("two", "command"), value: .string("/bin/zsh"))])
+        XCTAssertEqual(model.message(SettingsModel.profilesKey), SettingsModel.profileGoneNotice)
+        XCTAssertNil(model.message("profiles[1].command"))
+        XCTAssertNil(model.value("profiles[1].command"))
+        XCTAssertFalse(model.profileEditsUnwritten)
+
+        let (deleting, _, deleteWriter) = try fakeModel(Self.fakeConfig)
+        deleteWriter.resolveProfile = { name, _ in name == "one" ? 0 : nil }
+        XCTAssertTrue(deleting.deleteProfile(1))
+        try await waitUntil("written") { !deleting.isWriting }
+        XCTAssertEqual(deleteWriter.calls, [.init(key: FakeWriter.missingKey("two", ""), value: nil)])
+        XCTAssertNil(deleting.message(SettingsModel.profilesKey), "a delete of a profile gone says nothing")
+        XCTAssertFalse(deleting.profilesChanging, "the list is not locked")
+        XCTAssertEqual(deleting.value("profiles[1].name"), .string("two"))
+    }
+
+    /// #565: an edit queued after a rename of its profile addresses the
+    /// profile by its new name, which the file has once the rename (queued
+    /// first) is written; one before it, by the old.
+    func testAnEditAfterARenameAddressesTheNewName() async throws {
+        let (model, _, writer) = try fakeModel(Self.fakeConfig)
+        model.set("profiles[1].command", .string("/bin/a"))
+        model.set("profiles[1].name", .string("Renamed"))
+        model.set("profiles[1].command", .string("/bin/b"))
+        model.remove("profiles[1].command")
+        try await waitUntil("written") { !model.isWriting && writer.calls.count == 4 }
+        XCTAssertEqual(writer.profileNames, ["two", "two", "Renamed", "Renamed"])
+        XCTAssertEqual(
+            writer.calls.map(\.key),
+            ["profiles[1].command", "profiles[1].name", "profiles[1].command", "profiles[1].command"])
+        XCTAssertNil(model.message(SettingsModel.profilesKey))
+    }
+
+    /// #565 critic round 1 B1, on the core: of two profiles named alike, an
+    /// edit and a delete of the second (row 2) land on the second, as by
+    /// its index, not on the first of that name.
+    func testAnEditAndADeleteOfTheSecondOfTwoProfilesNamedAlikeLandOnIt() async throws {
+        let entry = { (name: String, command: String) in
+            "[[profiles]]\nname = \"\(name)\"\ncommand = \"\(command)\"\n"
+        }
+        let config = [entry("Keep", "/bin/keep"), entry("Twin", "/bin/first"), entry("Twin", "/bin/second")]
+        let model = try openSettings(config: config.joined(separator: "\n"))
+        XCTAssertEqual(model.profiles.map(\.name), ["Keep", "Twin", "Twin"])
+        let commands = { model.snapshot["profiles"]?.array?.map { $0["command"]?.string } ?? [] }
+        model.set("profiles[2].command", .string("/bin/edited"))
+        try await waitUntil("the edit applied") { commands() == ["/bin/keep", "/bin/first", "/bin/edited"] }
+        XCTAssertNil(model.message(SettingsModel.profilesKey))
+        XCTAssertTrue(model.deleteProfile(2))
+        try await waitUntil("the delete applied") { commands() == ["/bin/keep", "/bin/first"] }
+        XCTAssertEqual(model.profiles.map(\.name), ["Keep", "Twin"])
+        XCTAssertNil(model.message(SettingsModel.profilesKey))
+        let text = try String(contentsOf: configFile, encoding: .utf8)
+        XCTAssertTrue(text.contains("/bin/first") && !text.contains("/bin/edited"), text)
+    }
+
+    /// #565 adversarial cycle 1 B1: of two profiles named alike, an edit
+    /// of the second made while a hand save that inserted a profile ahead
+    /// of them is not applied yet lands on the second, not the first: the
+    /// window addresses it by its name and its ordinal among the profiles
+    /// of that name, which the insert does not change.
+    func testAnEditOfTheSecondOfTwoProfilesNamedAlikeLandsOnItPastAHandInsertAhead() async throws {
+        let entry = { (name: String, command: String) in
+            "[[profiles]]\nname = \"\(name)\"\ncommand = \"\(command)\"\n"
+        }
+        let config = [entry("Keep", "/bin/keep"), entry("Twin", "/bin/first"), entry("Twin", "/bin/second")]
+        let model = try openSettings(config: config.joined(separator: "\n"))
+        XCTAssertEqual(model.profiles.map(\.name), ["Keep", "Twin", "Twin"])
+        try ([entry("Hand", "/bin/hand")] + config).joined(separator: "\n")
+            .write(to: configFile, atomically: true, encoding: .utf8)
+        model.set("profiles[2].command", .string("/bin/edited"))
+        try await waitUntil("written") { !model.isWriting }
+        let text = try String(contentsOf: configFile, encoding: .utf8)
+        XCTAssertTrue(text.contains("\"/bin/first\""), "the first Twin's command was overwritten:\n\(text)")
+        XCTAssertFalse(text.contains("\"/bin/second\""), "the second Twin was not edited:\n\(text)")
+        XCTAssertTrue(text.contains("\"/bin/hand\"") && text.contains("\"/bin/edited\""), text)
+    }
+
+    /// #565 adversarial cycle 1 B1: the same for a delete of the second.
+    func testADeleteOfTheSecondOfTwoProfilesNamedAlikeRemovesItPastAHandInsertAhead() async throws {
+        let entry = { (name: String, command: String) in
+            "[[profiles]]\nname = \"\(name)\"\ncommand = \"\(command)\"\n"
+        }
+        let config = [entry("Keep", "/bin/keep"), entry("Twin", "/bin/first"), entry("Twin", "/bin/second")]
+        let model = try openSettings(config: config.joined(separator: "\n"))
+        XCTAssertEqual(model.profiles.map(\.name), ["Keep", "Twin", "Twin"])
+        try ([entry("Hand", "/bin/hand")] + config).joined(separator: "\n")
+            .write(to: configFile, atomically: true, encoding: .utf8)
+        XCTAssertTrue(model.deleteProfile(2))
+        try await waitUntil("written") { !model.isWriting }
+        let text = try String(contentsOf: configFile, encoding: .utf8)
+        XCTAssertTrue(text.contains("\"/bin/first\""), "the delete of the second Twin removed the first:\n\(text)")
+        XCTAssertFalse(text.contains("\"/bin/second\""), "the second Twin was not removed:\n\(text)")
+        XCTAssertTrue(text.contains("\"/bin/hand\""), text)
+    }
+
+    /// #565 critic round 1 B2: an edit queued behind a rename of its
+    /// profile that is refused is not written (its new name may be another
+    /// profile's: here a hand-added one's) and shows the rename's message
+    /// on its row.
+    func testAnEditQueuedBehindARefusedRenameIsNotWritten() async throws {
+        let (model, _, writer) = try fakeModel(Self.fakeConfig)
+        let refusal = TesseraConfigEditError(.refused, message: "renaming refused")
+        writer.respond = { call, _ in call.key == "profiles[1].name" ? refusal : nil }
+        // A hand edit added a profile named "Renamed" first.
+        writer.resolveProfile = { name, ordinal in
+            switch name {
+            case "Renamed": 0
+            case "two": ordinal == 0 ? 1 : nil
+            default: nil
+            }
+        }
+        // Both in one main-actor turn: the edit is on the queue before the
+        // refusal reaches the model.
+        model.renameProfile(1, to: "Renamed")
+        model.set("profiles[1].command", .string("/bin/b"))
+        try await waitUntil("written") { !model.isWriting }
+        XCTAssertEqual(writer.calls, [.init(key: "profiles[1].name", value: .string("Renamed"))])
+        XCTAssertEqual(writer.profileNames, ["two"])
+        XCTAssertEqual(model.message("profiles[1].name"), "renaming refused")
+        XCTAssertEqual(model.message("profiles[1].command"), "renaming refused")
+        XCTAssertNil(model.value("profiles[1].command"))
+        XCTAssertEqual(model.value("profiles[1].name"), .string("two"))
+
+        // The next edit addresses the name the file has.
+        model.set("profiles[1].command", .string("/bin/c"))
+        try await waitUntil("written") { !model.isWriting && writer.calls.count == 2 }
+        XCTAssertEqual(writer.calls.last, .init(key: "profiles[1].command", value: .string("/bin/c")))
+        XCTAssertEqual(writer.profileNames, ["two", "two"])
+    }
+
+    /// #565 critic round 1 B2: an edit queued behind a rename of its
+    /// profile that meets a hand edit (a `Conflict`, written again once
+    /// the hand edit applies, #549) is not written before the rename is:
+    /// it waits with it, and both land on the profile once the hand edit
+    /// applies, never on a hand-added profile of the new name.
+    func testAnEditQueuedBehindAConflictedRenameWaitsForIt() async throws {
+        let clock = ManualClock()
+        let (model, source, writer) = try fakeModel(Self.fakeConfig, clock: clock)
+        let conflict = TesseraConfigEditError(.conflict, message: "")
+        writer.respond = { call, attempt in call.key == "profiles[1].name" && attempt == 1 ? conflict : nil }
+        // Before the rename is written, "Renamed" is a hand-added profile.
+        let renamed = Locked(false)
+        writer.resolveProfile = { name, ordinal in
+            switch name {
+            case "two" where ordinal == 0: return 1
+            case "Renamed": return renamed.value ? 1 : 0
+            default: return nil
+            }
+        }
+        model.renameProfile(1, to: "Renamed")
+        model.set("profiles[1].command", .string("/bin/b"))
+        try await waitUntil("the rename ran") { writer.calls.count == 1 }
+        // The edit's run comes back too.
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(writer.calls, [.init(key: "profiles[1].name", value: .string("Renamed"))], "the edit not sent")
+        XCTAssertEqual(model.value("profiles[1].command"), .string("/bin/b"), "still shown")
+
+        // The hand edit applies: the rename is written again, then the edit.
+        writer.respond = { call, _ in
+            if call.key == "profiles[1].name" { renamed.value = true }
+            return nil
+        }
+        source.snapshot = TesseraConfigSnapshot(generation: 1, config: try Self.json(Self.fakeConfig))
+        model.reload()
+        try await waitUntil("written again") { !model.isWriting && writer.calls.count == 3 }
+        XCTAssertEqual(
+            writer.calls,
+            [
+                .init(key: "profiles[1].name", value: .string("Renamed")),
+                .init(key: "profiles[1].name", value: .string("Renamed")),
+                .init(key: "profiles[1].command", value: .string("/bin/b")),
+            ])
+        XCTAssertEqual(writer.profileNames, ["two", "two", "Renamed"])
+        XCTAssertNil(model.message(SettingsModel.profilesKey))
+        XCTAssertNil(model.message("profiles[1].command"))
+        XCTAssertNil(model.message("profiles[1].name"))
+    }
+
+    /// #565 adversarial cycle 2: of two profiles named alike, a rename of
+    /// the first that the core refuses (a name past 128 bytes) and an edit
+    /// of the second in the same turn: the edit's ordinal counted the first
+    /// as renamed, so once the rename failed it would land on the first. It
+    /// is not written, and says why on its row.
+    func testAnEditOfASecondTwinBehindARefusedRenameOfTheFirstIsNotWritten() async throws {
+        let entry = { (name: String, command: String) in
+            "[[profiles]]\nname = \"\(name)\"\ncommand = \"\(command)\"\n"
+        }
+        let model = try openSettings(config: [entry("T", "/bin/t1"), entry("T", "/bin/t2")].joined(separator: "\n"))
+        XCTAssertEqual(model.profiles.map(\.name), ["T", "T"])
+        model.renameProfile(0, to: String(repeating: "n", count: 200))
+        model.set("profiles[1].command", .string("/bin/edited"))
+        try await waitUntil("written") { !model.isWriting }
+        let text = try String(contentsOf: configFile, encoding: .utf8)
+        XCTAssertTrue(text.contains("\"/bin/t1\""), "the edit of the second twin landed on the first:\n\(text)")
+        XCTAssertTrue(text.contains("\"/bin/t2\"") && !text.contains("/bin/edited"), text)
+        XCTAssertNotNil(model.message("profiles[1].command"))
+    }
+
+    /// #565 adversarial cycle 2, the #549 variant: the rename of the first
+    /// twin meets a conflict (a hand edit) instead; the edit of the second,
+    /// queued behind it, is not sent with the ordinal that counted the
+    /// rename, then or after the hand edit applies.
+    func testAnEditOfASecondTwinBehindAConflictedRenameOfTheFirstIsNotSentForTheFirst() async throws {
+        let config = """
+            {"general": {"default_profile": "one"},
+             "profiles": [{"name": "T", "command": "/bin/t1"}, {"name": "T", "command": "/bin/t2"}]}
+            """
+        let (model, source, writer) = try fakeModel(config, clock: ManualClock())
+        let conflict = TesseraConfigEditError(.conflict, message: "")
+        writer.respond = { call, attempt in call.key == "profiles[0].name" && attempt == 1 ? conflict : nil }
+        model.renameProfile(0, to: "N")
+        model.set("profiles[1].command", .string("/bin/edited"))
+        try await waitUntil("the rename ran") { writer.calls.count >= 1 }
+        // The edit's run comes back too.
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertFalse(writer.calls.contains { $0.key == "profiles[0].command" }, "\(writer.calls)")
+        // The hand edit applies (the same two twins): nothing is sent for
+        // the first twin either.
+        source.snapshot = TesseraConfigSnapshot(generation: 1, config: try Self.json(config))
+        model.reload()
+        try await waitUntil("settled") { !model.isWriting }
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertFalse(writer.calls.contains { $0.key == "profiles[0].command" }, "\(writer.calls)")
+    }
+
+    /// #565 round 2 M-a: an edit queued behind a conflicted rename whose
+    /// own wait ends later than the rename's (the rename is written again
+    /// at one apply, the edit comes back after it and waits for the next)
+    /// finds its profile by the new name once that apply lists it: it is
+    /// written there, not dropped as a profile gone.
+    func testAnEditWaitingPastItsRenamesApplyLandsByTheNewName() async throws {
+        let clock = ManualClock()
+        let (model, source, writer) = try fakeModel(Self.fakeConfig, clock: clock)
+        let conflict = TesseraConfigEditError(.conflict, message: "")
+        let renamed = Locked(false)
+        let hold = DispatchSemaphore(value: 0)
+        writer.respond = { call, attempt in
+            switch call.key {
+            case "profiles[1].name" where attempt == 1: return conflict
+            case "profiles[1].name": renamed.value = true
+            case "appearance.theme": hold.wait()
+            default: break
+            }
+            return nil
+        }
+        // Before the rename is written, "Renamed" is a hand-added profile.
+        writer.resolveProfile = { name, ordinal in
+            switch name {
+            case "two" where ordinal == 0 && !renamed.value: 1
+            case "Renamed": renamed.value ? 1 : 0
+            default: nil
+            }
+        }
+        // The edit waits on the queue behind another key's slow write.
+        model.renameProfile(1, to: "Renamed")
+        model.set("appearance.theme", .string("Nord"))
+        model.set("profiles[1].command", .string("/bin/b"))
+        try await waitUntil("the rename met the conflict") { writer.calls.count == 2 }
+        try await Task.sleep(for: .milliseconds(50))
+        // The hand edit applies: the rename is queued again, behind the edit.
+        source.snapshot = TesseraConfigSnapshot(generation: 1, config: try Self.json(Self.fakeConfig))
+        model.reload()
+        hold.signal()
+        try await waitUntil("the rename written again") { writer.calls.count == 3 && renamed.value }
+        try await Task.sleep(for: .milliseconds(50))
+        // The rename applies: the edit is written by the profile's new name.
+        let after = Self.fakeConfig.replacingOccurrences(of: #""name": "two""#, with: #""name": "Renamed""#)
+        XCTAssertNotEqual(after, Self.fakeConfig)
+        source.snapshot = TesseraConfigSnapshot(generation: 2, config: try Self.json(after))
+        model.reload()
+        try await waitUntil("the edit written") { !model.isWriting }
+        XCTAssertEqual(writer.calls.last, .init(key: "profiles[1].command", value: .string("/bin/b")))
+        XCTAssertEqual(writer.profileNames, ["two", "two", "Renamed"])
+        XCTAssertNil(model.message(SettingsModel.profilesKey))
+        XCTAssertNil(model.message("profiles[1].command"))
     }
 
     /// #344 round 1: a configuration applied while a slider is dragged (an
@@ -5539,6 +5870,66 @@ final class FakeWriter: SettingsConfigWriting, @unchecked Sendable {
         try record(Call(key: key, value: nil))
     }
 
+    private var resolver: (@Sendable (String, Int) -> Int?)?
+    private var renamed: [String: String] = [:]
+    private var addressed: [String] = []
+
+    /// Where a profile's edit by name and its ordinal among the profiles of
+    /// that name lands (#565): the index of the profile in the file as the
+    /// call reads it, `nil` for none. By default the applied
+    /// configuration's (``applied``), a rename this writer made and not yet
+    /// applied included: the profile of that ordinal among those with the
+    /// name.
+    var resolveProfile: (@Sendable (String, Int) -> Int?)? {
+        get { lock.withLock { resolver } }
+        set { lock.withLock { resolver = newValue } }
+    }
+
+    /// The names the profiles' edits addressed, in order.
+    var profileNames: [String] { lock.withLock { addressed } }
+
+    /// The key a profile's edit by name records: `profiles[i]` and the
+    /// key within it, or `no profile “name”…` when no profile has it.
+    static func missingKey(_ name: String, _ key: String) -> String {
+        "no profile “\(name)”" + (key.isEmpty ? "" : ".\(key)")
+    }
+
+    private func index(named name: String, ordinal: Int) -> Int? {
+        let (resolver, renamed) = lock.withLock { (self.resolver, self.renamed) }
+        if let resolver { return resolver(name, ordinal) }
+        let listed = applied?.value["profiles"]?.array ?? []
+        var name = name
+        for _ in 0...renamed.count {
+            let named = listed.indices.filter { listed[$0]["name"]?.string == name }
+            if named.indices.contains(ordinal) { return named[ordinal] }
+            guard let old = renamed[name] else { return nil }
+            name = old
+        }
+        return nil
+    }
+
+    private func recordProfile(
+        _ name: String, _ ordinal: Int, _ key: String, _ value: TesseraConfigValue?
+    ) throws(TesseraConfigEditError) {
+        lock.withLock { addressed.append(name) }
+        guard let index = index(named: name, ordinal: ordinal) else {
+            lock.withLock { recorded.append(Call(key: Self.missingKey(name, key), value: value)) }
+            throw TesseraConfigEditError(.noSuchProfile, message: "no profile in config.toml is named \"\(name)\"")
+        }
+        try record(Call(key: "profiles[\(index)]" + (key.isEmpty ? "" : ".\(key)"), value: value))
+        if key == "name", let new = value?.string { lock.withLock { renamed[new] = name } }
+    }
+
+    func setProfile(
+        named name: String, ordinal: Int, _ key: String, to value: TesseraConfigValue
+    ) throws(TesseraConfigEditError) {
+        try recordProfile(name, ordinal, key, value)
+    }
+
+    func removeProfile(named name: String, ordinal: Int, _ key: String) throws(TesseraConfigEditError) {
+        try recordProfile(name, ordinal, key, nil)
+    }
+
     func importTheme(at file: URL) throws(TesseraConfigEditError) -> String {
         try record(Call(key: "import:\(file.lastPathComponent)", value: nil))
         return try importResult.get()
@@ -5683,8 +6074,9 @@ private final class RecordingOpenPanel: SettingsOpenPanel {
 }
 
 /// A stand-in `config.toml` of profiles for ``FakeWriter/respond``: edited
-/// as the core edits it (a profile by its index, in the file as it is at
-/// the call), with a hand edit armed to land during the next call of a
+/// as the core edits it (a profile at the index its name has in the file
+/// at the call, with ``index(named:ordinal:)`` as ``FakeWriter/resolveProfile``,
+/// #565), with a hand edit armed to land during the next call of a
 /// profile's key, which then reports `Conflict` (#549).
 final class HandEditedProfiles: @unchecked Sendable {
     struct Profile {
@@ -5706,6 +6098,15 @@ final class HandEditedProfiles: @unchecked Sendable {
     }
 
     var profiles: [Profile] { lock.withLock { listed } }
+    /// The index of the profile named `name` of that `ordinal` among the
+    /// profiles of the name, in the file now, as the core finds a
+    /// profile's edit by name (#565); `nil` for none.
+    func index(named name: String, ordinal: Int) -> Int? {
+        lock.withLock {
+            let all = listed.indices.filter { listed[$0].name == name }
+            return all.indices.contains(ordinal) ? all[ordinal] : nil
+        }
+    }
     /// What happened to the file, in order.
     var log: [String] { lock.withLock { entries } }
 

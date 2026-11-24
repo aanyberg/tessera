@@ -117,7 +117,8 @@ path at a time in memory, `save` writes it back.
   number, boolean, array; `null`, objects and integers past `i64` refused;
   at most 64 KiB). Two new status codes: `TESSERA_ERROR_REFUSED` (9) and
   `TESSERA_ERROR_CONFLICT` (10). A message for the user goes to an
-  optional buffer, cut on a character boundary.
+  optional buffer, cut on a character boundary. (A profile's edit by name
+  adds `TESSERA_ERROR_NO_SUCH_PROFILE`, 11: ADR 0044, #565 amendment.)
 - `tessera_theme_list` and `tessera_theme_import(path)`: the latter writes
   the new theme's id and needs `id_cap` ≥ `TESSERA_THEME_ID_LEN` (64)
   before it imports anything, so the id is never lost.

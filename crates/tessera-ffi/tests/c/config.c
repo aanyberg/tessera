@@ -246,6 +246,36 @@ int main(void) {
     CHECK(strstr(text, "No Such Theme") == NULL && strstr(text, "\"x\"") == NULL);
     free(text);
 
+    /* A profile's key by the profile's name (#565): found in the file as
+       the call reads it; a name no entry has is NO_SUCH_PROFILE; an empty
+       key removes the entry; two entries of one name are told apart by
+       the ordinal among them, here 0. */
+    EXPECT(tessera_config_set_profile(app, S("Work 2"), 0, S("command"), S("\"/bin/ksh-565\""), msg,
+                                      sizeof msg, &msg_len),
+           TESSERA_ERROR_OK);
+    CHECK(msg_len == 0);
+    EXPECT(tessera_config_set_profile(app, S("Gone"), 0, S("command"), S("\"/bin/ksh-565\""), msg,
+                                      sizeof msg, &msg_len),
+           TESSERA_ERROR_NO_SUCH_PROFILE);
+    CHECK(msg_len > 0);
+    EXPECT(tessera_config_set_profile(app, NULL, 4, 0, S("command"), S("\"/bin/ksh-565\""), NULL, 0,
+                                      NULL),
+           TESSERA_ERROR_NULL_POINTER);
+    EXPECT(tessera_config_set_profile(app, (const uint8_t *)long_key,
+                                      TESSERA_MAX_PROFILE_NAME_LEN + 1, 0, S("command"),
+                                      S("\"/bin/ksh-565\""), NULL, 0, NULL),
+           TESSERA_ERROR_INVALID_ARGUMENT);
+    EXPECT(tessera_config_remove_profile(app, S("Gone"), 0, S(""), NULL, 0, NULL),
+           TESSERA_ERROR_NO_SUCH_PROFILE);
+    text = slurp(config_path);
+    CHECK(text != NULL && strstr(text, "command = \"/bin/ksh-565\"") != NULL);
+    free(text);
+    EXPECT(tessera_config_remove_profile(app, S("Work 2"), 0, S(""), NULL, 0, NULL),
+           TESSERA_ERROR_OK);
+    text = slurp(config_path);
+    CHECK(text != NULL && strstr(text, "Work 2") == NULL && strstr(text, "/bin/ksh-565") == NULL);
+    free(text);
+
     /* A file the editor would not write back unchanged (mixed line
        endings) is refused at open as an I/O failure naming no key path,
        and left alone (#324 item 1). */
