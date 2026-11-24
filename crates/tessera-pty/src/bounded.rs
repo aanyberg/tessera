@@ -31,7 +31,9 @@ pub(crate) const MAX_STUCK_HELPERS: usize = 4;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TimedOut;
 
-/// The process's helpers.
+/// The process's helpers for [`run_bounded`]. Calls that must not share
+/// a cap with these (the pty opens of [`crate::NativePty::spawn`], #568)
+/// have a [`Pool`] of their own and use [`run_bounded_in`].
 static HELPERS: Pool = Pool::new(MAX_STUCK_HELPERS);
 
 /// Runs `f` on a helper thread named `name` that first runs the crate's
@@ -53,12 +55,31 @@ pub(crate) fn run_bounded<T: Send + 'static>(
     timeout: Duration,
     f: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, TimedOut> {
-    HELPERS.run(name, timeout, f)
+    run_bounded_in(&HELPERS, name, timeout, f)
 }
 
-/// Helpers counted against one cap: [`HELPERS`], or a test's own.
+/// [`run_bounded`] counted against `pool`'s cap instead of the one shared
+/// by every other caller, so helpers stuck in one kind of call cannot
+/// refuse another kind: with [`MAX_STUCK_HELPERS`] program lookups stuck,
+/// a pty open still runs, and the other way round.
+///
+/// # Errors
+///
+/// [`TimedOut`] when there is no result within `timeout` (see there),
+/// `pool` standing in for the shared helpers.
+pub(crate) fn run_bounded_in<T: Send + 'static>(
+    pool: &'static Pool,
+    name: &str,
+    timeout: Duration,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, TimedOut> {
+    pool.run(name, timeout, f)
+}
+
+/// Helpers counted against one cap: [`HELPERS`], another kind of call's
+/// own (see [`run_bounded_in`]), or a test's.
 #[derive(Debug)]
-struct Pool {
+pub(crate) struct Pool {
     /// Most helpers running at once.
     cap: usize,
     counts: Mutex<Counts>,
@@ -94,7 +115,8 @@ enum State<T> {
 }
 
 impl Pool {
-    const fn new(cap: usize) -> Self {
+    /// A pool that runs at most `cap` helpers at once, stuck or not.
+    pub(crate) const fn new(cap: usize) -> Self {
         Self {
             cap,
             counts: Mutex::new(Counts {
@@ -105,6 +127,25 @@ impl Pool {
             #[cfg(test)]
             started: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// Helpers of this pool still running past their caller's timeout.
+    #[cfg(test)]
+    pub(crate) fn stuck(&self) -> usize {
+        self.lock().stuck
+    }
+
+    /// Helpers of this pool still running, stuck or waited for.
+    #[cfg(test)]
+    pub(crate) fn running(&self) -> usize {
+        let counts = self.lock();
+        counts.waited + counts.stuck
+    }
+
+    /// Helper threads this pool has started.
+    #[cfg(test)]
+    pub(crate) fn started(&self) -> usize {
+        self.started.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn lock(&self) -> MutexGuard<'_, Counts> {
@@ -235,6 +276,10 @@ impl<T> Drop for Finish<T> {
                 counts.waited -= 1;
                 *call = self.value.take().map_or(State::Panicked, State::Done);
             }
+            // The late value (`self.value`) drops only after this body,
+            // once the stuck count is released, so for that moment the
+            // pool may run one helper past its cap and a late pty open may
+            // hold its two descriptors uncounted.
             State::Abandoned => counts.stuck -= 1,
             State::Done(_) | State::Panicked => {
                 unreachable!("a helper finishes once")

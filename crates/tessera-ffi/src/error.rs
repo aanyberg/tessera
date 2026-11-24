@@ -21,7 +21,8 @@ pub enum Error {
     InvalidArgument = 2,
     /// The session id does not name a live session of this application.
     SessionNotFound = 3,
-    /// The session could not be started: no PTY was available, the program
+    /// The session could not be started: no PTY was available or opening
+    /// one gave no answer in time, the program
     /// does not exist or is not executable, its arguments and environment
     /// are too large to start it with, or a thread could not be created.
     SpawnFailed = 4,
@@ -56,7 +57,8 @@ impl From<&CoreError> for Error {
                 PtyError::Open(_)
                 | PtyError::Spawn { .. }
                 | PtyError::ArgumentsTooLong { .. }
-                | PtyError::ProgramTimedOut { .. } => Self::SpawnFailed,
+                | PtyError::ProgramTimedOut { .. }
+                | PtyError::OpenTimedOut => Self::SpawnFailed,
                 PtyError::InvalidSize(_) => Self::InvalidArgument,
                 PtyError::Resize(_) | PtyError::Io(_) => Self::Io,
             },
@@ -140,6 +142,7 @@ mod tests {
                 CoreError::Pty(PtyError::ProgramTimedOut { path_bytes: 1 }),
                 Error::SpawnFailed,
             ),
+            (CoreError::Pty(PtyError::OpenTimedOut), Error::SpawnFailed),
             (
                 CoreError::Pty(PtyError::InvalidSize(PtySize::new(0, 1))),
                 Error::InvalidArgument,

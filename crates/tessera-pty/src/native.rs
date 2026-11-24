@@ -21,9 +21,9 @@ use std::time::Duration;
 use nix::errno::Errno;
 use nix::sys::signal::{self, Signal};
 use nix::unistd::Pid;
-use portable_pty::{CommandBuilder, MasterPty, native_pty_system};
+use portable_pty::{CommandBuilder, MasterPty, PtyPair, native_pty_system};
 
-use crate::bounded::{TimedOut, run_bounded};
+use crate::bounded::{MAX_STUCK_HELPERS, Pool, TimedOut, run_bounded, run_bounded_in};
 use crate::foreground::{self, ForegroundProcess};
 use crate::{ExitStatus, Program, Pty, PtyError, PtyEvent, PtyEvents, PtySize, SpawnOptions};
 
@@ -240,7 +240,10 @@ impl NativePty {
     /// an argument or variable contains a NUL byte,
     /// [`PtyError::ProgramTimedOut`] if the file system gave no answer
     /// within 5 s while the program was looked up (see below),
-    /// [`PtyError::Io`] if the
+    /// [`PtyError::OpenTimedOut`] if opening the PTY gave no answer within
+    /// 5 s or four earlier opens are still without one (the open runs on
+    /// a helper thread, so a `grantpt(3)` that never returns fails this
+    /// spawn only), [`PtyError::Io`] if the
     /// reader or writer side of the master or one of their threads could
     /// not be set up.
     ///
@@ -289,8 +292,7 @@ impl NativePty {
     pub fn spawn(options: &SpawnOptions) -> Result<(Self, PtyEvents), PtyError> {
         check_size(options.size)?;
         let command = checked_command(options)?;
-        let pair = redrive_open(|| native_pty_system().openpty(options.size.into()))
-            .map_err(|err| PtyError::Open(err.to_string()))?;
+        let pair = open_pair(options.size)?;
         // On Linux the parent must not keep the slave open: the master
         // would never see end-of-file after the child exits. On macOS it
         // holds a description of its own until end-of-file or the close, so
@@ -1399,6 +1401,179 @@ fn duplicate_master(master: &dyn MasterPty) -> Result<File, PtyError> {
     Ok(File::from(duplicate))
 }
 
+/// How long [`NativePty::spawn`] waits for the pty pair to open (#568).
+/// On macOS `grantpt(3)`, which `openpty(3)` calls, can spin in the kernel
+/// and never return while other ptys are opened and closed at the same
+/// time (once in 170 000 to 600 000 opens in a 16-thread stress run,
+/// `tests/c/grantpt_stress.c`); only a signal ends that thread. The open
+/// runs on a helper thread so such a spin fails one spawn with
+/// [`PtyError::OpenTimedOut`] instead of holding its caller, the app's
+/// main thread, for ever. An open that is merely slow (a loaded machine,
+/// the retries of [`redrive_open`]) takes milliseconds, far inside this.
+const PTY_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The helpers that open ptys: a cap of [`MAX_STUCK_HELPERS`] of their
+/// own (docs/security.md S5), apart from the program lookups and `#!`
+/// checks of [`run_bounded`], so stuck lookups on a stalled volume cannot
+/// make opens fail at once, nor stuck opens lookups.
+static OPEN_HELPERS: Pool = Pool::new(MAX_STUCK_HELPERS);
+
+/// Opens a pty pair of `size` ([`redrive_open`] over `openpty(3)`) on a
+/// `pty-open` helper thread of [`OPEN_HELPERS`], waited for at most
+/// [`PTY_OPEN_TIMEOUT`] (see [`run_bounded_in`]). Without an answer in
+/// time, or with [`MAX_STUCK_HELPERS`] earlier opens still stuck (the
+/// spawn then fails at once and starts no thread), the spawn fails with
+/// [`PtyError::OpenTimedOut`] before anything is forked. An open that
+/// returns after its caller gave up drops its result on the helper, which
+/// closes both ends of the pty it opened.
+fn open_pair(size: PtySize) -> Result<PtyPair, PtyError> {
+    let hold = open_hold::take();
+    run_bounded_in(
+        open_hold::pool(&OPEN_HELPERS),
+        "pty-open",
+        PTY_OPEN_TIMEOUT,
+        move || {
+            open_hold::pause(&hold);
+            let opened = redrive_open(|| native_pty_system().openpty(size.into()));
+            open_hold::returned(&hold, opened.is_ok());
+            opened
+        },
+    )
+    .map_err(|TimedOut| {
+        tracing::warn!("opening a pty gave no answer in time; failing the spawn");
+        PtyError::OpenTimedOut
+    })?
+    .map_err(|err| PtyError::Open(err.to_string()))
+}
+
+/// Test-only stand-in for an open that does not return (#568): the next
+/// [`open_pair`] on a thread a test arms blocks on its helper, before the
+/// real open, until the test releases its [`open_hold::Gate`], and records
+/// what it did. A test can also make the opens of one thread count against
+/// a pool of its own, so filling a cap does not touch other tests running
+/// beside it (`cargo test`). Outside tests every call is a no-op and
+/// [`open_hold::pool`] returns its argument.
+mod open_hold {
+    use crate::bounded::Pool;
+
+    /// What [`take`] hands the helper: the armed gate, if any (nothing
+    /// outside tests).
+    #[derive(Debug)]
+    pub(super) struct Hold(#[cfg(test)] Option<std::sync::Arc<Gate>>);
+
+    /// Longest a held open blocks without a release, so a regression
+    /// fails its test instead of hanging it.
+    #[cfg(test)]
+    pub(super) const MOST: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// A held open and what it did.
+    #[cfg(test)]
+    #[derive(Debug, Default)]
+    pub(super) struct Gate {
+        state: std::sync::Mutex<GateState>,
+        changed: std::sync::Condvar,
+    }
+
+    #[cfg(test)]
+    #[derive(Debug, Default, Clone, PartialEq, Eq)]
+    pub(super) struct GateState {
+        /// Released by the test.
+        pub(super) released: bool,
+        /// Names of the threads that entered the held open.
+        pub(super) entered: Vec<String>,
+        /// Held opens whose real open then succeeded.
+        pub(super) opened: usize,
+    }
+
+    #[cfg(test)]
+    impl Gate {
+        fn lock(&self) -> std::sync::MutexGuard<'_, GateState> {
+            self.state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        }
+
+        /// What the held opens did so far.
+        pub(super) fn state(&self) -> GateState {
+            self.lock().clone()
+        }
+
+        /// Lets the held open go on to the real open.
+        pub(super) fn release(&self) {
+            self.lock().released = true;
+            self.changed.notify_all();
+        }
+    }
+
+    #[cfg(test)]
+    thread_local! {
+        static NEXT: std::cell::RefCell<Option<std::sync::Arc<Gate>>> =
+            const { std::cell::RefCell::new(None) };
+        static POOL: std::cell::Cell<Option<&'static Pool>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// Holds the next open on this thread at `gate`.
+    #[cfg(test)]
+    pub(super) fn hold_next(gate: &std::sync::Arc<Gate>) {
+        NEXT.with(|next| *next.borrow_mut() = Some(std::sync::Arc::clone(gate)));
+    }
+
+    /// Makes this thread's opens count against `pool`.
+    #[cfg(test)]
+    pub(super) fn use_pool(pool: &'static Pool) {
+        POOL.with(|cell| cell.set(Some(pool)));
+    }
+
+    /// The gate armed for this thread's open, disarming it.
+    #[cfg_attr(not(test), inline)]
+    pub(super) fn take() -> Hold {
+        Hold(
+            #[cfg(test)]
+            NEXT.with(|next| next.borrow_mut().take()),
+        )
+    }
+
+    /// The pool this thread's opens count against: `pool` unless a test
+    /// chose another.
+    #[cfg_attr(not(test), inline)]
+    pub(super) fn pool(pool: &'static Pool) -> &'static Pool {
+        #[cfg(test)]
+        if let Some(chosen) = POOL.with(std::cell::Cell::get) {
+            return chosen;
+        }
+        pool
+    }
+
+    /// On the helper, before the real open: blocks while `hold` is held,
+    /// at most [`MOST`].
+    #[cfg_attr(not(test), inline)]
+    pub(super) fn pause(hold: &Hold) {
+        #[cfg(test)]
+        if let Hold(Some(gate)) = hold {
+            let mut state = gate.lock();
+            let name = std::thread::current().name().unwrap_or("?").to_owned();
+            state.entered.push(name);
+            let _ = gate
+                .changed
+                .wait_timeout_while(state, MOST, |state| !state.released)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        let _ = hold;
+    }
+
+    /// On the helper, after the real open: records a held open that
+    /// succeeded.
+    #[cfg_attr(not(test), inline)]
+    pub(super) fn returned(hold: &Hold, ok: bool) {
+        #[cfg(test)]
+        if let (Hold(Some(gate)), true) = (hold, ok) {
+            gate.lock().opened += 1;
+            gate.changed.notify_all();
+        }
+        let _ = (hold, ok);
+    }
+}
+
 /// The errno XNU uses inside the kernel to redrive an open that lost the
 /// pty allocation race (`EREDRIVEOPEN` in `sys/errno.h`, kernel only).
 ///
@@ -2383,6 +2558,219 @@ mod tests {
             lookup().1 == 1
         });
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A short-lived child that exits with `code`.
+    fn exiting(code: u8) -> SpawnOptions {
+        SpawnOptions::command("/bin/sh", "open").args(["-c", &format!("exit {code}")])
+    }
+
+    /// Waits for `events` to report the child's exit.
+    fn exit_of(events: &PtyEvents) -> ExitStatus {
+        loop {
+            match events.recv_timeout(Duration::from_secs(10)) {
+                Ok(PtyEvent::Exited(status)) => break status,
+                Ok(PtyEvent::Output(_)) => {}
+                Err(err) => panic!("no exit: {err}"),
+            }
+        }
+    }
+
+    /// Fills `pool` with [`MAX_STUCK_HELPERS`] opens stuck until the
+    /// returned sender is dropped (or 30 s).
+    fn fill_with_stuck(pool: &'static Pool) -> mpsc::Sender<()> {
+        let (release, released) = mpsc::channel::<()>();
+        let released = Arc::new(Mutex::new(released));
+        for _ in 0..MAX_STUCK_HELPERS {
+            let released = Arc::clone(&released);
+            let result = run_bounded_in(pool, "pty-open", Duration::ZERO, move || {
+                let _ = lock_ignoring_poison(&released).recv_timeout(Duration::from_secs(30));
+            });
+            assert_eq!(result.err(), Some(TimedOut));
+        }
+        release
+    }
+
+    fn lock_ignoring_poison<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+        mutex.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// #568: an open that never returns (as `grantpt(3)` spinning in the
+    /// kernel) fails the spawn on the caller's thread with
+    /// [`PtyError::OpenTimedOut`] once [`PTY_OPEN_TIMEOUT`] has passed,
+    /// within 6 s and before anything is forked, while a spawn on another
+    /// thread opens its pty and runs in the meantime: opens are not
+    /// serialised behind a stuck one.
+    #[test]
+    fn an_open_that_never_returns_fails_that_spawn_alone() {
+        static POOL: Pool = Pool::new(MAX_STUCK_HELPERS);
+        static FIRST_RETURNED: AtomicBool = AtomicBool::new(false);
+        open_hold::use_pool(&POOL);
+        let gate = Arc::new(open_hold::Gate::default());
+        open_hold::hold_next(&gate);
+
+        let other = {
+            let gate = Arc::clone(&gate);
+            thread::spawn(move || {
+                open_hold::use_pool(&POOL);
+                wait_until("the held open was not entered", || {
+                    !gate.state().entered.is_empty()
+                });
+                let (pty, events) = NativePty::spawn(&exiting(3)).expect("a concurrent spawn");
+                let during = !FIRST_RETURNED.load(Ordering::SeqCst);
+                let status = exit_of(&events);
+                drop(pty);
+                (during, status)
+            })
+        };
+
+        let _ = fault::take_forked();
+        let start = std::time::Instant::now();
+        let spawned = NativePty::spawn(&exiting(0));
+        let took = start.elapsed();
+        FIRST_RETURNED.store(true, Ordering::SeqCst);
+        assert!(
+            matches!(spawned, Err(PtyError::OpenTimedOut)),
+            "not refused as timed out: {spawned:?}"
+        );
+        assert!(
+            took >= Duration::from_secs(5) && took < Duration::from_secs(6),
+            "the spawn returned after {took:?}"
+        );
+        assert_eq!(fault::take_forked(), None, "a child was forked");
+        let state = gate.state();
+        assert_eq!(state.entered, ["pty-open"], "the open ran on the caller");
+        assert_eq!(state.opened, 0, "the held open returned");
+        assert_eq!(POOL.stuck(), 1);
+
+        let (during, status) = other.join().expect("the concurrent spawn");
+        assert!(during, "the concurrent spawn waited for the stuck open");
+        assert_eq!(status, ExitStatus::Exited(3));
+
+        gate.release();
+        wait_until("the released open did not finish", || POOL.running() == 0);
+        assert_eq!(gate.state().opened, 1);
+    }
+
+    /// #568: an open that returns after its spawn gave up closes both ends
+    /// of the pty it opened on its helper: the process has as many
+    /// descriptors afterwards as before. Counted only when the test runs
+    /// alone in its process, as under nextest.
+    #[test]
+    fn a_late_open_closes_its_descriptors() {
+        static POOL: Pool = Pool::new(MAX_STUCK_HELPERS);
+        let alone = std::env::var_os("NEXTEST").is_some();
+        open_hold::use_pool(&POOL);
+        let fds = open_fds();
+        let gate = Arc::new(open_hold::Gate::default());
+        open_hold::hold_next(&gate);
+        let spawned = NativePty::spawn(&exiting(0));
+        assert!(
+            matches!(spawned, Err(PtyError::OpenTimedOut)),
+            "{spawned:?}"
+        );
+        gate.release();
+        wait_until("the late open did not return", || gate.state().opened == 1);
+        wait_until("the late open's helper did not finish", || {
+            POOL.running() == 0
+        });
+        if alone {
+            wait_until("the late open's descriptors are still open", || {
+                open_fds() == fds
+            });
+        }
+        // A pty opens again, and its descriptors close with it.
+        let (pty, events) = NativePty::spawn(&exiting(4)).expect("spawn after a late open");
+        assert_eq!(exit_of(&events), ExitStatus::Exited(4));
+        drop((pty, events));
+        if alone {
+            wait_until("the later spawn's descriptors are still open", || {
+                open_fds() == fds
+            });
+        }
+    }
+
+    /// #568, S5: with [`MAX_STUCK_HELPERS`] opens stuck, a spawn fails with
+    /// [`PtyError::OpenTimedOut`] at once (well inside
+    /// [`PTY_OPEN_TIMEOUT`]), starts no helper and never reaches its open;
+    /// once the stuck opens return, spawns open ptys again.
+    #[test]
+    fn with_four_stuck_opens_a_spawn_fails_at_once_without_a_thread() {
+        static POOL: Pool = Pool::new(MAX_STUCK_HELPERS);
+        open_hold::use_pool(&POOL);
+        let release = fill_with_stuck(&POOL);
+        assert_eq!(POOL.stuck(), MAX_STUCK_HELPERS);
+        let gate = Arc::new(open_hold::Gate::default());
+        open_hold::hold_next(&gate);
+        let _ = fault::take_forked();
+        let start = std::time::Instant::now();
+        let spawned = NativePty::spawn(&exiting(0));
+        let took = start.elapsed();
+        assert!(
+            matches!(spawned, Err(PtyError::OpenTimedOut)),
+            "{spawned:?}"
+        );
+        assert!(took < PTY_OPEN_TIMEOUT / 2, "the spawn waited {took:?}");
+        assert_eq!(POOL.started(), MAX_STUCK_HELPERS, "a fifth helper started");
+        assert_eq!(
+            gate.state(),
+            open_hold::GateState::default(),
+            "the open ran"
+        );
+        assert_eq!(fault::take_forked(), None, "a child was forked");
+        gate.release();
+
+        drop(release);
+        wait_until("the stuck opens did not finish", || POOL.running() == 0);
+        let (pty, events) = NativePty::spawn(&exiting(5)).expect("spawn once the opens returned");
+        assert_eq!(exit_of(&events), ExitStatus::Exited(5));
+        drop(pty);
+    }
+
+    /// #568: opens and program lookups have caps of their own, so four
+    /// stuck lookups (a stalled volume) leave opens alone and four stuck
+    /// opens leave lookups alone; and the real open pool is capped. Fills
+    /// the process's own pools, so it runs only alone in its process (as
+    /// under nextest), where no other test spawns meanwhile.
+    #[test]
+    fn stuck_opens_and_stuck_lookups_do_not_share_a_cap() {
+        if std::env::var_os("NEXTEST").is_none() {
+            eprintln!("skipped: fills the process-wide helper pools; run under nextest");
+            return;
+        }
+        let size = PtySize::new(24, 80);
+        let opens = fill_with_stuck(&OPEN_HELPERS);
+        assert!(
+            matches!(open_pair(size), Err(PtyError::OpenTimedOut)),
+            "the open pool is not capped"
+        );
+        assert_eq!(
+            run_bounded("pty-spawn-program", Duration::from_secs(5), || 7),
+            Ok(7),
+            "stuck opens refused a lookup"
+        );
+        drop(opens);
+        wait_until("the stuck opens did not finish", || {
+            OPEN_HELPERS.running() == 0
+        });
+
+        let (release, released) = mpsc::channel::<()>();
+        let released = Arc::new(Mutex::new(released));
+        for _ in 0..MAX_STUCK_HELPERS {
+            let released = Arc::clone(&released);
+            let result = run_bounded("pty-spawn-check", Duration::ZERO, move || {
+                let _ = lock_ignoring_poison(&released).recv_timeout(Duration::from_secs(30));
+            });
+            assert_eq!(result, Err(TimedOut));
+        }
+        assert_eq!(
+            run_bounded("pty-spawn-check", Duration::from_secs(5), || 1),
+            Err(TimedOut),
+            "the lookup pool is not full"
+        );
+        let pair = open_pair(size).expect("stuck lookups refused an open");
+        drop(pair);
+        drop(release);
     }
 
     /// The lookup probes `PATH` candidates in order, through the same

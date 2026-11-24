@@ -596,7 +596,8 @@ impl App {
     /// that exists but cannot be entered, a `command` that cannot be
     /// executed: a [`PtyError::Spawn`]; a `command` longer than the system
     /// lets a program's arguments be: a [`PtyError::ArgumentsTooLong`],
-    /// #342), the session is started once more
+    /// #342; a pty open that gave no answer in time: a
+    /// [`PtyError::OpenTimedOut`], #568), the session is started once more
     /// as the built-in profile would start it (the caller's `options`: the
     /// login shell in the home directory) and drawn with `[appearance]`. Its
     /// first line then says so: `[Tessera] profile "<name>" could not start
@@ -635,10 +636,8 @@ impl App {
         let (Some(name), true) = (resolved.name.as_deref(), changed) else {
             return Err(error);
         };
-        let errno = match &error {
-            Error::Pty(PtyError::Spawn { reason, .. }) => profile::spawn_errno(reason),
-            Error::Pty(PtyError::ArgumentsTooLong { .. }) => Some(profile::errno::E2BIG),
-            _ => return Err(error),
+        let Ok(errno) = fallback_errno(&error) else {
+            return Err(error);
         };
         let index = self.config().profiles.iter().position(|p| p.name == name);
         tracing::warn!(
@@ -2870,6 +2869,19 @@ impl fmt::Debug for App {
     }
 }
 
+/// Whether a profile's session that failed to start with `error` is
+/// started once more as the built-in profile (`Ok`), and the `errno` its
+/// notice then names (`None`: a reason without one); see
+/// [`App::spawn_session_with_profile`].
+fn fallback_errno(error: &Error) -> Result<Option<i32>, ()> {
+    match error {
+        Error::Pty(PtyError::Spawn { reason, .. }) => Ok(profile::spawn_errno(reason)),
+        Error::Pty(PtyError::ArgumentsTooLong { .. }) => Ok(Some(profile::errno::E2BIG)),
+        Error::Pty(PtyError::OpenTimedOut) => Ok(Some(profile::errno::ETIMEDOUT)),
+        _ => Err(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::panic::AssertUnwindSafe;
@@ -4117,6 +4129,31 @@ mod tests {
             "{result:?}"
         );
         assert_eq!(app.session_ids(), Vec::<SessionId>::new());
+    }
+
+    /// #568: a profile's session whose pty open gave no answer in time is
+    /// started once more as the built-in profile, its notice naming
+    /// `ETIMEDOUT`; errors that are not the profile's are not retried.
+    #[test]
+    fn a_timed_out_pty_open_falls_back_with_etimedout() {
+        let errno = fallback_errno(&Error::Pty(PtyError::OpenTimedOut));
+        assert_eq!(errno, Ok(Some(nix::errno::Errno::ETIMEDOUT as i32)));
+        let notice = String::from_utf8(profile::fallback_notice("p", errno.unwrap())).unwrap();
+        assert_eq!(
+            notice,
+            "[Tessera] profile \"p\" could not start (Operation timed out); started the default shell.\r\n"
+        );
+        assert_eq!(
+            fallback_errno(&Error::Pty(PtyError::ArgumentsTooLong { bytes: 2, max: 1 })),
+            Ok(Some(profile::errno::E2BIG))
+        );
+        for refused in [
+            PtyError::Open("x".to_owned()),
+            PtyError::ProgramTimedOut { path_bytes: 1 },
+            PtyError::InvalidSize(PtySize::new(0, 1)),
+        ] {
+            assert_eq!(fallback_errno(&Error::Pty(refused)), Err(()));
+        }
     }
 
     #[test]
