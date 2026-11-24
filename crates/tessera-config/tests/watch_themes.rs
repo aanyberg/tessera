@@ -8,9 +8,9 @@
 //! arrives (up to [`EVENTUALLY`]), never for a fixed window that a starved
 //! watcher can miss; the files a test saves never pass through a partial
 //! state ([`save`]); the one latency bar is the fastest of up to
-//! [`BOUND_ROUNDS`] edits of each kind; and every window that asserts *no* event is a lower bound: a
-//! watcher starved past it can only make the test miss a wrong event, never
-//! fail on a right one.
+//! [`BOUND_ROUNDS`] edits of each kind; and every window that asserts *no*
+//! event is a lower bound: a watcher starved past it can only make the test
+//! miss a wrong event, never fail on a right one.
 
 use std::io::Write as _;
 use std::path::Path;
@@ -179,7 +179,7 @@ fn save(path: &Path, text: &str) {
 
 /// One edit of the theme in use in a round of
 /// `editing_the_theme_in_use_is_reported_once_within_the_bound`.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Edit {
     /// In place: no directory event; the native backend must watch the
     /// file itself.
@@ -196,9 +196,13 @@ enum Edit {
 /// `taskpolicy -b` single edits took 1 to 9 s (#525), so a bar on every
 /// edit, or on every edit of one round, cannot hold there. A watcher that
 /// is late at every edit (a delay before the event) fails every round. A
-/// late *phase* is not caught: a polling backend that sampled the theme
-/// file in use only at its full listing would meet the bound by chance at
-/// about half its edits.
+/// late *phase* is not caught here: a polling backend that sampled the
+/// theme file in use only at its full listing would meet the bound by
+/// chance at about half its edits. The unit tests
+/// `watch::tests::a_theme_switch_caught_up_at_start_up_is_followed_before_it_is_published`
+/// and `watch::tests::a_theme_switch_while_running_is_followed_before_it_is_published`
+/// catch it: they poll at 500 ms, so the full listing comes every 10 s,
+/// and wait 5 s for an in-place fix of the theme file in use.
 #[test]
 fn editing_the_theme_in_use_is_reported_once_within_the_bound() {
     use Edit::{InPlace, RenameSave};
@@ -212,7 +216,7 @@ fn editing_the_theme_in_use_is_reported_once_within_the_bound() {
         let mut took: Vec<(Edit, Duration)> = Vec::new();
         let fastest = |took: &[(Edit, Duration)], kind: Edit| {
             took.iter()
-                .filter(|(edit, _)| std::mem::discriminant(edit) == std::mem::discriminant(&kind))
+                .filter(|(edit, _)| *edit == kind)
                 .map(|(_, took)| *took)
                 .min()
         };
@@ -351,8 +355,13 @@ fn the_watched_theme_file_follows_appearance_theme() {
         assert!(drain(&watcher, QUIET).is_empty(), "{backend:?}");
 
         // Several in-place writes at delays that fall at different points
-        // of the polling interval: each is seen through the newly followed
-        // file within the bound, not by the slower full listing.
+        // of the polling interval: each is seen eventually (within
+        // [`EVENTUALLY`]). No latency is asserted, so this does not tell
+        // the newly followed file from the polling backend's full listing.
+        // `editing_the_theme_in_use_is_reported_once_within_the_bound`
+        // bounds an edit of the theme already in use; no test bounds the
+        // latency of a file newly followed after `appearance.theme`
+        // switches.
         for (n, delay_ms) in [0_u64, 130, 370].into_iter().enumerate() {
             std::thread::sleep(Duration::from_millis(delay_ms));
             let colour = format!("#2{n}2{n}2{n}");
@@ -669,8 +678,10 @@ fn a_flood_of_unloadable_theme_files_is_followed_up_to_the_cap() {
     expect_themes_changed(&watcher, WatchBackend::Native, "keyed.toml created empty");
     drain(&watcher, QUIET);
     let after = settled_descriptors();
-    // `mine.toml` is no longer followed, up to eight unloadable files are,
-    // and nothing else changed.
+    // `mine.toml` stays followed as the fallback `previous` (no file
+    // stem matches `Keyed Theme`, and an empty `keyed.toml` does not load),
+    // up to eight unloadable files are followed beside it, and nothing
+    // else changed.
     assert!(
         after <= before + 8,
         "{after} descriptors open, {before} before the switch"
