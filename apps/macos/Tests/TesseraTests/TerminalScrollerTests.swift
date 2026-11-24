@@ -569,33 +569,253 @@ final class TerminalScrollerTests: XCTestCase {
 
     func testTheKnobMovesWithoutAnAnimation() throws {
         // The knob tracks the view at once; the scroller's own opacity is
-        // what fades.
+        // what fades, and the pointer's widening is the only animation of
+        // the knob (#559), which the moves neither restart nor end.
         let (scroller, window) = makeScroller()
         defer { window.close() }
         try enter(scroller)
+        let widening = try overlayAnimations(scroller)
+        XCTAssertFalse(widening.isEmpty, "the pointer widens the knob")
         // Layers animate implicitly only once committed.
         CATransaction.flush()
         scroller.update(.init(offset: 2000, history: 10_000, rows: 24))
         scroller.frame.size.height = 300
         try exit(scroller)
         scroller.flash()
-        func animated(_ layer: CALayer) -> [String] {
-            (layer.animationKeys() ?? []) + (layer.sublayers ?? []).flatMap(animated)
+        let after = try overlayAnimations(scroller)
+        XCTAssertEqual(after.keys.sorted(), widening.keys.sorted(), "only the scroller's fade and the widening animate")
+        for (key, animation) in widening {
+            XCTAssertTrue(after[key] === animation, "\(key): the widening goes on")
         }
-        let layer = try XCTUnwrap(scroller.layer)
-        XCTAssertEqual((layer.sublayers ?? []).flatMap(animated), [], "only the scroller's fade animates")
+    }
+
+    // MARK: The widening (#559)
+
+    /// The overlay layers' animations, keyed by layer (`knob`, `fill`,
+    /// `rim`, `slot`) and animation key.
+    private func overlayAnimations(_ scroller: TerminalScroller) throws -> [String: CAAnimation] {
+        var found: [String: CAAnimation] = [:]
+        let layers = try knobLayers(scroller)
+        for (name, layer) in [("knob", layers.knob), ("fill", layers.fill), ("rim", layers.rim), ("slot", layers.slot)] {
+            for key in layer.animationKeys() ?? [] {
+                found["\(name) \(key)"] = layer.animation(forKey: key)
+            }
+        }
+        return found
+    }
+
+    /// The overlay knob layer, its fill and its rim (a 1 pt border), and
+    /// the slot layer.
+    private func knobLayers(
+        _ scroller: TerminalScroller
+    ) throws -> (knob: CALayer, fill: CALayer, rim: CALayer, slot: CALayer) {
+        let layers = try overlayLayers(scroller)
+        let knob = try XCTUnwrap(layers.first { $0.zPosition == 2 }, "the knob layer")
+        let slot = try XCTUnwrap(layers.first { $0.zPosition == 1 }, "the slot layer")
+        let sublayers = knob.sublayers ?? []
+        let rim = try XCTUnwrap(sublayers.first { $0.borderWidth > 0 }, "the rim")
+        let fill = try XCTUnwrap(sublayers.first { $0.borderWidth == 0 }, "the fill")
+        return (knob, fill, rim, slot)
+    }
+
+    /// AppKit's knob or slot rect `rect` wide or narrow, as the scroller
+    /// draws it: at its right edge, wide from as far from the left edge as
+    /// AppKit insets it from the right, narrow at most half that.
+    private func drawn(_ rect: NSRect, wide: Bool, in scroller: TerminalScroller) -> NSRect {
+        let left = min(max(scroller.bounds.maxX - rect.maxX, 0), rect.minX)
+        let full = rect.maxX - left
+        let width = wide ? full : min(rect.width, (full / 2).rounded(.up))
+        return NSRect(x: rect.maxX - width, y: rect.minY, width: width, height: rect.height)
+    }
+
+    /// The additive widening animation of `keyPath` on `layer`.
+    private func widening(_ layer: CALayer, _ keyPath: String) -> CABasicAnimation? {
+        (layer.animationKeys() ?? []).lazy.compactMap { layer.animation(forKey: $0) as? CABasicAnimation }
+            .first { $0.keyPath == keyPath }
+    }
+
+    /// How far the widening of `keyPath` starts from the model value (its
+    /// additive `fromValue`), or 0 without one.
+    private func startOffset(_ layer: CALayer, _ keyPath: String) -> CGFloat {
+        (widening(layer, keyPath)?.fromValue as? NSNumber).map { CGFloat($0.doubleValue) } ?? 0
+    }
+
+    /// The frame `layer` shows on the widening's first frame: its model
+    /// frame offset by the additive animations of x and width.
+    private func startFrame(_ layer: CALayer) -> NSRect {
+        let width = layer.bounds.width + startOffset(layer, "bounds.size.width")
+        let midX = layer.position.x + startOffset(layer, "position.x")
+        return NSRect(x: midX - width / 2, y: layer.frame.minY, width: width, height: layer.frame.height)
+    }
+
+    private func controlPoints(_ function: CAMediaTimingFunction?) -> [Float] {
+        guard let function else { return [] }
+        return (0..<4).flatMap { index -> [Float] in
+            var point: [Float] = [0, 0]
+            function.getControlPoint(at: index, values: &point)
+            return point
+        }
+    }
+
+    func testThePointerWidensTheKnobAndItsSlotOverAppKitsDurationAndCurve() throws {
+        // AppKit's, measured on macOS 27.2 (build 26B123).
+        XCTAssertEqual(TerminalScroller.knobExpandDuration, 0.125)
+        let easeInEaseOut: [Float] = [0, 0, 0.42, 0, 0.58, 1, 1, 1]
+        XCTAssertEqual(controlPoints(TerminalScroller.knobExpandTimingFunction), easeInEaseOut)
+
+        let (scroller, window) = makeScroller()
+        defer { window.close() }
+        let layers = try knobLayers(scroller)
+        let narrowKnob = layers.knob.frame
+        let knob = scroller.rect(for: .knob), slot = scroller.rect(for: .knobSlot)
+        XCTAssertEqual(narrowKnob, drawn(knob, wide: false, in: scroller).insetBy(dx: -1, dy: -1), "narrow")
+        XCTAssertTrue(layers.slot.isHidden, "no slot behind the narrow knob")
+        try enter(scroller)
+
+        // The model frames are the end frames at once.
+        let wideKnob = drawn(knob, wide: true, in: scroller)
+        XCTAssertEqual(layers.knob.frame, wideKnob.insetBy(dx: -1, dy: -1), "wide at once")
+        XCTAssertEqual(layers.slot.frame, drawn(slot, wide: true, in: scroller), "the wide slot at once")
+        XCTAssertFalse(layers.slot.isHidden)
+        XCTAssertEqual(layers.fill.frame, CGRect(origin: .zero, size: wideKnob.size).offsetBy(dx: 1, dy: 1))
+        XCTAssertEqual(layers.fill.cornerRadius, wideKnob.width / 2)
+        XCTAssertEqual(layers.rim.frame.size, layers.knob.bounds.size)
+        XCTAssertEqual(layers.rim.cornerRadius, wideKnob.width / 2 + 1)
+
+        // Every width animation is AppKit's, additive, ending at the model.
+        var count = 0
+        for layer in [layers.knob, layers.fill, layers.rim, layers.slot] {
+            for keyPath in ["position.x", "bounds.size.width"] {
+                let animation = try XCTUnwrap(widening(layer, keyPath), "\(keyPath) of \(layer) widens")
+                XCTAssertEqual(animation.duration, TerminalScroller.knobExpandDuration)
+                XCTAssertEqual(controlPoints(animation.timingFunction), easeInEaseOut, keyPath)
+                XCTAssertTrue(animation.isAdditive, keyPath)
+                XCTAssertEqual((animation.toValue as? NSNumber)?.doubleValue, 0, "\(keyPath) ends at the model")
+                XCTAssertEqual(animation.beginTime, 0, "in lockstep: begun at the same commit")
+                count += 1
+            }
+        }
+        XCTAssertEqual(count, 8)
+        // From the narrow frames: the knob as it was, the slot at its
+        // width from the first frame, in the knob's column.
+        XCTAssertEqual(startFrame(layers.knob), narrowKnob, "the knob starts narrow")
+        let slotStart = startFrame(layers.slot)
+        XCTAssertEqual(slotStart, drawn(slot, wide: false, in: scroller), "the slot starts narrow")
+        XCTAssertEqual(slotStart.minX, narrowKnob.minX + 1, "in the knob's column")
+        XCTAssertEqual(slotStart.width, narrowKnob.width - 2)
+        // The fill and rim stay centred and round.
+        for (layer, inset) in [(layers.fill, CGFloat(1)), (layers.rim, 0)] {
+            let width = startOffset(layer, "bounds.size.width")
+            XCTAssertEqual(width, narrowKnob.width - layers.knob.frame.width)
+            XCTAssertEqual(startOffset(layer, "position.x"), width / 2, "centred")
+            let radius = layer.cornerRadius + startOffset(layer, "cornerRadius")
+            XCTAssertEqual(radius, (narrowKnob.width - 2 * inset) / 2, "round at the narrow width")
+            XCTAssertEqual(widening(layer, "cornerRadius")?.duration, TerminalScroller.knobExpandDuration)
+        }
+        // The wide knob grabs from the first frame (G6).
+        XCTAssertEqual(scroller.testPart(scroller.convert(hoverPoint(scroller), to: nil)), .knob)
+    }
+
+    func testAFlashFromFadedOutNarrowsAtOnceAndEndsAWideningInFlight() throws {
+        let (scroller, window) = makeScroller()
+        defer { window.close() }
+        let layers = try knobLayers(scroller)
+        let narrowKnob = layers.knob.frame
+        try enter(scroller)
+        try exit(scroller)
+        clock += 10
+        XCTAssertFalse(scroller.isRevealed, "faded out")
+        XCTAssertFalse(try overlayAnimations(scroller).isEmpty, "the widening is still on the layers")
+        // Committed, so that an implicit animation would show.
+        CATransaction.flush()
+        scroller.flash()
+        XCTAssertEqual(try overlayAnimations(scroller).keys.sorted(), [], "narrowed without an animation")
+        XCTAssertEqual(layers.knob.frame, narrowKnob, "narrow")
+        XCTAssertTrue(layers.slot.isHidden)
+
+        // Hidden without history while widening, then shown by a scroll.
+        try enter(scroller)
+        XCTAssertFalse(try overlayAnimations(scroller).isEmpty)
+        scroller.update(.init(offset: 0, history: 0, rows: 24))
+        scroller.update(Self.middle)
+        scroller.flash()
+        XCTAssertEqual(try overlayAnimations(scroller).keys.sorted(), [], "narrowed without an animation")
+        XCTAssertEqual(layers.knob.frame, narrowKnob)
+        XCTAssertTrue(layers.slot.isHidden)
+
+        // Widened again, it starts from the narrow knob on screen.
+        try enter(scroller)
+        XCTAssertEqual(startFrame(layers.knob), narrowKnob, "no jump")
+        XCTAssertEqual(startFrame(layers.slot).width, narrowKnob.width - 2)
+    }
+
+    func testUnderReduceMotionThePointerWidensTheKnobAtOnce() throws {
+        let (scroller, window) = makeScroller()
+        defer { window.close() }
+        scroller.reducesMotion = true
+        try enter(scroller)
+        let layers = try knobLayers(scroller)
+        XCTAssertEqual(try overlayAnimations(scroller).keys.sorted(), [], "no animation")
+        XCTAssertEqual(
+            layers.knob.frame, drawn(scroller.rect(for: .knob), wide: true, in: scroller).insetBy(dx: -1, dy: -1))
+        XCTAssertEqual(layers.slot.frame, drawn(scroller.rect(for: .knobSlot), wide: true, in: scroller))
+        XCTAssertFalse(layers.slot.isHidden)
+    }
+
+    func testAFadeAndADragDuringTheWideningLeaveItRunningToTheWideKnob() throws {
+        let (scroller, window) = makeScroller()
+        defer { window.close() }
+        try enter(scroller)
+        CATransaction.flush()
+        let widening = try overlayAnimations(scroller)
+        XCTAssertFalse(widening.isEmpty, "widening")
+        let layers = try knobLayers(scroller)
+        func wideKnob() -> NSRect { drawn(scroller.rect(for: .knob), wide: true, in: scroller).insetBy(dx: -1, dy: -1) }
+        func assertRunning(_ message: String, line: UInt = #line) throws {
+            let now = try overlayAnimations(scroller)
+            XCTAssertEqual(now.keys.sorted(), widening.keys.sorted(), message, line: line)
+            for (key, animation) in widening {
+                XCTAssertTrue(now[key] === animation, "\(message): \(key) neither restarted nor ended", line: line)
+            }
+            XCTAssertEqual(layers.knob.frame, wideKnob(), "\(message): the wide knob", line: line)
+        }
+
+        // A knob drag (G2): pressed, moved by AppKit, which sends the action.
+        let start = layers.knob.frame
+        scroller.beginTracking()
+        try assertRunning("pressed")
+        scroller.doubleValue = 0.8
+        XCTAssertTrue(scroller.sendAction(scroller.action, to: scroller.target))
+        try assertRunning("dragged")
+        XCTAssertGreaterThan(abs(layers.knob.frame.minY - start.minY), 20, "at the dragged position")
+        XCTAssertEqual(layers.knob.frame.width, start.width, "as wide")
+        scroller.endTracking()
+        try assertRunning("released")
+
+        // The fade after the pointer left (G4, D4) is the scroller's own.
+        try exit(scroller)
+        XCTAssertNotNil(try flashOpacity(scroller, after: 0), "fading")
+        try assertRunning("fading")
     }
 
     // MARK: Dragging
 
     func testDraggingTheWideKnobMovesTheViewAndTheKnobFollowsThePointer() throws {
-        let (scroller, window) = makeScroller()
+        // A short history: the knob is longer than AppKit's minimum, so
+        // the output the driver adds while it is held shows in its length
+        // once released. While held, AppKit's tracking loop keeps its knob
+        // whatever value and proportion are set (#559: with `freezesKnob`
+        // always false the drawn knob still stays put, so that rule is
+        // pinned by `TerminalScrollTests`, not here).
+        let history: UInt64 = 200
+        let (scroller, window) = makeScroller(.init(offset: history / 2, history: history, rows: 24))
         defer { window.close() }
         var targets: [TesseraSession.ScrollTarget] = []
         scroller.onScroll = { targets.append($0) }
         try enter(scroller)
         let start = hoverPoint(scroller)
         let before = try XCTUnwrap(try render(scroller).knob(atX: start.x))
+        XCTAssertGreaterThan(before.bottom - before.top, minimumKnobLength(scroller) + 8, "longer than the minimum")
         let driver = KnobDragDriver(scroller: scroller, window: window, start: start, distance: 40)
         driver.render = { [unowned self] in try? self.render(scroller).knob(atX: start.x) }
         let knobWidth: () -> CGFloat? = { [unowned self] in
@@ -617,15 +837,23 @@ final class TerminalScrollerTests: XCTestCase {
         let moved = try XCTUnwrap(driver.moved, "the knob is drawn during the drag")
         XCTAssertEqual(moved.top - before.top, 40, accuracy: 1.5, "the knob follows the pointer")
         let value = try XCTUnwrap(driver.value)
-        let expected = 10_000 - UInt64((value * 10_000).rounded())
+        let expected = history - UInt64((value * Double(history)).rounded())
         XCTAssertGreaterThan(value, 0.55, "dragged towards the live screen")
         XCTAssertEqual(driver.targetsAfterDrag.last, .offset(expected), "the view goes to the knob's line")
-        XCTAssertEqual(driver.afterOutput?.top, moved.top, "output during the drag does not move the knob")
+        XCTAssertEqual(driver.afterOutput?.top, moved.top, "output during the drag does not move the drawn knob")
         XCTAssertEqual(driver.afterOutput?.bottom, moved.bottom)
         XCTAssertEqual(
             try XCTUnwrap(driver.widthAfterExit), wideWidth, accuracy: 1,
             "still wide with the pointer off the strip during the drag")
         XCTAssertFalse(scroller.isTracking)
+        // Released, the knob shows the position last read: the output's.
+        let last = try XCTUnwrap(scroller.position)
+        XCTAssertEqual(last.history, history + 500)
+        XCTAssertEqual(scroller.doubleValue, Double(last.history - last.offset) / Double(last.history), accuracy: 1e-9)
+        let column = scroller.rect(for: .knob).midX - 3
+        let released = try XCTUnwrap(try render(scroller, ignoringOpacity: true).knob(atX: column), "the released knob")
+        XCTAssertEqual(released.top, scroller.rect(for: .knob).minY, accuracy: 2, "where the position puts it")
+        XCTAssertLessThan(released.bottom - released.top, before.bottom - before.top - 8, "shorter: more history")
     }
 
     // MARK: Layout
@@ -653,18 +881,30 @@ final class TerminalScrollerTests: XCTestCase {
         scroller.setFrameSize(full)
         XCTAssertEqual(scroller.usableParts, .allScrollerParts)
         XCTAssertTrue(try overlayLayers(scroller).allSatisfy { !$0.isHidden }, "both are back")
+
+        // At AppKit's boundary: 32 pt on macOS 27 (#559, E1).
+        let shortest = try XCTUnwrap(
+            (1...100).map(CGFloat.init).first { height in
+                scroller.setFrameSize(NSSize(width: full.width, height: height))
+                return scroller.usableParts == .allScrollerParts
+            }, "AppKit gives a knob from some height")
+        if ProcessInfo.processInfo.operatingSystemVersion.majorVersion >= 27 {
+            XCTAssertEqual(shortest, 32, "AppKit's shortest overlay scroller with a knob")
+        }
+        scroller.setFrameSize(NSSize(width: full.width, height: shortest - 1))
+        XCTAssertTrue(try overlayLayers(scroller).allSatisfy(\.isHidden), "\(shortest - 1) pt: neither is shown")
+        scroller.setFrameSize(NSSize(width: full.width, height: shortest))
+        XCTAssertTrue(try overlayLayers(scroller).allSatisfy { !$0.isHidden }, "\(shortest) pt: both are shown")
     }
 
     /// Moved to a screen of another scale, the drawn knob goes where AppKit
     /// now puts its own: AppKit rounds the knob's rect to the backing scale.
     /// The change is called as AppKit calls it; the window reports the scale.
-    func testAChangeOfBackingScaleMovesTheKnobToAppKitsRect() throws {
-        let window = ScaledWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 480, height: Self.height), styleMask: [.titled],
-            backing: .buffered, defer: false)
-        let (scroller, _) = makeScroller(in: window)
-        defer { window.close() }
-        // A position whose knob rounds differently at the two scales.
+    /// A position whose knob AppKit rounds differently at 1x and 2x, and
+    /// its knob rect at 2x; the window is left at 1x.
+    private func positionRoundedDifferently(
+        _ scroller: TerminalScroller, in window: ScaledWindow
+    ) throws -> (position: TesseraSession.ScrollPosition, rect: NSRect) {
         var found: (position: TesseraSession.ScrollPosition, rect: NSRect)?
         for offset in stride(from: UInt64(3000), to: 7000, by: 13) {
             let position = TesseraSession.ScrollPosition(offset: offset, history: 10_000, rows: 24)
@@ -678,7 +918,16 @@ final class TerminalScrollerTests: XCTestCase {
                 break
             }
         }
-        let (position, fine) = try XCTUnwrap(found, "AppKit rounds the knob to the backing scale")
+        return try XCTUnwrap(found, "AppKit rounds the knob to the backing scale")
+    }
+
+    func testAChangeOfBackingScaleMovesTheKnobToAppKitsRect() throws {
+        let window = ScaledWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 480, height: Self.height), styleMask: [.titled],
+            backing: .buffered, defer: false)
+        let (scroller, _) = makeScroller(in: window)
+        defer { window.close() }
+        let (position, fine) = try positionRoundedDifferently(scroller, in: window)
         // Laid out at 1x: an unchanged position would lay nothing out.
         scroller.update(.init(offset: position.offset + 1, history: position.history, rows: position.rows))
         scroller.update(position)
@@ -690,6 +939,39 @@ final class TerminalScrollerTests: XCTestCase {
 
         XCTAssertEqual(knob.frame.minY, fine.minY - 1, "the rim is 1 pt outside AppKit's knob")
         XCTAssertEqual(knob.frame.height, fine.height + 2)
+    }
+
+    /// A change of backing scale while the knob widens (E5): the layers
+    /// are at once where AppKit puts its knob and slot at the new scale,
+    /// and the widening, made of differences from the model, ends there.
+    func testAChangeOfBackingScaleDuringTheWideningEndsAtAppKitsNewRect() throws {
+        let window = ScaledWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 480, height: Self.height), styleMask: [.titled],
+            backing: .buffered, defer: false)
+        let (scroller, _) = makeScroller(in: window)
+        defer { window.close() }
+        let (position, fine) = try positionRoundedDifferently(scroller, in: window)
+        scroller.update(.init(offset: position.offset + 1, history: position.history, rows: position.rows))
+        scroller.update(position)
+        try enter(scroller)
+        let layers = try knobLayers(scroller)
+        XCTAssertNotEqual(layers.knob.frame.minY, fine.minY - 1, "at 1x, not yet where 2x puts it")
+        XCTAssertFalse(try overlayAnimations(scroller).isEmpty, "widening")
+        CATransaction.flush()
+
+        window.scale = 2
+        scroller.viewDidChangeBackingProperties()
+
+        XCTAssertEqual(scroller.rect(for: .knob), fine)
+        XCTAssertEqual(layers.knob.frame, drawn(fine, wide: true, in: scroller).insetBy(dx: -1, dy: -1), "2x")
+        XCTAssertEqual(layers.slot.frame, drawn(scroller.rect(for: .knobSlot), wide: true, in: scroller))
+        let animations = try overlayAnimations(scroller)
+        XCTAssertFalse(animations.isEmpty, "the widening goes on")
+        for (key, animation) in animations {
+            let basic = try XCTUnwrap(animation as? CABasicAnimation, key)
+            XCTAssertTrue(basic.isAdditive, "\(key): relative to the model, so not stale")
+            XCTAssertEqual((basic.toValue as? NSNumber)?.doubleValue, 0, "\(key): ends at the new frame")
+        }
     }
 
     // MARK: Legacy style

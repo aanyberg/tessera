@@ -31,7 +31,10 @@ import TesseraKit
 ///   appearance (#558), and the slot is drawn to match. A scroll shows the
 ///   narrow knob alone; under the pointer, or while the knob is held, the
 ///   knob is wide, over AppKit's slot drawn as wide, and stays so until
-///   the scroller has faded out after the pointer left.
+///   the scroller has faded out after the pointer left. It widens as
+///   AppKit's does (``knobExpandDuration``), the slot with it, and narrows
+///   at once (it is faded out then); under Reduce Motion it widens at
+///   once.
 /// - Input: dragging the knob or clicking the track reports where to go
 ///   through ``onScroll``; the terminal view moves the session's view.
 @MainActor
@@ -80,7 +83,7 @@ final class TerminalScroller: NSScroller {
     /// one, drawn over AppKit's layers; hidden in legacy style.
     private let knobLayer = CALayer()
     private let knobFill = CALayer()
-    private let knobRim = CAShapeLayer()
+    private let knobRim = CALayer()
     private let slotLayer = CALayer()
     /// The overlay layers' delegate: no implicit animations, and the slot
     /// drawn by AppKit.
@@ -90,6 +93,20 @@ final class TerminalScroller: NSScroller {
     static let holdDuration: CFTimeInterval = 1.0
     static let fadeDuration: CFTimeInterval = 0.3
     private static let flashKey = "flash"
+
+    /// How long the overlay knob and its slot take to widen, and over what
+    /// curve: AppKit's own. Measured on macOS 27.2 (build 26B123, #559)
+    /// with an overlay scroller in an `NSScrollView`: on hover its imp asks
+    /// its delegate for `scrollerImp:animateExpansionTransitionWithDuration:`
+    /// 0.125 s, and the knob's width over time fits ease-in-ease-out
+    /// (rms 0.004, linear 0.045). AppKit narrows its knob without an
+    /// animation, once its fade has ended, and so does this scroller.
+    static let knobExpandDuration: CFTimeInterval = 0.125
+    static let knobExpandTimingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+    /// The widening's animations, one per key path (``animateWidening(from:)``),
+    /// on the knob, fill, rim and slot layers.
+    private static let widenKeyPaths = ["position.x", "bounds.size.width", "cornerRadius"]
+    private static let widenKeyPrefix = "widen."
 
     /// The clock the flash is timed by (tests advance their own).
     var now: () -> CFTimeInterval = { CACurrentMediaTime() }
@@ -389,7 +406,7 @@ final class TerminalScroller: NSScroller {
         }
         painter.drawSlot = { [weak self] context, size in self?.drawOverlaySlot(in: context, size: size) }
         slotLayer.needsDisplayOnBoundsChange = true
-        knobRim.fillRule = .evenOdd
+        knobRim.borderWidth = 1
         knobLayer.addSublayer(knobRim)
         knobLayer.addSublayer(knobFill)
         // Above AppKit's track and knob layers, whatever their order.
@@ -444,7 +461,7 @@ final class TerminalScroller: NSScroller {
         default: darkKnob = effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) != .darkAqua
         }
         knobFill.backgroundColor = CGColor(gray: darkKnob ? 0 : 1, alpha: 0.5)
-        knobRim.fillColor = CGColor(gray: darkKnob ? 1 : 0, alpha: darkKnob ? 0.15 : 0.2)
+        knobRim.borderColor = CGColor(gray: darkKnob ? 1 : 0, alpha: darkKnob ? 0.15 : 0.2)
         slotLayer.setNeedsDisplay()
     }
 
@@ -459,10 +476,72 @@ final class TerminalScroller: NSScroller {
         NSGraphicsContext.restoreGraphicsState()
     }
 
+    /// Widens or narrows the overlay knob and shows or hides its slot. The
+    /// layers get the new frames at once; a widening then animates them
+    /// from the narrow ones (``animateWidening(from:)``), unless under
+    /// Reduce Motion. A narrowing, reached only while the scroller is faded
+    /// out (``flash()``), is not animated, as AppKit's is not, and ends a
+    /// widening still in flight.
     private func setExpanded(_ expanded: Bool) {
         guard expanded != isExpanded else { return }
+        let before = overlayRects
         isExpanded = expanded
+        removeWidening()
         layoutOverlayKnob()
+        if expanded, !reducesMotion {
+            animateWidening(from: before)
+        }
+    }
+
+    /// Animates the knob and slot layers, laid out wide, from `narrow` (the
+    /// ``overlayRects`` before the widening): additive animations of each
+    /// layer's x, width and corner radius from the narrow value's
+    /// difference to none, over ``knobExpandDuration``. Being differences
+    /// from the model, they compose with whatever moves the knob meanwhile
+    /// (a drag, output, a resize, a change of backing scale), which sets
+    /// the model frames at once and is not animated; the slot is shown at
+    /// the narrow width from the first frame and widens with the knob.
+    private func animateWidening(from narrow: (knob: NSRect, slot: NSRect)) {
+        let wide = overlayRects
+        if !narrow.knob.isEmpty, !wide.knob.isEmpty {
+            let from = narrow.knob.insetBy(dx: -1, dy: -1), to = wide.knob.insetBy(dx: -1, dy: -1)
+            let width = from.width - to.width
+            addWidening(knobLayer, "position.x", from.midX - to.midX)
+            addWidening(knobLayer, "bounds.size.width", width)
+            // The fill and rim are centred in the knob layer.
+            func radius(_ size: CGSize) -> CGFloat { min(size.width, size.height) / 2 }
+            for (sublayer, inset) in [(knobFill, CGFloat(1)), (knobRim, 0)] {
+                addWidening(sublayer, "position.x", width / 2)
+                addWidening(sublayer, "bounds.size.width", width)
+                let radiusDelta = radius(from.insetBy(dx: inset, dy: inset).size)
+                    - radius(to.insetBy(dx: inset, dy: inset).size)
+                addWidening(sublayer, "cornerRadius", radiusDelta)
+            }
+        }
+        if !narrow.slot.isEmpty, !wide.slot.isEmpty {
+            addWidening(slotLayer, "position.x", narrow.slot.midX - wide.slot.midX)
+            addWidening(slotLayer, "bounds.size.width", narrow.slot.width - wide.slot.width)
+        }
+    }
+
+    private func addWidening(_ layer: CALayer, _ keyPath: String, _ delta: CGFloat) {
+        guard delta != 0 else { return }
+        let animation = CABasicAnimation(keyPath: keyPath)
+        animation.isAdditive = true
+        animation.fromValue = delta
+        animation.toValue = 0
+        animation.duration = Self.knobExpandDuration
+        animation.timingFunction = Self.knobExpandTimingFunction
+        layer.add(animation, forKey: Self.widenKeyPrefix + keyPath)
+    }
+
+    /// Ends a widening in flight: the layers show their model frames.
+    private func removeWidening() {
+        for layer in [knobLayer, knobFill, knobRim, slotLayer] {
+            for keyPath in Self.widenKeyPaths {
+                layer.removeAnimation(forKey: Self.widenKeyPrefix + keyPath)
+            }
+        }
     }
 
     /// `rect` (AppKit's knob or slot) in the overlay knob's column, at its
@@ -479,15 +558,22 @@ final class TerminalScroller: NSScroller {
         return NSRect(x: rect.maxX - width, y: rect.minY, width: width, height: rect.height)
     }
 
+    /// The overlay knob's and slot's rects at the current width
+    /// (``widened(_:)``), or empty in legacy style, without history, or
+    /// when the scroller is too short for AppKit to give it a knob.
+    private var overlayRects: (knob: NSRect, slot: NSRect) {
+        guard scrollerStyle == .overlay, hasHistory, usableParts == .allScrollerParts else { return (.zero, .zero) }
+        return (widened(rect(for: .knob)), widened(rect(for: .knobSlot)))
+    }
+
     /// Places the overlay knob over AppKit's knob rect (its position and
     /// minimum length are AppKit's), narrow or wide, and the slot
-    /// behind it while expanded; hides both in legacy style, without
-    /// history, or when the scroller is too short for AppKit to give it a
-    /// knob. Sets nothing that has not changed.
+    /// behind it while expanded; hides both where ``overlayRects`` are
+    /// empty. Sets nothing that has not changed.
     private func layoutOverlayKnob() {
-        let overlay = scrollerStyle == .overlay && hasHistory && usableParts == .allScrollerParts
-        let knob = overlay ? widened(rect(for: .knob)) : .zero
-        let slot = overlay && isExpanded ? widened(rect(for: .knobSlot)) : .zero
+        let rects = overlayRects
+        let knob = rects.knob
+        let slot = isExpanded ? rects.slot : .zero
         let knobShown = !knob.isEmpty, slotShown = !slot.isEmpty
         if knobLayer.isHidden == knobShown {
             knobLayer.isHidden = !knobShown
@@ -508,12 +594,9 @@ final class TerminalScroller: NSScroller {
         let fill = bounds.insetBy(dx: 1, dy: 1)
         knobFill.frame = fill
         knobFill.cornerRadius = min(fill.width, fill.height) / 2
-        let rim = CGMutablePath()
-        let outerRadius = min(bounds.width, bounds.height) / 2
-        rim.addRoundedRect(in: bounds, cornerWidth: outerRadius, cornerHeight: outerRadius)
-        rim.addRoundedRect(in: fill, cornerWidth: knobFill.cornerRadius, cornerHeight: knobFill.cornerRadius)
+        // A 1 pt border, whose inner edge is the fill's outline.
         knobRim.frame = bounds
-        knobRim.path = rim
+        knobRim.cornerRadius = min(bounds.width, bounds.height) / 2
     }
 
     override func setFrameSize(_ newSize: NSSize) {
@@ -632,8 +715,9 @@ final class TerminalScroller: NSScroller {
 }
 
 /// The delegate of ``TerminalScroller``'s overlay layers: no implicit
-/// animations (the knob moves with the view, and the scroller's own
-/// opacity fades it), and the slot drawn by the scroller. Core Animation
+/// animations (the knob moves with the view, the scroller's own opacity
+/// fades it, and its widening is animated explicitly), and the slot drawn
+/// by the scroller. Core Animation
 /// asks on the thread that changes or displays the layers: the main one.
 @MainActor
 private final class OverlayPainter: NSObject, @preconcurrency CALayerDelegate {

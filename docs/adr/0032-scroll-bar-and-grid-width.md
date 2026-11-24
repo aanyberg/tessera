@@ -281,8 +281,20 @@ wheel and clicks) left for 0.3.0. In overlay style:
   unchanged). The drawn knob follows AppKit's knob on each action during a
   drag, and the position otherwise, at once: the layers have no implicit
   animations, and the scroller's own opacity is what fades.
-- The widening is not animated (AppKit widens its own over about half a
-  second).
+- The widening is animated as AppKit's (#559): measured on macOS 27.2
+  (build 26B123), AppKit's overlay scroller in a scroll view asks for a
+  0.125 s expansion transition whose width follows ease-in-ease-out, its
+  slot shown at the narrow width at once and widening with the knob
+  (`knobExpandDuration`, `knobExpandTimingFunction`). The layers take the
+  wide frames at once and additive animations of x, width and corner
+  radius run from the narrow ones, so a drag, output, a resize or a
+  backing-scale change meanwhile moves the knob at once and the widening
+  still ends at the model frames; the fade is on the scroller's own layer
+  and composes. The knob's rim is a 1 pt border, whose corner radius
+  animates with it. The narrowing is not animated: AppKit narrows only
+  once its fade has ended, and this scroller narrows only while faded
+  out, which ends a widening still in flight. Under Reduce Motion the
+  knob widens at once.
 
 The view's layout is unchanged: an overlay scroller still takes no grid
 width, and a legacy scroller is AppKit's alone.
@@ -293,7 +305,10 @@ the knob, its width, its rim and its slot from the pixels, so the oracle is
 what is drawn, not `alphaValue`. The pointer enters and leaves
 through the handlers with a synthesised event (a window never on screen
 gets no tracking-area events); the tracking area's options are checked
-beside them, and real pointer dispatch is a manual check.
+beside them, and real pointer dispatch is a manual check. The widening is
+checked from the layers' model frames (the end frames, at once) and their
+animation objects (keys, duration, curve, start offsets), never from
+presentation frames against the clock (#559).
 
 **Manual checks.**
 
@@ -302,5 +317,9 @@ beside them, and real pointer dispatch is a manual check.
   view is and fades. Move the pointer to the right edge: the knob widens
   over its slot at the view's place; drag it, the view follows; move away:
   it stays about 1 s, then fades. Compare with Terminal.app.
+- The widening (#559): point at the strip with the knob narrow; the knob
+  and its slot widen together over about an eighth of a second, smoothly,
+  with no jump at the start or the end, as in Terminal.app; under Reduce
+  Motion they are wide at once.
 - The same in dark appearance, and with "Always": the legacy scroller is
   unchanged.
