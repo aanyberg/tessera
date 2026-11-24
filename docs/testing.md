@@ -101,7 +101,12 @@ the test bundle's principal class (`HostDisplaySettings`) pins Reduce
 Motion, Reduce Transparency and Increase Contrast off before the first
 test, and a test that turns one on puts the pin back in its tearDown. A
 view's VoiceOver monitor is the machine's until a test replaces it, so a
-test that needs a client attached sets a detached fake first.
+test that needs a client attached sets a detached fake first. It also
+turns AppKit's window open and close animations off
+(`NSAutomaticWindowAnimationsEnabled`, in the volatile argument domain):
+in some console states (seen locally, cause unknown) a closing window's
+animation never ends and holds a dispatch worker, and once a run has held
+64 the quit tests hang in `NSApp.terminate` (#637).
 
 ## Timing tests and the `timing` group
 

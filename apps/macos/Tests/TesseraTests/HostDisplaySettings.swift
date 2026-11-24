@@ -10,7 +10,8 @@ import XCTest
 /// (a CI runner may report Reduce Motion on, and a scroll bar would then
 /// never fade). A test that needs one on sets the app delegate's read
 /// itself and calls ``pin(_:)`` in its tearDown. It also holds the run to
-/// ``LiveWindows/bound``.
+/// ``LiveWindows/bound`` and turns window animations off
+/// (``turnOffWindowAnimations()``).
 @objc(TesseraTestsHostDisplaySettings)
 final class HostDisplaySettings: NSObject, XCTestObservation {
     override init() {
@@ -21,6 +22,7 @@ final class HostDisplaySettings: NSObject, XCTestObservation {
 
     func testBundleWillStart(_ testBundle: Bundle) {
         MainActor.assumeIsolated {
+            Self.turnOffWindowAnimations()
             // A child of TerminationSignalTests or FullScreenToggleTests
             // runs no test.
             FullScreenToggleChild.runIfRequested()
@@ -45,6 +47,24 @@ final class HostDisplaySettings: NSObject, XCTestObservation {
         FileHandle.standardError.write(Data(line.utf8))
     }
 
+    /// The test host opens and closes windows without AppKit's open and
+    /// close animations (`NSAutomaticWindowAnimationsEnabled` off, in the
+    /// volatile argument domain, which writes nothing to disk) (#637). In
+    /// some console states (seen locally, cause unknown) those animations
+    /// never get a frame: a closing window's animation never ends and holds
+    /// one dispatch worker for the rest of the run. A full run closes hundreds
+    /// of windows, so the pool reaches its limit of 64 workers, and
+    /// `NSApp.terminate` then waits forever for the window-state work it
+    /// queues before it asks the delegate (the quit tests hung under load).
+    static func turnOffWindowAnimations() {
+        let defaults = UserDefaults.standard
+        var arguments = defaults.volatileDomain(forName: UserDefaults.argumentDomain)
+        arguments[windowAnimationsKey] = false
+        defaults.setVolatileDomain(arguments, forName: UserDefaults.argumentDomain)
+    }
+
+    static let windowAnimationsKey = "NSAutomaticWindowAnimationsEnabled"
+
     /// All three read as off, applied at once (the scroll bars' default
     /// and the core's options follow).
     @MainActor
@@ -66,5 +86,14 @@ final class HostDisplaySettingsTests: XCTestCase {
         XCTAssertFalse(appDelegate.increasesContrast())
         XCTAssertFalse(TerminalScroller.systemReducesMotion, "a new scroll bar fades")
         XCTAssertFalse(TerminalScroller().reducesMotion)
+    }
+
+    /// Window animations are off in the test host (#637): in some console
+    /// states (seen locally, cause unknown) each window close otherwise
+    /// holds a dispatch worker in `-[NSAnimation _runBlocking]` for good,
+    /// and the quit tests hang once 64 are held.
+    func testWindowAnimationsAreOff() {
+        XCTAssertEqual(
+            UserDefaults.standard.object(forKey: HostDisplaySettings.windowAnimationsKey) as? Bool, false)
     }
 }
