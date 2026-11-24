@@ -2,7 +2,7 @@
 
 **Status:** accepted · 2026-11-08 · amended 2026-11-13 (#351: click budget, path marks,
 rich-copy output); amended 2026-11-18 (#433: a per-match click budget, single-walk
-rich copy)
+rich copy); amended 2026-11-24 (#557: the click clock read every 16 matches)
 
 ## Context
 
@@ -132,7 +132,7 @@ one is short), and a copy past the cap is `TESSERA_ERROR_REFUSED` with only
 | Rules | 64 (`MAX_SMART_RULES`), later ones dropped with one warning |
 | Pattern | 1024 bytes (`MAX_SMART_RULE_PATTERN_LEN`); compiled program and lazy DFA cache 1 MiB each (`SMART_RULE_SIZE_LIMIT`), nesting 50 (`SMART_RULE_NEST_LIMIT`); a rule that breaks one, does not compile or matches the empty string is left out with a warning naming its index |
 | Scan | 8192 characters of the logical line around the click (`SMART_SCAN_LEN`: 4096 before it, the rest after) and 32 KiB (`SMART_SCAN_BYTES`: 16 KiB before it, 16 KiB from it on, #433) |
-| Click time | 50 ms (`SMART_RULE_BUDGET`), checked before each rule and after each match, the first rule included (#433) |
+| Click time | 50 ms (`SMART_RULE_BUDGET`), checked before each rule, the first rule included (#433), and after each costly search and every 16th match (`SMART_CLOCK_STRIDE`, #557) |
 | Formatted copy | 16 MiB of HTML and of RTF (`MAX_RICH_COPY_LEN`), counted while the runs are built; past it the formatted copy is refused and the plain copy still works |
 | RTF colour table | 4096 entries (`MAX_RTF_COLORS`); more is refused like a copy past the size cap |
 
@@ -434,3 +434,25 @@ size floor), instructions, three fresh probes, bar 1.10, the warm-up click
 counted. At a load of 7-8, head/base: 64 rules on a 2048-column `/a` line
 1.053-1.054, the 15 built-in rules on an ASCII line 1.011-1.012 and on a
 2048-column `日/` line 1.003, checksums equal.
+
+## Amendment: the click clock read every 16 matches (#557, 2026-11-24)
+
+The budget read the clock after every match. A rule that matches at every
+character spends a good part of its click on those reads, and since #518
+most matches come from a DFA search on cached states, which costs about as
+much as the read. The clock is now read after a match only when its search
+may have been costly (the first search on a cold cache, one that gave up,
+reset its cache and ran again cold, or any match of the fallback), or when
+the match is the click's 16th, 32nd, ... (`SMART_CLOCK_STRIDE`). The
+searches between two reads neither reset the cache nor fall back, so
+together they add at most one cache fill (the states added since the last
+reset fit in it) and a pass over the window each: a click still costs the
+budget plus one attempt, plus fewer than 16 such searches (microseconds),
+and a rule matching everywhere stops within the budget plus 16 matches.
+`.` on the hostile test's 20 000-character lines took 117-282 µs a click
+(release, thread CPU, fastest of 3) against 164-369 µs before.
+
+The hostile test's bars now come from each row: a rule that finds matches
+on that text gets the budget plus one attempt (100 ms), one that finds none
+one attempt (50 ms), from the matches its clicks found rather than a flag
+per rule.

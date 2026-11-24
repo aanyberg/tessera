@@ -58,9 +58,12 @@ use tessera_config::{CompiledRule, SMART_RULE_NEST_LIMIT, SMART_RULE_SIZE_LIMIT,
 /// DFA cache at most twice (a warm cache that fills is reset and the search
 /// retried cold) or runs the fallback within [`SMART_FALLBACK_UNITS`].
 /// About 25 ms was the worst seen on a loaded machine, over thousands of
-/// random patterns. With the click budget checked after each match
-/// ([`crate::selection::SMART_RULE_BUDGET`]), a rule costs a click at most
-/// the budget plus this.
+/// random patterns. With the click budget
+/// ([`crate::selection::SMART_RULE_BUDGET`]) checked after each costly
+/// search (the first on a cold cache, a reset, or the fallback) and every
+/// [`crate::selection::SMART_CLOCK_STRIDE`] matches, a rule costs a click
+/// at most the budget plus this, plus fewer than that stride of searches
+/// on cached states.
 pub const SMART_RULE_ATTEMPT_BOUND: Duration = Duration::from_millis(50);
 
 /// The most work a smart-selection rule may give the regex crate's own
@@ -94,6 +97,22 @@ pub(crate) struct SmartEngines {
     /// Shared with the engines of an equal set loaded later
     /// ([`SmartEngines::for_rules`]).
     engines: Arc<[RuleEngine]>,
+}
+
+/// What the search that found a match may have cost (#557): whether the
+/// caller must read the clock after it to keep a click within
+/// [`crate::selection::SMART_RULE_BUDGET`] plus one attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SearchCost {
+    /// A DFA search on a cache it neither found cold nor reset: the states
+    /// it added since the cache was last reset fit in one fill, so a run of
+    /// such searches costs at most one fill plus a pass over the window
+    /// each (microseconds on cached states).
+    Cached,
+    /// A search that may have cost up to [`SMART_RULE_ATTEMPT_BOUND`]: the
+    /// first on a cold cache, one that reset its cache and ran again cold,
+    /// or one of the regex crate's fallback.
+    Costly,
 }
 
 /// How a rule's scan of a window ended.
@@ -163,14 +182,15 @@ impl SmartEngines {
     }
 
     /// Scans `text` with rule `index` from its start, calling `found` with
-    /// each match's bytes in order until it breaks. `ascii` is whether
-    /// `text` is all ASCII. See the module docs for the engine it takes.
+    /// each match's bytes, and what its search may have cost, in order
+    /// until it breaks. `ascii` is whether `text` is all ASCII. See the
+    /// module docs for the engine it takes.
     pub(crate) fn scan(
         &self,
         index: usize,
         text: &str,
         ascii: bool,
-        mut found: impl FnMut(Range<usize>) -> ControlFlow<()>,
+        mut found: impl FnMut(Range<usize>, SearchCost) -> ControlFlow<()>,
     ) -> Scanned {
         let (Some(engine), Some(rule)) = (self.engines.get(index), self.rules.rules().get(index))
         else {
@@ -294,7 +314,7 @@ impl RuleEngine {
         regex: &Regex,
         text: &str,
         skip: usize,
-        mut found: impl FnMut(Range<usize>) -> ControlFlow<()>,
+        mut found: impl FnMut(Range<usize>, SearchCost) -> ControlFlow<()>,
     ) -> Scanned {
         let within = self
             .fallback_states(regex.as_str())
@@ -306,7 +326,7 @@ impl RuleEngine {
         #[cfg(test)]
         FALLBACK_RUNS.with(|runs| runs.set(runs.get() + 1));
         for one in regex.find_iter(text).skip(skip) {
-            if found(one.range()).is_break() {
+            if found(one.range(), SearchCost::Costly).is_break() {
                 break;
             }
         }
@@ -411,8 +431,13 @@ impl Dfa {
         })
     }
 
-    /// Scans `text` from its start, reporting each match to `found`.
-    fn scan(&self, text: &str, found: &mut impl FnMut(Range<usize>) -> ControlFlow<()>) -> DfaScan {
+    /// Scans `text` from its start, reporting each match, and whether its
+    /// search found the cache cold or reset it, to `found`.
+    fn scan(
+        &self,
+        text: &str,
+        found: &mut impl FnMut(Range<usize>, SearchCost) -> ControlFlow<()>,
+    ) -> DfaScan {
         let mut held = self.cache.lock().unwrap_or_else(|poisoned| {
             // A scan that panicked may have left the cache half updated.
             let mut held = poisoned.into_inner();
@@ -424,12 +449,17 @@ impl Dfa {
         let mut searcher = Searcher::new(Input::new(text));
         let mut seen = 0;
         loop {
+            let mut cost = SearchCost::Cached;
             let next = searcher.try_advance(|input| {
                 let was_cold = std::mem::replace(cold, false);
+                if was_cold {
+                    cost = SearchCost::Costly;
+                }
                 match self.regex.try_search(cache, input) {
                     Err(error)
                         if !was_cold && matches!(error.kind(), MatchErrorKind::GaveUp { .. }) =>
                     {
+                        cost = SearchCost::Costly;
                         cache.reset(&self.regex);
                         self.regex.try_search(cache, input)
                     }
@@ -439,7 +469,7 @@ impl Dfa {
             match next {
                 Ok(Some(one)) => {
                     seen += 1;
-                    if found(one.range()).is_break() {
+                    if found(one.range(), cost).is_break() {
                         return DfaScan::Done;
                     }
                 }
@@ -575,7 +605,7 @@ mod tests {
     /// The DFA's spans of `pattern` in `text`, or how it stopped.
     fn dfa_spans(dfa: &Dfa, text: &str) -> Result<Vec<Range<usize>>, DfaScan> {
         let mut spans = Vec::new();
-        match dfa.scan(text, &mut |one| {
+        match dfa.scan(text, &mut |one, _| {
             spans.push(one);
             ControlFlow::Continue(())
         }) {
@@ -630,7 +660,7 @@ mod tests {
         for (index, rule) in engines.rules().rules().iter().enumerate() {
             for text in windows() {
                 let mut spans = Vec::new();
-                let scanned = engines.scan(index, &text, text.is_ascii(), |one| {
+                let scanned = engines.scan(index, &text, text.is_ascii(), |one, _| {
                     spans.push(one);
                     ControlFlow::Continue(())
                 });
@@ -694,7 +724,7 @@ mod tests {
     /// The matches rule `index` reports on `text`, and how its scan ended.
     fn scan(engines: &SmartEngines, index: usize, text: &str) -> (Vec<Range<usize>>, Scanned) {
         let mut spans = Vec::new();
-        let scanned = engines.scan(index, text, text.is_ascii(), |one| {
+        let scanned = engines.scan(index, text, text.is_ascii(), |one, _| {
             spans.push(one);
             ControlFlow::Continue(())
         });
@@ -741,6 +771,44 @@ mod tests {
             (vec![Range { start: 0, end: 4 }], Scanned::Done)
         );
         assert_eq!(WARNINGS.with(std::cell::Cell::get), 1);
+    }
+
+    /// The cost rule `index` reports for each match it finds on `text`.
+    fn costs(engines: &SmartEngines, index: usize, text: &str) -> Vec<SearchCost> {
+        let mut costs = Vec::new();
+        let _ = engines.scan(index, text, text.is_ascii(), |_, cost| {
+            costs.push(cost);
+            ControlFlow::Continue(())
+        });
+        costs
+    }
+
+    /// #557: a scan reports its first search on a cold cache as costly and
+    /// the later ones on that cache as cached, a search that resets a used
+    /// cache as costly, and every match of the fallback as costly, so the
+    /// click budget reads the clock after each of those.
+    #[test]
+    fn a_scan_reports_which_searches_may_have_been_costly() {
+        use SearchCost::{Cached, Costly};
+        let rule = engines(&["a"]);
+        assert_eq!(costs(&rule, 0, "a a a"), [Costly, Cached, Cached], "cold");
+        assert_eq!(costs(&rule, 0, "a a a"), [Cached, Cached, Cached], "warm");
+        let thrash = engines(&[r"(?:[^X]{0,50}){0,20}X|a"]);
+        assert_eq!(
+            scan(&thrash, 0, &multi_script(8192, 1)).1,
+            Scanned::Nothing,
+            "the long line fills the cache"
+        );
+        // The short line's search gives up on the full cache, resets it and
+        // runs again cold; on the cache it left, it runs cached.
+        assert_eq!(costs(&thrash, 0, "ab X ok"), [Costly], "reset");
+        assert_eq!(costs(&thrash, 0, "ab X ok"), [Cached], "warm again");
+        let word = engines(&[r"\x{e9}\B"]);
+        assert_eq!(
+            costs(&word, 0, "\u{e9}\u{e9}\u{e9}"),
+            [Costly, Costly],
+            "the fallback"
+        );
     }
 
     /// #518: the fallback runs on a window whose work is exactly
