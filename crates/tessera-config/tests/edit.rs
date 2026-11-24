@@ -1544,3 +1544,297 @@ fn an_edit_among_many_mark_like_lines_is_fast() {
         "best of 5: {best:?}"
     );
 }
+
+/// #565: an edit addressed to a profile by its name, made against a read
+/// of the file from before a hand edit inserted a profile ahead of it
+/// (the app queued the edit, the hand save landed, the edit ran before the
+/// watch applied the save), lands on that profile; the same edit by the
+/// index the app had would have hit the profile before it.
+#[test]
+fn an_edit_by_name_lands_on_its_profile_after_a_hand_edit_moved_it() {
+    let text = "[[profiles]]\nname = \"Work\"\n\n[[profiles]]\nname = \"Shell\"\n";
+    let dir = tempfile::tempdir().unwrap();
+    let path = write(dir.path(), text);
+    // The app read the file: "Shell" was profiles[1]. Then a hand edit
+    // inserted a profile first, before the edit ran.
+    let hand = format!("[[profiles]]\nname = \"Hand\"\n\n{text}");
+    std::fs::write(&path, &hand).unwrap();
+
+    let mut by_index = ConfigEditor::open(&path).unwrap();
+    by_index.set("profiles[1].command", s("/bin/fish")).unwrap();
+    let wrong = tessera_config::Config::from_toml_lenient(&by_index.to_toml()).unwrap();
+    assert_eq!(
+        wrong.config.profiles[1].name, "Work",
+        "by index, the edit lands on the profile before"
+    );
+
+    let mut editor = ConfigEditor::open(&path).unwrap();
+    editor
+        .set_in_profile("Shell", 0, "command", s("/bin/fish"))
+        .unwrap();
+    editor
+        .set_in_profile("Shell", 0, "appearance.font_size", toml::Value::Float(15.0))
+        .unwrap();
+    assert!(editor.save().unwrap());
+    let saved = tessera_config::Config::from_toml_lenient(&read(&path)).unwrap();
+    let profiles: Vec<(&str, Option<&str>)> = saved
+        .config
+        .profiles
+        .iter()
+        .map(|p| (p.name.as_str(), p.command.as_deref()))
+        .collect();
+    assert_eq!(
+        profiles,
+        [("Hand", None), ("Work", None), ("Shell", Some("/bin/fish"))]
+    );
+    assert_eq!(
+        saved.config.profiles[2]
+            .appearance
+            .as_ref()
+            .and_then(|a| a.font_size),
+        Some(15.0)
+    );
+    assert!(read(&path).starts_with(&hand), "the hand edit is kept");
+
+    // Removed by name: a key, then the entry itself, the later ones moving
+    // down; a key it does not have is nothing to remove.
+    let mut editor = ConfigEditor::open(&path).unwrap();
+    assert!(editor.remove_in_profile("Shell", 0, "command").unwrap());
+    assert!(!editor.remove_in_profile("Shell", 0, "command").unwrap());
+    assert!(editor.remove_in_profile("Hand", 0, "").unwrap());
+    assert!(editor.save().unwrap());
+    let saved = tessera_config::Config::from_toml_lenient(&read(&path)).unwrap();
+    let names: Vec<&str> = saved
+        .config
+        .profiles
+        .iter()
+        .map(|p| p.name.as_str())
+        .collect();
+    assert_eq!(names, ["Work", "Shell"]);
+    assert_eq!(saved.config.profiles[1].command, None);
+}
+
+/// #565: a name no entry has is `NoSuchProfile` (renamed or removed by
+/// hand), shown safely (S3); a name only a profile file has is that
+/// profile's refusal; of two entries with one name the one of the ordinal
+/// shown is edited or deleted, and an ordinal past the last is
+/// `NoSuchProfile`; a key that does not parse, an empty one for a set, or
+/// one too deep once prefixed is refused. Nothing is changed by
+/// any refusal.
+#[test]
+fn an_edit_by_name_refuses_a_missing_name_and_bad_keys() {
+    let text =
+        "[[profiles]]\nname = \"Twin\"\n\n[[profiles]]\nname = \"Twin\"\ncommand = \"vim\"\n";
+    let (dir, path, mut editor) = open(text);
+    std::fs::create_dir_all(dir.path().join("profiles")).unwrap();
+    std::fs::write(
+        dir.path().join("profiles/file.toml"),
+        "name = \"FromFile\"\n",
+    )
+    .unwrap();
+
+    let gone = editor.set_in_profile("Gone\u{202e}\u{1b}", 0, "command", s("x"));
+    let Err(EditError::NoSuchProfile { name }) = &gone else {
+        panic!("{gone:?}");
+    };
+    assert_eq!(name, "Gone", "control and bidi characters dropped");
+    assert!(!gone.unwrap_err().to_string().contains('\u{202e}'));
+    assert!(matches!(
+        editor.remove_in_profile("Gone", 0, ""),
+        Err(EditError::NoSuchProfile { .. })
+    ));
+    assert!(
+        matches!(
+            editor.set_in_profile("twin", 0, "command", s("x")),
+            Err(EditError::NoSuchProfile { .. })
+        ),
+        "byte for byte"
+    );
+    let file = editor.set_in_profile("FromFile", 0, "command", s("x"));
+    let Err(EditError::Unsupported {
+        path: refused,
+        reason,
+    }) = &file
+    else {
+        panic!("{file:?}");
+    };
+    assert_eq!(*reason, tessera_config::edit::FILE_PROFILE_REFUSED);
+    assert_eq!(refused.to_string(), "profiles[2].command");
+    for key in ["", "a..b", "x[", "k.".repeat(15).trim_end_matches('.')] {
+        assert!(
+            matches!(
+                editor.set_in_profile("Twin", 0, key, s("x")),
+                Err(EditError::KeyPath(_))
+            ),
+            "{key:?}"
+        );
+    }
+    assert!(!editor.is_modified());
+
+    // Of two entries with one name, the one of the ordinal shown (the
+    // second is 1): each edit and the delete of the second leave the
+    // first alone; an ordinal past the last is no such profile.
+    let commands = |editor: &ConfigEditor| -> Vec<Option<String>> {
+        tessera_config::Config::from_toml_lenient(&editor.to_toml())
+            .unwrap()
+            .config
+            .profiles
+            .iter()
+            .map(|p| p.command.clone())
+            .collect()
+    };
+    let some = |text: &str| Some(text.to_owned());
+    editor
+        .set_in_profile("Twin", 1, "command", s("/bin/second"))
+        .unwrap();
+    assert_eq!(commands(&editor), [None, some("/bin/second")]);
+    editor
+        .set_in_profile("Twin", 0, "command", s("/bin/first"))
+        .unwrap();
+    assert_eq!(commands(&editor), [some("/bin/first"), some("/bin/second")]);
+    let before = editor.to_toml();
+    for ordinal in [2, 7] {
+        let result = editor.set_in_profile("Twin", ordinal, "command", s("x"));
+        assert!(
+            matches!(&result, Err(EditError::NoSuchProfile { name }) if name == "Twin"),
+            "{result:?}"
+        );
+        assert!(matches!(
+            editor.remove_in_profile("Twin", ordinal, ""),
+            Err(EditError::NoSuchProfile { .. })
+        ));
+    }
+    assert_eq!(editor.to_toml(), before);
+    assert!(editor.remove_in_profile("Twin", 1, "").unwrap());
+    assert_eq!(commands(&editor), [some("/bin/first")]);
+    drop(path);
+}
+
+/// #565 (adversarial cycle 1): two entries of one name are told apart by
+/// the ordinal among the entries of that name as the window listed them,
+/// not by the index, so a hand save that adds or removes another profile
+/// ahead of them moves neither an edit nor a delete onto the other one.
+#[test]
+fn an_edit_by_name_of_a_twin_keeps_to_it_across_a_hand_edit_ahead() {
+    let listed = "[[profiles]]\nname = \"Keep\"\n\n[[profiles]]\nname = \"Twin\"\ncommand = \"/bin/first\"\n\n[[profiles]]\nname = \"Twin\"\ncommand = \"/bin/second\"\n";
+    let profiles = |editor: &ConfigEditor| -> Vec<(String, Option<String>)> {
+        tessera_config::Config::from_toml_lenient(&editor.to_toml())
+            .unwrap()
+            .config
+            .profiles
+            .iter()
+            .map(|p| (p.name.clone(), p.command.clone()))
+            .collect()
+    };
+    let entry = |name: &str, command: Option<&str>| (name.to_owned(), command.map(str::to_owned));
+    // Listed as Keep, Twin, Twin; a hand save then inserts Hand first.
+    let inserted = format!("[[profiles]]\nname = \"Hand\"\n\n{listed}");
+    let (_dir, _path, mut editor) = open(&inserted);
+    editor
+        .set_in_profile("Twin", 1, "command", s("/bin/edited"))
+        .unwrap();
+    assert_eq!(
+        profiles(&editor),
+        [
+            entry("Hand", None),
+            entry("Keep", None),
+            entry("Twin", Some("/bin/first")),
+            entry("Twin", Some("/bin/edited")),
+        ]
+    );
+    let (_dir, _path, mut editor) = open(&inserted);
+    assert!(editor.remove_in_profile("Twin", 1, "").unwrap());
+    assert_eq!(
+        profiles(&editor),
+        [
+            entry("Hand", None),
+            entry("Keep", None),
+            entry("Twin", Some("/bin/first")),
+        ]
+    );
+    // Or removes Keep: the first Twin is the one at index 1 no longer.
+    let removed = listed.replacen("[[profiles]]\nname = \"Keep\"\n\n", "", 1);
+    let (_dir, _path, mut editor) = open(&removed);
+    editor
+        .set_in_profile("Twin", 0, "command", s("/bin/edited"))
+        .unwrap();
+    assert_eq!(
+        profiles(&editor),
+        [
+            entry("Twin", Some("/bin/edited")),
+            entry("Twin", Some("/bin/second")),
+        ]
+    );
+    let (_dir, _path, mut editor) = open(&removed);
+    assert!(editor.remove_in_profile("Twin", 0, "").unwrap());
+    assert_eq!(profiles(&editor), [entry("Twin", Some("/bin/second"))]);
+}
+
+/// #565: an entry without a name counts as "Default", the name the loader
+/// gives it and the window lists, for the ordinal too, also while the
+/// file does not load.
+#[test]
+fn an_edit_by_name_counts_a_nameless_entry_as_default() {
+    // Work and a nameless entry whose command does not load: the edit of
+    // the first "Default" mends it.
+    let text = "[[profiles]]\nname = \"Work\"\n\n[[profiles]]\ncommand = 5\n";
+    let (_dir, _path, mut editor) = open(text);
+    assert!(editor.config().is_none());
+    editor
+        .set_in_profile("Default", 0, "command", s("/bin/b"))
+        .unwrap();
+    let profiles = &editor.config().unwrap().profiles;
+    assert_eq!(profiles[1].command.as_deref(), Some("/bin/b"));
+
+    // Two nameless entries: the second "Default" is the second of them.
+    let text = "[[profiles]]\ncommand = \"/bin/a\"\n\n[[profiles]]\nname = \"Work\"\n\n[[profiles]]\ncommand = \"/bin/c\"\n";
+    let (_dir, _path, mut editor) = open(text);
+    assert!(editor.remove_in_profile("Default", 1, "command").unwrap());
+    let commands: Vec<Option<&str>> = editor
+        .config()
+        .unwrap()
+        .profiles
+        .iter()
+        .map(|p| p.command.as_deref())
+        .collect();
+    assert_eq!(commands, [Some("/bin/a"), None, None]);
+}
+
+/// #565: while the file does not load, a profile is still found by its
+/// name as written.
+#[test]
+fn an_edit_by_name_finds_the_written_name_in_a_file_that_does_not_load() {
+    let text = "[appearance]\nopacity = \"x\"\n\n[[profiles]]\nname = \"Work\"\n";
+    let (_dir, _path, mut editor) = open(text);
+    assert!(editor.config().is_none());
+    // The file still fails after the edit, so the edit is refused for
+    // that, not for the name.
+    let result = editor.set_in_profile("Work", 0, "command", s("/bin/sh"));
+    assert!(
+        matches!(result, Err(EditError::Invalid { .. })),
+        "{result:?}"
+    );
+    assert!(matches!(
+        editor.set_in_profile("Gone", 0, "command", s("/bin/sh")),
+        Err(EditError::NoSuchProfile { .. })
+    ));
+}
+
+/// #565: the window sends the name the loader gave the profile, which is
+/// not the written one when the loader made it safe (a NUL is U+FFFD): it
+/// is found by that name too.
+#[test]
+fn an_edit_by_name_finds_the_name_the_loader_gave() {
+    let text = "[[profiles]]\nname = \"A\\u0000B\"\n";
+    let (_dir, _path, mut editor) = open(text);
+    let loaded = editor.config().unwrap().profiles[0].name.clone();
+    assert_eq!(loaded, "A\u{FFFD}B");
+    editor
+        .set_in_profile(&loaded, 0, "command", s("/bin/sh"))
+        .unwrap();
+    let edited = tessera_config::Config::from_toml_lenient(&editor.to_toml()).unwrap();
+    assert_eq!(
+        edited.config.profiles[0].command.as_deref(),
+        Some("/bin/sh")
+    );
+}

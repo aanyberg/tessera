@@ -47,6 +47,11 @@ pub enum Error {
     /// `config.toml` (or `themes/`) changed on disk while the call worked
     /// on it: nothing was written and the other change stays.
     Conflict = 10,
+    /// No `[[profiles]]` entry of `config.toml` has the name a profile's
+    /// edit addressed (`tessera_config_set_profile`,
+    /// `tessera_config_remove_profile`): it was renamed or removed, by hand
+    /// or by an earlier edit. Nothing was written.
+    NoSuchProfile = 11,
 }
 
 impl From<&CoreError> for Error {
@@ -113,9 +118,10 @@ mod tests {
             Error::NoSurface,
             Error::Refused,
             Error::Conflict,
+            Error::NoSuchProfile,
         ];
         let values: Vec<i32> = codes.iter().map(|&code| code as i32).collect();
-        assert_eq!(values, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        assert_eq!(values, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
     }
 
     #[test]

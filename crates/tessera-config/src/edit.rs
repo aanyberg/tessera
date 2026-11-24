@@ -2,8 +2,10 @@
 //! wrote by hand (ADR 0040).
 //!
 //! [`ConfigEditor`] opens the file, changes one key at a time
-//! ([`ConfigEditor::set`], [`ConfigEditor::remove`],
-//! [`ConfigEditor::add_profile`], or a whole new profile at once with
+//! ([`ConfigEditor::set`], [`ConfigEditor::remove`], a profile's key by
+//! the profile's name with [`ConfigEditor::set_in_profile`] and
+//! [`ConfigEditor::remove_in_profile`], [`ConfigEditor::add_profile`], or
+//! a whole new profile at once with
 //! [`ConfigEditor::add_profile_with`]) and [`ConfigEditor::save`]s it. Every
 //! comment, blank line, key order and spelling (quotes, dotted keys,
 //! inline tables, number formats) that an edit does not touch comes out
@@ -42,7 +44,7 @@ use crate::load::{
     needs_unicode_escape, read_capped,
 };
 use crate::theme::{MAX_THEME_DIR_ENTRIES, MAX_THEME_FILES, ThemeSource, clip_theme_name, slug};
-use crate::{Config, Error, ParseError, Theme, Warning};
+use crate::{BUILT_IN_PROFILE_NAME, Config, Error, ParseError, Theme, Warning};
 
 /// The value type [`ConfigEditor::set`] takes (`toml::Value`), so a
 /// caller needs no `toml` dependency of its own (it deserializes from
@@ -356,6 +358,15 @@ pub enum EditError {
     /// written. Open the file again to edit the new version.
     #[error("config.toml changed on disk since it was opened")]
     Conflict,
+    /// No `[[profiles]]` entry has the name an edit addressed
+    /// ([`ConfigEditor::set_in_profile`], [`ConfigEditor::remove_in_profile`]),
+    /// or fewer entries than its ordinal: it was renamed or removed.
+    /// Nothing is written.
+    #[error("no profile in config.toml is named \"{name}\"")]
+    NoSuchProfile {
+        /// The name, made safe to show ([`display_name`]).
+        name: String,
+    },
     /// A theme file with the imported theme's file name exists already.
     #[error("a theme file named {file_name} exists already")]
     ThemeExists {
@@ -708,12 +719,17 @@ impl ConfigEditor {
     /// As for [`ConfigEditor::set`].
     pub fn remove(&mut self, path: &str) -> Result<bool, EditError> {
         let path: KeyPath = path.parse()?;
+        self.remove_path(&path)
+    }
+
+    /// [`ConfigEditor::remove`] of a parsed `path`.
+    fn remove_path(&mut self, path: &KeyPath) -> Result<bool, EditError> {
         let unsupported = |reason| EditError::Unsupported {
             path: path.clone(),
             reason,
         };
-        past_loader_cap(&self.doc, &path)?;
-        self.not_in_a_profile_file(&path)?;
+        past_loader_cap(&self.doc, path)?;
+        self.not_in_a_profile_file(path)?;
         let mut doc = self.doc.clone();
         let carried = cut_leading_decor(&mut doc, &path.0);
         let marked = doc.to_string();
@@ -735,8 +751,8 @@ impl ConfigEditor {
         }
         let mut expected = toml::Value::Table(self.plain.clone());
         plain_edit(&mut expected, &path.0, None);
-        let before = renumbered(self.warnings.as_deref().unwrap_or_default(), &path);
-        self.commit(&path, &text, &expected, &removed, &before)?;
+        let before = renumbered(self.warnings.as_deref().unwrap_or_default(), path);
+        self.commit(path, &text, &expected, &removed, &before)?;
         Ok(true)
     }
 
@@ -909,6 +925,122 @@ impl ConfigEditor {
             *self = before;
         }
         added
+    }
+
+    /// [`ConfigEditor::set`] of `key`, a key path within a profile
+    /// (`command`, `appearance.theme`), in the `[[profiles]]` entry named
+    /// `name`, the `ordinal`-th (from 0, in file order) of the entries the
+    /// caller showed with that name (#565). The profile is looked up in
+    /// this document, the one being written, so an edit made against an
+    /// older read of the file still lands on its profile when a hand edit
+    /// has added, removed or moved other profiles since: the ordinal tells
+    /// two entries of one name apart wherever they are now. Names compare
+    /// byte for byte, each entry's as written and as the loader reads it;
+    /// an entry without a name is [`BUILT_IN_PROFILE_NAME`], as the loader
+    /// names it.
+    ///
+    /// # Errors
+    ///
+    /// [`EditError::NoSuchProfile`] when fewer than `ordinal + 1` entries
+    /// have that name;
+    /// [`EditError::Unsupported`] with [`FILE_PROFILE_REFUSED`] when only a
+    /// profile of `profiles/` has it; [`EditError::KeyPath`] for a `key`
+    /// that does not parse (an empty one too) or makes a path of more than
+    /// [`MAX_KEY_PATH_STEPS`] steps or [`MAX_KEY_PATH_LEN`] bytes; else as
+    /// for [`ConfigEditor::set`]. The document is unchanged after any
+    /// error.
+    pub fn set_in_profile(
+        &mut self,
+        name: &str,
+        ordinal: usize,
+        key: &str,
+        value: toml::Value,
+    ) -> Result<(), EditError> {
+        let relative: KeyPath = key.parse()?;
+        let path = self.path_in_profile(name, ordinal, relative.0)?;
+        self.set_path(&path, value, Rejected::Refuse)
+    }
+
+    /// [`ConfigEditor::remove`] of `key` in the `[[profiles]]` entry named
+    /// `name` of that `ordinal`, found as [`ConfigEditor::set_in_profile`]
+    /// finds it; an empty `key` removes the entry itself, and the later
+    /// ones move down.
+    /// `Ok(false)` when the entry has nothing at `key`.
+    ///
+    /// # Errors
+    ///
+    /// As for [`ConfigEditor::set_in_profile`] (an empty `key` is the
+    /// entry) and [`ConfigEditor::remove`].
+    pub fn remove_in_profile(
+        &mut self,
+        name: &str,
+        ordinal: usize,
+        key: &str,
+    ) -> Result<bool, EditError> {
+        let relative = if key.is_empty() {
+            Vec::new()
+        } else {
+            key.parse::<KeyPath>()?.0
+        };
+        let path = self.path_in_profile(name, ordinal, relative)?;
+        self.remove_path(&path)
+    }
+
+    /// The key path of `relative` in the `[[profiles]]` entry named `name`
+    /// of that `ordinal`, in this document.
+    fn path_in_profile(
+        &self,
+        name: &str,
+        ordinal: usize,
+        relative: Vec<Step>,
+    ) -> Result<KeyPath, EditError> {
+        if relative.len() + 2 > MAX_KEY_PATH_STEPS {
+            return Err(KeyPathError::TooManySteps.into());
+        }
+        let count = self.profile_count();
+        // Without a name, an entry is the loader's "Default", also while
+        // the file does not load.
+        let written = |i: usize| {
+            let profile = self.plain.get("profiles")?.get(i)?;
+            match profile.get("name") {
+                None => Some(BUILT_IN_PROFILE_NAME),
+                Some(name) => name.as_str(),
+            }
+        };
+        // Entries keep their places in the loaded configuration, the
+        // profile files' profiles after them.
+        let loaded = |i: usize| {
+            self.config
+                .as_ref()
+                .and_then(|config| config.profiles.get(i))
+                .map(|profile| profile.name.as_str())
+        };
+        let named = |i: usize| written(i) == Some(name) || loaded(i) == Some(name);
+        let found = (0..count).filter(|&i| named(i)).nth(ordinal);
+        let Some(index) = found else {
+            let files = self.load_profile_files();
+            let Some(at) = files.names().position(|file| file == name) else {
+                return Err(EditError::NoSuchProfile {
+                    name: display_name(name),
+                });
+            };
+            let mut steps = vec![
+                Step::Key("profiles".to_owned()),
+                Step::Index(count.saturating_add(at)),
+            ];
+            steps.extend(relative);
+            return Err(EditError::Unsupported {
+                path: KeyPath(steps),
+                reason: FILE_PROFILE_REFUSED,
+            });
+        };
+        let mut steps = vec![Step::Key("profiles".to_owned()), Step::Index(index)];
+        steps.extend(relative);
+        let path = KeyPath(steps);
+        if path.to_string().len() > MAX_KEY_PATH_LEN {
+            return Err(KeyPathError::TooLong.into());
+        }
+        Ok(path)
     }
 
     /// [`EditError::Unsupported`] when `path` is in a profile that a file

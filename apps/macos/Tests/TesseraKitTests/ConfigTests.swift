@@ -297,6 +297,70 @@ final class ConfigTests: XCTestCase {
         XCTAssertEqual(try file(), original, "nothing was written")
     }
 
+    /// A profile's edit by name lands on the profile of that name in the
+    /// file as the core reads it, wherever a hand edit put it since the
+    /// configuration applied; a name no entry has is `.noSuchProfile` and
+    /// writes nothing; an empty key removes the entry; of two entries of
+    /// one name, the one of the ordinal given (#565).
+    func testAProfileEditByNameLandsOnItsProfileAfterAHandEdit() throws {
+        let app = try start(config: "[[profiles]]\nname = \"Work\"\n\n[[profiles]]\nname = \"Shell\"\n")
+        let writer = app.configWriter
+        // A hand edit inserts a profile first: "Shell" was at index 1.
+        try ("[[profiles]]\nname = \"Hand\"\n\n" + file()).write(to: configFile, atomically: true, encoding: .utf8)
+        try writer.setProfile(named: "Shell", ordinal: 0, "command", to: .string("/bin/zsh"))
+        let text = try file()
+        let shell = try XCTUnwrap(text.range(of: "name = \"Shell\""), text)
+        let command = try XCTUnwrap(text.range(of: "command = \"/bin/zsh\""), text)
+        XCTAssertLessThan(shell.lowerBound, command.lowerBound, "in “Shell”, the last entry:\n\(text)")
+        XCTAssertEqual(text.components(separatedBy: "command").count, 2, text)
+
+        let before = try file()
+        XCTAssertThrowsError(try writer.setProfile(named: "Gone", ordinal: 0, "command", to: .string("/bin/sh"))) {
+            let error = $0 as? TesseraConfigEditError
+            XCTAssertEqual(error?.kind, .noSuchProfile)
+            XCTAssertTrue(error?.message.contains("Gone") ?? false, error?.message ?? "")
+        }
+        XCTAssertThrowsError(try writer.removeProfile(named: "Gone", ordinal: 0, "")) {
+            XCTAssertEqual(($0 as? TesseraConfigEditError)?.kind, .noSuchProfile)
+        }
+        let long = String(repeating: "a", count: 129)
+        XCTAssertThrowsError(try writer.setProfile(named: long, ordinal: 0, "command", to: .bool(true))) {
+            XCTAssertEqual(($0 as? TesseraConfigEditError)?.kind, .invalidArgument)
+        }
+        XCTAssertThrowsError(try writer.setProfile(named: "Shell", ordinal: 0, "command", to: .table([:]))) {
+            XCTAssertEqual(($0 as? TesseraConfigEditError)?.kind, .invalidArgument)
+        }
+        XCTAssertEqual(try file(), before, "nothing was written")
+
+        try writer.removeProfile(named: "Shell", ordinal: 0, "command")
+        try writer.removeProfile(named: "Hand", ordinal: 0, "")
+        XCTAssertEqual(
+            try file().trimmingCharacters(in: .newlines),
+            "[[profiles]]\nname = \"Work\"\n\n[[profiles]]\nname = \"Shell\"")
+
+        // Two entries of one name, a hand edit having inserted a profile
+        // ahead of them: the second (ordinal 1) is edited; an ordinal past
+        // the last is no such profile.
+        try ("[[profiles]]\nname = \"Hand\"\n\n[[profiles]]\nname = \"Twin\"\n\n[[profiles]]\nname = \"Twin\"\n\n"
+            + "[[profiles]]\nname = \"Keep\"\n").write(to: configFile, atomically: true, encoding: .utf8)
+        try writer.setProfile(named: "Twin", ordinal: 1, "command", to: .string("/bin/second"))
+        let twins = try file()
+        XCTAssertLessThan(
+            try XCTUnwrap(twins.range(of: "command")).lowerBound,
+            try XCTUnwrap(twins.range(of: "Keep")).lowerBound, twins)
+        XCTAssertEqual(twins.components(separatedBy: "Twin").count, 3, twins)
+        XCTAssertGreaterThan(
+            try XCTUnwrap(twins.range(of: "command")).lowerBound,
+            try XCTUnwrap(twins.range(of: "Twin", options: .backwards)).lowerBound, "in the second Twin:\n\(twins)")
+        XCTAssertThrowsError(try writer.removeProfile(named: "Twin", ordinal: 2, "")) {
+            XCTAssertEqual(($0 as? TesseraConfigEditError)?.kind, .noSuchProfile)
+        }
+        XCTAssertThrowsError(try writer.setProfile(named: "Twin", ordinal: -1, "command", to: .bool(true))) {
+            XCTAssertEqual(($0 as? TesseraConfigEditError)?.kind, .invalidArgument)
+        }
+        XCTAssertEqual(try file(), twins, "nothing was written")
+    }
+
     // MARK: Themes
 
     /// An `.itermcolors` file with every colour the importer needs.

@@ -1,5 +1,6 @@
 import AppKit
 import Observation
+import Synchronization
 import TesseraKit
 import os
 
@@ -9,6 +10,10 @@ import os
 protocol SettingsConfigWriting: Sendable {
     func set(_ key: String, to value: TesseraConfigValue) throws(TesseraConfigEditError)
     func remove(_ key: String) throws(TesseraConfigEditError)
+    func setProfile(
+        named name: String, ordinal: Int, _ key: String, to value: TesseraConfigValue
+    ) throws(TesseraConfigEditError)
+    func removeProfile(named name: String, ordinal: Int, _ key: String) throws(TesseraConfigEditError)
     func importTheme(at file: URL) throws(TesseraConfigEditError) -> String
     func addProfile(
         named base: String, keys: [(key: String, value: TesseraConfigValue)]
@@ -80,8 +85,11 @@ final class SystemSettingsClock: SettingsClock {
 /// configuration the core applies, with the edits not yet applied laid over
 /// it.
 ///
-/// Every edit is one `tessera_config_set` or `_remove` of one key path, or
-/// one `tessera_config_add_profile` for Add and Duplicate (#312), made in
+/// Every edit is one `tessera_config_set` or `_remove` of one key path, a
+/// profile's key one `tessera_config_set_profile` or `_remove_profile`
+/// addressed by the profile's name, which the core looks up in the file it
+/// writes (#565), or one `tessera_config_add_profile` for Add and Duplicate
+/// (#312), made in
 /// order on one serial background queue (``writeQueue``); the
 /// core's configuration watch applies the saved file, and the model reads
 /// it back on ``reload()``. Until then the control shows the value it was
@@ -92,14 +100,18 @@ final class SystemSettingsClock: SettingsClock {
 /// message (sanitised, S3) next to it. An edit that meets an external edit
 /// of the file since the core read it (`Conflict`) is retried once, and the
 /// model reloads. An edit of a profile's key is retried once the external
-/// edit applies, at the index of the profile it was made for, or dropped if
-/// that profile is gone (#549).
+/// edit applies, shown at the index of the profile it was made for, or
+/// dropped if that profile is gone (#549); one whose profile's name the
+/// file no longer has is dropped with the list's notice.
 @MainActor
 @Observable
 final class SettingsModel {
     /// The serial queue every edit runs on, shared by every model so edits
     /// keep their order even across a closed and reopened window.
     nonisolated static let writeQueue = DispatchQueue(label: "com.aanyberg.tessera.settings.write", qos: .userInitiated)
+    /// The renames of this model's profiles that failed on ``writeQueue``,
+    /// read and written there only (#565 B2).
+    @ObservationIgnored private nonisolated let failedRenames = FailedRenames()
     /// Slider and stepper edits are written at most this often while the
     /// control is dragged.
     static let coalescingInterval: Duration = .milliseconds(100)
@@ -848,6 +860,52 @@ final class SettingsModel {
         var key: String
         var value: TesseraConfigValue?
         var onConflict: OnConflict = .retry
+        /// For a key of a profile, the name the edit addresses its profile
+        /// by: the core looks it up in the file it writes, so a hand edit
+        /// that moved the profile since does not move the edit to another
+        /// (#565). Set when it is queued (``addressed(_:)``); `nil` for a
+        /// profile with no name, which is not written.
+        var profile: String?
+        /// Of the profiles listed with the name ``profile``, the place of
+        /// this one (from 0), which tells two profiles of one name apart
+        /// where a hand edit added or removed another profile ahead of
+        /// them since (#565). Set with ``profile``.
+        var ordinal = 0
+        /// Whether ``profile`` is the name a rename queued before this edit
+        /// gives the profile, not the one applied: the edit is not written
+        /// if that rename failed (``FailedRenames``).
+        var afterRename = false
+        /// The new names of the renames queued before this edit, of rows
+        /// before its own, that ``ordinal`` counted: the ones whose old or
+        /// new name is ``profile``. The edit is not written if one failed
+        /// (``FailedRenames``): its ordinal would then be another profile's
+        /// (#565 adversarial cycle 2).
+        var earlierRenames: [String] = []
+    }
+
+    /// The new names of the renames that failed on ``writeQueue``, each
+    /// with its error, until a rename to that name is written: an edit
+    /// queued behind a rename addresses its profile by the new name, and
+    /// once the rename failed that name is no longer the profile's, but
+    /// may be another's a hand edit added. Such an edit fails unsent with
+    /// the rename's error (#565 B2). Used on the write queue only.
+    final class FailedRenames: Sendable {
+        private let names = Mutex<[String: TesseraConfigEditError]>([:])
+
+        /// The error of the last rename to `name`, if it failed.
+        func failure(_ name: String) -> TesseraConfigEditError? {
+            names.withLock { $0[name] }
+        }
+
+        /// The last rename to `name` ran with `result`.
+        func record(_ name: String, _ result: Result<Void, TesseraConfigEditError>) {
+            names.withLock { names in
+                switch result {
+                case .success: names[name] = nil
+                case .failure(let error): names[name] = error
+                }
+            }
+        }
     }
 
     /// What a `Conflict` (the file changed since the core read it) does to
@@ -856,8 +914,9 @@ final class SettingsModel {
         /// Written again at once on the write queue: the core reads the
         /// file again, so the external edit stays.
         case retry
-        /// A key of a profile, named by its index, which the external edit
-        /// may have moved: not written again on the queue but
+        /// A key of a profile, shown at its index, which the external edit
+        /// may have moved: not written again on the queue (its key and
+        /// message would stay at the old index) but
         /// ``awaitProfileRetry(_:name:)`` (#549), for the profile of this name
         /// (as listed when the edit was queued).
         case retryProfile(name: String?)
@@ -885,7 +944,7 @@ final class SettingsModel {
             profileSettle = nil
             released = nil
         }
-        let edits = edits.map { edit in
+        let edits = addressed(edits).map { edit in
             var edit = edit
             if edit.onConflict == .retry, let (index, _) = Self.profilePath(edit.key) {
                 let listed = snapshot["profiles"]?.array ?? []
@@ -923,6 +982,7 @@ final class SettingsModel {
             return
         }
         let writer = source.settingsWriter
+        let failedRenames = failedRenames
         // A profile's edit that meets a conflict is written again by this
         // model, so it outlives a closed window until then (#549).
         let keep = edits.contains { if case .retryProfile = $0.onConflict { true } else { false } } ? self : nil
@@ -934,13 +994,22 @@ final class SettingsModel {
                     continue
                 }
                 var retried = false
-                var result = Self.perform(writer, edit.key, edit.value)
+                var result: Result<Void, TesseraConfigEditError>
+                let renames = (edit.afterRename ? edit.profile.map { [$0] } ?? [] : []) + edit.earlierRenames
+                if let error = renames.lazy.compactMap({ failedRenames.failure($0) }).first {
+                    // A rename it counted failed: its name and ordinal may
+                    // be another profile's.
+                    result = .failure(error)
+                } else {
+                    result = Self.perform(writer, edit)
+                }
                 if case .failure(let error) = result, error.kind == .conflict, edit.onConflict == .retry {
                     // The file changed since the core read it: the core reads
                     // it again on the retry, so the other edit stays.
                     retried = true
-                    result = Self.perform(writer, edit.key, edit.value)
+                    result = Self.perform(writer, edit)
                 }
+                if let name = Self.renamed(edit) { failedRenames.record(name, result) }
                 outcomes.append((result, retried))
             }
             let done = outcomes
@@ -974,14 +1043,68 @@ final class SettingsModel {
         return index >= (snapshot["profiles"]?.array?.count ?? 0)
     }
 
+    /// `edits` with the name each key of a profile addresses its profile
+    /// by (``Edit/profile``): the one shown at its index, a rename queued
+    /// before it included (the queue writes it first, and does not write
+    /// the edit if the rename failed: ``Edit/afterRename``). (No run holds
+    /// a rename and another key of its profile: a rename's run is it and
+    /// `general.default_profile`.) An edit written again after a conflict
+    /// (#549) keeps the name it was first queued with: a rename's own
+    /// value is pending by then, and is not the name the file has. The
+    /// ordinal (``Edit/ordinal``) is counted where the edit is now, among
+    /// the rows before it with that name, renames queued before it
+    /// included, and the edit is not written if one of those that
+    /// counted failed (``Edit/earlierRenames``).
+    private func addressed(_ edits: [Edit]) -> [Edit] {
+        let listed = snapshot["profiles"]?.array ?? []
+        return edits.map { edit in
+            var edit = edit
+            guard let (index, _) = Self.profilePath(edit.key) else { return edit }
+            if edit.profile == nil {
+                edit.profile = appliedValue("profiles[\(index)].name")?.string
+                let applied = listed.indices.contains(index) ? listed[index]["name"]?.string : nil
+                edit.afterRename = edit.profile != nil && edit.profile != applied
+            }
+            if let name = edit.profile {
+                edit.ordinal = (0..<index).count { appliedValue("profiles[\($0)].name")?.string == name }
+                edit.earlierRenames = (0..<index).compactMap { row in
+                    guard let new = pending["profiles[\(row)].name"]?.string else { return nil }
+                    let old = listed.indices.contains(row) ? listed[row]["name"]?.string : nil
+                    return new == name || old == name ? new : nil
+                }
+            }
+            return edit
+        }
+    }
+
+    /// The new name `edit` gives its profile, if it is a rename.
+    private nonisolated static func renamed(_ edit: Edit) -> String? {
+        guard let (_, rest) = profilePath(edit.key), rest == ".name" else { return nil }
+        return edit.value?.string
+    }
+
+    /// Runs `edit` on the write queue: a key of a profile through the
+    /// profile's name (``Edit/profile``) and its ordinal among the profiles
+    /// of that name (``Edit/ordinal``), so no profile's edit is written by
+    /// its index (#565); any other key by its path.
     private nonisolated static func perform(
-        _ writer: any SettingsConfigWriting, _ key: String, _ value: TesseraConfigValue?
+        _ writer: any SettingsConfigWriting, _ edit: Edit
     ) -> Result<Void, TesseraConfigEditError> {
         do throws(TesseraConfigEditError) {
-            if let value {
-                try writer.set(key, to: value)
+            if let (_, rest) = profilePath(edit.key) {
+                guard let name = edit.profile else {
+                    throw TesseraConfigEditError(.noSuchProfile, message: "")
+                }
+                let inner = String(rest.hasPrefix(".") ? rest.dropFirst() : rest)
+                if let value = edit.value {
+                    try writer.setProfile(named: name, ordinal: edit.ordinal, inner, to: value)
+                } else {
+                    try writer.removeProfile(named: name, ordinal: edit.ordinal, inner)
+                }
+            } else if let value = edit.value {
+                try writer.set(edit.key, to: value)
             } else {
-                try writer.remove(key)
+                try writer.remove(edit.key)
             }
             return .success(())
         } catch {
@@ -1007,10 +1130,18 @@ final class SettingsModel {
         if case .failure(let error) = result {
             // S8: the message may quote the file; only its kind is logged.
             Self.log.info("setting not saved: \(String(describing: error.kind), privacy: .public)")
-            messages[key] = Self.displayMessage(error)
-            if let written, movesProfiles(key, written) {
-                // No row shows the key of an add or delete: the list does.
-                messages[Self.profilesKey] = Self.displayMessage(error)
+            let deletes = written.map { movesProfiles(key, $0) } ?? false
+            if error.kind == .noSuchProfile {
+                // A hand edit renamed or removed the profile since it was
+                // listed: the row at its index may be another one's, so the
+                // list says so; a delete has nothing left to do (#565).
+                if !deletes { messages[Self.profilesKey] = Self.profileGoneNotice }
+            } else {
+                messages[key] = Self.displayMessage(error)
+                if deletes {
+                    // No row shows the key of an add or delete: the list does.
+                    messages[Self.profilesKey] = Self.displayMessage(error)
+                }
             }
             if inFlight[key] == nil {
                 pending[key] = nil
@@ -1042,7 +1173,7 @@ final class SettingsModel {
     /// edit of the file, then the edits of its run not run) are not written
     /// again at once:
     /// the external edit may have removed or moved the profile, and the
-    /// key names it by its index. They stay queued and shown, the
+    /// key and its message show it at its index. They stay queued and shown, the
     /// configuration is read again, and once a configuration applied after
     /// this one lists the profile (``profileSettleTimeout`` at most, for an
     /// external edit the watch applied already or never applies) they are
@@ -1065,7 +1196,8 @@ final class SettingsModel {
     /// Writes again the edits of ``profileRetries`` that a configuration
     /// applied since their conflict (or `due`, whose time is up) can place:
     /// at the index of the one profile listed under the name the edit was
-    /// made for, each `.show`ing its next conflict. With no such profile,
+    /// made for (or, for an edit queued behind a rename, under the new
+    /// name once the rename applied), each `.show`ing its next conflict. With no such profile,
     /// they are dropped: a delete has nothing left to do, a value is not
     /// saved and the list says so. Run while the list is locked by an add
     /// or delete, they are not written either, with the list's notice.
@@ -1076,7 +1208,12 @@ final class SettingsModel {
             profileRetries[id] = nil
             guard let key = retry.edits.first?.key, let (index, _) = Self.profilePath(key) else { continue }
             let listed = snapshot["profiles"]?.array ?? []
-            let places = listed.indices.filter { retry.name != nil && listed[$0]["name"]?.string == retry.name }
+            var places = listed.indices.filter { retry.name != nil && listed[$0]["name"]?.string == retry.name }
+            if places.isEmpty, let first = retry.edits.first, first.afterRename, let name = first.profile {
+                // Queued behind a rename that applied while it waited: its
+                // profile has the new name it addresses (#565 round 2).
+                places = listed.indices.filter { listed[$0]["name"]?.string == name }
+            }
             var again: [Edit] = []
             if places.count == 1 {
                 again = retry.edits.map { edit in
@@ -1201,6 +1338,7 @@ final class SettingsModel {
         return switch error.kind {
         case .refused: "Tessera would not use this value."
         case .conflict: "config.toml changed on disk; try again."
+        case .noSuchProfile: profileGoneNotice
         case .invalidArgument: "This value cannot be written."
         case .io: "config.toml could not be read or written."
         case .core: "The setting could not be saved."
@@ -1359,8 +1497,8 @@ final class SettingsModel {
     }
 
     /// Whether an add, duplicate or delete of a profile is queued, running
-    /// or written and not yet applied. Edits name a profile by its index,
-    /// which moves once the watch applies the file, so until then the list,
+    /// or written and not yet applied. The keys and rows show a profile at
+    /// its index, which moves once the watch applies the file, so until then the list,
     /// its buttons and the profile's controls are disabled and the profile
     /// actions do nothing. A failed write ends it at once (its message by
     /// the list); a written one ends with the next configuration applied.
@@ -1383,7 +1521,7 @@ final class SettingsModel {
 
     /// `key`'s profile index and the rest of it (`.command`, or empty for
     /// `profiles[i]` itself), for a key path in a profile.
-    private static func profilePath(_ key: String) -> (index: Int, rest: Substring)? {
+    private nonisolated static func profilePath(_ key: String) -> (index: Int, rest: Substring)? {
         guard key.hasPrefix("profiles["), let close = key.firstIndex(of: "]"),
             let index = Int(key[key.index(key.startIndex, offsetBy: 9)..<close])
         else { return nil }
