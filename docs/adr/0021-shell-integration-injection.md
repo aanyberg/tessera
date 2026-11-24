@@ -694,3 +694,61 @@ each in `tests/bash_rows.rs`):
   adds another; `_direnv_hook` then runs twice per prompt (it is
   idempotent). Startup files are not affected: they run before the head is
   placed.
+
+## Amendment: a start the injection takes over the exec limit runs without it (#519, 2026-11-24)
+
+The variables (and, for bash, the arguments) the injection adds count
+toward the `execve` size check (#74) like any others. An inherited
+environment just under the limit (one 943 KB variable, say) therefore
+started `zsh -i` with shell integration off and failed with it on: the
+injection's 175 to 235 bytes took it over, and the refusal said nothing of
+shell integration, so the user got no shell and no hint why.
+
+**Decision (lead).** When the injected start is refused with
+`PtyError::ArgumentsTooLong`, `App::spawn_pty` starts the same options once
+more without the injection, and the session's first line says so:
+
+```text
+[Tessera] Shell integration is off for this session: the environment is too large (<bytes> bytes with it, more than the <max> allowed).
+```
+
+`<bytes>` and `<max>` are the refused start's footprint and the limit, as
+the error gives them; the user learns how much to trim to get shell
+integration back. The size check runs before anything is opened or forked,
+so the refused start leaves nothing behind and the retry costs no fork.
+One warning is logged with the two sizes as fields and nothing else: no
+variable's name or value, no path, no shell name (which may come from
+`$SHELL`; docs/security.md S8). The notice is fixed text and numbers.
+
+- **Once.** The retry is the start integration off would make; there is no
+  third start. When it fails, its error is returned, so a start too large
+  without the injection too is refused exactly as with integration off
+  (the same `bytes` and `max`), and a program the injection leaves alone
+  (`sh`, `bash -c`, a preset `TESSERA_SHELL_INTEGRATION`) is refused as
+  before, with no retry and no notice.
+- **With a profile (#333).** The retry happens inside each start, so a
+  profile whose start the injection takes over the limit runs on the
+  profile without integration, with this notice only. A profile that falls
+  back to the built-in one, whose start the injection also takes over the
+  limit, gets both lines, the profile's first.
+- **Not an error, not refused.** Refusing with a message naming shell
+  integration was the alternative; it leaves the user without a shell for
+  ~200 bytes of ours. The notice keeps the cause visible.
+- On Linux, where one string over `MAX_ARG_STRLEN` is refused too, the
+  sizes are that string's and its limit; Tessera ships for macOS only.
+
+Tests: `a_start_the_injection_takes_over_the_exec_limit_runs_without_it`
+(zsh's `ZDOTDIR` redirect and bash's `--rcfile`, the limit measured from a
+refusal at run time, so no injection size is written into the test),
+`a_program_without_integration_over_the_limit_is_refused_as_before`,
+`a_profile_fallback_and_the_exec_limit_retry_each_say_so_once` (all in
+`crates/tessera-app-core/tests/shell_integration.rs`) and
+`the_exec_limit_retry_logs_the_sizes_only` (`lib.rs`, the S8 check).
+
+The same task closes the `spawn_errno` minors of #526 (M3): a
+`portable-pty` refusal (`Unable to spawn <path> because ...`) quotes the
+program's path and `PATH`, and an entry like `x (os error 13)` chose the
+fallback notice's `errno`. Only the fixed words after the path are read
+now (`profile::lookup_errno`), so a path can pick none of its own; a `PATH`
+entry with a line break can at most make up a candidate line, which picks
+among `EISDIR`, `EACCES` and `ENOENT`, the three a search can give.
