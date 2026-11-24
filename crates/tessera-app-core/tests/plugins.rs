@@ -1106,30 +1106,51 @@ fn a_slow_plugin_under_a_title_flood_keeps_the_queue_capped() {
     assert!(slow.events().len() < 100, "{}", slow.events().len());
 }
 
-/// Reads `path` through a session and returns how long the read took.
-fn time_cat(app: &App, path: &std::path::Path, marker: &str) -> Duration {
+/// Reads `path` through a session and returns how long the read took, or
+/// `None` once it has taken longer than `deadline`.
+fn time_cat(
+    app: &App,
+    path: &std::path::Path,
+    marker: &str,
+    deadline: Duration,
+) -> Option<Duration> {
     let start = Instant::now();
     let id = spawn(
         app,
         &format!("cat '{}'; echo {marker}; sleep 600", path.display()),
     );
-    loop {
+    let took = loop {
         if screen_holds(app, id, marker) {
-            break;
+            break Some(start.elapsed());
+        }
+        if start.elapsed() > deadline {
+            break None;
         }
         thread::sleep(Duration::from_millis(2));
-    }
-    let took = start.elapsed();
+    };
     app.close_session(id).unwrap();
     took
 }
 
 /// S6: 100 MB through a session, a title every KiB, with a plugin that
 /// sleeps 100 ms per event, reads within 1.05x of the same with no plugin
-/// enabled (best of 5, interleaved).
+/// enabled.
+///
+/// The bar is the best of up to ten pairs of reads, each pair one read with
+/// the plugin and one without taken back to back (the order alternates), so
+/// both reads of a pair see the same load. The best read with the plugin
+/// over the best without, taken minutes apart, failed under load (#603:
+/// 1.39 at load 55-82). It stays a wall-clock bar: a plugin that blocks the
+/// session sleeps, so the reader's CPU time would not see it. That mutant
+/// (the reader waits for room in the queue instead of dropping the event,
+/// or runs the plugin itself) reads 100 MB in hours, so a read with the
+/// plugin that takes 20 times its pair's read without, plus 10 s, fails at
+/// once.
 #[test]
 #[cfg_attr(debug_assertions, ignore = "timing bar; run in release")]
 fn a_slow_plugin_keeps_session_throughput() {
+    const PAIRS: usize = 10;
+    const MAX_RATIO: f64 = 1.05;
     let root = tempfile::tempdir().unwrap();
     let flood = root.path().join("flood");
     titled_flood(&flood, 100 * 1024 * 1024 / 1010);
@@ -1140,20 +1161,48 @@ fn a_slow_plugin_keeps_session_throughput() {
     let without = app(&root, &[], vec![idle.factory()]);
     wait_for_state(&with, "test.speed.slow", PluginState::Active);
 
-    let mut best_with = Duration::MAX;
-    let mut best_without = Duration::MAX;
-    for round in 0..5 {
-        best_without = best_without.min(time_cat(&without, &flood, &format!("end-{round}-a")));
-        best_with = best_with.min(time_cat(&with, &flood, &format!("end-{round}-b")));
-    }
-    let ratio = best_with.as_secs_f64() / best_without.as_secs_f64();
-    eprintln!(
-        "with {best_with:?}, without {best_without:?}, ratio {ratio:.3}, {:?}",
-        with.plugin_queue_stats()
-    );
+    let unbounded = Duration::from_secs(3600);
+    // The longest a read with the plugin may take: 20 times a read without
+    // it plus 10 s.
+    let deadline = |without: Duration| without * 20 + Duration::from_secs(10);
+    let mut ratios = Vec::new();
+    let mut fastest_without = unbounded;
+    let passed = (0..PAIRS).any(|pair| {
+        let read_without = || {
+            time_cat(&without, &flood, &format!("end-{pair}-a"), unbounded)
+                .expect("a read without a plugin ends")
+        };
+        let read_with = |without| {
+            time_cat(&with, &flood, &format!("end-{pair}-b"), deadline(without)).unwrap_or_else(
+                || {
+                    panic!(
+                        "the slow plugin blocked the session: a read with it took over \
+                         {:?}, 20x a read without it plus 10 s",
+                        deadline(without)
+                    )
+                },
+            )
+        };
+        // The first pair reads without the plugin first, so a read with it
+        // always has a deadline.
+        let (took_with, took_without) = if pair % 2 == 0 {
+            let took_without = read_without();
+            (read_with(took_without), took_without)
+        } else {
+            (read_with(fastest_without), read_without())
+        };
+        fastest_without = fastest_without.min(took_without);
+        let ratio = took_with.as_secs_f64() / took_without.as_secs_f64();
+        eprintln!(
+            "pair {pair}: with {took_with:?}, without {took_without:?}, ratio {ratio:.3}, {:?}",
+            with.plugin_queue_stats()
+        );
+        ratios.push(ratio);
+        ratio <= MAX_RATIO
+    });
     assert!(
-        ratio <= 1.05,
-        "with {best_with:?}, without {best_without:?}"
+        passed,
+        "every pair read more than {MAX_RATIO}x slower with the plugin: {ratios:.3?}"
     );
     assert!(with.plugin_queue_stats().dropped > 0);
     assert_eq!(idle.events(), Vec::<Event>::new());
