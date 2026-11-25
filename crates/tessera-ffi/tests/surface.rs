@@ -28,7 +28,8 @@ use tessera_ffi::{
     tessera_session_close, tessera_session_resize, tessera_session_spawn, tessera_session_write,
     tessera_surface_attach, tessera_surface_detach, tessera_surface_metrics,
     tessera_surface_render, tessera_surface_resize, tessera_surface_set_font_size,
-    tessera_test_surface_panic, tessera_test_with_core,
+    tessera_test_hold_font_index, tessera_test_surface_panic,
+    tessera_test_surface_shows_provisional_faces, tessera_test_with_core,
 };
 
 /// How long freeing the application may take.
@@ -1067,4 +1068,171 @@ fn a_translucent_retheme_switches_an_attached_surface() {
     assert_eq!(modes(), (CompositeAlphaMode::Opaque, false));
     assert!(layer.is_opaque());
     assert_eq!(app.close(id), Error::Ok);
+}
+
+/// Landings of the font index the callback below saw, by test.
+static FONT_INDEX_READY: AtomicU32 = AtomicU32::new(0);
+
+unsafe extern "C" fn count_font_index_ready(user_data: *mut std::ffi::c_void) {
+    assert_eq!(user_data as usize, 0x594, "user_data is passed back");
+    FONT_INDEX_READY.fetch_add(1, Ordering::SeqCst);
+}
+
+/// Installs a table with only `on_font_index_ready` (or none).
+fn install_font_index_callback(app: &Handle, callback: bool) {
+    let callbacks = tessera_ffi::Callbacks {
+        user_data: 0x594 as *mut std::ffi::c_void,
+        on_session_output: None,
+        on_session_title: None,
+        on_session_bell: None,
+        on_session_exit: None,
+        on_appearance_changed: None,
+        on_session_clipboard: None,
+        on_config_applied: None,
+        on_session_remote: None,
+        on_config_invalid: None,
+        on_session_command_finished: None,
+        on_font_index_ready: callback.then_some(count_font_index_ready),
+    };
+    // SAFETY: a live handle and a readable table, copied by the call.
+    let installed = unsafe { tessera_ffi::tessera_app_set_callbacks(app.0, &raw const callbacks) };
+    assert_eq!(installed, Error::Ok);
+}
+
+/// Whether session `id`'s surface shows a provisional face.
+fn shows_provisional_faces(app: &Handle, id: u64) -> bool {
+    let mut shows = false;
+    // SAFETY: a live handle and writable storage for one `bool`.
+    let read = unsafe { tessera_test_surface_shows_provisional_faces(app.0, id, &raw mut shows) };
+    assert_eq!(read, Error::Ok);
+    shows
+}
+
+/// #594: when the font fallback index lands, the core calls
+/// `on_font_index_ready` once, and the next frame draws the row that
+/// waited for it (a provisional face before, none after) though nothing
+/// else changed. Each `App` loads its own fonts, so a second landing
+/// (the next `App`'s) calls the callback once more.
+/// Needs nextest's process per test: it shares `FONT_INDEX_READY` and the
+/// global index hold with the other font index test.
+#[test]
+fn the_font_index_landing_calls_back_once_and_the_next_frame_draws_it() {
+    if !gpu_enabled() {
+        return;
+    }
+    // SAFETY: NULL is refused.
+    assert_eq!(
+        unsafe { tessera_test_hold_font_index(ptr::null_mut(), true) },
+        Error::NullPointer
+    );
+    for landing in 1..=2 {
+        let app = Handle::new();
+        install_font_index_callback(&app, true);
+        // SAFETY: a live handle.
+        assert_eq!(
+            unsafe { tessera_test_hold_font_index(app.0, true) },
+            Error::Ok
+        );
+        // U+1F210 in text presentation (VS15): emoji-preferring, so the
+        // chain tries the emoji family last and it is provisional until
+        // the index finds the face that covers it.
+        let id = app.spawn_sh(&[
+            "-c",
+            "printf '\\360\\237\\210\\220\\357\\270\\216 ready'; exec cat",
+        ]);
+        let layer = Layer::new();
+        assert_eq!(app.attach(id, &layer, 640, 200, 1.0), Error::Ok);
+        wait_for_child(|| {
+            let (error, _) = app.render(id);
+            assert_eq!(error, Error::Ok);
+            if shows_provisional_faces(&app, id) {
+                Ok(())
+            } else {
+                Err(Miss::NotYet("no provisional face drawn yet".into()))
+            }
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            FONT_INDEX_READY.load(Ordering::SeqCst),
+            landing - 1,
+            "nothing lands while held"
+        );
+        // SAFETY: a live handle.
+        assert_eq!(
+            unsafe { tessera_test_hold_font_index(app.0, false) },
+            Error::Ok
+        );
+        let deadline = Instant::now() + CHILD_TIMEOUT;
+        while FONT_INDEX_READY.load(Ordering::SeqCst) < landing {
+            assert!(Instant::now() < deadline, "on_font_index_ready never came");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::thread::sleep(MIN_FRAME_INTERVAL * 2);
+        let (error, status) = app.render(id);
+        assert_eq!(error, Error::Ok);
+        assert_ne!(status, FrameStatus::Skipped, "the landing asks for a frame");
+        assert!(
+            !shows_provisional_faces(&app, id),
+            "drawn with the final face"
+        );
+        std::thread::sleep(MIN_FRAME_INTERVAL * 2);
+        assert_eq!(
+            app.render(id).1,
+            FrameStatus::Skipped,
+            "and then nothing is pending"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            FONT_INDEX_READY.load(Ordering::SeqCst),
+            landing,
+            "once per landing"
+        );
+        drop(layer);
+    }
+}
+
+/// #594: a table without `on_font_index_ready` ignores the landing.
+/// Needs nextest's process per test: it shares `FONT_INDEX_READY` and the
+/// global index hold with the other font index test.
+#[test]
+fn a_null_font_index_callback_is_ignored() {
+    if !gpu_enabled() {
+        return;
+    }
+    let app = Handle::new();
+    install_font_index_callback(&app, false);
+    // SAFETY: a live handle.
+    assert_eq!(
+        unsafe { tessera_test_hold_font_index(app.0, true) },
+        Error::Ok
+    );
+    let id = app.spawn_sh(&[
+        "-c",
+        "printf '\\360\\237\\210\\220\\357\\270\\216 ready'; exec cat",
+    ]);
+    let layer = Layer::new();
+    assert_eq!(app.attach(id, &layer, 640, 200, 1.0), Error::Ok);
+    wait_for_child(|| {
+        assert_eq!(app.render(id).0, Error::Ok);
+        if shows_provisional_faces(&app, id) {
+            Ok(())
+        } else {
+            Err(Miss::NotYet("no provisional face drawn yet".into()))
+        }
+    });
+    // SAFETY: a live handle.
+    assert_eq!(
+        unsafe { tessera_test_hold_font_index(app.0, false) },
+        Error::Ok
+    );
+    // The index lands (the next frames draw the final face) and nothing
+    // calls back.
+    let deadline = Instant::now() + CHILD_TIMEOUT;
+    while shows_provisional_faces(&app, id) {
+        assert!(Instant::now() < deadline, "the index never landed");
+        std::thread::sleep(MIN_FRAME_INTERVAL * 2);
+        assert_eq!(app.render(id).0, Error::Ok);
+    }
+    assert_eq!(FONT_INDEX_READY.load(Ordering::SeqCst), 0);
+    drop(layer);
 }

@@ -14,11 +14,14 @@ use tessera_app_core::{Remote, SessionEvent, SessionId, SessionObserver};
 /// # Threads
 ///
 /// Session callbacks run on an internal reader thread (one per session),
-/// and `on_appearance_changed` on the configuration watch's thread, or on
-/// the calling thread before `tessera_app_set_display_options` returns;
-/// no other callback runs on the thread that calls `tessera_*`. A host
-/// lock held around `tessera_app_set_display_options` must therefore not
-/// be taken again in `on_appearance_changed`. A callback must return quickly, must
+/// `on_appearance_changed` on the configuration watch's thread, or on
+/// the calling thread before `tessera_app_set_display_options` returns,
+/// and `on_font_index_ready` on the font index's thread, or, if that thread
+/// cannot be spawned, on the thread calling `tessera_surface_attach` before
+/// it returns; no other callback runs on the thread that calls `tessera_*`.
+/// A host lock held around `tessera_app_set_display_options` or
+/// `tessera_surface_attach` must therefore not be taken again in
+/// `on_appearance_changed` or `on_font_index_ready`. A callback must return quickly, must
 /// not call any `tessera_*` function, and must not wait for the thread that
 /// does (for example with a synchronous dispatch to the main queue): closing
 /// a session, replacing the callbacks and freeing the application all wait
@@ -44,7 +47,8 @@ use tessera_app_core::{Remote, SessionEvent, SessionId, SessionObserver};
 ///
 /// Fields are only ever added at the end (`on_appearance_changed`,
 /// `on_session_clipboard`, `on_config_applied`, `on_session_remote`,
-/// `on_config_invalid` and `on_session_command_finished` were). A host compiled against an older header
+/// `on_config_invalid`, `on_session_command_finished` and
+/// `on_font_index_ready` were). A host compiled against an older header
 /// passes a shorter table, which this core would read past: rebuild the
 /// host against the header that ships with the core it links. Initialise the table with designated
 /// initialisers (C) or every field (Swift), so a new field is `NULL`.
@@ -176,6 +180,23 @@ pub struct Callbacks {
             duration_ms: u64,
         ),
     >,
+    /// The font fallback index finished loading in the background (#594):
+    /// rows a view drew before it with a provisional face (a missing-glyph
+    /// box, or a synthetic bold a real bold font beats) are drawn again by
+    /// that view's next frame, so the host asks every attached view for a
+    /// frame (`tessera_surface_render`) even if nothing else changed; a
+    /// view that has none to redraw reports `TESSERA_FRAME_STATUS_SKIPPED`.
+    /// Called once per font database the core loads (the first
+    /// `tessera_surface_attach` of the application loads it), on the font
+    /// index's own thread (on the attaching thread, before
+    /// `tessera_surface_attach` returns, if that thread cannot be spawned;
+    /// the core then holds its font, views and callback-table locks, so any
+    /// `tessera_*` call from the callback deadlocks),
+    /// with `user_data` only: it names no session and
+    /// carries no data. Not called if the index lands while no table is
+    /// installed. Under the rules of every callback: return quickly, call
+    /// no `tessera_*`, marshal the work to the main thread.
+    pub on_font_index_ready: Option<unsafe extern "C" fn(user_data: *mut c_void)>,
 }
 
 /// Most bytes of the host `on_session_remote` passes: the longest DNS name
@@ -316,6 +337,13 @@ impl SessionObserver for CallbackObserver {
             unsafe { callback(self.0.user_data) };
         }
     }
+
+    fn on_font_index_ready(&self) {
+        if let Some(callback) = self.0.on_font_index_ready {
+            // SAFETY: host contract on `Callbacks`.
+            unsafe { callback(self.0.user_data) };
+        }
+    }
 }
 
 /// Converts `text` to a C string, dropping interior NULs.
@@ -331,14 +359,16 @@ fn c_string_lossy(text: String) -> CString {
 mod tests {
     use super::*;
 
-    /// The table's C layout: eleven pointers, `on_session_command_finished`
-    /// last, right after `on_config_invalid` (fields are only appended, S7).
+    /// The table's C layout: twelve pointers, `on_font_index_ready` last,
+    /// right after `on_session_command_finished` (fields are only
+    /// appended, S7).
     #[test]
-    fn the_command_finished_callback_is_appended_last() {
+    fn the_font_index_callback_is_appended_last() {
         use std::mem::{offset_of, size_of};
 
         let pointer = size_of::<*const c_void>();
-        assert_eq!(size_of::<Callbacks>(), 11 * pointer);
+        assert_eq!(size_of::<Callbacks>(), 12 * pointer);
+        assert_eq!(offset_of!(Callbacks, on_font_index_ready), 11 * pointer);
         assert_eq!(offset_of!(Callbacks, on_appearance_changed), 5 * pointer);
         assert_eq!(offset_of!(Callbacks, on_session_clipboard), 6 * pointer);
         assert_eq!(offset_of!(Callbacks, on_config_applied), 7 * pointer);
@@ -383,6 +413,7 @@ mod tests {
             on_session_remote: None,
             on_config_invalid: None,
             on_session_command_finished: None,
+            on_font_index_ready: None,
         }
     }
 
@@ -419,6 +450,7 @@ mod tests {
             on_session_remote: Some(record_remote),
             on_config_invalid: None,
             on_session_command_finished: None,
+            on_font_index_ready: None,
         });
         let id = SessionId::from_raw(1);
         observer.on_session_event(id, SessionEvent::Remote(Remote::Host("far.example".into())));

@@ -283,10 +283,11 @@ upload.
 A frame re-shapes the damaged rows, and every row when the layout
 (target size, cell metrics, padding), the shaper's pixel size, the theme
 or the number of rows changed, after a failed frame, or for `All`. It
-also re-shapes a row whose length changed, and a row that drew a
-`.notdef` glyph (glyph id 0, from a font face) while the fallback index
-was still building, once `Fonts::fallback_index_ready()` turns true, as
-ADR 0007 asked of a renderer that caches shaped rows. Rows kept from an
+also re-shapes a row whose length changed, and a row shaped with a
+provisional face (`.notdef`, or a chain family's synthetic bold the index
+may beat) while the fallback index was still building, once
+`Fonts::fallback_index_ready()` turns true, as ADR 0007 asked of a
+renderer that caches shaped rows. Rows kept from an
 earlier frame hold atlas texel positions, so when the atlas evicts or
 resets during a frame (the counters in `AtlasStats` change), every row's
 instances are rebuilt once from its cached glyphs (no re-shaping); a full
@@ -502,11 +503,17 @@ as before. The interim measures from #21 are retired:
   resize asks for a frame. An occluded window already pauses the link and
   redraws when it shows again.
 
-A known gap in "nothing is pending": `Renderer::needs_redraw()` can turn
-true with no event when the fallback font index finishes loading in the
-background while a row shows a `.notdef` glyph it may now resolve. A host
-idling after `Skipped` draws that row with its next frame for another
-reason; a follow-up issue tracks waking the host for it.
+`Renderer::needs_redraw()` can turn true with no event of the session
+when the fallback font index finishes loading in the background while a
+row shows a provisional face (`.notdef`, or a chain family's synthetic
+bold the index may beat) it may now resolve. The core wakes the host for
+it (#594): the index's landing calls `on_font_index_ready(user_data)`
+once per font database the process loads, on the index thread, and
+`TerminalSurfaceView` sets `needsRender` on every attached view, so an
+idle link runs for one frame (which re-shapes those rows, or skips where
+none waits) and pauses again. The callback names no session and carries
+no data: the font database is shared by every view. The view's frame
+code is unchanged; the cost is one call per process launch.
 
 Residual risk: a surface that stays not ready while visible and non-empty
 (a layer that never vends a drawable) is retried every refresh, by both

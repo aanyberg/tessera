@@ -5,7 +5,7 @@
  * without TESSERA_HANDLE_KEY_BINDINGS_ONLY), that an unbound key under the
  * flag is ignored, and that unknown flag bits are refused. The callback
  * table carries on_config_applied, appended after on_session_clipboard
- * (remote.c checks the table's last field, on_config_invalid, #547). #317:
+ * (remote.c checks the table's last field, on_font_index_ready, #594). #317:
  * a chord with an invisible key is refused with an escaped message, and
  * once a binding applies the JSON carries the new generation with the new
  * chords. Uses a configuration directory of its own under the script's

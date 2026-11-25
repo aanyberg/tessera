@@ -2599,12 +2599,14 @@ impl App {
         if let Some(fonts) = slot.as_ref() {
             return Ok(fonts.clone());
         }
-        let fonts = Fonts::new(&FontConfig {
+        let observers = Arc::clone(&self.observers);
+        let config = FontConfig {
             family,
             size_pt: theme.font_size,
             scale: 1.0,
             fallback: Vec::new(),
-        })?;
+        };
+        let fonts = Fonts::with_index_notice(&config, move || font_index_ready(&observers))?;
         *slot = Some(fonts.clone());
         Ok(fonts)
     }
@@ -2649,6 +2651,35 @@ impl App {
     pub fn panic_holding_session_lock(&self) {
         let _sessions = lock(&self.sessions);
         panic!("deliberate panic for testing");
+    }
+
+    /// Holds (`true`) or releases (`false`) every font fallback index that
+    /// finishes building, process-wide (#594); holding also forgets this
+    /// `App`'s font database, so the next view attached loads a new one
+    /// whose index waits for the release. Views attached before keep
+    /// theirs.
+    ///
+    /// Exists only so tests can draw rows with a provisional face, then
+    /// land the index with nothing else going on.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn hold_font_index(&self, hold: bool) {
+        tessera_render::hold_fallback_index(hold);
+        if hold {
+            *lock(&self.fonts) = None;
+        }
+    }
+
+    /// Whether session `id`'s view shows a row shaped with a provisional
+    /// face that the font fallback index may change; `None` without a view.
+    ///
+    /// Exists only so tests can tell a frame drew the final faces.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn view_shows_provisional_faces(&self, id: SessionId) -> Option<bool> {
+        lock(&self.views)
+            .get(&id)
+            .map(View::shows_provisional_faces)
     }
 
     /// The theme session `id`'s view's renderer draws with, or `None`
@@ -2969,6 +3000,22 @@ fn fallback_errno(error: &Error) -> Result<Option<i32>, ()> {
         }
         Error::Pty(PtyError::ProgramLookupBusy { .. }) => Ok(Some(profile::errno::EAGAIN)),
         _ => Err(()),
+    }
+}
+
+/// Tells the observer in `observers` the font fallback index landed
+/// ([`SessionObserver::on_font_index_ready`]); runs on the index thread.
+fn font_index_ready(observers: &ObserverSlot) {
+    let observers = observers
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(observer) = observers.as_ref()
+        && std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            observer.on_font_index_ready();
+        }))
+        .is_err()
+    {
+        tracing::error!("session observer panicked in on_font_index_ready");
     }
 }
 

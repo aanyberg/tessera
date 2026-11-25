@@ -85,6 +85,9 @@ A hosted test that cannot exercise what it checks on this host skips with the re
 - **Tests that need a visible window or a full screen transition** (`FullScreenToggleTests`, `ResizeFootprintTests`)
   skip on a locked console, where nothing is drawn and no transition finishes; CI runs them.
 
+A Rust test that cannot run here prints `SKIP <test>: <reason>` and returns; for the #555 font index renderer tests
+a `success-output` override in `.config/nextest.toml` puts that line in the log (#590).
+
 ## Tests and the home directory
 
 Tests never read or write the real home directory. Tests that create an

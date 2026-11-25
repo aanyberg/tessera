@@ -90,6 +90,7 @@ impl Recorder {
             on_session_remote: None,
             on_config_invalid: None,
             on_session_command_finished: None,
+            on_font_index_ready: None,
         }
     }
 }
@@ -867,6 +868,7 @@ fn session_threads_run_at_user_initiated_qos() {
         on_session_remote: None,
         on_config_invalid: None,
         on_session_command_finished: None,
+        on_font_index_ready: None,
     };
     // SAFETY: live handle; valid table; `qos` outlives the handle.
     assert_eq!(

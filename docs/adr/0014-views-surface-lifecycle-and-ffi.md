@@ -466,3 +466,29 @@ one frame old: output that arrived since the last render has not moved it
 yet. That is the frame the user is looking at. `TesseraSurface.cellMetrics`
 and `cursorCell` read the core on each access and are meant for callers
 outside the view.
+
+## Amendment: #594, waking the host when the font index lands
+
+`Callbacks` gains `on_font_index_ready(user_data)`, appended after
+`on_session_command_finished` (fields are only appended, S7). The font
+fallback index (ADR 0007) loads on a background thread after the first
+view attaches; rows drawn before it lands with a provisional face are
+drawn again by the next frame (ADR 0016), but a host whose display link
+idles has no reason to ask for one. The core calls the callback once per
+font database it loads (one per `App`, loaded by its first view), on the
+index thread (on the attaching thread, inside `tessera_surface_attach`,
+if that thread cannot be spawned), with no arguments but `user_data`: it names no session,
+since every view shares the fonts. It follows the rules of every
+callback (return quickly, call no `tessera_*`, marshal to the main
+thread); it is not called if the index lands while no table is installed.
+`CallbackBridge` coalesces it into one main-actor delivery, and
+`SessionRouter` marks every attached `TerminalSurfaceView` as needing a
+frame. A `NULL` pointer ignores it.
+
+Tests drive the landing with `tessera_test_hold_font_index(app, hold)`,
+exported only by a core built with the `test-hooks` feature and absent
+from the generated header: holding forgets the `App`'s font database, so
+the next view loads one whose index waits for the release. Today only the
+FFI tests use it; the xcframework `just app-test` builds is a release
+build without the feature, so a hosted app test that holds the index
+needs a test-hooks xcframework first (future work, #650).

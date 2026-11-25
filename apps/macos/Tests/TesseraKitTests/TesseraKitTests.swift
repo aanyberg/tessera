@@ -91,6 +91,14 @@ final class Recorder: TesseraAppDelegate {
         XCTAssertTrue(Thread.isMainThread, "delegate called off the main thread")
         loadFailures += 1
     }
+
+    /// How many `fontIndexDidLand()` calls came.
+    private(set) var fontIndexLandings = 0
+
+    func fontIndexDidLand() {
+        XCTAssertTrue(Thread.isMainThread, "delegate called off the main thread")
+        fontIndexLandings += 1
+    }
 }
 
 @MainActor

@@ -550,7 +550,28 @@ impl Fonts {
     /// second (more in debug builds), so create one `Fonts` per process and
     /// share it.
     pub fn new(config: &FontConfig) -> Result<Self, RenderError> {
-        Self::with_system(FontSystem::new(), config, IndexBuild::Background)
+        Self::with_system(FontSystem::new(), config, IndexBuild::Background(None))
+    }
+
+    /// [`Self::new`], calling `notice` once the background coverage index
+    /// has landed ([`Self::fallback_index_ready`] is `true` by then), so a
+    /// host that pauses its drawing while nothing changes can draw the
+    /// rows shaped with a provisional face again (#594).
+    ///
+    /// `notice` runs exactly once, on the index thread (or on this thread,
+    /// before this returns, if no thread could be spawned), and never if
+    /// loading the fonts fails. It must return quickly and must not take
+    /// these fonts' lock for long: the index thread holds no lock while it
+    /// runs.
+    pub fn with_index_notice(
+        config: &FontConfig,
+        notice: impl FnOnce() + Send + 'static,
+    ) -> Result<Self, RenderError> {
+        Self::with_system(
+            FontSystem::new(),
+            config,
+            IndexBuild::Background(Some(Box::new(notice))),
+        )
     }
 
     fn with_system(
@@ -638,8 +659,12 @@ impl Fonts {
                 inner.families[0]
             )));
         }
-        if index == IndexBuild::Background {
-            spawn_coverage_build(inner.system.db().clone(), &inner.coverage);
+        match index {
+            IndexBuild::Background(notice) => {
+                spawn_coverage_build(inner.system.db().clone(), &inner.coverage, notice);
+            }
+            #[cfg(test)]
+            IndexBuild::Never => {}
         }
         let coverage = Arc::clone(&inner.coverage);
         Ok(Self {
@@ -1254,35 +1279,94 @@ impl Inner {
     }
 }
 
+/// Called once when the coverage index lands ([`Fonts::with_index_notice`]).
+type IndexNotice = Box<dyn FnOnce() + Send + 'static>;
+
 /// How [`Fonts::with_system`] provides the coverage index.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IndexBuild {
-    /// Build it on a background thread.
-    Background,
+    /// Build it on a background thread, then call the notice, if any.
+    Background(Option<IndexNotice>),
     /// Leave it unset (tests fill it by hand).
     #[cfg(test)]
     Never,
 }
 
-/// Builds the coverage index of `db` off the render path and stores it in
-/// `slot`. Falls back to building it on this thread if no thread can be
-/// spawned, so the index always appears.
-fn spawn_coverage_build(db: fontdb::Database, slot: &Arc<OnceLock<Coverage>>) {
+/// Builds the coverage index of `db` off the render path, stores it in
+/// `slot`, then calls `notice`. Falls back to building it on this thread if
+/// no thread can be spawned, so the index always appears.
+fn spawn_coverage_build(
+    db: fontdb::Database,
+    slot: &Arc<OnceLock<Coverage>>,
+    notice: Option<IndexNotice>,
+) {
     let db = Arc::new(db);
     let (thread_db, thread_slot) = (Arc::clone(&db), Arc::clone(slot));
+    // The notice moves into the thread's closure, and comes back with the
+    // error if the thread cannot be spawned.
+    let notice = Mutex::new(notice);
+    let notice = Arc::new(notice);
+    let thread_notice = Arc::clone(&notice);
     let spawned = std::thread::Builder::new()
         .name("tessera-font-index".into())
-        .spawn(move || {
-            let _ = thread_slot.set(Coverage::build(&thread_db));
-        });
+        .spawn(move || land(&thread_slot, Coverage::build(&thread_db), &thread_notice));
     if let Err(e) = spawned {
         tracing::warn!(
             target: "tessera_render",
             error = %e,
             "could not spawn the font index thread; building it inline"
         );
-        let _ = slot.set(Coverage::build(&db));
+        land(slot, Coverage::build(&db), &notice);
     }
+}
+
+/// Stores `index` in `slot` and calls the notice, once: only the first
+/// landing of a slot calls it.
+fn land(slot: &OnceLock<Coverage>, index: Coverage, notice: &Mutex<Option<IndexNotice>>) {
+    #[cfg(feature = "test-hooks")]
+    test_hold::wait();
+    if slot.set(index).is_err() {
+        return;
+    }
+    let notice = notice.lock().unwrap_or_else(PoisonError::into_inner).take();
+    if let Some(notice) = notice {
+        notice();
+    }
+}
+
+/// Holds every coverage index that finishes building while the hold is on
+/// until it is released (feature `test-hooks`): a test opens a view with
+/// provisional rows, then lands the index with nothing else going on.
+#[cfg(feature = "test-hooks")]
+mod test_hold {
+    use std::sync::{Condvar, Mutex, PoisonError};
+
+    static HELD: Mutex<bool> = Mutex::new(false);
+    static RELEASED: Condvar = Condvar::new();
+
+    /// Holds (`true`) or releases (`false`) the indexes.
+    pub(super) fn set(hold: bool) {
+        *HELD.lock().unwrap_or_else(PoisonError::into_inner) = hold;
+        if !hold {
+            RELEASED.notify_all();
+        }
+    }
+
+    /// Waits while the hold is on.
+    pub(super) fn wait() {
+        let mut held = HELD.lock().unwrap_or_else(PoisonError::into_inner);
+        while *held {
+            held = RELEASED.wait(held).unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+}
+
+/// Holds (`true`) every coverage index that finishes building from now on,
+/// so it does not land, until a call with `false` releases them (#594).
+/// Process-wide. Test-only (feature `test-hooks`).
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub fn hold_fallback_index(hold: bool) {
+    test_hold::set(hold);
 }
 
 /// Which installed face first covers each code point: sorted, disjoint,
@@ -2323,6 +2407,82 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// #594: the notice of [`Fonts::with_index_notice`] runs once, after
+    /// the index landed; a second landing of the same slot calls nothing.
+    #[test]
+    fn the_index_notice_runs_once_after_the_index_lands() {
+        use std::sync::atomic::AtomicUsize;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let ready_when_called = Arc::new(Mutex::new(None));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let fonts = {
+            let (calls, ready) = (Arc::clone(&calls), Arc::clone(&ready_when_called));
+            let slot = Arc::new(Mutex::new(None::<Fonts>));
+            let probe = Arc::clone(&slot);
+            let fonts = Fonts::with_index_notice(&FontConfig::default(), move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                *ready.lock().unwrap() = probe
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(Fonts::fallback_index_ready);
+                let _ = tx.send(());
+            })
+            .expect("fonts");
+            *slot.lock().unwrap() = Some(fonts.clone());
+            fonts
+        };
+        rx.recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the notice never ran");
+        assert!(fonts.fallback_index_ready());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // Landing the slot again (as `build_index_now` would) is refused
+        // and calls no notice.
+        let notice: IndexNotice = Box::new({
+            let calls = Arc::clone(&calls);
+            move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        land(
+            &fonts.coverage,
+            Coverage::default(),
+            &Mutex::new(Some(notice)),
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "one call per landing");
+        // The notice may run before the test stores its handle; when it
+        // did see one, the index was ready already.
+        assert_ne!(*ready_when_called.lock().unwrap(), Some(false));
+    }
+
+    /// #555: `resolve_presented` with text presentation (VS15) of a
+    /// character that prefers emoji and that no chain family covers
+    /// resolves provisionally before the index lands (the count moves) and
+    /// for good after (it does not).
+    #[test]
+    fn a_text_presented_emoji_resolution_is_provisional_until_the_index_lands() {
+        let fonts = menlo_without_index();
+        let ch = '\u{1F210}';
+        assert!(prefers_emoji(ch));
+        let (before, first) = {
+            let mut inner = fonts.lock();
+            let before = inner.provisional();
+            let r = inner.resolve_presented(ch, FontStyle::Regular, false);
+            (inner.provisional().wrapping_sub(before), r)
+        };
+        assert_eq!(before, 1, "provisional before the index: {first:?}");
+        fonts.build_index_now();
+        let mut inner = fonts.lock();
+        let count = inner.provisional();
+        let _ = inner.resolve_presented(ch, FontStyle::Regular, false);
+        assert_eq!(
+            inner.provisional(),
+            count,
+            "settled once the index is ready"
+        );
     }
 
     #[test]

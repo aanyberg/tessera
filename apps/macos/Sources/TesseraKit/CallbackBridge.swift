@@ -36,7 +36,8 @@ internal import TesseraCore
 /// coalesced the same way, app-wide: at most one delivery is queued, and it
 /// reports the latest `opaque`. `on_config_applied` (same thread) likewise
 /// reports the latest generation, and `on_config_invalid` (same thread) is a
-/// flag.
+/// flag. `on_font_index_ready` (the core's font index thread, once per font
+/// database the core loads) is a flag too (#594).
 @MainActor
 final class CallbackBridge {
     weak var delegate: (any TesseraAppDelegate)?
@@ -73,6 +74,9 @@ final class CallbackBridge {
     private nonisolated let pendingInvalid = Mutex<Bool>(false)
     /// Load-failure deliveries scheduled so far (tests: a burst schedules one).
     nonisolated let scheduledInvalidDeliveries = Mutex<Int>(0)
+    /// Whether `on_font_index_ready` was received and not yet delivered;
+    /// `true` exactly while a delivery is queued.
+    private nonisolated let pendingFontIndex = Mutex<Bool>(false)
     /// The registry's command names, by id (``TesseraKeymap/Command/command``),
     /// read once at start: the registry never changes while the core runs.
     var commandNames: [String] = []
@@ -153,6 +157,9 @@ final class CallbackBridge {
                         pending.commandFinished = finish
                     }
                 }
+            },
+            on_font_index_ready: { userData in
+                CallbackBridge.from(userData)?.receiveFontIndexReady()
             }
         )
     }
@@ -242,7 +249,27 @@ final class CallbackBridge {
         }
     }
 
+    private nonisolated func receiveFontIndexReady() {
+        let schedule = pendingFontIndex.withLock { pending in
+            defer { pending = true }
+            return !pending
+        }
+        guard schedule else { return }
+        Task { @MainActor in
+            self.deliverFontIndexReady()
+        }
+    }
+
     // MARK: Main actor
+
+    private func deliverFontIndexReady() {
+        guard pendingFontIndex.withLock({ pending in
+            defer { pending = false }
+            return pending
+        }) else { return }
+        guard !isShutDown, let delegate else { return }
+        delegate.fontIndexDidLand()
+    }
 
     private func deliverInvalid() {
         guard pendingInvalid.withLock({ pending in

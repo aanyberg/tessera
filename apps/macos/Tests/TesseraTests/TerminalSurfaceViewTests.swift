@@ -775,6 +775,35 @@ final class TerminalSurfaceViewTests: XCTestCase {
         XCTAssertEqual(view.renderCount, before + 3, "a focus change is rendered")
     }
 
+    /// #594: when the font fallback index lands, the core calls the host
+    /// once (`on_font_index_ready`) and the router asks every view for a
+    /// frame, so an idle pane redraws the rows it drew with a provisional
+    /// face without waiting for output; one frame later the link idles
+    /// again. Both through the view and through the router the core calls.
+    func testTheFontIndexLandingWakesAnIdleViewForOneFrame() throws {
+        try requireSurface()
+        view.occlusionOverride = false
+        view.displayLinkDidFire()
+        XCTAssertFalse(view.isRenderPending)
+        XCTAssertTrue(view.isDisplayLinkPaused, "idle")
+
+        for (label, land) in [
+            ("the view", { self.view.fontIndexDidLand() }),
+            ("the router", { self.appDelegate.router.fontIndexDidLand() }),
+        ] as [(String, () -> Void)] {
+            let before = view.renderCount
+            land()
+            XCTAssertTrue(view.isRenderPending, "\(label): a frame is asked for")
+            XCTAssertFalse(view.isDisplayLinkPaused, "\(label): the landing wakes the link")
+            view.displayLinkDidFire()
+            XCTAssertEqual(view.renderCount, before + 1, "\(label): one frame")
+            XCTAssertFalse(view.isRenderPending, "\(label): nothing pending after it")
+            XCTAssertTrue(view.isDisplayLinkPaused, "\(label): the link idles again")
+            view.displayLinkDidFire()
+            XCTAssertEqual(view.renderCount, before + 1, "\(label): no second frame")
+        }
+    }
+
     /// What the session router calls on every view when the core re-themes
     /// them (`appearanceDidChange(opaque:)`): the window follows the
     /// session's own appearance (here the default theme's, opaque), not the

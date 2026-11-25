@@ -64,6 +64,7 @@ impl Recorder {
             on_session_remote: None,
             on_config_invalid: None,
             on_session_command_finished: Some(on_finished),
+            on_font_index_ready: None,
         }
     }
 }
