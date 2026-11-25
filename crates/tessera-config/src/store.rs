@@ -353,19 +353,25 @@ impl ConfigStore {
         self.load_from_disk_identified().1
     }
 
-    /// [`ConfigStore::load_from_disk`], with the `config.toml` it went to
-    /// as a handle on it names it (the final target, whatever the path
-    /// names since), whether it loaded or not; `None` for a missing file
-    /// (the defaults, or an error for a missing target) or where there are
-    /// no inode numbers. The watcher compares it with the one it
-    /// registered (#697).
-    pub(crate) fn load_from_disk_identified(&self) -> (Option<FileId>, Result<FromDisk, Error>) {
-        let (read, from) = self.load_config_file();
+    /// [`ConfigStore::load_from_disk`], with the files it went to
+    /// ([`WentTo`]). The watcher compares them with the ones it
+    /// registered (#697, #701).
+    pub(crate) fn load_from_disk_identified(&self) -> (WentTo, Result<FromDisk, Error>) {
+        let (config, from) = self.load_config_file();
+        let mut went_to = WentTo {
+            config,
+            profiles: None,
+        };
         let from = from.map(|mut from| {
-            crate::profile_files::load_and_merge(&mut from.loaded, &self.paths.profiles_dir());
+            #[cfg(test)]
+            before_profiles();
+            went_to.profiles = Some(crate::profile_files::load_and_merge(
+                &mut from.loaded,
+                &self.paths.profiles_dir(),
+            ));
             from
         });
-        (read, from)
+        (went_to, from)
     }
 
     /// `config.toml` alone, for [`ConfigStore::load_from_disk`], which adds
@@ -605,6 +611,46 @@ pub(crate) fn captures_see_every_event() {
     });
     // A callsite whose interest was cached before the line above.
     tracing::callsite::rebuild_interest_cache();
+}
+
+/// The files a load ([`ConfigStore::load_from_disk_identified`]) went to,
+/// each as a handle on it names it (the final target, whatever the path
+/// names since; `None` where there are no inode numbers).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct WentTo {
+    /// `config.toml`, whether it loaded or not; `None` for a missing file
+    /// (the defaults, or an error for a missing target) or one that did
+    /// not open.
+    pub(crate) config: Option<FileId>,
+    /// Each profile file read, by stem; `None` when `config.toml` did not
+    /// load, since the profile files are then not read. At most
+    /// [`crate::MAX_PROFILE_FILES`].
+    pub(crate) profiles: Option<Vec<crate::profile_files::ProfileRead>>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Run once by [`ConfigStore::load_from_disk_identified`] on this
+    /// thread between its read of `config.toml` and its listing of
+    /// `profiles/`: a test that retargets a link in that window (#701).
+    static BEFORE_PROFILES: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+/// Has the next load on this thread that reads the profile files run
+/// `hook` before it lists them.
+pub(crate) fn once_before_profiles(hook: impl FnOnce() + 'static) {
+    BEFORE_PROFILES.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+/// The hook point in [`ConfigStore::load_from_disk_identified`]; see
+/// [`BEFORE_PROFILES`].
+fn before_profiles() {
+    if let Some(hook) = BEFORE_PROFILES.with(|slot| slot.borrow_mut().take()) {
+        hook();
+    }
 }
 
 #[cfg(test)]

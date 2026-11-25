@@ -100,8 +100,8 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::load::{FileId, Warning};
-use crate::store::{ConfigStore, FromDisk};
+use crate::load::Warning;
+use crate::store::{ConfigStore, FromDisk, WentTo};
 use crate::theme::{MAX_THEME_DIR_ENTRIES, Theme, ThemeSource};
 use crate::{Config, Error};
 
@@ -466,10 +466,9 @@ impl Drop for WatchGuard {
 /// reports [`ConfigEvent::Unchanged`]: yes after a change on disk, no for
 /// the catch-up when the watcher starts.
 ///
-/// Returns the `config.toml` the load went to, whether it loaded or not
-/// ([`ConfigStore::load_from_disk_identified`]), `None` when it found
-/// none.
-fn settle(store: &ConfigStore, follow: impl FnOnce(&Config), reread: Reread) -> Option<FileId> {
+/// Returns the files the load went to, `config.toml` whether it loaded
+/// or not ([`ConfigStore::load_from_disk_identified`]).
+fn settle(store: &ConfigStore, follow: impl FnOnce(&Config), reread: Reread) -> WentTo {
     let (read, outcome) = store.load_from_disk_identified();
     match &outcome {
         Ok(from) => follow(&from.loaded.config),
@@ -793,6 +792,21 @@ impl Fingerprint {
             Err(_) => Self::Missing,
         }
     }
+
+    /// [`Fingerprint::of`] for a profile file: `Missing` unless `path`
+    /// names a regular file, as the load reads only those. A link to a
+    /// directory the listing samples (with the dangling ones) is then no
+    /// file in the sample, as it is none to the load (#701 B1).
+    fn of_regular(path: &Path) -> Self {
+        match std::fs::metadata(path) {
+            Ok(meta) if meta.is_file() => Self::Present {
+                modified: meta.modified().ok(),
+                len: meta.len(),
+                identity: identity_of(&meta),
+            },
+            _ => Self::Missing,
+        }
+    }
 }
 
 /// A cheap identity of the themes directory's state: the name and
@@ -842,7 +856,9 @@ pub(crate) const MAX_PROFILE_FILES_FOLLOWED: usize = 32;
 /// [`crate::profile_files::list_first`] finds, in stem order, followed by
 /// the dangling links it reports (a target that appears changes them).
 /// Following symbolic links, so a linked file's target saved by rename
-/// changes it too.
+/// changes it too. An entry that names no regular file (a dangling link,
+/// a link to a directory) is `Missing`, as the load reads none there
+/// ([`Fingerprint::of_regular`]).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct ProfilesFingerprint {
     dir: Fingerprint,
@@ -865,7 +881,7 @@ impl ProfilesFingerprint {
             .map(|(_, path)| path)
             .chain(listing.dangling)
             .map(|path| {
-                let fingerprint = Fingerprint::of(&path);
+                let fingerprint = Fingerprint::of_regular(&path);
                 (path, fingerprint)
             })
             .collect();
@@ -892,7 +908,7 @@ impl ProfilesFingerprint {
                 .enumerate()
                 .map(|(i, (path, seen))| {
                     let fingerprint = if i < limit {
-                        Fingerprint::of(path)
+                        Fingerprint::of_regular(path)
                     } else {
                         *seen
                     };
@@ -1141,13 +1157,13 @@ mod native {
         /// cannot be registered (unreadable, say) is skipped rather than
         /// making the backend poll, since it may well be unrelated.
         unloadable: Vec<PathBuf>,
-        unloadable_handles: Vec<File>,
+        unloadable_handles: Vec<(PathBuf, File)>,
         /// The theme files the profiles name ([`profile_theme_files`], at
         /// most [`super::MAX_PROFILE_THEMES_FOLLOWED`]), so an in-place save
         /// of one restyles that profile's sessions (#397), and the handles
         /// of those registered. Best effort, as `unloadable`.
         profile_themes: Vec<PathBuf>,
-        profile_theme_handles: Vec<File>,
+        profile_theme_handles: Vec<(PathBuf, File)>,
         /// The profiles directory and its handle, `None` while it is
         /// missing (#312). As with `themes/`, its creation is seen through
         /// the root directory's watch, and opening it follows a link, so
@@ -1162,7 +1178,7 @@ mod native {
         /// symbolic links are followed through the chain too
         /// ([`Native::walk_all`]).
         profile_files: Vec<PathBuf>,
-        profile_file_handles: Vec<File>,
+        profile_file_handles: Vec<(PathBuf, File)>,
         /// The state of `profiles/` and of `profile_files` when the last
         /// settle began. A chain event, or a poll while the backend is not
         /// armed, that finds it changed reloads, as `config_seen` does for
@@ -1196,17 +1212,26 @@ mod native {
         config_seen: super::Fingerprint,
         /// Whether the last settle's load went to another `config.toml`
         /// than the one `file_handle` registers, loaded or not (or found
-        /// none where one is registered): the way to it changed between
-        /// the registration and the load. The handles then do not describe
-        /// what the store holds (a configuration, or an error, from the
-        /// other file), so [`Native::chain_unchanged`] cannot vouch for
-        /// it: a retarget undone before the thread looks at the chain
-        /// would look like no change at all, and leave the store on the
-        /// target the load found (#697). The event the change raised on an
-        /// armed directory of the way re-registers and reloads instead. A
-        /// registered file that fails to load (a parse error, a file over
-        /// the size cap) does not set it: the handles still describe the
-        /// store's state, and a chain event does not reload it again.
+        /// none where one is registered), or, when `config.toml` loaded,
+        /// read another set of profile files than the followed ones
+        /// `profile_file_handles` registers ([`profiles_as_registered`]),
+        /// or, past them, than the ones `profiles_tail` sampled before the
+        /// load ([`tail_as_sampled`]): the way to one changed between the
+        /// registration and the load. Or the theme lookup of the follow
+        /// listed another `themes/` than `themes_handle` registers
+        /// ([`Native::themes_as_registered`]).
+        /// The handles then do not describe what the store holds (a
+        /// configuration, or an error, from the other file), so
+        /// [`Native::chain_unchanged`] cannot vouch for it: a retarget
+        /// undone before the thread looks at the chain would look like no
+        /// change at all, and leave the store on the target the load found
+        /// (#697, #701). The event the change raised on an armed directory
+        /// of the way re-registers and reloads instead. A registered file
+        /// that fails to load (a parse error, a file over the size cap)
+        /// does not set it: the handles still describe the store's state,
+        /// and a chain event does not reload it again. Nor does a
+        /// `config.toml` that fails to load, whose profile files are not
+        /// read.
         load_unregistered: bool,
         /// Counts what the thread did, for tests.
         #[cfg(test)]
@@ -1371,13 +1396,18 @@ mod native {
     /// Registers each of `paths` (theme files followed in case they
     /// change in place), skipping, with a debug log, one that cannot be
     /// registered (unreadable, say) rather than making the backend poll,
-    /// since it may well be unrelated. Returns the handles registered.
-    fn best_effort(queue: &mut kqueue::Watcher, paths: &[PathBuf], what: &str) -> Vec<File> {
+    /// since it may well be unrelated. Returns the handles registered,
+    /// each with its path.
+    fn best_effort(
+        queue: &mut kqueue::Watcher,
+        paths: &[PathBuf],
+        what: &str,
+    ) -> Vec<(PathBuf, File)> {
         let mut handles = Vec::new();
         for path in paths {
             let mut slot = None;
             match register(queue, &mut slot, path, Kind::File) {
-                Ok(()) => handles.extend(slot),
+                Ok(()) => handles.extend(slot.map(|handle| (path.clone(), handle))),
                 Err(error) => tracing::debug!(
                     target: "tessera_config",
                     path = %crate::load::escaped(
@@ -1578,6 +1608,97 @@ mod native {
             }
         }
         Ok(dirs)
+    }
+
+    /// Whether the profile files a load read (`read`, by stem, with the
+    /// file each read went to) are the followed ones `registered` holds:
+    /// among the first [`super::MAX_PROFILE_FILES_FOLLOWED`] read, each
+    /// went to the file its path's handle names, and found none where
+    /// there is no handle (one not registered: unreadable, say); and each
+    /// registered path was read. Files read past those are not followed:
+    /// [`tail_as_sampled`] checks them against [`Native::profiles_tail`].
+    fn profiles_as_registered(
+        read: &[crate::profile_files::ProfileRead],
+        registered: &[(PathBuf, File)],
+    ) -> bool {
+        let followed = &read[..read.len().min(super::MAX_PROFILE_FILES_FOLLOWED)];
+        let registered_as = |path: &Path| {
+            registered
+                .iter()
+                .find(|(held, _)| held == path)
+                .and_then(|(_, handle)| handle.metadata().ok())
+                .and_then(|meta| crate::load::FileId::of(&meta))
+        };
+        followed
+            .iter()
+            .all(|file| registered_as(&file.path) == file.went_to)
+            && registered
+                .iter()
+                .all(|(held, _)| followed.iter().any(|file| file.path == *held))
+    }
+
+    /// Whether the profile files a load read match the tail sampled
+    /// before the load ([`Native::profiles_tail`], `None` when the sample
+    /// found no more than the followed ones), by path and inode (the
+    /// inode alone: the sample records no device). A file read "is" the
+    /// one the read went to, or, when the open failed (an unreadable
+    /// file), the one its `stat` found ([`ProfileRead::found`]). The
+    /// check runs in both directions:
+    ///
+    /// - each file read past [`super::MAX_PROFILE_FILES_FOLLOWED`] is one
+    ///   the sample found at its path;
+    /// - each file the sample found at a path (a regular file, as the
+    ///   load reads: see [`super::ProfilesFingerprint`]) is the one read
+    ///   there, so a load that found fewer files than the sample (34
+    ///   sampled and 33 read, or 33 and 32), or found something it does
+    ///   not read there (a directory, a FIFO, a link to a directory), or
+    ///   another file it could not open, does not pass.
+    ///
+    /// The sample is what [`Native::tail_changed`] compares with, so a
+    /// file set the load found elsewhere (a root retarget in between, then
+    /// back) would match it again after the undo and stay in the store
+    /// for good (#701 B1). Only what the load saw is compared, never the
+    /// paths after it, which may name the other root still. A file read
+    /// that `stat`s as nothing (gone since the listing) is not checked
+    /// against the sample: the next sample shows it gone. A steady
+    /// unreadable file matches its sample (the `stat` finds it), and a
+    /// steady link to a directory is sampled as no file, so neither
+    /// reloads on each chain event.
+    ///
+    /// [`ProfileRead::found`]: crate::profile_files::ProfileRead::found
+    fn tail_as_sampled(
+        read: &[crate::profile_files::ProfileRead],
+        tail: Option<&super::ProfilesFingerprint>,
+    ) -> bool {
+        let is = |file: &crate::profile_files::ProfileRead| file.went_to.or(file.found);
+        let sampled_as = |path: &Path, ino: u64| {
+            tail.and_then(|tail| tail.files.iter().find(|(sampled, _)| sampled == path))
+                .is_some_and(|(_, sampled)| {
+                    matches!(
+                        sampled,
+                        super::Fingerprint::Present { identity: (sampled, ..), .. }
+                            if *sampled == ino
+                    )
+                })
+        };
+        let read_as_sampled = read
+            .iter()
+            .skip(super::MAX_PROFILE_FILES_FOLLOWED)
+            .all(|file| is(file).is_none_or(|id| sampled_as(&file.path, id.ino())));
+        read_as_sampled
+            && tail.is_none_or(|tail| {
+                tail.files
+                    .iter()
+                    .all(|(sampled, fingerprint)| match fingerprint {
+                        super::Fingerprint::Missing => true,
+                        super::Fingerprint::Present {
+                            identity: (ino, ..),
+                            ..
+                        } => read.iter().any(|file| {
+                            file.path == *sampled && is(file).is_some_and(|id| id.ino() == *ino)
+                        }),
+                    })
+            })
     }
 
     /// Whether `handle` (the registration of `path`) still names what
@@ -1885,7 +2006,7 @@ mod native {
         /// effort, replacing the previous registrations. Touches no other
         /// slot.
         fn register_profile_files(&mut self) {
-            for old in self.profile_file_handles.drain(..) {
+            for (_, old) in self.profile_file_handles.drain(..) {
                 let _ = self.queue.remove_file(&old, EventFilter::EVFILT_VNODE);
             }
             self.profile_file_handles =
@@ -1925,9 +2046,11 @@ mod native {
         }
 
         /// Whether nothing that leads to `config.toml` changed (the test
-        /// `changes_nothing` makes after its event): walks the chain once.
-        /// Never after a load that read another file than the one
-        /// registered ([`Native::load_unregistered`]).
+        /// `changes_nothing` makes after its event): walks the chain once,
+        /// and checks that every registered handle on the way, and on the
+        /// theme files followed ([`Native::theme_files_unchanged`]), still
+        /// names what its path names. Never after a load that read other
+        /// files than the ones registered ([`Native::load_unregistered`]).
         fn chain_unchanged(&self) -> bool {
             if self.load_unregistered {
                 return false;
@@ -1950,7 +2073,31 @@ mod native {
                     .as_deref()
                     .is_none_or(|dir| names_now(dir, self.link_dir_handle.as_ref()))
                 && names_now(&self.file, self.file_handle.as_ref())
+                && self.theme_files_unchanged()
                 && self.sample_profiles().1 == self.profiles_seen
+        }
+
+        /// Whether each theme file followed (the theme in use, the
+        /// unloadable ones and the profiles' themes) that has a handle
+        /// still names what its path names. Roots that share a
+        /// hard-linked `config.toml` each have their own `themes/`: a root
+        /// retarget between the registration of the root and the follow,
+        /// then back, leaves every handle on the way as it was but the
+        /// theme files' on the other root's files, whose saves no event
+        /// reports (#701 F1). A theme file with no handle (not registered
+        /// after an error) is not checked: its failure is the
+        /// registration's ([`Native::register_error`], or best effort),
+        /// and a chain event that reloaded for it would reload each time.
+        fn theme_files_unchanged(&self) -> bool {
+            let in_use = self.theme_file.iter().zip(&self.theme_file_handle);
+            let others = self
+                .unloadable_handles
+                .iter()
+                .chain(&self.profile_theme_handles)
+                .map(|(path, handle)| (path, handle));
+            in_use
+                .chain(others)
+                .all(|(path, handle)| still_names(path, handle).unwrap_or(false))
         }
 
         /// Whether a registration is incomplete: one failed
@@ -1971,7 +2118,7 @@ mod native {
         /// registrations of the previous ones. Touches no other slot, so
         /// pending directory events survive it.
         fn register_theme_file(&mut self) -> std::io::Result<()> {
-            for old in self
+            for (_, old) in self
                 .unloadable_handles
                 .drain(..)
                 .chain(self.profile_theme_handles.drain(..))
@@ -2156,13 +2303,20 @@ mod native {
             self.profiles_seen = seen;
             #[cfg(test)]
             self.probe.note_settle();
-            let read = super::settle(store, |config| self.follow(config), reread);
+            let mut listed = true;
+            let went_to = super::settle(store, |config| listed = self.follow(config), reread);
             let registered = self
                 .file_handle
                 .as_ref()
                 .and_then(|handle| handle.metadata().ok())
-                .and_then(|meta| super::FileId::of(&meta));
-            self.load_unregistered = read != registered;
+                .and_then(|meta| crate::load::FileId::of(&meta));
+            self.load_unregistered = !listed
+                || !self.themes_as_registered()
+                || went_to.config != registered
+                || went_to.profiles.as_deref().is_some_and(|read| {
+                    !profiles_as_registered(read, &self.profile_file_handles)
+                        || !tail_as_sampled(read, self.profiles_tail.as_ref())
+                });
         }
 
         /// Whether `config.toml` or `profiles/` changed since the last
@@ -2192,8 +2346,11 @@ mod native {
         }
 
         /// Follows the theme files `config`'s `appearance.theme` and its
-        /// profiles' themes resolve to now.
-        fn follow(&mut self, config: &crate::Config) {
+        /// profiles' themes resolve to now. Returns whether `themes/` was
+        /// the registered one when the lookup began
+        /// ([`Native::themes_as_registered`]).
+        fn follow(&mut self, config: &crate::Config) -> bool {
+            let listed = self.themes_as_registered();
             let (file, unloadable) = theme_files_to_follow(
                 &self.themes,
                 &config.appearance.theme,
@@ -2208,6 +2365,27 @@ mod native {
             let result = self.register_theme_file();
             if result.is_err() {
                 self.note_registration(result);
+            }
+            listed
+        }
+
+        /// Whether `themes/` is the directory `themes_handle` registers: the
+        /// one its path names, or, with no handle, none the theme lookup
+        /// could list (missing, not a directory, or unreadable, which
+        /// [`Native::registration_incomplete`] recovers from). Sampled when
+        /// the follow's lookup begins and after the settle reported the
+        /// themes: a root retarget before the lookup, or undone after the
+        /// report, leaves the lookup on another root's `themes/` that no
+        /// event of the registered one would follow (#701 B2). An
+        /// unreadable `themes/` counts as none, so it does not reload on
+        /// each chain event.
+        fn themes_as_registered(&self) -> bool {
+            match &self.themes_handle {
+                Some(handle) => still_names(&self.themes, handle).unwrap_or(false),
+                None => {
+                    !std::fs::metadata(&self.themes).is_ok_and(|meta| meta.is_dir())
+                        || std::fs::read_dir(&self.themes).is_err()
+                }
             }
         }
 
@@ -2239,11 +2417,12 @@ mod native {
                 // `debounce`, and holds back neither an edit of the file nor
                 // a change on the way (a busy `$TMPDIR` or `~` is common).
                 // The one exception is a settle whose load went to another
-                // file than the one registered (`load_unregistered`, #697):
-                // the next chain event reloads once, which registers and
-                // reads the file the way names then. A registered file that
-                // does not load is not such an exception, so a broken
-                // `config.toml` is not reloaded on each chain event.
+                // file than the one registered (`load_unregistered`: a
+                // `config.toml` or profile file, #697, #701): the next chain
+                // event reloads once, which registers and reads the files
+                // the way names then. A registered file that does not load
+                // is not such an exception, so a broken `config.toml` or
+                // profile file is not reloaded on each chain event.
                 let mut changed = !self.on_chain(&event);
                 let mut chain_seen = !changed;
                 if changed {
@@ -3037,7 +3216,7 @@ mod native {
             assert_eq!(native.profile_file_handles.len(), 2);
             while native.queue.poll(Some(Duration::ZERO)).is_some() {}
             std::fs::write(&b, "command = \"/bin/b\"\n").unwrap();
-            let fd = native.profile_file_handles[1].as_raw_fd();
+            let fd = native.profile_file_handles[1].1.as_raw_fd();
             assert!(event_on(&mut native, fd).is_some(), "no event on b.toml");
             std::fs::remove_file(&a).unwrap();
             native.settle(&store);
@@ -3110,7 +3289,7 @@ mod native {
             assert_eq!(native.profiles_seen.files.len(), 3);
             while native.queue.poll(Some(Duration::ZERO)).is_some() {}
             std::fs::write(&c, "command = \"/bin/c\"\n").unwrap();
-            let fd = native.profile_file_handles[2].as_raw_fd();
+            let fd = native.profile_file_handles[2].1.as_raw_fd();
             assert!(event_on(&mut native, fd).is_some(), "no event on c.toml");
         }
 
@@ -3616,6 +3795,810 @@ mod native {
                     "{broken:?}: the store holds gen2's error, the disk names gen1: {event:?}"
                 );
             }
+        }
+
+        /// Gives roots `a` and `b` of `home` one `themes/` (`home/themes`,
+        /// each `<root>/themes` a link to it), so a root retarget leaves the
+        /// theme lookup where `themes_handle` registers it (#701 B2), and
+        /// a test of another file's retarget sees only that.
+        fn share_themes(home: &Path) {
+            std::fs::create_dir_all(home.join("themes")).unwrap();
+            for root in ["a", "b"] {
+                std::fs::create_dir_all(home.join(root)).unwrap();
+                std::os::unix::fs::symlink("../themes", home.join(root).join("themes")).unwrap();
+            }
+        }
+
+        /// The command of the profile `work` the store holds.
+        fn work_command(store: &ConfigStore) -> Option<String> {
+            store
+                .config()
+                .profiles
+                .iter()
+                .find(|profile| profile.name == "work")
+                .and_then(|profile| profile.command.clone())
+        }
+
+        /// A profile file (`work.toml`) whose command is `command`.
+        fn work_profile(command: &str) -> String {
+            format!("name = \"work\"\ncommand = \"{command}\"\n")
+        }
+
+        /// #701: a linked profile file (`profiles/work.toml ->
+        /// dots/cur/work.toml`) whose way is retargeted between the
+        /// settle's sample of `profiles/` and the load, then back: the
+        /// store holds the other target's profile, which the handles do
+        /// not describe, so the event the undo raises is a change.
+        /// Deterministic: the retarget runs in that window from a hook,
+        /// and the events are read off the queue.
+        #[test]
+        fn a_profile_retarget_undone_after_the_load_it_landed_before_is_a_change() {
+            let (_dir, base) = resolved_tempdir();
+            let dots = base.join("dots");
+            for generation in 0..3_u8 {
+                let tree = dots.join(format!("v{generation}"));
+                std::fs::create_dir_all(&tree).unwrap();
+                std::fs::write(
+                    tree.join("work.toml"),
+                    work_profile(&format!("/bin/cmd{generation}")),
+                )
+                .unwrap();
+            }
+            let cur = dots.join("cur");
+            std::os::unix::fs::symlink("v0", &cur).unwrap();
+            let root = base.join("root");
+            std::fs::create_dir_all(root.join("profiles")).unwrap();
+            std::fs::write(root.join("config.toml"), sized(11)).unwrap();
+            std::os::unix::fs::symlink(cur.join("work.toml"), root.join("profiles/work.toml"))
+                .unwrap();
+            let paths = ConfigPaths::new(&root);
+            let store = ConfigStore::open(paths.clone()).unwrap();
+            let (mut native, _stop) = Native::open(&paths).unwrap();
+            retarget(&cur, "v1");
+            native.rearm();
+            native.settle(&store);
+            assert!(native.armed());
+            assert_eq!(work_command(&store).as_deref(), Some("/bin/cmd1"));
+
+            // Registered and sampled on v1; the load reads v2.
+            let link = cur.clone();
+            crate::store::once_before_profiles(move || retarget(&link, "v2"));
+            native.settle(&store);
+            assert_eq!(work_command(&store).as_deref(), Some("/bin/cmd2"));
+            retarget(&cur, "v1");
+            let fd = chain_fd(&native, &dots);
+            let event = event_on(&mut native, fd).expect("no event for the retarget");
+            assert!(
+                !native.changes_nothing(&event),
+                "the store holds v2's profile, the disk names v1: {event:?}"
+            );
+        }
+
+        /// The theme files [`Native`] follows, by slot (#701 F1).
+        #[derive(Debug, Clone, Copy)]
+        enum Followed {
+            /// The theme in use (`theme_file`).
+            InUse,
+            /// A profile's theme (`profile_themes`).
+            Profile,
+            /// A theme file that does not load, followed while the theme
+            /// asked for is found nowhere (`unloadable`).
+            Unloadable,
+        }
+
+        impl Followed {
+            /// The `config.toml` that has this slot follow `themes/<the
+            /// file name>`, and that file's text in root `root`.
+            fn setup(self, root: &str) -> (&'static str, &'static str, String) {
+                match self {
+                    Self::InUse => (
+                        "[appearance]\ntheme = \"mine\"\n",
+                        "mine.toml",
+                        theme_named(&format!("Mine {root}")),
+                    ),
+                    Self::Profile => (
+                        "[[profiles]]\nname = \"p\"\n[profiles.appearance]\ntheme = \"pt\"\n",
+                        "pt.toml",
+                        theme_named(&format!("Pt {root}")),
+                    ),
+                    Self::Unloadable => (
+                        "[appearance]\ntheme = \"Nowhere\"\n",
+                        "broken.toml",
+                        format!("[[[ {root}\n"),
+                    ),
+                }
+            }
+
+            /// The inode of the file this slot of `native` has a handle on.
+            fn ino(self, native: &Native) -> u64 {
+                let handle = match self {
+                    Self::InUse => native.theme_file_handle.as_ref(),
+                    Self::Profile => native.profile_theme_handles.first().map(|(_, h)| h),
+                    Self::Unloadable => native.unloadable_handles.first().map(|(_, h)| h),
+                };
+                handle
+                    .unwrap_or_else(|| panic!("{self:?}: not followed"))
+                    .metadata()
+                    .unwrap()
+                    .ino()
+            }
+        }
+
+        /// #701 F1: roots that share a hard-linked `config.toml` and a
+        /// `themes/` whose theme file is a link through the root link to
+        /// each root's own file. A retarget of the root between its
+        /// registration and the follow of the theme files, then back,
+        /// leaves a followed theme file's handle on the other root's file,
+        /// so an in-place save of the one the path names would raise no
+        /// event: the event the undo raises is a change. For each slot a
+        /// theme file is followed in. Deterministic: the retarget runs
+        /// during the load from a hook, and the events are read off the
+        /// queue.
+        #[test]
+        fn a_root_retarget_undone_after_the_theme_was_followed_is_a_change() {
+            for slot in [Followed::InUse, Followed::Profile, Followed::Unloadable] {
+                let (_dir, base) = resolved_tempdir();
+                let home = base.join("home");
+                let (config, name, _) = slot.setup("a");
+                for root in ["a", "b"] {
+                    std::fs::create_dir_all(home.join(root).join("files")).unwrap();
+                    std::fs::write(home.join(root).join("files").join(name), slot.setup(root).2)
+                        .unwrap();
+                }
+                share_themes(&home);
+                std::os::unix::fs::symlink(
+                    home.join("cfg/files").join(name),
+                    home.join("themes").join(name),
+                )
+                .unwrap();
+                std::fs::write(home.join("a/config.toml"), config).unwrap();
+                std::fs::hard_link(home.join("a/config.toml"), home.join("b/config.toml")).unwrap();
+                let link = home.join("cfg");
+                std::os::unix::fs::symlink("a", &link).unwrap();
+                let paths = ConfigPaths::new(&link);
+                let store = ConfigStore::open(paths.clone()).unwrap();
+                let (mut native, _stop) = Native::open(&paths).unwrap();
+                native.settle(&store);
+                assert!(native.armed(), "{slot:?}");
+                let ino = |root: &str| {
+                    std::fs::metadata(home.join(root).join("files").join(name))
+                        .unwrap()
+                        .ino()
+                };
+                assert_eq!(slot.ino(&native), ino("a"), "{slot:?}");
+
+                // Registered on a; the theme files are followed on b.
+                let during = link.clone();
+                crate::store::once_before_profiles(move || retarget(&during, "b"));
+                native.settle(&store);
+                assert_eq!(slot.ino(&native), ino("b"), "{slot:?}");
+                retarget(&link, "a");
+                let fd = chain_fd(&native, &home);
+                let event = event_on(&mut native, fd).expect("no event for the retarget");
+                assert!(
+                    !native.changes_nothing(&event),
+                    "{slot:?}: the theme followed is b's, the disk names a's: {event:?}"
+                );
+            }
+        }
+
+        /// #701 F3: a root retarget that lands between the load's read of
+        /// `config.toml` and its listing of `profiles/`, then is undone:
+        /// the store holds the other root's profiles (another `work`, or
+        /// none), so the event the undo raises is a change. Deterministic:
+        /// the retarget runs in that window from a hook, and the events
+        /// are read off the queue.
+        #[test]
+        fn a_root_retarget_undone_after_the_profiles_listing_it_landed_before_is_a_change() {
+            for other in [Some("/bin/b"), None] {
+                let (_dir, base) = resolved_tempdir();
+                let home = base.join("home");
+                share_themes(&home);
+                for (root, command) in [("a", Some("/bin/a")), ("b", other)] {
+                    let profiles = home.join(root).join("profiles");
+                    std::fs::create_dir_all(&profiles).unwrap();
+                    std::fs::write(home.join(root).join("config.toml"), sized(11)).unwrap();
+                    if let Some(command) = command {
+                        std::fs::write(profiles.join("work.toml"), work_profile(command)).unwrap();
+                    }
+                }
+                let link = home.join("cfg");
+                std::os::unix::fs::symlink("a", &link).unwrap();
+                let paths = ConfigPaths::new(&link);
+                let store = ConfigStore::open(paths.clone()).unwrap();
+                let (mut native, _stop) = Native::open(&paths).unwrap();
+                native.settle(&store);
+                assert!(native.armed(), "{other:?}");
+                assert_eq!(work_command(&store).as_deref(), Some("/bin/a"));
+
+                // Registered on a, and `config.toml` read there; the
+                // profiles are listed in b.
+                let during = link.clone();
+                crate::store::once_before_profiles(move || retarget(&during, "b"));
+                native.settle(&store);
+                assert_eq!(work_command(&store).as_deref(), other);
+                retarget(&link, "a");
+                let fd = chain_fd(&native, &home);
+                let event = event_on(&mut native, fd).expect("no event for the retarget");
+                assert!(
+                    !native.changes_nothing(&event),
+                    "{other:?}: the store holds b's profiles, the disk names a's: {event:?}"
+                );
+            }
+        }
+
+        /// A profile file named `p<i>` whose command names root `root`.
+        fn numbered_profile(i: usize, root: &str) -> String {
+            format!("name = \"p{i:02}\"\ncommand = \"/bin/{root}{i:02}\"\n")
+        }
+
+        /// The command of the profile `p<i>` the store holds.
+        fn numbered_command(store: &ConfigStore, i: usize) -> Option<String> {
+            let name = format!("p{i:02}");
+            store
+                .config()
+                .profiles
+                .iter()
+                .find(|profile| profile.name == name)
+                .and_then(|profile| profile.command.clone())
+        }
+
+        /// #701 B1: a root retarget between the settle's sample of
+        /// `profiles/` and the load, then back, where the roots' profile
+        /// files are hard links of each other up to the followed ones and
+        /// differ past them: b's own last file (sampled in a's tail), or
+        /// one more file than a holds (no tail sampled). The store holds
+        /// b's last profile, which neither the handles nor the tail sample
+        /// describe, so the event the undo raises is a change.
+        /// Deterministic: the retarget runs in that window from a hook,
+        /// and the events are read off the queue.
+        #[test]
+        fn a_root_retarget_undone_after_the_load_read_past_the_followed_profiles_is_a_change() {
+            let followed = crate::watch::MAX_PROFILE_FILES_FOLLOWED;
+            // (files in a, files in b): b's last is its own.
+            for (in_a, in_b) in [(followed + 3, followed + 3), (followed, followed + 1)] {
+                let (_dir, base) = resolved_tempdir();
+                let home = base.join("home");
+                share_themes(&home);
+                for root in ["a", "b"] {
+                    std::fs::create_dir_all(home.join(root).join("profiles")).unwrap();
+                    std::fs::write(home.join(root).join("config.toml"), sized(11)).unwrap();
+                }
+                let file = |root: &str, i: usize| {
+                    home.join(root)
+                        .join("profiles")
+                        .join(format!("p{i:02}.toml"))
+                };
+                for i in 0..in_a {
+                    std::fs::write(file("a", i), numbered_profile(i, "a")).unwrap();
+                }
+                for i in 0..in_b - 1 {
+                    std::fs::hard_link(file("a", i), file("b", i)).unwrap();
+                }
+                let last = in_b - 1;
+                std::fs::write(file("b", last), numbered_profile(last, "b")).unwrap();
+                let link = home.join("cfg");
+                std::os::unix::fs::symlink("a", &link).unwrap();
+                let paths = ConfigPaths::new(&link);
+                let store = ConfigStore::open(paths.clone()).unwrap();
+                let (mut native, _stop) = Native::open(&paths).unwrap();
+                native.settle(&store);
+                assert!(native.armed(), "{in_a}/{in_b}");
+                assert_eq!(native.profiles_tail.is_some(), in_a > followed);
+
+                // Registered and sampled on a; the profiles are read in b.
+                let during = link.clone();
+                crate::store::once_before_profiles(move || retarget(&during, "b"));
+                native.settle(&store);
+                let expected = format!("/bin/b{last:02}");
+                assert_eq!(numbered_command(&store, last).as_deref(), Some(&*expected));
+                retarget(&link, "a");
+                let fd = chain_fd(&native, &home);
+                let event = event_on(&mut native, fd).expect("no event for the retarget");
+                assert!(
+                    !native.changes_nothing(&event),
+                    "{in_a}/{in_b}: the store holds b's p{last:02}, the disk names a's: {event:?}"
+                );
+            }
+        }
+
+        /// #701 B1 round 2: a root retarget between the settle's sample of
+        /// `profiles/` and the load, then back, where b holds fewer
+        /// profile files than a, each a hard link of a's: past the
+        /// followed ones (34 and 33), across them (33 and 32, so the load
+        /// reads none past them), or within them (35 and 31). The store
+        /// holds b's set, which neither the handles nor the tail sample
+        /// describe, so the event the undo raises is a change.
+        /// Deterministic: the retarget runs in that window from a hook,
+        /// and the events are read off the queue.
+        #[test]
+        fn a_root_retarget_undone_after_the_load_read_fewer_profiles_than_sampled_is_a_change() {
+            let followed = crate::watch::MAX_PROFILE_FILES_FOLLOWED;
+            for (in_a, in_b) in [
+                (followed + 2, followed + 1),
+                (followed + 1, followed),
+                (followed + 3, followed - 1),
+            ] {
+                let (_dir, base) = resolved_tempdir();
+                let home = base.join("home");
+                share_themes(&home);
+                for root in ["a", "b"] {
+                    std::fs::create_dir_all(home.join(root).join("profiles")).unwrap();
+                    std::fs::write(home.join(root).join("config.toml"), sized(11)).unwrap();
+                }
+                let file = |root: &str, i: usize| {
+                    home.join(root)
+                        .join("profiles")
+                        .join(format!("p{i:02}.toml"))
+                };
+                for i in 0..in_a {
+                    std::fs::write(file("a", i), numbered_profile(i, "a")).unwrap();
+                }
+                for i in 0..in_b {
+                    std::fs::hard_link(file("a", i), file("b", i)).unwrap();
+                }
+                let link = home.join("cfg");
+                std::os::unix::fs::symlink("a", &link).unwrap();
+                let paths = ConfigPaths::new(&link);
+                let store = ConfigStore::open(paths.clone()).unwrap();
+                let (mut native, _stop) = Native::open(&paths).unwrap();
+                native.settle(&store);
+                assert!(native.armed(), "{in_a}/{in_b}");
+                assert!(native.profiles_tail.is_some(), "{in_a}/{in_b}");
+                assert_eq!(store.config().profiles.len(), in_a, "{in_a}/{in_b}");
+
+                // Registered and sampled on a; the profiles are read in b.
+                let during = link.clone();
+                crate::store::once_before_profiles(move || retarget(&during, "b"));
+                native.settle(&store);
+                assert_eq!(store.config().profiles.len(), in_b, "{in_a}/{in_b}");
+                retarget(&link, "a");
+                let fd = chain_fd(&native, &home);
+                let event = event_on(&mut native, fd).expect("no event for the retarget");
+                assert!(
+                    !native.changes_nothing(&event),
+                    "{in_a}/{in_b}: the store holds b's {in_b} profiles, the disk names a's: {event:?}"
+                );
+            }
+        }
+
+        /// #701 B1 adversarial: a root retarget between the settle's sample
+        /// of `profiles/` and the load, then back, where b's files are
+        /// hard links of a's up to the last, and b holds at the last
+        /// path something the load reads no profile from: another file
+        /// it cannot open (mode 000), a directory, a FIFO or a link to a
+        /// directory. The store lacks a's last profile, which the tail
+        /// sample has, so the event the undo raises is a change.
+        /// Deterministic: the retarget runs in that window from a hook,
+        /// and the events are read off the queue.
+        #[test]
+        fn a_root_retarget_undone_after_the_load_read_no_profile_at_a_sampled_path_is_a_change() {
+            use std::os::unix::fs::PermissionsExt as _;
+            let followed = crate::watch::MAX_PROFILE_FILES_FOLLOWED;
+            for at_b in ["mode 000", "directory", "fifo", "link to a directory"] {
+                let (_dir, base) = resolved_tempdir();
+                let home = base.join("home");
+                share_themes(&home);
+                for root in ["a", "b"] {
+                    std::fs::create_dir_all(home.join(root).join("profiles")).unwrap();
+                    std::fs::write(home.join(root).join("config.toml"), sized(11)).unwrap();
+                }
+                let file = |root: &str, i: usize| {
+                    home.join(root)
+                        .join("profiles")
+                        .join(format!("p{i:02}.toml"))
+                };
+                for i in 0..=followed {
+                    std::fs::write(file("a", i), numbered_profile(i, "a")).unwrap();
+                }
+                for i in 0..followed {
+                    std::fs::hard_link(file("a", i), file("b", i)).unwrap();
+                }
+                let last = file("b", followed);
+                match at_b {
+                    "mode 000" => {
+                        std::fs::write(&last, numbered_profile(followed, "b")).unwrap();
+                        std::fs::set_permissions(&last, std::fs::Permissions::from_mode(0o000))
+                            .unwrap();
+                    }
+                    "directory" => std::fs::create_dir(&last).unwrap(),
+                    "fifo" => mkfifo(&last),
+                    _ => {
+                        std::fs::create_dir(home.join("b/elsewhere")).unwrap();
+                        std::os::unix::fs::symlink("../elsewhere", &last).unwrap();
+                    }
+                }
+                let link = home.join("cfg");
+                std::os::unix::fs::symlink("a", &link).unwrap();
+                let paths = ConfigPaths::new(&link);
+                let store = ConfigStore::open(paths.clone()).unwrap();
+                let (mut native, _stop) = Native::open(&paths).unwrap();
+                native.settle(&store);
+                assert!(native.armed(), "{at_b}");
+                assert!(native.profiles_tail.is_some(), "{at_b}");
+                assert_eq!(store.config().profiles.len(), followed + 1, "{at_b}");
+
+                // Registered and sampled on a; the profiles are read in b.
+                let during = link.clone();
+                crate::store::once_before_profiles(move || retarget(&during, "b"));
+                native.settle(&store);
+                assert_eq!(store.config().profiles.len(), followed, "{at_b}");
+                retarget(&link, "a");
+                let fd = chain_fd(&native, &home);
+                let event = event_on(&mut native, fd).expect("no event for the retarget");
+                let unchanged = native.changes_nothing(&event);
+                if at_b == "mode 000" {
+                    std::fs::set_permissions(&last, std::fs::Permissions::from_mode(0o644))
+                        .unwrap();
+                }
+                assert!(
+                    !unchanged,
+                    "{at_b}: the store lacks a's p{followed:02}, the disk names it: {event:?}"
+                );
+            }
+        }
+
+        /// #701 B2: roots that share a hard-linked `config.toml`, whose
+        /// `themes/` differ: only a's holds the theme in use, or only b
+        /// has one (holding no theme the configuration names). A root
+        /// retarget between the registration and the follow of the theme
+        /// files, then back, leaves the theme lookup on b's directory,
+        /// which `themes_handle` does not register: the store's theme (or
+        /// themes listing) is b's, so the event the undo raises is a
+        /// change. Deterministic: the retarget runs during the load from
+        /// a hook, and the events are read off the queue.
+        #[test]
+        fn a_root_retarget_undone_after_the_themes_lookup_it_landed_before_is_a_change() {
+            for (in_a, in_b) in [(Some("mine.toml"), None), (None, Some("other.toml"))] {
+                let (_dir, base) = resolved_tempdir();
+                let home = base.join("home");
+                for (root, file) in [("a", in_a), ("b", in_b)] {
+                    std::fs::create_dir_all(home.join(root)).unwrap();
+                    if let Some(file) = file {
+                        std::fs::create_dir_all(home.join(root).join("themes")).unwrap();
+                        std::fs::write(
+                            home.join(root).join("themes").join(file),
+                            theme_named(&format!("Mine {root}")),
+                        )
+                        .unwrap();
+                    }
+                }
+                std::fs::write(
+                    home.join("a/config.toml"),
+                    "[appearance]\ntheme = \"mine\"\n",
+                )
+                .unwrap();
+                std::fs::hard_link(home.join("a/config.toml"), home.join("b/config.toml")).unwrap();
+                let link = home.join("cfg");
+                std::os::unix::fs::symlink("a", &link).unwrap();
+                let paths = ConfigPaths::new(&link);
+                let store = ConfigStore::open(paths.clone()).unwrap();
+                if in_a.is_none() {
+                    // `open` creates the directory.
+                    std::fs::remove_dir(home.join("a/themes")).unwrap();
+                }
+                let (mut native, _stop) = Native::open(&paths).unwrap();
+                native.settle(&store);
+                assert!(native.armed(), "{in_a:?}");
+                assert_eq!(native.themes_handle.is_some(), in_a.is_some());
+                assert_eq!(native.theme_file_handle.is_some(), in_a.is_some());
+
+                // Registered on a; the theme files are looked up in b.
+                let during = link.clone();
+                crate::store::once_before_profiles(move || retarget(&during, "b"));
+                native.settle(&store);
+                assert!(native.theme_file_handle.is_none(), "{in_a:?}");
+                retarget(&link, "a");
+                let fd = chain_fd(&native, &home);
+                let event = event_on(&mut native, fd).expect("no event for the retarget");
+                assert!(
+                    !native.changes_nothing(&event),
+                    "{in_a:?}: the themes looked up are b's, the disk names a's: {event:?}"
+                );
+            }
+        }
+
+        thread_local! {
+            /// The link [`retarget_at_register`] retargets, and to what.
+            static RETARGET_AT_REGISTER: std::cell::RefCell<Option<(PathBuf, &'static str)>> =
+                const { std::cell::RefCell::new(None) };
+        }
+
+        /// A [`BEFORE_OPEN`] hook: the first time a path is about to be
+        /// registered, retargets the link [`RETARGET_AT_REGISTER`] holds.
+        fn retarget_at_register(_: &Path) {
+            if let Some((link, target)) = RETARGET_AT_REGISTER.with(|held| held.borrow_mut().take())
+            {
+                retarget(&link, target);
+            }
+        }
+
+        /// #701 B2: roots that share a hard-linked `config.toml`, each with
+        /// its own `themes/`, and a root retarget inside the follow's
+        /// theme lookup: from before the lookup (on b) to the theme file's
+        /// registration (back on a), whose lookup found b's file
+        /// (`zz.toml`, named Mine), which a lacks; or from the
+        /// registration (to b, which has no `themes/`) to after the settle.
+        /// Either way the theme file the store resolves (a's `mine.toml`)
+        /// is not followed and the event the retarget raises is a change.
+        /// Deterministic: the retargets run from hooks, and the events are
+        /// read off the queue.
+        #[test]
+        fn a_root_retarget_inside_the_theme_lookup_is_a_change() {
+            // Whether the lookup is on b (the retarget lands before it),
+            // and what b's `themes/` holds.
+            for (on_b, in_b) in [(true, Some("zz.toml")), (false, None)] {
+                let (_dir, base) = resolved_tempdir();
+                let home = base.join("home");
+                for (root, file) in [("a", Some("mine.toml")), ("b", in_b)] {
+                    std::fs::create_dir_all(home.join(root)).unwrap();
+                    if let Some(file) = file {
+                        std::fs::create_dir_all(home.join(root).join("themes")).unwrap();
+                        std::fs::write(
+                            home.join(root).join("themes").join(file),
+                            theme_named("Mine"),
+                        )
+                        .unwrap();
+                    }
+                }
+                std::fs::write(
+                    home.join("a/config.toml"),
+                    "[appearance]\ntheme = \"mine\"\n",
+                )
+                .unwrap();
+                std::fs::hard_link(home.join("a/config.toml"), home.join("b/config.toml")).unwrap();
+                let link = home.join("cfg");
+                std::os::unix::fs::symlink("a", &link).unwrap();
+                let paths = ConfigPaths::new(&link);
+                let store = ConfigStore::open(paths.clone()).unwrap();
+                let (mut native, _stop) = Native::open(&paths).unwrap();
+                native.settle(&store);
+                assert!(native.armed(), "{on_b}");
+                assert!(native.theme_file_handle.is_some(), "{on_b}");
+
+                if on_b {
+                    let during = link.clone();
+                    crate::store::once_before_profiles(move || retarget(&during, "b"));
+                }
+                let target = if on_b { "a" } else { "b" };
+                RETARGET_AT_REGISTER.with(|held| *held.borrow_mut() = Some((link.clone(), target)));
+                BEFORE_OPEN.with(|hook| hook.set(Some(retarget_at_register)));
+                native.settle(&store);
+                BEFORE_OPEN.with(|hook| hook.set(None));
+                assert!(
+                    RETARGET_AT_REGISTER.with(|held| held.borrow().is_none()),
+                    "{on_b}"
+                );
+                assert!(native.theme_file_handle.is_none(), "{on_b}");
+                if !on_b {
+                    retarget(&link, "a");
+                }
+                let fd = chain_fd(&native, &home);
+                let event = event_on(&mut native, fd).expect("no event for the retarget");
+                assert!(
+                    !native.changes_nothing(&event),
+                    "{on_b}: a's mine.toml is not followed: {event:?}"
+                );
+            }
+        }
+
+        /// #701: a root retarget between the load's read of `config.toml`
+        /// and its listing of `profiles/`, then back, where a's
+        /// `work.toml` cannot be opened (mode 000, so not registered) and
+        /// b's loads: the store holds b's `work`, which no handle
+        /// describes, so the event the undo raises is a change.
+        /// Deterministic: the retarget runs in that window from a hook,
+        /// and the events are read off the queue.
+        #[test]
+        fn a_root_retarget_undone_after_the_load_read_an_unregistered_profile_is_a_change() {
+            use std::os::unix::fs::PermissionsExt as _;
+            let (_dir, base) = resolved_tempdir();
+            let home = base.join("home");
+            share_themes(&home);
+            for root in ["a", "b"] {
+                let profiles = home.join(root).join("profiles");
+                std::fs::create_dir_all(&profiles).unwrap();
+                std::fs::write(home.join(root).join("config.toml"), sized(11)).unwrap();
+                std::fs::write(
+                    profiles.join("work.toml"),
+                    work_profile(&format!("/bin/{root}")),
+                )
+                .unwrap();
+            }
+            let unreadable = home.join("a/profiles/work.toml");
+            std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let link = home.join("cfg");
+            std::os::unix::fs::symlink("a", &link).unwrap();
+            let paths = ConfigPaths::new(&link);
+            let store = ConfigStore::open(paths.clone()).unwrap();
+            let (mut native, _stop) = Native::open(&paths).unwrap();
+            native.settle(&store);
+            assert!(native.armed());
+            assert!(native.profile_file_handles.is_empty());
+            assert_eq!(work_command(&store), None);
+
+            let during = link.clone();
+            crate::store::once_before_profiles(move || retarget(&during, "b"));
+            native.settle(&store);
+            assert_eq!(work_command(&store).as_deref(), Some("/bin/b"));
+            retarget(&link, "a");
+            let fd = chain_fd(&native, &home);
+            let event = event_on(&mut native, fd).expect("no event for the retarget");
+            assert!(
+                !native.changes_nothing(&event),
+                "the store holds b's work, a's is not readable: {event:?}"
+            );
+        }
+
+        /// #701 B2: a `themes/` that `stat`s but cannot be listed (mode
+        /// 000) holds no handle, yet the lookup found it as a missing one
+        /// would be, so an unrelated event on a directory of the chain
+        /// changes nothing and a stream of them reloads nothing.
+        #[test]
+        fn an_unreadable_themes_dir_is_not_reloaded_by_chain_events() {
+            use std::os::unix::fs::PermissionsExt as _;
+            let (_dir, base) = resolved_tempdir();
+            let home = base.join("home");
+            let tree = home.join("gen0").join("tessera");
+            std::fs::create_dir_all(tree.join("themes")).unwrap();
+            std::fs::write(tree.join("config.toml"), "[appearance]\ntheme = \"mine\"\n").unwrap();
+            std::fs::set_permissions(tree.join("themes"), std::fs::Permissions::from_mode(0o000))
+                .unwrap();
+            std::os::unix::fs::symlink("gen0", home.join("cfg")).unwrap();
+            let paths = ConfigPaths::new(home.join("cfg").join("tessera"));
+            let store = ConfigStore::open(paths.clone()).unwrap();
+            let (mut native, _stop) = Native::open(&paths).unwrap();
+            native.settle(&store);
+            assert!(native.themes_handle.is_none());
+
+            std::fs::write(home.join("noise"), "x").unwrap();
+            let fd = chain_fd(&native, &home);
+            let event = event_on(&mut native, fd).expect("no event for the noise");
+            let unchanged = native.changes_nothing(&event);
+            std::fs::set_permissions(tree.join("themes"), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+            assert!(
+                unchanged,
+                "an unreadable themes/ is reloaded by a chain event"
+            );
+        }
+
+        /// What `profiles/` holds in
+        /// [`profile_files_loaded_as_registered_are_not_reloaded_by_chain_events`].
+        #[derive(Debug, Clone, Copy)]
+        enum ProfilesHeld {
+            /// More files than are followed, the last of them one that
+            /// `stat`s but does not open (mode 000), and a link to a
+            /// directory.
+            PastFollowed,
+            /// A file that does not load.
+            Broken,
+            /// A file that `stat`s but does not open (mode 000).
+            Unreadable,
+            /// A file, next to a `config.toml` that does not load (so the
+            /// load reads no profile file).
+            BrokenConfig,
+        }
+
+        /// #701: profile files the load reads as registered (more than are
+        /// followed, one that does not load, one that cannot be opened,
+        /// or none read since `config.toml` does not load) leave the
+        /// handles describing what the store holds, so an unrelated event
+        /// on a directory of the chain changes nothing and a stream of
+        /// them reloads nothing (#697 minor 1). Deterministic: the events
+        /// are read off the queue here.
+        #[test]
+        fn profile_files_loaded_as_registered_are_not_reloaded_by_chain_events() {
+            use std::os::unix::fs::PermissionsExt as _;
+            for held in [
+                ProfilesHeld::PastFollowed,
+                ProfilesHeld::Broken,
+                ProfilesHeld::Unreadable,
+                ProfilesHeld::BrokenConfig,
+            ] {
+                let (_dir, base) = resolved_tempdir();
+                let home = base.join("home");
+                let tree = home.join("gen0").join("tessera");
+                let profiles = tree.join("profiles");
+                std::fs::create_dir_all(&profiles).unwrap();
+                std::fs::write(tree.join("config.toml"), sized(11)).unwrap();
+                match held {
+                    ProfilesHeld::PastFollowed => {
+                        let count = crate::watch::MAX_PROFILE_FILES_FOLLOWED + 3;
+                        for i in 0..count {
+                            std::fs::write(
+                                profiles.join(format!("p{i:02}.toml")),
+                                work_profile("/bin/true"),
+                            )
+                            .unwrap();
+                        }
+                        // One past them the load cannot open.
+                        std::fs::set_permissions(
+                            profiles.join(format!("p{:02}.toml", count - 1)),
+                            std::fs::Permissions::from_mode(0o000),
+                        )
+                        .unwrap();
+                        // And a link to a directory, which the tail
+                        // samples but the load does not read.
+                        std::fs::create_dir(tree.join("not-a-profile")).unwrap();
+                        std::os::unix::fs::symlink("../not-a-profile", profiles.join("zz.toml"))
+                            .unwrap();
+                    }
+                    ProfilesHeld::Broken => {
+                        std::fs::write(profiles.join("work.toml"), "[[[broken\n").unwrap();
+                    }
+                    ProfilesHeld::Unreadable => {
+                        let file = profiles.join("work.toml");
+                        std::fs::write(&file, work_profile("/bin/true")).unwrap();
+                        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000))
+                            .unwrap();
+                    }
+                    ProfilesHeld::BrokenConfig => {
+                        std::fs::write(profiles.join("work.toml"), work_profile("/bin/true"))
+                            .unwrap();
+                        break_config(&tree.join("config.toml"), Broken::Parse);
+                    }
+                }
+                std::os::unix::fs::symlink("gen0", home.join("cfg")).unwrap();
+                let paths = ConfigPaths::new(home.join("cfg").join("tessera"));
+                let store = ConfigStore::open(paths.clone()).unwrap();
+                let (mut native, _stop) = Native::open(&paths).unwrap();
+                native.settle(&store);
+                assert!(native.armed(), "{held:?}");
+
+                std::fs::write(home.join("noise"), "x").unwrap();
+                let fd = chain_fd(&native, &home);
+                let event = event_on(&mut native, fd).expect("no event for the noise");
+                assert!(
+                    native.changes_nothing(&event),
+                    "{held:?}: profile files read as registered are reloaded by a chain event"
+                );
+            }
+        }
+
+        /// #701 F2: an `unlink; symlink` retarget whose unlink lands
+        /// between the load's `stat` of `config.toml` and its open. The
+        /// load finds no file and applies the defaults, which the
+        /// registered handles do not describe, so the event the `symlink`
+        /// raises is a change. Deterministic: the unlink runs in that
+        /// window from a hook, and the events are read off the queue.
+        #[test]
+        fn a_config_toml_gone_between_its_stat_and_its_open_is_not_vouched_for() {
+            let (_dir, base) = resolved_tempdir();
+            let home = base.join("home");
+            for generation in 0..2_u8 {
+                let tree = home.join(format!("gen{generation}")).join("tessera");
+                std::fs::create_dir_all(&tree).unwrap();
+                std::fs::write(tree.join("config.toml"), sized(10 + generation)).unwrap();
+            }
+            let link = home.join("cfg");
+            std::os::unix::fs::symlink("gen0", &link).unwrap();
+            let paths = ConfigPaths::new(link.join("tessera"));
+            let store = ConfigStore::open(paths.clone()).unwrap();
+            let (mut native, _stop) = Native::open(&paths).unwrap();
+            retarget(&link, "gen1");
+            native.rearm();
+            native.settle(&store);
+            assert!(native.armed());
+            let font_size = |store: &ConfigStore| store.config().appearance.font_size;
+            assert!((font_size(&store) - 11.0).abs() < f32::EPSILON);
+
+            // Registered on gen1; the load stats gen1's file, then finds
+            // the link gone.
+            let during = link.clone();
+            crate::load::once_before_read_open(move |_| std::fs::remove_file(&during).unwrap());
+            native.settle(&store);
+            assert!(
+                (font_size(&store) - 11.0).abs() > f32::EPSILON,
+                "the load read gen1 after all"
+            );
+            std::os::unix::fs::symlink("gen1", &link).unwrap();
+            let fd = chain_fd(&native, &home);
+            let event = event_on(&mut native, fd).expect("no event for the symlink");
+            assert!(
+                !native.changes_nothing(&event),
+                "the store holds what the load found (no file), the disk names gen1: {event:?}"
+            );
         }
 
         /// #417 M-A, the T4 probe (`adv retarget head native 0 ln`): a
@@ -4444,7 +5427,7 @@ mod native {
 
             let first = paths.themes_dir().join("t0.toml");
             std::fs::write(&first, theme_named("T0 saved")).unwrap();
-            let fd = native.profile_theme_handles[0].as_raw_fd();
+            let fd = native.profile_theme_handles[0].1.as_raw_fd();
             assert!(
                 event_on(&mut native, fd).is_some(),
                 "no event for the save of a profile's theme ({fd})"

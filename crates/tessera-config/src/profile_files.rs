@@ -39,7 +39,7 @@ use std::path::{Path, PathBuf};
 use toml::Spanned;
 use toml::de::{DeArray, DeTable, DeValue};
 
-use crate::load::{Logging, MAX_WARNING_PATH_LEN, Warning, escaped, read_capped};
+use crate::load::{FileId, Logging, MAX_WARNING_PATH_LEN, Warning, escaped, read_capped_found};
 use crate::{Config, Error, Loaded, MAX_PROFILES, Profile, ProfileSource};
 
 /// Most profile files read from `profiles/`: the first by stem; the others
@@ -164,6 +164,24 @@ pub(crate) struct ProfileFiles {
     warnings: Vec<Warning>,
     /// Each file read, by stem.
     files: Vec<FileProfile>,
+    /// Each file read, by stem ([`ProfileRead`]). At most
+    /// [`MAX_PROFILE_FILES`]. The watcher compares them with the files it
+    /// registered and sampled (#701).
+    pub(crate) read: Vec<ProfileRead>,
+}
+
+/// One profile file a load read ([`ProfileFiles::read`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProfileRead {
+    /// Its path.
+    pub(crate) path: PathBuf,
+    /// The file the read went to (`None` when it found none: removed
+    /// since the listing, or not opened; see
+    /// [`crate::load::read_capped_identified`]).
+    pub(crate) went_to: Option<FileId>,
+    /// The file the read's `stat` found at the path, opened or not
+    /// (`None` when it found none; see [`crate::load::read_capped_found`]).
+    pub(crate) found: Option<FileId>,
 }
 
 impl ProfileFiles {
@@ -198,13 +216,20 @@ pub(crate) fn load(dir: &Path) -> ProfileFiles {
             dropped: listing.dropped,
         });
     }
+    let mut read = Vec::with_capacity(listing.files.len());
     let files = listing
         .files
         .into_iter()
         .map(|(stem, path)| {
             let source = ProfileSource::File(stem);
             let file = escaped(&source.label(), MAX_WARNING_PATH_LEN);
-            match load_one(source, &path) {
+            let (found, went_to, loaded) = load_one(source, &path);
+            read.push(ProfileRead {
+                path,
+                went_to,
+                found,
+            });
+            match loaded {
                 Ok((profile, inner)) => FileProfile {
                     profile: Some(profile),
                     warnings: inner
@@ -224,7 +249,11 @@ pub(crate) fn load(dir: &Path) -> ProfileFiles {
             }
         })
         .collect();
-    ProfileFiles { warnings, files }
+    ProfileFiles {
+        warnings,
+        files,
+        read,
+    }
 }
 
 /// Appends the profiles of `files` to `loaded` (`config.toml`'s, already
@@ -288,21 +317,41 @@ pub(crate) fn merge(loaded: &mut Loaded, files: ProfileFiles) {
 }
 
 /// [`load`] and [`merge`] in one: what a load of `config.toml` does with
-/// the profile files of `dir`.
-pub(crate) fn load_and_merge(loaded: &mut Loaded, dir: &Path) {
-    merge(loaded, load(dir));
+/// the profile files of `dir`. Returns the files read and where each read
+/// went ([`ProfileFiles::read`]).
+pub(crate) fn load_and_merge(loaded: &mut Loaded, dir: &Path) -> Vec<ProfileRead> {
+    let mut files = load(dir);
+    let read = std::mem::take(&mut files.read);
+    merge(loaded, files);
+    read
 }
 
-/// Loads the profile file at `path`, whose source is `source`: the profile
-/// and its warnings (paths as the loader writes them for `profiles[0]`), or
+/// A profile file loaded: the profile and its warnings, or why it is
+/// skipped ([`load_one`]).
+type OneLoaded = Result<(Profile, Vec<Warning>), String>;
+
+/// Loads the profile file at `path`, whose source is `source`: the file
+/// the read's `stat` found and the one it went to (see
+/// [`read_capped_found`]) and the profile and
+/// its warnings (paths as the loader writes them for `profiles[0]`), or
 /// why it is skipped.
-fn load_one(source: ProfileSource, path: &Path) -> Result<(Profile, Vec<Warning>), String> {
-    let bytes = match read_capped(path, MAX_PROFILE_FILE_LEN, "profile file") {
-        Ok(bytes) => bytes,
-        Err(Error::Io(error)) => return Err(read_reason(&error)),
-        Err(_) => return Err("cannot be read".to_owned()),
-    };
-    let text = std::str::from_utf8(&bytes)
+fn load_one(source: ProfileSource, path: &Path) -> (Option<FileId>, Option<FileId>, OneLoaded) {
+    let (found, went_to, bytes) = read_capped_found(path, MAX_PROFILE_FILE_LEN, "profile file");
+    (
+        found,
+        went_to,
+        bytes
+            .map_err(|error| match error {
+                Error::Io(error) => read_reason(&error),
+                _ => "cannot be read".to_owned(),
+            })
+            .and_then(|bytes| parse_one(source, &bytes)),
+    )
+}
+
+/// [`load_one`] once the file is read: `bytes` are its contents.
+fn parse_one(source: ProfileSource, bytes: &[u8]) -> OneLoaded {
+    let text = std::str::from_utf8(bytes)
         .map_err(|error| format!("not UTF-8 (at byte {})", error.valid_up_to()))?;
     let mut table =
         DeTable::parse(text).map_err(|error| toml_reason("not TOML", text, error.span()))?;

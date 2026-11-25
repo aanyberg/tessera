@@ -1217,6 +1217,25 @@ impl FileId {
     pub(crate) fn of(_meta: &std::fs::Metadata) -> Option<Self> {
         None
     }
+
+    /// The inode number alone, to compare with a fingerprint that records
+    /// no device (the watcher's sample of the profile files past the
+    /// followed ones, #701). The device is dropped, so a file on another
+    /// device with the same inode number compares equal.
+    #[cfg_attr(
+        not(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd",
+            target_os = "dragonfly"
+        )),
+        allow(dead_code)
+    )]
+    pub(crate) fn ino(self) -> u64 {
+        self.ino
+    }
 }
 
 /// [`load_file`] and whether the file held nothing but whitespace after
@@ -1252,29 +1271,51 @@ pub(crate) fn read_capped(path: &Path, limit: u64, what: &str) -> Result<Vec<u8>
 /// [`read_capped`], with the identity of the file it went to: from the
 /// open handle once there is one, before that from the path's metadata
 /// (a file too large, or not a regular one, is refused unopened), and
-/// `None` when even that fails (a missing file).
-fn read_capped_identified(
+/// `None` when even that fails (a missing file) or when the open fails
+/// after it. A path that `stat`s and then does not open is mid-swap (an
+/// `unlink; symlink` retarget, #701 F2) or unreadable: either way the
+/// load read no file, and the stat's file is not the one it describes. A
+/// watcher's registration opens the path too, so an unreadable file has no
+/// identity there either.
+pub(crate) fn read_capped_identified(
     path: &Path,
     limit: u64,
     what: &str,
 ) -> (Option<FileId>, Result<Vec<u8>, Error>) {
+    let (_, went_to, bytes) = read_capped_found(path, limit, what);
+    (went_to, bytes)
+}
+
+/// [`read_capped_identified`], with first the identity of the file the
+/// path's `stat` found (`None` when it found none), which an open that
+/// fails after it does not clear: what the read saw at the path, for a
+/// comparison with an earlier `stat` of it (the watcher's sample of the
+/// profile files past the followed ones, #701 B1). The second is the one
+/// [`read_capped_identified`] returns.
+pub(crate) fn read_capped_found(
+    path: &Path,
+    limit: u64,
+    what: &str,
+) -> (Option<FileId>, Option<FileId>, Result<Vec<u8>, Error>) {
     use std::io::Read as _;
 
     let meta = match std::fs::metadata(path) {
         Ok(meta) => meta,
-        Err(error) => return (None, Err(error.into())),
+        Err(error) => return (None, None, Err(error.into())),
     };
     let found = FileId::of(&meta);
     if let Err(error) = check_regular_file(path, &meta, limit, what) {
-        return (found, Err(error.into()));
+        return (found, found, Err(error.into()));
     }
+    #[cfg(test)]
+    before_read_open(path);
     let file = match open_nonblocking(path) {
         Ok(file) => file,
-        Err(error) => return (found, Err(error.into())),
+        Err(error) => return (found, None, Err(error.into())),
     };
     let meta = match file.metadata() {
         Ok(meta) => meta,
-        Err(error) => return (found, Err(error.into())),
+        Err(error) => return (found, None, Err(error.into())),
     };
     let read = FileId::of(&meta);
     let bytes = (|| {
@@ -1286,7 +1327,7 @@ fn read_capped_identified(
         }
         Ok(bytes)
     })();
-    (read, bytes)
+    (found, read, bytes)
 }
 
 /// Opens `path` read-only without blocking on a FIFO: the one open for
@@ -1532,6 +1573,35 @@ pub fn write_atomic(path: &Path, contents: &str) -> Result<(), Error> {
         return Err(e.into());
     }
     Ok(())
+}
+
+/// A test hook run once with a path ([`once_before_read_open`]).
+#[cfg(test)]
+type PathHook = Box<dyn FnOnce(&Path)>;
+
+#[cfg(test)]
+thread_local! {
+    /// Run once by [`read_capped_identified`] on this thread between
+    /// its `stat` and its open: a test that swaps the path in that
+    /// window (#701 F2).
+    static BEFORE_READ_OPEN: std::cell::RefCell<Option<PathHook>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+/// Has the next [`read_capped_identified`] on this thread run `hook`
+/// between its `stat` and its open.
+pub(crate) fn once_before_read_open(hook: impl FnOnce(&Path) + 'static) {
+    BEFORE_READ_OPEN.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+/// The hook point in [`read_capped_identified`]; see
+/// [`BEFORE_READ_OPEN`].
+fn before_read_open(path: &Path) {
+    if let Some(hook) = BEFORE_READ_OPEN.with(|slot| slot.borrow_mut().take()) {
+        hook(path);
+    }
 }
 
 #[cfg(test)]
