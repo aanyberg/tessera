@@ -11,7 +11,7 @@
 //! (`regex_automata::hybrid::regex::Regex`, no captures), whose cache of
 //! [`SMART_RULE_CACHE_BYTES`] per direction gives up the first time it
 //! would be cleared: one attempt fills that cache at most once cold, after
-//! at most one reset, a few milliseconds, within
+//! at most one fresh start, a few milliseconds, within
 //! [`SMART_RULE_ATTEMPT_BOUND`].
 //!
 //! A rule's scan of a click's window, in order:
@@ -22,17 +22,23 @@
 //! 2. Otherwise the DFA scans the window, leftmost-first and without
 //!    overlaps as the regex crate's `find_iter` (through
 //!    `regex_automata::util::iter::Searcher`). When a search gives up on a
-//!    cache that earlier searches had used, the cache is reset and that
-//!    search runs once more on it cold; a second give-up is the rule's for
+//!    cache that earlier searches had used, the cache is replaced with an
+//!    empty one and that search runs once more on it cold; a second give-up is the rule's for
 //!    that click: no match from it, and one warning per rule index
 //!    carrying the index only (S8).
 //! 3. A rule that skipped its DFA, or a Unicode-`\b` rule whose DFA quit,
-//!    runs the regex crate's `find_iter` instead, only when its compiled
-//!    program's states times the window's bytes are at most
-//!    [`SMART_FALLBACK_UNITS`] (that engine costs at most a few nanoseconds
-//!    per state and byte) and its states times its capture slots fit
+//!    runs the fallback instead: the matches of the regex crate's
+//!    `find_iter`, each search on the rule's DFA until it quits or gives
+//!    up and then on a `PikeVM` of the same program (#649: not the regex
+//!    crate's own engine, whose backtracker's stack has no bound). It runs
+//!    only when its compiled program's states times the window's bytes are
+//!    at most [`SMART_FALLBACK_UNITS`] (the `PikeVM` costs a few to about
+//!    15 nanoseconds per state and byte) and its states times its capture
+//!    slots fit
 //!    [`SMART_FALLBACK_SLOT_BYTES`]; past either the rule has no match for
-//!    that click, with one warning per rule index. A rule without a Unicode
+//!    that click, with one warning per rule index. A rule whose DFA cache
+//!    regex-automata raises past [`SMART_RULE_CACHE_BYTES`] has no
+//!    fallback (#649), with one warning when its engines are built. A rule without a Unicode
 //!    word boundary whose DFA quit (it cannot) has no fallback: no match,
 //!    and one warning saying so.
 //!
@@ -46,24 +52,29 @@
 
 use std::ops::{ControlFlow, Range};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
-use regex::Regex;
 use regex_automata::hybrid::{dfa, regex as hybrid};
-use regex_automata::nfa::thompson;
+use regex_automata::nfa::thompson::{self, pikevm};
 use regex_automata::util::iter::Searcher;
 use regex_automata::util::prefilter::Prefilter;
 use regex_automata::util::syntax;
 use regex_automata::{Input, MatchErrorKind, MatchKind};
-use tessera_config::{CompiledRule, SMART_RULE_NEST_LIMIT, SMART_RULE_SIZE_LIMIT, SmartRules};
+use tessera_config::{
+    CompiledRule, MAX_SMART_RULES, SMART_RULE_NEST_LIMIT, SMART_RULE_SIZE_LIMIT, SmartRules,
+};
 
 /// The most CPU time one match attempt of a smart-selection rule takes
 /// (S5, S6, #518): one search of the scan window, which fills the rule's
 /// DFA cache at most twice (a warm cache that fills is reset and the search
 /// retried cold) or runs the fallback within [`SMART_FALLBACK_UNITS`].
 /// About 25 ms was the worst seen on a loaded machine, over thousands of
-/// random patterns. With the click budget
+/// random patterns, for a DFA search. A fallback search does not hold to
+/// it: a `PikeVM` search at the fallback's gate takes up to about 120 ms,
+/// and a click about 150 ms ([`SMART_FALLBACK_UNITS`]; 115 ms with the
+/// regex crate's engine before #649; #687 restores the bound). With the
+/// click budget
 /// ([`crate::selection::SMART_RULE_BUDGET`]) checked after each costly
 /// search (the first on a cold cache, a reset, or the fallback) and every
 /// [`crate::selection::SMART_CLOCK_STRIDE`] matches, a rule costs a click
@@ -71,20 +82,27 @@ use tessera_config::{CompiledRule, SMART_RULE_NEST_LIMIT, SMART_RULE_SIZE_LIMIT,
 /// on cached states.
 pub const SMART_RULE_ATTEMPT_BOUND: Duration = Duration::from_millis(50);
 
-/// The most work a smart-selection rule may give the regex crate's own
-/// engine in one click (#518): its compiled program's states (capture
-/// groups included) times the scan window's bytes. Past it the rule has no
-/// match for that click. 8 000 000 cost at most 22 ms measured, and every
-/// built-in rule stays under it on a full 32 KiB window (the largest, 131
-/// states, at 4.3 M).
+/// The most work a smart-selection rule may give its fallback in one
+/// search (#518): its compiled program's states (capture groups included)
+/// times the scan window's bytes. Past it the rule has no match for that
+/// click. Re-measured on the fallback's `PikeVM` (#649), one search costs
+/// 4.3 ns a unit with every state live at every byte (`[ab]*a[ab]{300}`
+/// and `[ab]*a[ab]{1000}` on random `a` and `b`, 34 ms at the gate), but a
+/// state whose class is many single bytes scans them one by one: a class
+/// of 64 one-byte members (`\b C*bC{990}`) costs 14.8 ns a unit, about
+/// 120 ms a search and 150 ms a click on 8000 characters, three times
+/// [`SMART_RULE_ATTEMPT_BOUND`] (the regex crate's engine took 115 ms
+/// before #649; #687 restores the bound). Every built-in rule stays under
+/// the gate on a full 32 KiB window (the largest, 131 states, at 4.3 M).
 pub const SMART_FALLBACK_UNITS: usize = 8_000_000;
 
-/// The most memory the regex crate's `PikeVM` may take for a smart-selection
-/// rule's fallback in its slot tables (S5, #590): its compiled program's
-/// states (capture groups included) times its capture slots times 16 bytes
-/// (two tables of 8-byte slots, as regex-automata sizes them when the
-/// fallback first runs, kept in the regex crate's cache pool), leaving out
-/// only the table's few extra slots for one set of captures. Past it the
+/// The most memory a smart-selection rule's fallback `PikeVM` may take in
+/// its slot tables (S5, #590): its compiled program's states (capture
+/// groups included) times its capture slots times 16 bytes (two tables of
+/// 8-byte slots, as regex-automata sizes them when the fallback first runs,
+/// kept in the rule's fallback cache), leaving out only the table's few
+/// extra slots for one set of captures. The fallback's own program keeps
+/// only the implicit group, so it takes at most this. Past it the
 /// rule has no match for a click that would fall back. The table is
 /// quadratic in the pattern: 250 groups repeated 23 times in a 1011-byte
 /// pattern would take 177 MiB. No built-in rule has a capture group: each
@@ -92,25 +110,132 @@ pub const SMART_FALLBACK_UNITS: usize = 8_000_000;
 pub const SMART_FALLBACK_SLOT_BYTES: usize = 512 * 1024;
 
 /// The bytes one smart-selection rule's DFA may cache in each direction
-/// (S5, #518): [`tessera_config::SMART_RULE_SIZE_LIMIT`], 1 MiB, as the
-/// regex crate's own lazy DFA had. Kept across clicks, forward and reverse,
-/// so 64 rules' DFAs hold at most 128 MiB once every one has filled both.
+/// (S5, #518): 512 KiB (1 MiB before #649), kept across clicks, forward
+/// and reverse. regex-automata raises a direction's capacity to its
+/// minimum for the program when that is larger: about 27 bytes an NFA
+/// state (2 sparse sets of 8 bytes, a stack of 4 and room for two states
+/// of 5 bytes per NFA state), past 512 KiB for a program of more than
+/// about 19 000 states, 0.84 MiB at the most (32 768 states, all the size
+/// limit allows). A rule whose capacity is raised in either direction has
+/// no fallback (#649): it matches wherever its DFA completes, every line
+/// that is all ASCII, and selects nothing on a line that is not when it
+/// would fall back (`\b\w{20}`, whose reverse program has about 28 700
+/// states, though its forward one is within the slot gate), one warning
+/// per rule index when its engines are built.
 ///
-/// That is not the whole ceiling (ADR 0042, #590): a rule that takes the
-/// fallback also keeps the regex crate's own caches in that crate's pool,
-/// one set per thread that clicks: its lazy DFA's 1 MiB per direction, the
-/// bounded backtracker's 256 KiB, the `PikeVM`'s slot tables within
-/// `SMART_FALLBACK_SLOT_BYTES` (512 KiB) and its sparse sets and stack
-/// (about 32 bytes per state, at most 16 384 states within that cap),
-/// about 3.3 MiB by those limits. A rule then keeps at most about 5.3 MiB,
-/// and 64 rules with one clicking thread about 128 + 64 x 3.3 = 336 MiB.
-/// That figure assumes one clicking thread and leaves out the regex crate's
-/// reverse-inner lazy DFA cache, which is not yet bounded (#649).
-/// Measured (release, kept heap after the clicks): at most 0.93 MiB of a
-/// rule's own DFA caches, 1.10 MiB of the regex crate's for a rule at the
-/// slot cap (5455 states) and 0.14 MiB for a built-in rule; 64 rules at the
-/// cap kept 70.5 MiB and 64 thrashing rules 95.6 MiB.
-pub const SMART_RULE_CACHE_BYTES: usize = SMART_RULE_SIZE_LIMIT;
+/// What a rule keeps allocated at most (ADR 0042, #649), in bytes the
+/// allocator hands out, not the crates' counts:
+///
+/// - its DFA's two caches, by construction at most 2.59 times what each
+///   counts against its capacity: a state counts its transition row
+///   (4 bytes a class, at least 2 classes), 16 bytes in the state list,
+///   20 in the state map and its own bytes (at least 9), 4s + 36 + l, and
+///   allocates at most twice its row and list entry (both grow by
+///   doubling), 2.29 map buckets of 25 bytes and its bytes behind a
+///   16-byte header rounded to 8, 8s + 112.15 + l, so at most 137.15 / 53
+///   of its count; the sparse sets, stack and scratch allocate what they
+///   count. A reset cache would keep its tables' capacity, and a fill of
+///   many small states followed by one of large states would reach three
+///   times the capacity (2.90 measured), so a give-up replaces the cache
+///   with an empty one: 2 x 2.59 x 512 KiB = 2.59 MiB. A raised direction
+///   allocates at most its sparse sets plus 2.59 times the rest,
+///   8 + 2.59 x 19 bytes an NFA state, 1.79 MiB at 32 768 states; such a
+///   rule has no `PikeVM` cache, so its terms come to at most 2 x 1.79 +
+///   2 + 0.156 = 5.74 MiB;
+/// - its fallback's `PikeVM` cache, by the slot gate at most 16 384 states
+///   of 80 bytes (1.25 MiB): two slot tables of two 8-byte slots, two
+///   sparse sets of two 4-byte ids and a stack frame of 16 bytes grown by
+///   doubling;
+/// - its programs, its DFA's forward and reverse NFAs (the `PikeVM` runs
+///   the forward one), each compiled within
+///   [`tessera_config::SMART_RULE_SIZE_LIMIT`]: 2 x 1 MiB = 2 MiB. The
+///   limit bounds the compiler's count of its program, 32 bytes a state
+///   plus their transitions, and the finished NFA is smaller than that
+///   count (boxed slices for the compiler's vectors); the most measured,
+///   over families of patterns at their largest size that loads, is
+///   1.86 MiB for both, 0.93 MiB an NFA (a class of 64 one-byte members
+///   repeated 1820 times; `\b(?-u:a){32760}` 1.50 MiB, `\b\w{20}`
+///   1.07 MiB). tessera-config drops its own compile of the rule after
+///   the load-time checks ([`tessera_config::CompiledRule::pattern`]),
+///   which allocated as much again;
+/// - its DFA's literal prefilter (the `PikeVM` shares it), kept only when
+///   its own count (`Prefilter::memory_usage`) is at most 128 KiB: an
+///   exact set of up to 250 literals becomes an Aho-Corasick DFA of
+///   19 MiB or more (`\b[0-9]{2}[ab]` and 97 more bytes), and a rule
+///   whose prefilter counts more has none (#649). The count leaves out
+///   the automaton's own structs, at most 6.3 KiB measured over 1005
+///   prefilters, so the term allows 128 + 32 KiB = 0.156 MiB.
+///
+/// So 2.59 + 1.25 + 2 + 0.156 = 5.996 MiB per rule, and 64 rules keep at
+/// most 64 x 5.996 = 383.76 MiB, under the 384 MiB bar. The bar is for the steady
+/// state: when the rules change, the app builds the new engines while it
+/// still holds the old ones, so a reload peaks at both sets, up to about
+/// twice the ceiling (277.8 MiB over the baseline measured for 64 rules,
+/// #688). Every cache is one per rule whatever thread clicks: the app
+/// holds one `SmartEngines`, an `Arc` that every session and thread shares
+/// and that is rebuilt only when the rules change; each rule's DFA cache
+/// and `PikeVM` cache sit behind that rule's own `Mutex`; and no engine
+/// keeps a per-thread pool. So a further clicking thread waits for the
+/// rule's lock and adds 0 MiB; a reload while another thread clicks keeps
+/// the old engines until that click returns (only the main thread clicks
+/// today).
+///
+/// Measured (release, kept heap after the clicks, programs included, #649):
+/// the critic's mix of a large program and a cache filler
+/// (`\b(?:(?-u:[cegikmoqsuwyCEGIKMOQSUWY02468]){2000}|(?-u:q){12000}|[ab]*a[ab]{14})`)
+/// 2.67 MiB alone; 64 rules mixing it with the families above, cache
+/// fillers and stack fillers 96.3 MiB, which tessera-ffi's
+/// `smart_selection_heap` holds under the ceiling.
+pub const SMART_RULE_CACHE_BYTES: usize = 512 * 1024;
+
+/// The most a rule's literal prefilter may count
+/// (`Prefilter::memory_usage`) to be kept (#649,
+/// [`SMART_RULE_CACHE_BYTES`]); past it the rule's DFA has none.
+const SMART_PREFILTER_BYTES: usize = 128 * 1024;
+
+/// What a kept prefilter allocates at most: its count and 32 KiB for
+/// the structs the count leaves out (6.3 KiB the most measured).
+const RULE_PREFILTER_BYTES: usize = SMART_PREFILTER_BYTES + 32 * 1024;
+
+/// What a lazy DFA cache allocates at most, in hundredths of its capacity
+/// (#649 B2), by construction over one fill from empty (a give-up
+/// replaces the cache, [`SMART_RULE_CACHE_BYTES`]): 137.15 / 53, at most
+/// 2.59 times.
+const DFA_ALLOC_HUNDREDTHS: usize = 259;
+
+/// The most states a fallback program has within
+/// [`SMART_FALLBACK_SLOT_BYTES`]: every program has at least the two slots
+/// of the whole match.
+const FALLBACK_MAX_STATES: usize = SMART_FALLBACK_SLOT_BYTES / (2 * 16);
+
+/// The `PikeVM`'s cache per state: two slot tables of two 8-byte slots, two
+/// sparse sets of two 4-byte ids, and a 16-byte stack frame grown by
+/// doubling.
+const FALLBACK_STATE_BYTES: usize = 2 * 2 * 8 + 2 * 2 * 4 + 2 * 16;
+
+/// The bytes a rule's programs (its DFA's forward and reverse NFAs)
+/// allocate at most: each within [`SMART_RULE_SIZE_LIMIT`] (#649 B1,
+/// [`SMART_RULE_CACHE_BYTES`]).
+const RULE_PROGRAM_BYTES: usize = 2 * SMART_RULE_SIZE_LIMIT;
+
+/// What a rule's two DFA caches allocate at most.
+const RULE_DFA_BYTES: usize = (2 * SMART_RULE_CACHE_BYTES * DFA_ALLOC_HUNDREDTHS).div_ceil(100);
+
+/// What one rule keeps allocated at most ([`SMART_RULE_CACHE_BYTES`] names
+/// the terms): its DFA's caches, its fallback's cache, its programs and
+/// its prefilter.
+const RULE_CEILING: usize = RULE_DFA_BYTES
+    + FALLBACK_MAX_STATES * FALLBACK_STATE_BYTES
+    + RULE_PROGRAM_BYTES
+    + RULE_PREFILTER_BYTES;
+
+/// Every rule's allocations at most, whatever threads click.
+const SMART_CACHE_CEILING: usize = MAX_SMART_RULES * RULE_CEILING;
+
+/// The memory bar the ceiling stays under (#649).
+const SMART_CACHE_BAR: usize = 384 << 20;
+
+const _: () = assert!(SMART_CACHE_CEILING <= SMART_CACHE_BAR);
 
 #[cfg(test)]
 thread_local! {
@@ -167,7 +292,7 @@ impl SmartEngines {
             .rules()
             .iter()
             .enumerate()
-            .map(|(index, rule)| RuleEngine::new(index, rule.regex().as_str()))
+            .map(|(index, rule)| RuleEngine::new(index, rule.pattern()))
             .collect();
         Self { rules, engines }
     }
@@ -187,9 +312,7 @@ impl SmartEngines {
             return Arc::clone(self);
         }
         let same = |a: &CompiledRule, b: &CompiledRule| {
-            a.regex().as_str() == b.regex().as_str()
-                && a.precision() == b.precision()
-                && a.check() == b.check()
+            a.pattern() == b.pattern() && a.precision() == b.precision() && a.check() == b.check()
         };
         let unchanged = self.rules.len() == rules.len()
             && self
@@ -254,7 +377,7 @@ impl SmartEngines {
                 DfaScan::Quit(matches) => seen = matches,
             }
         }
-        engine.fallback(index, rule.regex(), text, seen, found)
+        engine.fallback(index, rule.pattern(), text, seen, found)
     }
 
     /// Whether rule `index` has given up, been over the gate, or had its
@@ -265,6 +388,23 @@ impl SmartEngines {
         self.engines.get(index).is_some_and(|engine| {
             engine.gave_up.load(Ordering::Relaxed) || engine.over_gate.load(Ordering::Relaxed)
         })
+    }
+
+    /// Whether rule `index` has no fallback because its DFA's cache is
+    /// raised past [`SMART_RULE_CACHE_BYTES`].
+    #[cfg(test)]
+    pub(crate) fn barred_from_fallback(&self, index: usize) -> bool {
+        self.engines
+            .get(index)
+            .is_some_and(|engine| engine.unicode_word && !engine.may_fall_back())
+    }
+
+    /// What rule `index`'s kept prefilter counts, if it has one.
+    #[cfg(test)]
+    pub(crate) fn prefilter_bytes(&self, index: usize) -> Option<usize> {
+        let dfa = self.engines.get(index)?.dfa.as_ref()?;
+        let config = dfa.regex.forward().get_config();
+        config.get_prefilter().map(Prefilter::memory_usage)
     }
 
     /// Whether rule `index` has a DFA (it built).
@@ -283,7 +423,7 @@ impl SmartEngines {
         let engine = self.engines.get(index)?;
         let rule = self.rules.rules().get(index)?;
         engine
-            .fallback_states(rule.regex().as_str())
+            .fallback_states(rule.pattern())
             .map(|cost| cost.states.saturating_mul(bytes))
     }
 
@@ -295,7 +435,7 @@ impl SmartEngines {
         let engine = self.engines.get(index)?;
         let rule = self.rules.rules().get(index)?;
         engine
-            .fallback_states(rule.regex().as_str())
+            .fallback_states(rule.pattern())
             .map(FallbackCost::slot_bytes)
     }
 }
@@ -340,6 +480,10 @@ struct RuleEngine {
     /// then never quits), so a quit there selects nothing
     /// ([`SmartEngines::scan`]).
     fallback_states: OnceLock<Option<FallbackCost>>,
+    /// The fallback's `PikeVM`, built the first time a click runs it within
+    /// the gate; `None` if it did not build (the regex crate built the
+    /// same pattern with the same limits).
+    fallback: OnceLock<Option<Fallback>>,
     /// Whether its give-up warning is logged.
     gave_up: AtomicBool,
     /// Whether its over-the-gate warning, or its warning that its DFA quit
@@ -363,13 +507,32 @@ impl RuleEngine {
                 .look_set_any()
                 .contains_word_unicode()
         });
+        // A rule whose DFA cache is raised has no fallback: its warning is
+        // logged once, now, and not again by a click.
+        let barred = unicode_word && dfa.as_ref().is_some_and(|dfa| dfa.raised);
+        if barred {
+            #[cfg(test)]
+            WARNINGS.with(|warnings| warnings.set(warnings.get() + 1));
+            tracing::warn!(
+                rule = index,
+                "smart selection rule's program needs a DFA cache over the standard size; \
+                 it selects nothing on a line that is not ASCII"
+            );
+        }
         Self {
             dfa,
             unicode_word,
             fallback_states: OnceLock::new(),
+            fallback: OnceLock::new(),
             gave_up: AtomicBool::new(false),
-            over_gate: AtomicBool::new(false),
+            over_gate: AtomicBool::new(barred),
         }
+    }
+
+    /// Whether the rule may run its fallback: not when its DFA's cache is
+    /// raised past [`SMART_RULE_CACHE_BYTES`] (#649).
+    fn may_fall_back(&self) -> bool {
+        self.dfa.as_ref().is_none_or(|dfa| !dfa.raised)
     }
 
     /// The fallback program's size ([`RuleEngine::fallback_states`]).
@@ -394,31 +557,71 @@ impl RuleEngine {
         })
     }
 
-    /// The regex crate's `find_iter` of `text`, the first `skip` matches
-    /// (already reported) left out, when within the gate.
+    /// The fallback's matches in `text`, as the regex crate's `find_iter`
+    /// finds them, the first `skip` (already reported) left out, when
+    /// within the gate. Each search runs the rule's DFA first, as the regex
+    /// crate runs its lazy DFA, and the `PikeVM` when the DFA quits (on a
+    /// byte that is not ASCII, at a Unicode word boundary) or gives up;
+    /// after a give-up the DFA's cache is replaced with an empty one and the rest of the scan is
+    /// the `PikeVM`'s, so one scan fills that cache at most once.
     fn fallback(
         &self,
         index: usize,
-        regex: &Regex,
+        pattern: &str,
         text: &str,
         skip: usize,
         mut found: impl FnMut(Range<usize>, SearchCost) -> ControlFlow<()>,
     ) -> Scanned {
-        let within = self
-            .fallback_states(regex.as_str())
-            .is_some_and(|cost| cost.within(text.len()));
+        let within = self.may_fall_back()
+            && self
+                .fallback_states(pattern)
+                .is_some_and(|cost| cost.within(text.len()));
         if !within {
             Self::warn_once(&self.over_gate, index, "its fallback is over the gate");
             return Scanned::Nothing;
         }
+        let Some(fallback) = self
+            .fallback
+            .get_or_init(|| Fallback::build(self.dfa.as_ref(), pattern))
+        else {
+            Self::warn_once(&self.over_gate, index, "its fallback did not build");
+            return Scanned::Nothing;
+        };
         #[cfg(test)]
         FALLBACK_RUNS.with(|runs| runs.set(runs.get() + 1));
-        for one in regex.find_iter(text).skip(skip) {
-            if found(one.range(), SearchCost::Costly).is_break() {
-                break;
+        // Lock order: the fallback's cache, then the DFA's (both leaves).
+        let mut vm = fallback.cache.lock().unwrap_or_else(|poisoned| {
+            let mut held = poisoned.into_inner();
+            held.reset(&fallback.vm);
+            held
+        });
+        let mut dfa = self.dfa.as_ref().map(|dfa| (dfa, dfa.lock()));
+        let mut searcher = Searcher::new(Input::new(text));
+        let mut seen = 0;
+        loop {
+            let next = searcher.advance(|input| {
+                if let Some((engine, held)) = &mut dfa {
+                    held.cold = false;
+                    match engine.regex.try_search(&mut held.cache, input) {
+                        Ok(one) => return Ok(one),
+                        Err(error) if matches!(error.kind(), MatchErrorKind::GaveUp { .. }) => {
+                            held.cache = engine.empty_cache();
+                            held.cold = true;
+                            dfa = None;
+                        }
+                        Err(_) => {}
+                    }
+                }
+                Ok(fallback.vm.find(&mut vm, input.clone()))
+            });
+            let Some(one) = next else {
+                return Scanned::Done;
+            };
+            seen += 1;
+            if seen > skip && found(one.range(), SearchCost::Costly).is_break() {
+                return Scanned::Done;
             }
         }
-        Scanned::Done
     }
 
     /// Logs that rule `index` selects nothing (`why`), the first time only.
@@ -436,12 +639,57 @@ impl RuleEngine {
     }
 }
 
+/// A rule's fallback: a `PikeVM` on its DFA's forward program (one
+/// program for both), or on its own when the DFA did not build, with one
+/// cache kept across clicks behind a leaf lock. The regex crate's own
+/// engine (`regex::Regex`, `regex_automata::meta`) is not used: its bounded
+/// backtracker's stack has no bound (#649 B1: one rule kept 10.5 MiB), and
+/// it would compile the program again and keep three lazy DFA caches more.
+#[derive(Debug)]
+struct Fallback {
+    vm: pikevm::PikeVM,
+    cache: Mutex<pikevm::Cache>,
+}
+
+impl Fallback {
+    /// The fallback of `pattern`, whose DFA is `dfa`; `None` if it does not
+    /// build.
+    fn build(dfa: Option<&Dfa>, pattern: &str) -> Option<Self> {
+        let config = pikevm::Config::new().match_kind(MatchKind::LeftmostFirst);
+        let vm = match dfa {
+            Some(dfa) => {
+                let forward = dfa.regex.forward();
+                pikevm::Builder::new()
+                    .configure(config.prefilter(forward.get_config().get_prefilter().cloned()))
+                    .build_from_nfa(forward.get_nfa().clone())
+            }
+            None => pikevm::Builder::new()
+                .configure(config)
+                .syntax(syntax::Config::new().nest_limit(SMART_RULE_NEST_LIMIT))
+                .thompson(
+                    thompson::Config::new()
+                        .nfa_size_limit(Some(SMART_RULE_SIZE_LIMIT))
+                        .which_captures(thompson::WhichCaptures::Implicit),
+                )
+                .build(pattern),
+        }
+        .ok()?;
+        let cache = Mutex::new(vm.create_cache());
+        Some(Self { vm, cache })
+    }
+}
+
 /// A rule's lazy DFA and its cache.
 #[derive(Debug)]
 struct Dfa {
     regex: hybrid::Regex,
     /// A leaf lock: held for one scan.
     cache: Mutex<RuleCache>,
+    /// Whether regex-automata raised a direction's cache capacity past
+    /// [`SMART_RULE_CACHE_BYTES`] to its minimum for the program: such a
+    /// rule has no fallback (#649), so its raised cache and a `PikeVM`
+    /// cache are never kept together.
+    raised: bool,
 }
 
 /// A rule's DFA cache, and whether it is cold.
@@ -467,18 +715,26 @@ impl Dfa {
     /// The DFA of `pattern` within the regex crate's limits
     /// ([`SMART_RULE_SIZE_LIMIT`] for the program and each cache,
     /// [`SMART_RULE_NEST_LIMIT`]), giving up instead of clearing its cache,
-    /// with a literal prefilter as the regex crate has; `None` if it does
-    /// not build.
+    /// with a literal prefilter as the regex crate has when it counts at
+    /// most [`SMART_PREFILTER_BYTES`]; `None` if it does not build.
     fn build(pattern: &str) -> Option<Self> {
         // One parse for both directions and the prefilter.
         let syntax = syntax::Config::new().nest_limit(SMART_RULE_NEST_LIMIT);
         let hir = syntax::parse_with(pattern, &syntax).ok()?;
-        let prefilter = Prefilter::from_hirs_prefix(MatchKind::LeftmostFirst, &[&hir]);
+        // A large literal set's prefilter is an Aho-Corasick DFA that no
+        // cache bounds: kept only within its term (#649).
+        let prefilter = Prefilter::from_hirs_prefix(MatchKind::LeftmostFirst, &[&hir])
+            .filter(|prefilter| prefilter.memory_usage() <= SMART_PREFILTER_BYTES);
         let nfa = thompson::Config::new()
             .nfa_size_limit(Some(SMART_RULE_SIZE_LIMIT))
             .which_captures(thompson::WhichCaptures::None);
+        // The whole match's capture slots, which the fallback's `PikeVM`
+        // reports from; the DFA skips them.
         let forward = thompson::Compiler::new()
-            .configure(nfa.clone())
+            .configure(
+                nfa.clone()
+                    .which_captures(thompson::WhichCaptures::Implicit),
+            )
             .build_from_hir(&hir)
             .ok()?;
         let reverse = thompson::Compiler::new()
@@ -511,11 +767,38 @@ impl Dfa {
             )
             .build_from_nfa(reverse)
             .ok()?;
+        let raised = [&forward, &reverse].into_iter().any(|dfa| {
+            dfa.get_config()
+                .get_minimum_cache_capacity(dfa.get_nfa())
+                .ok()
+                .is_none_or(|minimum| minimum > SMART_RULE_CACHE_BYTES)
+        });
         let regex = hybrid::Regex::builder().build_from_dfas(forward, reverse);
         let cache = regex.create_cache();
         Some(Self {
             regex,
             cache: Mutex::new(RuleCache { cache, cold: true }),
+            raised,
+        })
+    }
+
+    /// An empty cache, in place of a reset one: `hybrid::Cache::reset`
+    /// keeps every table's capacity, so a fill of many small states and
+    /// then a refill of large ones would allocate up to three times the
+    /// cache's capacity (2.90 times measured, #649 B2); a new cache
+    /// allocates for one fill only ([`SMART_RULE_CACHE_BYTES`]).
+    fn empty_cache(&self) -> hybrid::Cache {
+        self.regex.create_cache()
+    }
+
+    /// Its cache, held.
+    fn lock(&self) -> MutexGuard<'_, RuleCache> {
+        self.cache.lock().unwrap_or_else(|poisoned| {
+            // A scan that panicked may have left the cache half updated.
+            let mut held = poisoned.into_inner();
+            held.cache = self.empty_cache();
+            held.cold = true;
+            held
         })
     }
 
@@ -526,13 +809,7 @@ impl Dfa {
         text: &str,
         found: &mut impl FnMut(Range<usize>, SearchCost) -> ControlFlow<()>,
     ) -> DfaScan {
-        let mut held = self.cache.lock().unwrap_or_else(|poisoned| {
-            // A scan that panicked may have left the cache half updated.
-            let mut held = poisoned.into_inner();
-            held.cache.reset(&self.regex);
-            held.cold = true;
-            held
-        });
+        let mut held = self.lock();
         let RuleCache { cache, cold } = &mut *held;
         let mut searcher = Searcher::new(Input::new(text));
         let mut seen = 0;
@@ -548,7 +825,7 @@ impl Dfa {
                         if !was_cold && matches!(error.kind(), MatchErrorKind::GaveUp { .. }) =>
                     {
                         cost = SearchCost::Costly;
-                        cache.reset(&self.regex);
+                        *cache = self.empty_cache();
                         self.regex.try_search(cache, input)
                     }
                     result => result,
@@ -618,6 +895,8 @@ pub(crate) fn multi_script(count: usize, mut seed: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use proptest::prelude::*;
     use tessera_config::{DEFAULT_SMART_RULES, Precision, Selection, SmartRule};
 
@@ -683,7 +962,7 @@ mod tests {
 
     /// The regex crate's spans of `pattern` in `text`.
     fn reference(pattern: &str, text: &str) -> Vec<Range<usize>> {
-        Regex::new(pattern)
+        regex::Regex::new(pattern)
             .unwrap()
             .find_iter(text)
             .map(|one| one.range())
@@ -755,7 +1034,7 @@ mod tests {
                 assert_eq!(scanned, Scanned::Done, "rule {index} on {text:?}");
                 assert_eq!(
                     spans,
-                    reference(rule.regex().as_str(), &text),
+                    reference(rule.pattern(), &text),
                     "rule {index} on {text:?}"
                 );
             }
@@ -764,6 +1043,58 @@ mod tests {
         // ASCII (the empty one is).
         assert_eq!(FALLBACK_RUNS.with(std::cell::Cell::get), 8 * 6);
         assert!(!(0..engines.rules().len()).any(|index| engines.warned(index)));
+    }
+
+    /// #649 (round 2): the tricky patterns that load, and every assertion
+    /// on its own beside a word, through [`SmartEngines::scan`] (the DFA,
+    /// or on a window that is not ASCII the fallback's DFA then `PikeVM`)
+    /// select what the regex crate selects on every window class.
+    #[test]
+    fn the_tricky_assertions_select_what_the_regex_crate_selects() {
+        let assertions = [
+            r"\b\w+\b",
+            r"\B\w",
+            r"\w\B",
+            r"\b{start}\w",
+            r"\w\b{end}",
+            r"\b{start-half}\w+\b{end-half}",
+            r"\<\w+\>",
+            r"^\w+",
+            r"\w+$",
+            r"(?m)^\w",
+            r"(?m)\w$",
+            r"\A\w",
+            r"\w\z",
+            r"(?-u:\b)\w+(?-u:\b)",
+            r"(?-u:\B)\w",
+            r"(?i)\bk\w*",
+            r"\b\p{Greek}+\b",
+        ];
+        let loads = |pattern: &str| {
+            let mut selection = Selection::default();
+            selection.smart_rules = Some(vec![SmartRule::new(pattern, Precision::Normal)]);
+            selection.compiled_rules().len() == 1
+        };
+        let tricky: Vec<&str> = TRICKY.into_iter().filter(|p| loads(p)).collect();
+        assert!(tricky.len() >= 20, "{tricky:?}");
+        let patterns: Vec<&str> = tricky.into_iter().chain(assertions).collect();
+        let engines = engines(&patterns);
+        FALLBACK_RUNS.with(|runs| runs.set(0));
+        let mut non_ascii = 0;
+        for (index, pattern) in patterns.iter().enumerate() {
+            for text in windows() {
+                let (spans, scanned) = scan(&engines, index, &text);
+                assert_eq!(scanned, Scanned::Done, "{pattern} on {text:?}");
+                assert_eq!(spans, reference(pattern, &text), "{pattern} on {text:?}");
+                non_ascii += usize::from(!text.is_ascii());
+            }
+        }
+        assert!(non_ascii > 100, "{non_ascii} non-ASCII scans");
+        assert!(
+            FALLBACK_RUNS.with(std::cell::Cell::get) > 50,
+            "the fallback ran on the Unicode word boundaries"
+        );
+        assert!(!(0..patterns.len()).any(|index| engines.warned(index)));
     }
 
     proptest! {
@@ -796,6 +1127,15 @@ mod tests {
     }
 
     /// Engines for `patterns`, loaded as the configuration loads them.
+    /// `pre19.pat`'s text after its `\b[0-9]{2}[ab]`: 32 ASCII bytes and
+    /// 32 two-byte characters, some escaped.
+    const PRE19_TAIL: &str = "\u{80}\"\u{b6}\\$\u{e4}\\&\u{112}\\(\u{140}\\*\u{176},\u{1a4}\\.\u{1d2}0\u{200}2\u{236}4\u{264}6\u{292}8\u{2c0}:\u{2f6}<\u{324}>\u{352}@\u{380}B\u{3b6}D\u{3e4}F\u{412}H\u{440}J\u{476}L\u{4a4}N\u{4d2}P\u{500}R\u{536}T\u{564}V\u{592}X\u{5c0}Z\u{5f6}\\\\\u{624}\\^\u{652}`";
+
+    /// The adversary's `pre19.pat`, 117 bytes.
+    fn pre19() -> String {
+        format!(r"\b[0-9]{{2}}[ab]{PRE19_TAIL}")
+    }
+
     fn engines(patterns: &[&str]) -> SmartEngines {
         let mut selection = Selection::default();
         selection.smart_rules = Some(
@@ -882,8 +1222,13 @@ mod tests {
         assert_eq!(costs(&rule, 0, "a a a"), [Costly, Cached, Cached], "cold");
         assert_eq!(costs(&rule, 0, "a a a"), [Cached, Cached, Cached], "warm");
         let thrash = engines(&[r"(?:[^X]{0,50}){0,20}X|a"]);
+        // No ASCII in it, so the short line's search needs new states.
+        let long: String = multi_script(8192, 1)
+            .chars()
+            .filter(|c| !c.is_ascii())
+            .collect();
         assert_eq!(
-            scan(&thrash, 0, &multi_script(8192, 1)).1,
+            scan(&thrash, 0, &long).1,
             Scanned::Nothing,
             "the long line fills the cache"
         );
@@ -925,6 +1270,110 @@ mod tests {
             "one byte past it"
         );
         assert_eq!(WARNINGS.with(std::cell::Cell::get), 1);
+    }
+
+    /// #649 B2: a rule whose program raises its DFA's cache past
+    /// [`SMART_RULE_CACHE_BYTES`] (`\b\w{20}`: its reverse program has
+    /// about 28 700 states) loads, warns once when its engines are built,
+    /// matches wherever its DFA completes (every ASCII line), and on a line
+    /// that is not ASCII selects nothing at once: no fallback, no warning
+    /// per click. A smaller rule of the same kind keeps its fallback.
+    #[test]
+    fn a_rule_with_a_raised_cache_has_no_fallback() {
+        WARNINGS.with(|warnings| warnings.set(0));
+        let rule = engines(&[r"\b\w{20}"]);
+        assert!(rule.has_dfa(0), "its DFA builds");
+        assert!(rule.barred_from_fallback(0));
+        assert_eq!(WARNINGS.with(std::cell::Cell::get), 1, "one warning");
+        let word = "abcdefghijklmnopqrst";
+        let ascii = format!("x {word} {word}y {word}");
+        assert_eq!(
+            scan(&rule, 0, &ascii),
+            (vec![2..22, 23..43, 45..65], Scanned::Done),
+            "an ASCII line"
+        );
+        assert_eq!(reference(r"\b\w{20}", &ascii), [2..22, 23..43, 45..65]);
+        FALLBACK_RUNS.with(|runs| runs.set(0));
+        // The short line is within the fallback's units and slot gates
+        // (6331 states x 23 bytes): only the raised cache bars it.
+        let short = format!("\u{e9} {word}");
+        let cost = rule.engines[0].fallback_states(r"\b\w{20}").unwrap();
+        assert!(cost.within(short.len()), "{} states", cost.states);
+        let accented = format!("\u{e9} {word} {}", "\u{e9}a".repeat(4000));
+        let started = Instant::now();
+        for line in [&short, &accented].repeat(4) {
+            assert_eq!(
+                scan(&rule, 0, line),
+                (Vec::new(), Scanned::Nothing),
+                "a line that is not ASCII"
+            );
+        }
+        assert!(started.elapsed() < Duration::from_secs(1), "no stall");
+        assert_eq!(FALLBACK_RUNS.with(std::cell::Cell::get), 0, "no fallback");
+        assert_eq!(WARNINGS.with(std::cell::Cell::get), 1, "no more warnings");
+        let smaller = engines(&[r"\b\w{5}"]);
+        assert!(!smaller.barred_from_fallback(0));
+        assert_eq!(
+            scan(&smaller, 0, "\u{e9} abcde"),
+            (vec![Range { start: 3, end: 8 }], Scanned::Done),
+            "the smaller rule falls back"
+        );
+        assert_eq!(FALLBACK_RUNS.with(std::cell::Cell::get), 1);
+    }
+
+    /// The adversary's literal set (#649 cycle 2, `pre19.pat`): 200 exact
+    /// literals of 100 bytes, whose prefilter is an Aho-Corasick DFA of
+    /// 19 MiB. The rule loads, its DFA keeps no prefilter and it matches
+    /// as the regex crate does; the built-in rules and the bench's rules
+    /// keep theirs, within [`SMART_PREFILTER_BYTES`].
+    #[test]
+    fn a_large_literal_prefilter_is_dropped() {
+        let uncapped = |pattern: &str| {
+            let syntax = syntax::Config::new().nest_limit(SMART_RULE_NEST_LIMIT);
+            let hir = syntax::parse_with(pattern, &syntax).unwrap();
+            Prefilter::from_hirs_prefix(MatchKind::LeftmostFirst, &[&hir])
+                .map(|prefilter| prefilter.memory_usage())
+        };
+        let pattern = pre19();
+        assert_eq!(pattern.len(), 117);
+        let rule = engines(&[&pattern]);
+        assert!(rule.has_dfa(0), "its DFA builds");
+        let built = uncapped(&pattern).unwrap();
+        assert!(built > 19 << 20, "{built} bytes");
+        assert_eq!(rule.prefilter_bytes(0), None, "its prefilter is dropped");
+        // The tail as text: each escaped character stands for itself.
+        let mut line = "x 12a".to_owned();
+        let mut escaped = false;
+        for c in PRE19_TAIL.chars() {
+            escaped = !escaped && c == '\\';
+            if !escaped {
+                line.push(c);
+            }
+        }
+        line.push_str(" end");
+        let (found, scanned) = scan(&rule, 0, &line);
+        assert_eq!(found, reference(&pattern, &line));
+        assert_eq!((found.len(), scanned), (1, Scanned::Done));
+        let bench = [
+            r"\b[A-Z]{2,}-\d+\b",
+            r"\b[0-9a-f]{7,40}\b",
+            r"\b[a-z0-9-]+-[a-z0-9]{5}\b",
+            r"\bv?\d+\.\d+\.\d+(?:-[\w.]+)?\b",
+        ];
+        let patterns: Vec<&str> = DEFAULT_SMART_RULES
+            .iter()
+            .map(|&(pattern, _)| pattern)
+            .chain(bench)
+            .collect();
+        let kept = engines(&patterns);
+        let mut with = 0;
+        for (index, pattern) in patterns.iter().enumerate() {
+            let built = uncapped(pattern);
+            assert_eq!(kept.prefilter_bytes(index), built, "{pattern}");
+            assert!(built.is_none_or(|bytes| bytes <= SMART_PREFILTER_BYTES));
+            with += usize::from(built.is_some());
+        }
+        assert!(with > 0, "some rules have a prefilter");
     }
 
     /// #590 m3: a DFA quit on a rule without a Unicode word boundary cannot
@@ -1122,6 +1571,7 @@ mod tests {
         FALLBACK_RUNS.with(|runs| runs.set(0));
         let mut matched = 0;
         for (index, rule) in engines.rules().rules().iter().enumerate() {
+            assert!(!engines.barred_from_fallback(index), "rule {index}");
             let slot_bytes = engines.fallback_slot_bytes(index);
             assert!(
                 slot_bytes.is_none_or(|bytes| bytes <= SMART_FALLBACK_SLOT_BYTES / 16),
@@ -1129,7 +1579,7 @@ mod tests {
             );
             for text in &windows {
                 assert!(text.len() > crate::selection::SMART_SCAN_BYTES - 4);
-                let spans = reference(rule.regex().as_str(), text);
+                let spans = reference(rule.pattern(), text);
                 matched += spans.len();
                 assert_eq!(
                     scan(&engines, index, text),
@@ -1166,5 +1616,191 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The ceiling the docs give (#649) is the one these constants make:
+    /// every term and total, in this file's doc, ADR 0042 and S5.
+    #[test]
+    fn the_documented_ceiling_is_the_constants() {
+        const KIB: usize = 1024;
+        const MIB: usize = 1024 * 1024;
+        // MiB to the nearest hundredth, trailing zeros dropped.
+        let mib = |bytes: usize| {
+            let hundredths = (bytes * 100 + MIB / 2) / MIB;
+            let text = format!("{}.{:02}", hundredths / 100, hundredths % 100);
+            text.trim_end_matches('0').trim_end_matches('.').to_owned()
+        };
+        // The same to the nearest thousandth.
+        let mib3 = |bytes: usize| {
+            let thousandths = (bytes * 1000 + MIB / 2) / MIB;
+            let text = format!("{}.{:03}", thousandths / 1000, thousandths % 1000);
+            text.trim_end_matches('0').trim_end_matches('.').to_owned()
+        };
+        let own = RULE_DFA_BYTES;
+        let vm = FALLBACK_MAX_STATES * FALLBACK_STATE_BYTES;
+        let programs = RULE_PROGRAM_BYTES;
+        let prefilter = RULE_PREFILTER_BYTES;
+        assert_eq!(own + vm + programs + prefilter, RULE_CEILING);
+        let states = format!(
+            "{} {:03}",
+            FALLBACK_MAX_STATES / 1000,
+            FALLBACK_MAX_STATES % 1000
+        );
+        let phrases = [
+            format!(
+                "2 x {}.{:02} x {} KiB = {} MiB",
+                DFA_ALLOC_HUNDREDTHS / 100,
+                DFA_ALLOC_HUNDREDTHS % 100,
+                SMART_RULE_CACHE_BYTES / KIB,
+                mib(own)
+            ),
+            format!(
+                "{states} states of {FALLBACK_STATE_BYTES} bytes ({} MiB)",
+                mib(vm)
+            ),
+            format!(
+                "2 x {} MiB = {} MiB",
+                mib(SMART_RULE_SIZE_LIMIT),
+                mib(RULE_PROGRAM_BYTES)
+            ),
+            format!(
+                "{} + {} KiB = {} MiB",
+                SMART_PREFILTER_BYTES / KIB,
+                (RULE_PREFILTER_BYTES - SMART_PREFILTER_BYTES) / KIB,
+                mib3(prefilter)
+            ),
+            format!(
+                "{} + {} + {} + {} = {} MiB per rule",
+                mib(own),
+                mib(vm),
+                mib(programs),
+                mib3(prefilter),
+                mib3(RULE_CEILING)
+            ),
+            format!(
+                "{MAX_SMART_RULES} x {} = {} MiB",
+                mib3(RULE_CEILING),
+                mib(SMART_CACHE_CEILING)
+            ),
+            "adds 0 MiB".to_owned(),
+        ];
+        assert_eq!(phrases[5], "64 x 5.996 = 383.76 MiB");
+        // The docs are read at run time: xtask ab's base archive copies only
+        // what crates include at build time.
+        let doc = |path: &str| {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../..")
+                .join(path);
+            std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+        };
+        // Words only: a phrase may wrap, in a doc comment too.
+        let words = |text: &str| {
+            text.split_whitespace()
+                .filter(|word| *word != "///")
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let docs = [
+            ("smart_engine.rs", words(include_str!("smart_engine.rs"))),
+            (
+                "ADR 0042",
+                words(&doc("docs/adr/0042-smart-selection-and-rich-copy.md")),
+            ),
+            ("security.md", words(&doc("docs/security.md"))),
+        ];
+        for (name, text) in &docs {
+            for phrase in &phrases {
+                assert!(text.contains(phrase.as_str()), "{name} lacks {phrase:?}");
+            }
+        }
+    }
+
+    /// No built-in rule gives up in its DFA at [`SMART_RULE_CACHE_BYTES`]
+    /// (#649, 1 MiB before): searched from every start a scan searches
+    /// from, on the widest windows of ASCII and of other scripts, each
+    /// search finds what the regex crate finds, or quits on a byte that is
+    /// not ASCII (a Unicode-`\b` rule, which then runs its `PikeVM`). A
+    /// rule whose DFA has 2^15 states of 64 byte classes gives up there, so
+    /// the search would show one.
+    #[test]
+    fn no_built_in_rule_gives_up_in_its_dfa() {
+        let others: String = ('c'..='z')
+            .chain('C'..='Z')
+            .chain('0'..='9')
+            .flat_map(|c| ['|', c, c])
+            .collect();
+        let mut seed = 7_u64;
+        let line: String = (0..8_000)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                if seed & 1 == 0 { 'a' } else { 'b' }
+            })
+            .collect();
+        let filler = Dfa::build(&format!(r"(?:[ab]*a[ab]{{14}}{others})")).unwrap();
+        let mut held = filler.lock();
+        let gave_up = filler.regex.try_search(&mut held.cache, &Input::new(&line));
+        assert!(
+            gave_up
+                .as_ref()
+                .is_err_and(|error| matches!(error.kind(), MatchErrorKind::GaveUp { .. })),
+            "the filler gives up: {gave_up:?}"
+        );
+        drop(held);
+        let widest = |unit: &str, tail: &str| {
+            let mut text = String::new();
+            for c in unit.chars().cycle() {
+                if text.len() + c.len_utf8() + tail.len() > crate::selection::SMART_SCAN_BYTES {
+                    break;
+                }
+                text.push(c);
+            }
+            text + tail
+        };
+        let ascii = "user@example.com /usr/lib/x.so 10.0.0.1 https://a.b/c?d=1 \
+                     std::vector<int> 0123abcd fe80::1 mailto:a@b.co \"q\" \
+                     ssh://h/x [a b:c] <x.h> a.b.c::d \"x\\\"y\" @selector(a:) ";
+        let windows = [
+            widest(ascii, ""),
+            widest(&format!("\u{65e5}\u{672c}\u{8a9e} {ascii}\u{1f600} "), ""),
+            widest("\u{65e5}\u{672c}\u{8a9e}\u{1f600}", ""),
+            widest(ascii, "\u{e9}"),
+            multi_script(8_000, 7),
+            multi_script(8_000, 0x5EED),
+        ];
+        let mut searched = 0;
+        let mut quits = 0;
+        for pattern in DEFAULT_SMART_RULES.iter().map(|rule| rule.0) {
+            let dfa = Dfa::build(pattern).unwrap_or_else(|| panic!("{pattern}: no DFA"));
+            let mut held = dfa.lock();
+            for text in &windows {
+                let spans = reference(pattern, text);
+                let starts = std::iter::once(0).chain(spans.iter().map(|span| span.end));
+                for start in starts.filter(|&start| start <= text.len()) {
+                    searched += 1;
+                    let input = Input::new(text.as_str()).range(start..);
+                    match dfa.regex.try_search(&mut held.cache, &input) {
+                        Ok(one) => assert_eq!(
+                            one.map(|one| one.range()),
+                            spans.iter().find(|span| span.start >= start).cloned(),
+                            "{pattern} from {start}"
+                        ),
+                        Err(error) => {
+                            assert!(
+                                !matches!(error.kind(), MatchErrorKind::GaveUp { .. }),
+                                "{pattern} gave up from {start}: {error}"
+                            );
+                            quits += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            searched > 1000 && quits > 0,
+            "{searched} searches, {quits} quits"
+        );
     }
 }
