@@ -379,12 +379,17 @@ These caches hold at most 64 rules x 2 directions x 1 MiB = 128 MiB, the
 same ceiling the regex crate's cache pool had. That is not the whole worst
 case: a rule that takes the fallback also keeps the regex crate's own cache
 in its pool, one per thread that clicks, about 0.6 MiB per `\b` rule
-measured. Its ceiling is that crate's limits: its lazy DFA 1 MiB per
-direction (`dfa_size_limit`), the bounded backtracker's 256 KiB and a PikeVM
-cache linear in the program's states (the program within 1 MiB,
-`size_limit`), estimated at most about 4 MiB per rule, not measured. With
-64 fallback rules and one clicking thread the worst case is then about
-128 + 64 x 4 = 384 MiB.
+measured. Its ceiling is that crate's limits plus the slot gate of #590:
+its lazy DFA 1 MiB per direction (`dfa_size_limit`), the bounded
+backtracker's 256 KiB, the PikeVM's slot tables within
+`SMART_FALLBACK_SLOT_BYTES` (512 KiB) and its sparse sets and stack
+(about 32 bytes per state, at most 16 384 states within that cap), about
+3.3 MiB per rule. With 64 fallback rules and one clicking thread the worst
+case is then about 128 + 64 x 3.3, about 336 MiB, under the 384 MiB bar
+(assuming one clicking thread and leaving out the regex crate's
+reverse-inner lazy DFA cache, which #649 bounds);
+the most measured for 64 rules on one thread is 95.6 MiB kept (see the
+#590 amendment).
 
 **Behaviour change.** A rule whose search gives up (its cache would
 thrash) or whose fallback is over the gate selects nothing for that click,
@@ -456,3 +461,54 @@ The hostile test's bars now come from each row: a rule that finds matches
 on that text gets the budget plus one attempt (100 ms), one that finds none
 one attempt (50 ms), from the matches its clicks found rather than a flag
 per rule.
+
+## Amendment: what "by construction" bounds (#590, 2026-11-24)
+
+The #518 amendment's title says each rule attempt is bounded by
+construction. That holds for an attempt's memory only: a search fills its
+rule's cache at most once cold, after at most one reset, before it gives
+up, so the cache never holds more than `SMART_RULE_CACHE_BYTES` per
+direction (the regex crate's pool for the fallback has its own ceiling,
+under Warm caches). An attempt's
+time is not bounded by construction; it follows from the one fill only as
+measured (`SMART_RULE_ATTEMPT_BOUND`). A click's time is bounded by the
+attempt clock: the click budget read after every search that may have cost
+an attempt (the first on a cold cache, one that reset its cache, and every
+match of the fallback) and every `SMART_CLOCK_STRIDE` matches (#557), so a
+click stops within `SMART_RULE_BUDGET` plus one attempt, plus fewer than
+`SMART_CLOCK_STRIDE` searches on cached states.
+
+A DFA quit on a rule without a Unicode word boundary cannot happen (that
+DFA has no byte it quits on). Had it happened, the rule selected nothing
+for that click, as now, but logged that its fallback was over the gate; it
+now logs `its DFA quit and it has no fallback` (a test forces the quit).
+
+**Slot gate.** The ceiling #518 gave the fallback, about 4 MiB per rule,
+was wrong: the regex crate's PikeVM allocates, when the fallback first
+runs, two slot tables of the captures program's states x capture slots x
+8 bytes, quadratic in the pattern and kept in that crate's pool. A
+1011-byte rule within `SMART_FALLBACK_UNITS`, `\bx(?:` + 250 x `(a?)` +
+`){23}` (23 007 states, 502 slots), kept 177 MiB after one double-click on
+a 160-column line of `éx`, 708 MiB for four such rules (the 590e review's
+measurement). The fallback now
+also requires states x slots x 16 bytes to be at most
+`SMART_FALLBACK_SLOT_BYTES` (512 KiB, lowered from a first 2 MiB that
+let 64 rules reach about 530 MiB); past it the rule selects nothing for
+a click that would fall back, with the over-the-gate warning. That rule is
+refused and keeps nothing in the regex crate's pool (tested: the fallback
+never runs). No built-in rule has a capture group: each takes at most
+21 KiB of slot tables (670 states x 2 slots, the largest program, about
+25 times under the cap), and each
+falls back and matches as `find_iter` on 32 KiB windows of CJK and emoji
+text (tested). Measured kept heap (release, a counting allocator in a
+scratch probe): a rule at the cap (2 groups x 681, 5455 states) kept
+1.10 MiB on a non-ASCII line within the window gate, a thrashing `\b`
+rule 0.93 MiB of its own DFA caches on an ASCII line and 0.64 MiB of the
+regex crate's on a mixed one, 1.57 MiB for both, a built-in rule at most
+0.14 MiB. Sixty-four rules on one thread, each scanned once: 64 at the cap
+kept 70.5 MiB (peak RSS 109 MiB), 64 thrashing rules 95.6 MiB (peak RSS
+299 MiB, of which 168 MiB is the 64 compiled rules themselves). By the
+limits a rule keeps at most about 5.3 MiB: 2 MiB of its own DFA caches and
+about 3.3 MiB of the regex crate's (Warm caches), 336 MiB for 64 rules
+on one clicking thread, leaving out the regex crate's reverse-inner lazy
+DFA cache (#649).

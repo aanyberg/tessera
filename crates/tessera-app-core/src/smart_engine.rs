@@ -10,14 +10,15 @@
 //! of its own, built here from the same pattern with the same limits
 //! (`regex_automata::hybrid::regex::Regex`, no captures), whose cache of
 //! [`SMART_RULE_CACHE_BYTES`] per direction gives up the first time it
-//! would be cleared: one attempt fills that cache at most once, a few
-//! milliseconds, within [`SMART_RULE_ATTEMPT_BOUND`].
+//! would be cleared: one attempt fills that cache at most once cold, after
+//! at most one reset, a few milliseconds, within
+//! [`SMART_RULE_ATTEMPT_BOUND`].
 //!
 //! A rule's scan of a click's window, in order:
 //!
 //! 1. A rule with a Unicode word boundary (`\b`, `\B`, `\<`, ...) on a
 //!    window that is not all ASCII skips its DFA, which would quit at the
-//!    first non-ASCII byte; so does any rule whose DFA quits.
+//!    first non-ASCII byte; so does a Unicode-`\b` rule whose DFA quits.
 //! 2. Otherwise the DFA scans the window, leftmost-first and without
 //!    overlaps as the regex crate's `find_iter` (through
 //!    `regex_automata::util::iter::Searcher`). When a search gives up on a
@@ -25,11 +26,15 @@
 //!    search runs once more on it cold; a second give-up is the rule's for
 //!    that click: no match from it, and one warning per rule index
 //!    carrying the index only (S8).
-//! 3. A rule that skipped or quit its DFA runs the regex crate's
-//!    `find_iter` instead, only when its compiled program's states times
-//!    the window's bytes are at most [`SMART_FALLBACK_UNITS`] (that engine
-//!    costs at most a few nanoseconds per state and byte); past it the rule
-//!    has no match for that click, with one warning per rule index.
+//! 3. A rule that skipped its DFA, or a Unicode-`\b` rule whose DFA quit,
+//!    runs the regex crate's `find_iter` instead, only when its compiled
+//!    program's states times the window's bytes are at most
+//!    [`SMART_FALLBACK_UNITS`] (that engine costs at most a few nanoseconds
+//!    per state and byte) and its states times its capture slots fit
+//!    [`SMART_FALLBACK_SLOT_BYTES`]; past either the rule has no match for
+//!    that click, with one warning per rule index. A rule without a Unicode
+//!    word boundary whose DFA quit (it cannot) has no fallback: no match,
+//!    and one warning saying so.
 //!
 //! Caches persist across clicks, one per rule behind its own lock (a leaf:
 //! held for that rule's scan only), so a warm click costs what the regex
@@ -74,18 +79,45 @@ pub const SMART_RULE_ATTEMPT_BOUND: Duration = Duration::from_millis(50);
 /// states, at 4.3 M).
 pub const SMART_FALLBACK_UNITS: usize = 8_000_000;
 
+/// The most memory the regex crate's `PikeVM` may take for a smart-selection
+/// rule's fallback in its slot tables (S5, #590): its compiled program's
+/// states (capture groups included) times its capture slots times 16 bytes
+/// (two tables of 8-byte slots, as regex-automata sizes them when the
+/// fallback first runs, kept in the regex crate's cache pool), leaving out
+/// only the table's few extra slots for one set of captures. Past it the
+/// rule has no match for a click that would fall back. The table is
+/// quadratic in the pattern: 250 groups repeated 23 times in a 1011-byte
+/// pattern would take 177 MiB. No built-in rule has a capture group: each
+/// takes at most 21 KiB, about 25 times under the cap.
+pub const SMART_FALLBACK_SLOT_BYTES: usize = 512 * 1024;
+
 /// The bytes one smart-selection rule's DFA may cache in each direction
 /// (S5, #518): [`tessera_config::SMART_RULE_SIZE_LIMIT`], 1 MiB, as the
 /// regex crate's own lazy DFA had. Kept across clicks, forward and reverse,
-/// so 64 rules hold at most 128 MiB once every one has filled both.
+/// so 64 rules' DFAs hold at most 128 MiB once every one has filled both.
+///
+/// That is not the whole ceiling (ADR 0042, #590): a rule that takes the
+/// fallback also keeps the regex crate's own caches in that crate's pool,
+/// one set per thread that clicks: its lazy DFA's 1 MiB per direction, the
+/// bounded backtracker's 256 KiB, the `PikeVM`'s slot tables within
+/// `SMART_FALLBACK_SLOT_BYTES` (512 KiB) and its sparse sets and stack
+/// (about 32 bytes per state, at most 16 384 states within that cap),
+/// about 3.3 MiB by those limits. A rule then keeps at most about 5.3 MiB,
+/// and 64 rules with one clicking thread about 128 + 64 x 3.3 = 336 MiB.
+/// That figure assumes one clicking thread and leaves out the regex crate's
+/// reverse-inner lazy DFA cache, which is not yet bounded (#649).
+/// Measured (release, kept heap after the clicks): at most 0.93 MiB of a
+/// rule's own DFA caches, 1.10 MiB of the regex crate's for a rule at the
+/// slot cap (5455 states) and 0.14 MiB for a built-in rule; 64 rules at the
+/// cap kept 70.5 MiB and 64 thrashing rules 95.6 MiB.
 pub const SMART_RULE_CACHE_BYTES: usize = SMART_RULE_SIZE_LIMIT;
 
 #[cfg(test)]
 thread_local! {
     /// Test hook: how many times a rule's fallback ran on this thread.
     pub(crate) static FALLBACK_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    /// Test hook: how many give-up or over-the-gate warnings were logged
-    /// on this thread.
+    /// Test hook: how many give-up or over-the-gate warnings, or warnings
+    /// that a DFA quit with no fallback, were logged on this thread.
     pub(crate) static WARNINGS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -121,8 +153,9 @@ pub(crate) enum Scanned {
     /// Every match it reported stands: it saw them all, or the caller
     /// stopped it.
     Done,
-    /// It has no match for this click (it gave up, or its fallback was
-    /// over the gate): the caller drops what it reported.
+    /// It has no match for this click (it gave up, its fallback was over
+    /// the gate, or its DFA quit with no fallback): the caller drops what
+    /// it reported.
     Nothing,
 }
 
@@ -206,14 +239,27 @@ impl SmartEngines {
                     RuleEngine::warn_once(&engine.gave_up, index, "its DFA cache filled");
                     return Scanned::Nothing;
                 }
+                // Not reached (#590): without a Unicode word boundary the
+                // DFA has no byte to quit on, and a rule with one runs it
+                // on all-ASCII windows only. Such a rule has no fallback, so
+                // the quit is the rule's answer for that click.
+                DfaScan::Quit(_) if !engine.unicode_word => {
+                    RuleEngine::warn_once(
+                        &engine.over_gate,
+                        index,
+                        "its DFA quit and it has no fallback",
+                    );
+                    return Scanned::Nothing;
+                }
                 DfaScan::Quit(matches) => seen = matches,
             }
         }
         engine.fallback(index, rule.regex(), text, seen, found)
     }
 
-    /// Whether rule `index` has given up or been over the gate in a click
-    /// since these engines were built (its warning is logged).
+    /// Whether rule `index` has given up, been over the gate, or had its
+    /// DFA quit with no fallback in a click since these engines were built
+    /// (its warning is logged).
     #[cfg(test)]
     pub(crate) fn warned(&self, index: usize) -> bool {
         self.engines.get(index).is_some_and(|engine| {
@@ -238,7 +284,44 @@ impl SmartEngines {
         let rule = self.rules.rules().get(index)?;
         engine
             .fallback_states(rule.regex().as_str())
-            .map(|states| states.saturating_mul(bytes))
+            .map(|cost| cost.states.saturating_mul(bytes))
+    }
+
+    /// The bytes rule `index`'s fallback slot tables take, as the gate
+    /// counts them ([`SMART_FALLBACK_SLOT_BYTES`]); `None` when it may
+    /// never fall back.
+    #[cfg(test)]
+    pub(crate) fn fallback_slot_bytes(&self, index: usize) -> Option<usize> {
+        let engine = self.engines.get(index)?;
+        let rule = self.rules.rules().get(index)?;
+        engine
+            .fallback_states(rule.regex().as_str())
+            .map(FallbackCost::slot_bytes)
+    }
+}
+
+/// The size of a rule's program with capture groups, as the regex crate's
+/// fallback engines run it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FallbackCost {
+    /// Its states.
+    states: usize,
+    /// Its capture slots (two per group, the whole match included).
+    slots: usize,
+}
+
+impl FallbackCost {
+    /// The bytes of the `PikeVM`'s two slot tables: 8 bytes per slot of
+    /// every state in each (regex-automata's `SlotTable::reset`).
+    fn slot_bytes(self) -> usize {
+        self.states.saturating_mul(self.slots).saturating_mul(16)
+    }
+
+    /// Whether the fallback may run on a window of `bytes` bytes: within
+    /// [`SMART_FALLBACK_UNITS`] and [`SMART_FALLBACK_SLOT_BYTES`].
+    fn within(self, bytes: usize) -> bool {
+        self.slot_bytes() <= SMART_FALLBACK_SLOT_BYTES
+            && self.states.saturating_mul(bytes) <= SMART_FALLBACK_UNITS
     }
 }
 
@@ -254,11 +337,13 @@ struct RuleEngine {
     /// crate's fallback engines run it, compiled the first time a click
     /// needs the fallback (most clicks never do); `None` for a rule that
     /// cannot reach the fallback (no Unicode word boundary and a DFA, which
-    /// then never quits), so a quit there selects nothing.
-    fallback_states: OnceLock<Option<usize>>,
+    /// then never quits), so a quit there selects nothing
+    /// ([`SmartEngines::scan`]).
+    fallback_states: OnceLock<Option<FallbackCost>>,
     /// Whether its give-up warning is logged.
     gave_up: AtomicBool,
-    /// Whether its over-the-gate warning is logged.
+    /// Whether its over-the-gate warning, or its warning that its DFA quit
+    /// with no fallback, is logged.
     over_gate: AtomicBool,
 }
 
@@ -287,8 +372,8 @@ impl RuleEngine {
         }
     }
 
-    /// The fallback program's states ([`RuleEngine::fallback_states`]).
-    fn fallback_states(&self, pattern: &str) -> Option<usize> {
+    /// The fallback program's size ([`RuleEngine::fallback_states`]).
+    fn fallback_states(&self, pattern: &str) -> Option<FallbackCost> {
         if !self.unicode_word {
             return None;
         }
@@ -302,7 +387,10 @@ impl RuleEngine {
                 )
                 .build(pattern)
                 .ok()
-                .map(|nfa| nfa.states().len())
+                .map(|nfa| FallbackCost {
+                    states: nfa.states().len(),
+                    slots: nfa.group_info().slot_len(),
+                })
         })
     }
 
@@ -318,7 +406,7 @@ impl RuleEngine {
     ) -> Scanned {
         let within = self
             .fallback_states(regex.as_str())
-            .is_some_and(|states| states.saturating_mul(text.len()) <= SMART_FALLBACK_UNITS);
+            .is_some_and(|cost| cost.within(text.len()));
         if !within {
             Self::warn_once(&self.over_gate, index, "its fallback is over the gate");
             return Scanned::Nothing;
@@ -837,6 +925,223 @@ mod tests {
             "one byte past it"
         );
         assert_eq!(WARNINGS.with(std::cell::Cell::get), 1);
+    }
+
+    /// #590 m3: a DFA quit on a rule without a Unicode word boundary cannot
+    /// happen (such a DFA has no byte to quit on), so it is forced here: an
+    /// engine told its `\b` rule has none runs the DFA on text that is not
+    /// ASCII. The rule then selects nothing for that click, without the
+    /// fallback, and its one warning says its DFA quit, not that a fallback
+    /// was over the gate.
+    #[test]
+    fn a_dfa_quit_without_a_fallback_says_so_and_selects_nothing() {
+        let real = engines(&[r"\bx"]);
+        let forced = SmartEngines {
+            rules: Arc::clone(&real.rules),
+            engines: Arc::from([RuleEngine {
+                unicode_word: false,
+                ..RuleEngine::new(0, r"\bx")
+            }]),
+        };
+        let text = "x \u{e9} x";
+        FALLBACK_RUNS.with(|runs| runs.set(0));
+        captures_see_every_event();
+        let logged = crate::session::tests::warnings(|| {
+            assert_eq!(scan(&forced, 0, text).1, Scanned::Nothing);
+            assert_eq!(scan(&forced, 0, text).1, Scanned::Nothing, "again");
+        });
+        assert_eq!(FALLBACK_RUNS.with(std::cell::Cell::get), 0, "no fallback");
+        assert!(forced.warned(0));
+        assert_eq!(logged.len(), 1, "one warning per rule: {logged:?}");
+        assert!(
+            logged[0].contains("rule=0")
+                && logged[0].contains(r#"why="its DFA quit and it has no fallback""#),
+            "{logged:?}"
+        );
+        // The real engine takes the fallback there and finds both.
+        assert_eq!(scan(&real, 0, text), (vec![0..1, 5..6], Scanned::Done));
+    }
+
+    /// Makes the scoped subscriber of [`crate::session::tests::warnings`]
+    /// see every event when tests share a process (`cargo test`), as
+    /// `config_watch`'s tests do: a process-wide subscriber interested in
+    /// every callsite and enabled for none. Without it a callsite first hit
+    /// by a thread with no subscriber is cached as of no interest (#430).
+    fn captures_see_every_event() {
+        struct Interested;
+
+        impl tracing::Subscriber for Interested {
+            fn register_callsite(
+                &self,
+                _: &'static tracing::Metadata<'static>,
+            ) -> tracing::subscriber::Interest {
+                tracing::subscriber::Interest::sometimes()
+            }
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                false
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, _: &tracing::Event<'_>) {}
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            // Fails only if a global subscriber is set already, which then
+            // decides; nothing in this crate sets one.
+            let _ = tracing::subscriber::set_global_default(Interested);
+        });
+        // A callsite whose interest was cached before the line above.
+        tracing::callsite::rebuild_interest_cache();
+    }
+
+    /// #590: the fallback's slot tables may take exactly
+    /// [`SMART_FALLBACK_SLOT_BYTES`] and not one state more, whatever the
+    /// window; the window gate still applies within it.
+    #[test]
+    fn the_slot_gate_holds_at_its_cap_and_not_one_state_past() {
+        let at_cap = FallbackCost {
+            states: 256,
+            slots: 128,
+        };
+        assert_eq!(at_cap.slot_bytes(), SMART_FALLBACK_SLOT_BYTES);
+        assert!(at_cap.within(1), "at the cap");
+        assert!(
+            at_cap.within(SMART_FALLBACK_UNITS / 256),
+            "and the window gate"
+        );
+        assert!(
+            !at_cap.within(SMART_FALLBACK_UNITS / 256 + 1),
+            "past the window gate"
+        );
+        let past = FallbackCost {
+            states: 257,
+            ..at_cap
+        };
+        assert!(!past.within(1), "one state past the cap");
+        let wide = FallbackCost {
+            slots: 129,
+            ..at_cap
+        };
+        assert!(!wide.within(1), "one slot past the cap");
+    }
+
+    /// #590: the gate counts a real rule's program as the regex crate runs
+    /// it. Two groups repeated 681 times (5455 states, 6 slots) stay under
+    /// [`SMART_FALLBACK_SLOT_BYTES`] and fall back on a non-ASCII line; one
+    /// repeat more (5463 states) is over it and selects nothing, with one
+    /// warning.
+    #[test]
+    fn a_real_rule_falls_back_just_under_the_slot_cap_and_not_just_over() {
+        let pattern = |repeats: usize| format!(r"\bx(?:(a?)(a?)){{{repeats}}}");
+        let text = "\u{e9}x \u{e9} xa x\u{e9}";
+        let under = engines(&[&pattern(681)]);
+        let over = engines(&[&pattern(682)]);
+        assert_eq!(under.fallback_slot_bytes(0), Some(5455 * 6 * 16));
+        assert_eq!(over.fallback_slot_bytes(0), Some(5463 * 6 * 16));
+        FALLBACK_RUNS.with(|runs| runs.set(0));
+        WARNINGS.with(|warnings| warnings.set(0));
+        assert_eq!(
+            scan(&under, 0, text),
+            (reference(&pattern(681), text), Scanned::Done)
+        );
+        assert_eq!(reference(&pattern(681), text).len(), 2, "it matches");
+        assert_eq!(FALLBACK_RUNS.with(std::cell::Cell::get), 1, "it fell back");
+        assert!(!under.warned(0));
+        assert_eq!(scan(&over, 0, text), (Vec::new(), Scanned::Nothing));
+        assert_eq!(FALLBACK_RUNS.with(std::cell::Cell::get), 1, "it did not");
+        assert_eq!(WARNINGS.with(std::cell::Cell::get), 1, "one warning");
+        assert!(over.warned(0));
+    }
+
+    /// #590 (B1 of the 590e review): a 1011-byte rule within the window
+    /// gate whose slot tables would take about 177 MiB (23 007 states, 502
+    /// slots) is over the slot gate: on a 160-column line of `éx` its click
+    /// selects nothing from it, with one over-the-gate warning, and the
+    /// regex crate never runs, so nothing is kept for it in that crate's
+    /// cache pool; what the rule keeps is its own DFA cache, within its cap.
+    #[test]
+    fn a_rule_over_the_slot_gate_selects_nothing_and_keeps_no_fallback_cache() {
+        let pattern = format!(r"\bx(?:{}){{23}}", "(a?)".repeat(250));
+        assert_eq!(pattern.len(), 1011);
+        let rule = engines(&[&pattern]);
+        let text = "\u{e9}x".repeat(75);
+        assert!(
+            rule.fallback_units(0, text.len())
+                .is_some_and(|units| units <= SMART_FALLBACK_UNITS),
+            "within the window gate"
+        );
+        let slot_bytes = rule.fallback_slot_bytes(0).unwrap();
+        assert!(slot_bytes > 64 * SMART_FALLBACK_SLOT_BYTES, "{slot_bytes}");
+        FALLBACK_RUNS.with(|runs| runs.set(0));
+        WARNINGS.with(|warnings| warnings.set(0));
+        for _ in 0..3 {
+            assert_eq!(scan(&rule, 0, &text), (Vec::new(), Scanned::Nothing));
+        }
+        assert_eq!(
+            FALLBACK_RUNS.with(std::cell::Cell::get),
+            0,
+            "no fallback ran"
+        );
+        assert_eq!(WARNINGS.with(std::cell::Cell::get), 1, "one warning");
+        assert!(rule.warned(0));
+        assert!(rule.cache_bytes(0) <= 2 * SMART_RULE_CACHE_BYTES + 64 * 1024);
+    }
+
+    /// #590: no built-in rule is refused by the slot gate (the largest
+    /// takes 21 KiB, over 16 times under it), and each falls back and finds what the regex crate
+    /// finds on the widest window a click scans
+    /// ([`crate::selection::SMART_SCAN_BYTES`]) of CJK and emoji text with
+    /// paths, addresses and URLs in it, and on one of CJK alone.
+    #[test]
+    fn every_built_in_rule_falls_back_on_the_widest_cjk_window() {
+        let engines = SmartEngines::new(Selection::default().compiled_rules());
+        let widest = |unit: &str| {
+            let mut text = String::new();
+            for c in unit.chars().cycle() {
+                if text.len() + c.len_utf8() > crate::selection::SMART_SCAN_BYTES {
+                    break;
+                }
+                text.push(c);
+            }
+            text
+        };
+        let windows = [
+            widest(
+                "\u{65e5}\u{672c}\u{8a9e} user@example.com \u{1f600} /usr/lib/x.so 10.0.0.1 \
+                 https://a.b/c?d=1 std::vector<int> 0123abcd fe80::1 mailto:a@b.co \
+                 \"q\" ssh://h/x [a b:c] <x.h> \u{1f44d}\u{1f3fd}",
+            ),
+            widest("\u{65e5}\u{672c}\u{8a9e}\u{1f600}"),
+        ];
+        FALLBACK_RUNS.with(|runs| runs.set(0));
+        let mut matched = 0;
+        for (index, rule) in engines.rules().rules().iter().enumerate() {
+            let slot_bytes = engines.fallback_slot_bytes(index);
+            assert!(
+                slot_bytes.is_none_or(|bytes| bytes <= SMART_FALLBACK_SLOT_BYTES / 16),
+                "rule {index}: {slot_bytes:?}"
+            );
+            for text in &windows {
+                assert!(text.len() > crate::selection::SMART_SCAN_BYTES - 4);
+                let spans = reference(rule.regex().as_str(), text);
+                matched += spans.len();
+                assert_eq!(
+                    scan(&engines, index, text),
+                    (spans, Scanned::Done),
+                    "rule {index}"
+                );
+            }
+        }
+        assert!(matched > 1000, "{matched} matches");
+        // 8 of the 15 rules have a Unicode `\b`: each fell back on both.
+        assert_eq!(FALLBACK_RUNS.with(std::cell::Cell::get), 8 * 2);
+        assert!(!(0..engines.rules().len()).any(|index| engines.warned(index)));
     }
 
     /// S5: a rule's DFA cache holds at most [`SMART_RULE_CACHE_BYTES`] in
