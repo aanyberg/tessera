@@ -273,8 +273,9 @@ wheel and clicks) left for 0.3.0. In overlay style:
   size. It stays
   wide while the pointer is inside or the knob held, and through the fade
   after the pointer leaves (held 1 s, faded over 0.3 s, as a scroll's flash;
-  at once under Reduce Motion, ADR 0041); a scroll that shows the scroller
-  again from faded out, or after it was hidden, shows it narrow.
+  at once under Reduce Motion, ADR 0041), and narrows when that fade ends
+  (#695), so the next hover widens it again; a scroll that shows the
+  scroller again from faded out, or after it was hidden, shows it narrow.
 - While wide, `testPart(_:)` tests a point over the wide knob or slot at the
   narrow one's column, so the wide knob grabs and drags through AppKit's
   own tracking (`.knob`, the `freezesKnob` rule and the release dedupe are
@@ -292,10 +293,14 @@ wheel and clicks) left for 0.3.0. In overlay style:
   still ends at the model frames; the fade is on the scroller's own layer
   and composes. The knob's rim is a 1 pt border, whose corner radius
   animates with it. The narrowing is not animated: AppKit narrows only
-  once its fade has ended, and this scroller narrows only while faded
-  out or hidden (no history; a held knob once released), which ends a
-  widening still in flight. Under Reduce Motion the
-  knob widens at once.
+  once its fade has ended, and so does this scroller, through one hide
+  scheduled for the flash's end that looks again (the injectable
+  `scheduleHide` the Reduce Motion hide uses; #695). The main queue runs
+  that hide late (about 80 ms), so a hover or a press first settles a
+  flash that has ended: the knob narrows, then widens anew. It also
+  narrows when a scroll shows it from faded out, and when it is hidden
+  (no history; a held knob once released). A narrowing ends a widening
+  still in flight. Under Reduce Motion the knob widens at once.
 
 The view's layout is unchanged: an overlay scroller still takes no grid
 width, and a legacy scroller is AppKit's alone.

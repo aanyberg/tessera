@@ -1197,7 +1197,14 @@ final class ReduceMotionScrollerTests: XCTestCase {
         scroller.flash()
         XCTAssertTrue(flashAnimation is CAKeyframeAnimation, "the regression guard")
         XCTAssertEqual(scroller.alphaValue, 0, "the animation shows it")
-        XCTAssertTrue(hides.isEmpty)
+        // One end is scheduled, for the knob's narrowing once faded (#695);
+        // it hides nothing the animation has not.
+        let total = TerminalScroller.holdDuration + TerminalScroller.fadeDuration
+        XCTAssertEqual(hides.map(\.at), [now + total])
+        advance(by: total)
+        XCTAssertEqual(scroller.alphaValue, 0)
+        XCTAssertTrue(flashAnimation is CAKeyframeAnimation, "the fade is left on the layer")
+        XCTAssertFalse(scroller.isRevealed)
     }
 
     func testE12TurningReduceMotionOnDuringAFadeSettles() {

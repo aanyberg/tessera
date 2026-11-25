@@ -33,10 +33,11 @@ final class TerminalScrollerTests: XCTestCase {
     /// A scroller at the right edge of a 480 x 400 host in a window that is
     /// never on screen, in light appearance, on the test's clock, with the
     /// fade on whatever the machine's Reduce Motion (a CI runner may
-    /// report it on).
+    /// report it on). With `realClock` it keeps its own clock and hide
+    /// scheduling, as the app's scrollers do.
     private func makeScroller(
         _ position: TesseraSession.ScrollPosition = middle, style: NSScroller.Style = .overlay,
-        in provided: NSWindow? = nil
+        in provided: NSWindow? = nil, realClock: Bool = false
     ) -> (scroller: TerminalScroller, window: NSWindow) {
         let window = provided ?? NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 480, height: Self.height), styleMask: [.titled],
@@ -48,8 +49,10 @@ final class TerminalScrollerTests: XCTestCase {
         window.contentView = host
         let scroller = TerminalScroller()
         scroller.reducesMotion = false
-        scroller.now = { [unowned self] in self.clock }
-        scroller.scheduleHide = { [unowned self] delay, hide in self.hides.append((delay, hide)) }
+        if !realClock {
+            scroller.now = { [unowned self] in self.clock }
+            scroller.scheduleHide = { [unowned self] delay, hide in self.hides.append((delay, hide)) }
+        }
         scroller.preferredStyleOverride = style
         scroller.frame = NSRect(
             x: 480 - TerminalScroller.width(for: style), y: 0, width: TerminalScroller.width(for: style),
@@ -83,6 +86,16 @@ final class TerminalScrollerTests: XCTestCase {
     private func exit(_ scroller: TerminalScroller) throws {
         let point = NSPoint(x: -20, y: scroller.bounds.midY)
         scroller.mouseExited(with: try crossing(.mouseExited, scroller, at: point))
+    }
+
+    /// Runs the hides the scroller scheduled, each once its delay has
+    /// passed on the test's clock, and any a hide schedules again.
+    private func runScheduledHides() {
+        while !hides.isEmpty {
+            let next = hides.removeFirst()
+            clock += next.delay
+            next.hide()
+        }
     }
 
     /// What the scroller's layer tree draws (model values, so not a fade in
@@ -819,6 +832,184 @@ final class TerminalScrollerTests: XCTestCase {
         try enter(scroller)
         XCTAssertEqual(layers.knob.frame, wideKnob, "the next hover widens it")
         XCTAssertEqual(startFrame(layers.knob), narrowKnob, "with its animation, from the narrow knob")
+    }
+
+    /// The pointer leaves the wide knob and its fade ends with no scroll
+    /// after it (#695): the knob narrows then, without an animation, as
+    /// AppKit's does, and the next hover widens it with a new animation
+    /// from the narrow knob. A scroll during the fade moves its end, and a
+    /// pointer back before the end keeps the knob wide.
+    func testWhenTheFadeAfterTheHoverEndsTheKnobNarrowsAndTheNextHoverWidensIt() throws {
+        let (scroller, window) = makeScroller()
+        defer { window.close() }
+        let layers = try knobLayers(scroller)
+        let narrowKnob = layers.knob.frame
+        let wideKnob = drawn(scroller.rect(for: .knob), wide: true, in: scroller).insetBy(dx: -1, dy: -1)
+        let hold = TerminalScroller.holdDuration, fade = TerminalScroller.fadeDuration
+        try enter(scroller)
+        let first = try XCTUnwrap(widening(layers.knob, "bounds.size.width"), "the first hover's widening")
+        CATransaction.flush()
+        try exit(scroller)
+        XCTAssertEqual(layers.knob.frame, wideKnob, "wide through the fade")
+        let end = try XCTUnwrap(hides.first, "the fade's end is scheduled")
+        XCTAssertEqual(end.delay, hold + fade, accuracy: 1e-9, "at the fade's end")
+
+        // A scroll halfway through the fade moves its end.
+        clock += (hold + fade) / 2
+        scroller.flash()
+        hides.removeFirst()
+        clock += (hold + fade) / 2
+        end.hide()
+        XCTAssertTrue(scroller.isRevealed, "the scroll's flash is still on")
+        XCTAssertEqual(layers.knob.frame, wideKnob, "wide until the moved end")
+        // Committed, so that an implicit animation would show.
+        CATransaction.flush()
+        runScheduledHides()
+        XCTAssertFalse(scroller.isRevealed, "faded out")
+        XCTAssertEqual(scroller.alphaValue, 0)
+        XCTAssertEqual(layers.knob.frame, narrowKnob, "narrow once the fade ended")
+        XCTAssertTrue(layers.slot.isHidden, "no slot behind it")
+        XCTAssertEqual(try overlayAnimations(scroller).keys.sorted(), [], "narrowed without an animation")
+
+        try enter(scroller)
+        let next = try XCTUnwrap(widening(layers.knob, "bounds.size.width"), "the next hover animates")
+        XCTAssertFalse(next === first, "a new widening")
+        XCTAssertEqual(layers.knob.frame, wideKnob)
+        XCTAssertEqual(startFrame(layers.knob), narrowKnob, "from the narrow knob")
+
+        // Back under the pointer before the fade ends: the end it had
+        // scheduled leaves the knob wide.
+        try exit(scroller)
+        clock += hold
+        try enter(scroller)
+        runScheduledHides()
+        XCTAssertTrue(scroller.isRevealed)
+        XCTAssertEqual(layers.knob.frame, wideKnob, "the pointer is back: wide")
+        XCTAssertFalse(layers.slot.isHidden)
+    }
+
+    /// A knob dragged and released with the pointer off the strip fades
+    /// wide, then narrows when the fade ends (#695), and the next hover
+    /// widens it with a new animation. A knob held again before the fade
+    /// ends stays wide while held.
+    func testWhenTheFadeAfterADragReleasedOffTheStripEndsTheKnobNarrows() throws {
+        let (scroller, window) = makeScroller()
+        defer { window.close() }
+        let layers = try knobLayers(scroller)
+        let narrowKnob = layers.knob.frame
+        let wideKnob = drawn(scroller.rect(for: .knob), wide: true, in: scroller).insetBy(dx: -1, dy: -1)
+        scroller.beginTracking()
+        let first = try XCTUnwrap(widening(layers.knob, "bounds.size.width"), "the press's widening")
+        scroller.endTracking()
+        XCTAssertEqual(layers.knob.frame, wideKnob, "released: wide through the fade")
+        CATransaction.flush()
+        runScheduledHides()
+        XCTAssertFalse(scroller.isRevealed, "faded out")
+        XCTAssertEqual(layers.knob.frame, narrowKnob, "narrow once the fade ended")
+        XCTAssertTrue(layers.slot.isHidden)
+        XCTAssertEqual(try overlayAnimations(scroller).keys.sorted(), [], "narrowed without an animation")
+
+        try enter(scroller)
+        let next = try XCTUnwrap(widening(layers.knob, "bounds.size.width"), "the next hover animates")
+        XCTAssertFalse(next === first, "a new widening")
+        XCTAssertEqual(startFrame(layers.knob), narrowKnob, "from the narrow knob")
+        try exit(scroller)
+        runScheduledHides()
+        XCTAssertEqual(layers.knob.frame, narrowKnob)
+
+        // Pressed again from faded out, released, and held again during
+        // the fade: held past the end it scheduled, it stays wide.
+        scroller.beginTracking()
+        scroller.endTracking()
+        clock += TerminalScroller.holdDuration
+        scroller.beginTracking()
+        runScheduledHides()
+        XCTAssertTrue(scroller.isRevealed, "held")
+        XCTAssertEqual(layers.knob.frame, wideKnob, "held across the fade's end: wide")
+        XCTAssertFalse(layers.slot.isHidden)
+        scroller.endTracking()
+        runScheduledHides()
+        XCTAssertEqual(layers.knob.frame, narrowKnob, "released, the fade ended: narrow")
+    }
+
+    /// The #634 adversary's hover after a fade (ADV-B), verbatim: the
+    /// pointer comes back once the fade has ended but before the hide
+    /// scheduled for its end has run (the main queue runs it late), and
+    /// the hover still widens the knob with a new animation (#695).
+    func testAHoverAfterTheFadeEndedBeforeItsHideRanAnimatesAnew() throws {
+        let (scroller, window) = makeScroller()
+        defer { window.close() }
+        let layers = try knobLayers(scroller)
+        try enter(scroller)
+        let first = widening(layers.knob, "bounds.size.width")
+        CATransaction.flush()
+        try exit(scroller)
+        clock += 5
+        XCTAssertFalse(scroller.isRevealed)
+        try enter(scroller)
+        let next = widening(layers.knob, "bounds.size.width")
+        XCTAssertTrue(next != nil && next !== first, "a hover after the fade animates anew")
+    }
+
+    /// The #634 adversary's drag released off the strip (ADV-G),
+    /// verbatim: its fade ended, its hide not yet run, the next hover
+    /// widens the knob with a new animation (#695).
+    func testAHoverAfterADragsFadeEndedBeforeItsHideRanAnimatesAnew() throws {
+        let (scroller, window) = makeScroller()
+        defer { window.close() }
+        let layers = try knobLayers(scroller)
+        scroller.beginTracking()
+        let first = widening(layers.knob, "bounds.size.width")
+        scroller.endTracking()
+        clock += 5
+        XCTAssertFalse(scroller.isRevealed)
+        try enter(scroller)
+        let next = widening(layers.knob, "bounds.size.width")
+        XCTAssertTrue(next != nil && next !== first, "a hover after the drag's fade animates anew")
+    }
+
+    /// A press after the fade ended, before its hide ran, widens the knob
+    /// with a new animation from the narrow knob, as a hover does (#695).
+    func testAPressAfterTheFadeEndedBeforeItsHideRanAnimatesAnew() throws {
+        let (scroller, window) = makeScroller()
+        defer { window.close() }
+        let layers = try knobLayers(scroller)
+        let narrowKnob = layers.knob.frame
+        try enter(scroller)
+        let first = widening(layers.knob, "bounds.size.width")
+        CATransaction.flush()
+        try exit(scroller)
+        clock += 5
+        XCTAssertFalse(scroller.isRevealed)
+        scroller.beginTracking()
+        let next = widening(layers.knob, "bounds.size.width")
+        XCTAssertTrue(next != nil && next !== first, "a press after the fade animates anew")
+        XCTAssertEqual(startFrame(layers.knob), narrowKnob, "from the narrow knob")
+        scroller.endTracking()
+    }
+
+    /// On its own clock and main-queue hide, as in the app, the knob the
+    /// pointer widened narrows once the fade after it left has ended
+    /// (#695), and not before.
+    func testOnItsOwnClockTheKnobNarrowsWhenTheFadeEnds() throws {
+        let (scroller, window) = makeScroller(realClock: true)
+        defer { window.close() }
+        let layers = try knobLayers(scroller)
+        let narrowKnob = layers.knob.frame
+        try enter(scroller)
+        XCTAssertGreaterThan(layers.knob.frame.width, narrowKnob.width, "the pointer widened it")
+        let left = CACurrentMediaTime()
+        try exit(scroller)
+        let deadline = Date().addingTimeInterval(30)
+        while layers.knob.frame != narrowKnob, Date() < deadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        }
+        let narrowed = CACurrentMediaTime() - left
+        XCTAssertEqual(layers.knob.frame, narrowKnob, "narrow once the fade ended")
+        XCTAssertGreaterThanOrEqual(
+            narrowed, TerminalScroller.holdDuration + TerminalScroller.fadeDuration, "not before the fade ended")
+        XCTAssertFalse(scroller.isRevealed)
+        XCTAssertTrue(hides.isEmpty, "the scroller's own scheduling")
     }
 
     func testUnderReduceMotionThePointerWidensTheKnobAtOnce() throws {

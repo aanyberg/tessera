@@ -33,7 +33,7 @@ import TesseraKit
 ///   knob is wide, over AppKit's slot drawn as wide, and stays so until
 ///   the scroller has faded out after the pointer left. It widens as
 ///   AppKit's does (``knobExpandDuration``), the slot with it, and narrows
-///   at once (it is faded out then); under Reduce Motion it widens at
+///   at once when the fade ends (#695); under Reduce Motion it widens at
 ///   once.
 /// - Input: dragging the knob or clicking the track reports where to go
 ///   through ``onScroll``; the terminal view moves the session's view.
@@ -110,8 +110,9 @@ final class TerminalScroller: NSScroller {
 
     /// The clock the flash is timed by (tests advance their own).
     var now: () -> CFTimeInterval = { CACurrentMediaTime() }
-    /// Runs the closure on the main actor after the delay: hides a flash
-    /// shown without an animation (tests run it themselves).
+    /// Runs the closure on the main actor after the delay: ends a flash
+    /// once it has faded out, which narrows the knob, and hides one shown
+    /// without an animation (tests run it themselves).
     var scheduleHide: (CFTimeInterval, @escaping @MainActor () -> Void) -> Void = { delay, hide in
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { MainActor.assumeIsolated { hide() } }
     }
@@ -287,17 +288,22 @@ final class TerminalScroller: NSScroller {
         // commit, which an idle terminal never makes: the end time, not
         // the animation's presence, says whether it is still shown.
         flashEnd = now() + total
+        hideAfterFlash()
     }
 
-    /// Hides a flash shown without an animation once it has ended: at once
-    /// when it has, otherwise through one hide scheduled for its end, which
-    /// looks again (a later flash moves the end).
+    /// Ends a flash once it has faded out (or, without an animation, been
+    /// shown for its time): at once when it has, otherwise through one hide
+    /// scheduled for its end, which looks again (a later flash moves the
+    /// end; being shown for good, or hidden, forgets it). Ended, the
+    /// scroller is transparent and the knob narrow, without an animation,
+    /// as AppKit's narrows once its fade has ended (#695).
     private func hideAfterFlash() {
         guard let flashEnd else { return }
         let remaining = flashEnd - now()
         guard remaining > 0 else {
             self.flashEnd = nil
             applyVisibility()
+            setExpanded(false)
             return
         }
         guard !hidePending else { return }
@@ -482,9 +488,10 @@ final class TerminalScroller: NSScroller {
     /// Widens or narrows the overlay knob and shows or hides its slot. The
     /// layers get the new frames at once; a widening then animates them
     /// from the narrow ones (``animateWidening(from:)``), unless under
-    /// Reduce Motion. A narrowing, reached only while the scroller is faded
-    /// out (``flash()``) or hidden (``applyHidden()``), is not animated, as
-    /// AppKit's is not, and ends a widening still in flight.
+    /// Reduce Motion. A narrowing, reached only when the fade ends
+    /// (``hideAfterFlash()``), while the scroller is faded out (``flash()``)
+    /// or hidden (``applyHidden()``), is not animated, as AppKit's is not,
+    /// and ends a widening still in flight.
     private func setExpanded(_ expanded: Bool) {
         guard expanded != isExpanded else { return }
         let before = overlayRects
@@ -669,6 +676,9 @@ final class TerminalScroller: NSScroller {
 
     override func mouseEntered(with event: NSEvent) {
         super.mouseEntered(with: event)
+        // A flash that has ended, whose hide the main queue has yet to
+        // run, ends now: the knob narrows first, and widens anew (#695).
+        if let flashEnd, now() >= flashEnd { hideAfterFlash() }
         isPointerInside = true
         setExpanded(true)
         applyVisibility()
@@ -698,6 +708,7 @@ final class TerminalScroller: NSScroller {
     /// A press on the knob or the track starts tracking (`mouseDown`;
     /// tests call it directly instead of running AppKit's tracking loop).
     func beginTracking() {
+        if let flashEnd, now() >= flashEnd { hideAfterFlash() }
         isTracking = true
         lastSentKnobValue = nil
         setExpanded(true)
