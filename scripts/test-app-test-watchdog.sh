@@ -28,6 +28,8 @@
 #     failure (`hang-unlisted`, as with -test-iterations) is rerun too (#443).
 #   - a host that outlives the run's last suite line is sampled and killed after the limit, and the run fails
 #     (`hang-after`); a `sample` that never returns is killed after TESSERA_APP_TEST_SAMPLE_SECONDS (3 in that case, 60 otherwise);
+#   - xcodebuild's "exceeded execution time allowance" line (`allowance`, with a 100 s hang limit) has the host sampled
+#     and killed at once, and a TSan hang found that way is retried (#644);
 #   - a host that keeps forking is stopped before it is killed, so none of its children outlives it (`fork`);
 #   - SIGINT, SIGTERM, SIGHUP and SIGALRM to the wrapper alone kill the hosts and remove its state directory;
 #   - a process under the products path whose PID is reused by a newer process (a fake `ps` shifts its start time
@@ -80,6 +82,11 @@ mode="$(echo "$FAKE_RUNS" | cut -d, -f"$n")"
 hang() {
     echo "Test Case '-[FakeTests.HangTests testHangs]' started (Iteration 1 of 1)."
     "$dd/Build/Products/Debug/FakeHost" &
+    # As xcodebuild does once a test passes its execution time allowance (#644): the host still runs.
+    if [ "${mode#allowance}" != "$mode" ]; then
+        sleep 1
+        echo "Test Case '-[FakeTests.HangTests testHangs]' exceeded execution time allowance of 2 minutes. The test may have hung."
+    fi
     wait
     echo "Restarting after unexpected exit, crash, or test timeout; summary will include totals from previous launches."
 }
@@ -111,10 +118,10 @@ echo "Test Case '-[FakeTests.PassTests testPasses]' started."
 echo "Test Case '-[FakeTests.PassTests testPasses]' passed (0.001 seconds)."
 case "$mode" in
     hang-after) ;;
-    hang*) hang ;;
+    hang*|allowance) hang ;;
 esac
 case "$mode" in
-    hang)
+    hang|allowance)
         failing "HangTests.testHangs()" ;;
     hang-hang)
         echo "Test Case '-[FakeTests.HangTests testHangsToo]' started."
@@ -353,6 +360,7 @@ limit=$TESSERA_APP_TEST_HANG_SECONDS
 # (`set -o pipefail; ... 2>&1 | tee <log> | tail -5 || { ...; exit 1 }`). An alarm ends a watchdog that has not
 # returned after 120 s; its monitor then stops the fake on its own. The cases run at once, each with its own hosts.
 # $4 holds options: `user` starts a UserTessera under the case's products path first, in a process group of its own;
+# `long` gives it a hang limit of 100 s (the `allowance` mode's line must end the test before it);
 # `scaled` gives the run a hang limit that grows with the load (`scaled_limit`: the TSan rerun rows do more work per
 # attempt than the limit alone covers on a loaded machine); `fork` makes the host a ForkHost and `ps` slow; `ps` puts the fake `ps` on the watchdog's PATH; `samplehang` makes `sample` hang.
 start_case() {
@@ -364,6 +372,7 @@ start_case() {
     [[ "$opts" != *" ps "* ]] || case_path="$work/psbin:$PATH"
     local hang_sample="" pause="" ps_delay="" sample_secs=60 hang_secs="$TESSERA_APP_TEST_HANG_SECONDS"
     [[ "$opts" != *" scaled "* ]] || hang_secs="$scaled_limit"
+    [[ "$opts" != *" long "* ]] || hang_secs=100
     [[ "$opts" != *" samplehang "* ]] || { hang_sample=1; sample_secs=3; }
     [[ "$opts" != *" fork "* ]] || { pause=0.2; ps_delay=0.2; }
     (
@@ -505,6 +514,8 @@ start_direct slow-chat "TESSERA_APP_TEST_IDLE_SECONDS=$chat_idle" - zsh -c 'for 
 start_case pass pass 0
 start_case slow-results slow-results 0
 start_case hang hang,pass 0 user
+start_case allowance allowance,pass 0 long
+start_case tsan-allowance allowance,pass 1 long
 start_interrupt
 start_signal INT
 start_signal TERM
@@ -640,6 +651,23 @@ else
 fi
 check_no_strays "a hang"
 check_user_survives "a hang"
+
+# --- xcodebuild's allowance line (#644): the host is sampled at once, while it still hangs, long before the limit
+load_case allowance
+if (( st != 0 && secs <= 1 + slack )) && [[ "$tail" == *"FAILED: -[FakeTests.HangTests testHangs] exceeded xcodebuild's execution time allowance"* ]] \
+    && grep -q "Analysis of sampling FakeHost (pid $(head -1 "$w/hosts"))" "$w/sample.log" && [[ "$(runs)" == 1 ]]; then
+    ok "a test past xcodebuild's allowance has its host sampled and killed at once ($(sec "$secs") s of a 100 s limit), not retried"
+else
+    not_ok "the allowance line: exit $st after $(sec "$secs") s, $(runs) runs: $tail; log: $(cat "$w/sample.log" 2>/dev/null)"
+fi
+check_no_strays "the allowance line"
+load_case tsan-allowance
+if (( st == 0 && secs <= 1 + 2 * slack )) && [[ "$(runs)" == 2 && "$out" == *"TSan hang in -[FakeTests.HangTests testHangs] (#278), retried"* ]]; then
+    ok "a TSan hang reported by xcodebuild's allowance line is retried, and passes when the rerun does"
+else
+    not_ok "a TSan hang past the allowance: exit $st after $(sec "$secs") s, $(runs) runs: $out"
+fi
+check_no_strays "a TSan hang past the allowance"
 
 # --- Ctrl-C: the hosts are killed, a process that predates the run is not
 load_case interrupt
