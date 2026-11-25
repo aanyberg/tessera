@@ -2450,6 +2450,7 @@ name = "tessera-ffi"
 version = "0.2.1"
 dependencies = [
  "cbindgen",
+ "nix",
  "serde_json",
  "tempfile",
  "tessera-app-core",
