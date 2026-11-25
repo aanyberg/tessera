@@ -118,15 +118,18 @@ A test with a wall-clock bar (a latency, a lock hold, a ratio of two costs) join
 Other work on the machine still preempts the test, so a bar on the cost of code measures the thread's CPU time
 (`CLOCK_THREAD_CPUTIME_ID` through `nix::time`, see `thread_cpu_time` in the test helpers of `tessera-term` and
 `tessera-app-core`) or counts work, and compares costs taken side by side, since the cores differ in speed (#520, #521).
-Add an override with a `filter` that names the package, the binary and the test, and a one-line comment that says what
-the bar is and which issue set it. The groups today cover the config reload, shaping, close and writer bounds, the
-DECSCUSR flood, the theme-edit bound, the search caps (including `the_kept_copy_and_its_spares_stay_within_the_cap`,
-which failed at load 35 before it fixed its budget), the plugin host throughput and the rectangle cost bars: the `b02_*`
-tests of `tests/rect.rs` and the two cluster bars of `tests/rect_fixes.rs`. Release-only bars are also listed in the
-quality gate's release timing step (`release_timing` in `scripts/quality-gate.sh`); a bar added to one place belongs in
-the other, and `cargo nextest list --release --run-ignored all -E 'test(<name>)'` shows that the filter finds it.
-`scripts/verify-branch.sh` runs the suites such an override names, in a changed package, ten times each, so a new bar
-is exercised under load before it merges.
+A latency bar on a watcher, which a stall of the watcher's thread breaks whatever the group, is asserted on the fastest
+of a few rounds while every round asserts the events themselves (`tests/watch_themes.rs`, #525;
+`tests/profile_files.rs`, #656). Add an override with a `filter` that names the package, the binary and the test, and a
+one-line comment that says what the bar is and which issue set it. The groups today cover the config reload (with the
+profile-file bound, #656), shaping, close and writer bounds, the DECSCUSR flood, the theme-edit bound, the search caps
+(including `the_kept_copy_and_its_spares_stay_within_the_cap`, which failed at load 35 before it fixed its budget), the
+plugin host throughput and the rectangle cost bars: the `b02_*` tests of `tests/rect.rs` and the two cluster bars of
+`tests/rect_fixes.rs`. Release-only bars are also listed in the quality gate's release timing step (`release_timing` in
+`scripts/quality-gate.sh`); a bar added to one place belongs in the other, and
+`cargo nextest list --release --run-ignored all -E 'test(<name>)'` shows that the filter finds it.
+`scripts/verify-branch.sh` runs the suites such an override names, in a changed package, ten times each, so a new bar is
+exercised under load before it merges.
 
 ## Adding an escape-sequence test
 

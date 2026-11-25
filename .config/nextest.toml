@@ -16,6 +16,11 @@ gpu-memory = { max-threads = 1 }
 filter = 'package(tessera-config) & binary(reload)'
 test-group = 'timing'
 
+# The profile-file reload bound (#312 F4, 500 ms on the fastest of up to five rounds of each step; #656).
+[[profile.default.overrides]]
+filter = 'package(tessera-config) & binary(=profile_files) & test(=saving_adding_and_removing_a_profile_file_each_reload_once)'
+test-group = 'timing'
+
 [[profile.default.overrides]]
 filter = 'package(tessera-render) & binary(shaping) & test(uncovered_characters_are_cheap_after_warm_up)'
 test-group = 'timing'
