@@ -310,11 +310,13 @@ final class TerminalScroller: NSScroller {
     }
 
     /// Hidden only in overlay style without history. Hiding forgets the
-    /// pointer and any flash: shown again, it waits for a scroll or for
-    /// the pointer to enter. Nothing is set unless the history's presence
-    /// or the style changed since the last time, so a position read every
-    /// frame while output streams sets no AppKit property; the pointer and
-    /// tracking apply their own visibility.
+    /// pointer and any flash, and narrows the knob unless it is held
+    /// (#634; a knob released while hidden narrows then): shown again, it
+    /// waits for a scroll or for the pointer to enter, which widens it
+    /// again. Nothing is set unless the history's presence or the style
+    /// changed since the last time, so a position read every frame while
+    /// output streams sets no AppKit property; the pointer and tracking
+    /// apply their own visibility.
     private func applyHidden() {
         let style = effectiveStyle
         if let applied, applied.hasHistory == hasHistory, applied.style == style { return }
@@ -327,6 +329,7 @@ final class TerminalScroller: NSScroller {
                 isPointerInside = false
                 flashEnd = nil
                 layer?.removeAnimation(forKey: Self.flashKey)
+                setExpanded(isTracking)
             }
         }
         applyVisibility()
@@ -480,8 +483,8 @@ final class TerminalScroller: NSScroller {
     /// layers get the new frames at once; a widening then animates them
     /// from the narrow ones (``animateWidening(from:)``), unless under
     /// Reduce Motion. A narrowing, reached only while the scroller is faded
-    /// out (``flash()``), is not animated, as AppKit's is not, and ends a
-    /// widening still in flight.
+    /// out (``flash()``) or hidden (``applyHidden()``), is not animated, as
+    /// AppKit's is not, and ends a widening still in flight.
     private func setExpanded(_ expanded: Bool) {
         guard expanded != isExpanded else { return }
         let before = overlayRects
@@ -702,12 +705,16 @@ final class TerminalScroller: NSScroller {
     }
 
     /// The button went up: the knob returns to the position last read, and
-    /// the scroller fades unless it stays shown.
+    /// the scroller fades unless it stays shown; hidden, the knob narrows
+    /// (``applyHidden()``).
     func endTracking() {
         isTracking = false
         lastSentKnobValue = nil
         if let position, position.history > 0 {
             applyKnob(position)
+        }
+        if isHidden {
+            setExpanded(false)
         }
         applyVisibility()
         flash(keepingWidth: true)
