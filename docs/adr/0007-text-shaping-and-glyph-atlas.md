@@ -55,13 +55,18 @@ for characters with default emoji presentation and *after* it otherwise.
 A character none of them covers is looked up in a coverage index of every
 installed face except LastResort. The index is built once, on a
 background thread started by `Fonts::new` from a clone of the font
-database, by walking each face's character map in database order
-(about 20 ms in a release build, 120 ms in debug, on a stock macOS
+database, by walking every face's character map one font file at a
+time (about 20 ms in a release build, 120 ms in debug, on a stock macOS
 install) and kept as sorted code-point ranges, so misses are a binary
-search. The index records the first covering face, often a Bold cut, so
-the style is drawn from that face's family: the face for the requested
-style if it covers the character, else (for italic) the upright face at
-the requested weight, else the Regular face, each with the synthesis it
+search. The build maps each font file once and reads every face of a
+collection (`.ttc`) from that one map, unmapped when the file is done
+(#660: about 600 maps for 1,000 faces, where a map per face churned the
+Thread Sanitizer's `munmap` hook in the app's test host); a code point
+still goes to the first covering face in database order. The index
+records the first covering face, often a Bold cut, so the style is
+drawn from that face's family: the face for the requested style if it
+covers the character, else (for italic) the upright face at the
+requested weight, else the Regular face, each with the synthesis it
 needs, and only then the recorded face itself. The render path never
 builds it and never holds the `Fonts` lock while it is built; until it
 is ready, a character the chain misses draws the primary face's

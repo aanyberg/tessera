@@ -1377,14 +1377,30 @@ struct Coverage {
 }
 
 impl Coverage {
-    /// Walks every face's character map once, in database order, so each
-    /// code point maps to the first face that has a glyph for it (what a
+    /// Walks every face's character map once, so each code point maps to
+    /// the first face in database order that has a glyph for it (what a
     /// per-character linear search would find).
     fn build(db: &fontdb::Database) -> Self {
+        Self::build_counting_maps(db).0
+    }
+
+    /// [`Self::build`], also returning how many font files it memory
+    /// mapped. It reads each file through one call to fontdb's
+    /// `with_face_data`, which maps a file-backed source for the call and
+    /// unmaps it after: every face of a collection (`.ttc`) is read from
+    /// that one map, not mapped again per face (#660: each map and unmap
+    /// costs the Thread Sanitizer's shadow-memory hooks, which crashed the
+    /// app's test host). Nothing outlives the build: each map is gone when
+    /// its file is done.
+    fn build_counting_maps(db: &fontdb::Database) -> (Self, usize) {
         let started = std::time::Instant::now();
         let mut faces: Vec<fontdb::ID> = Vec::new();
-        // Index into `faces` per code point; `u32::MAX` = uncovered.
-        let mut owner = vec![u32::MAX; CODE_SPACE];
+        // One entry per face: (its source, index into `faces`, face index
+        // in the source). A source is named by the index of its first face:
+        // one per font file, keyed by path, and one per face for data held
+        // in memory (`Source::Binary`), which needs no map.
+        let mut members: Vec<(u32, u32, u32)> = Vec::new();
+        let mut by_path: HashMap<&std::path::Path, u32> = HashMap::new();
         for info in db.faces() {
             let forbidden = info.families.iter().any(|(name, _)| {
                 FORBIDDEN_FAMILIES
@@ -1398,20 +1414,47 @@ impl Coverage {
                 break;
             };
             faces.push(info.id);
-            db.with_face_data(info.id, |data, face_index| {
-                let Some(font) = swash::FontRef::from_index(data, face_index as usize) else {
-                    return;
-                };
-                font.charmap().enumerate(|cp, glyph| {
-                    if glyph != 0
-                        && let Some(slot) = owner.get_mut(cp as usize)
-                        && *slot == u32::MAX
-                    {
-                        *slot = index;
-                    }
-                });
+            let source = match &info.source {
+                fontdb::Source::File(path) | fontdb::Source::SharedFile(path, _) => {
+                    *by_path.entry(path.as_path()).or_insert(index)
+                }
+                fontdb::Source::Binary(_) => index,
+            };
+            members.push((source, index, info.index));
+        }
+        drop(by_path);
+        // Each source's faces become one run, in database order.
+        members.sort_unstable();
+        // Index into `faces` per code point; `u32::MAX` = uncovered. A
+        // source can hold a face that comes after a later source's first
+        // face, so a slot takes the lowest index that covers it, not the
+        // first one written: first face wins in database order.
+        let mut owner = vec![u32::MAX; CODE_SPACE];
+        let mut maps = 0;
+        for run in members.chunk_by(|a, b| a.0 == b.0) {
+            let Some(&load_by) = run
+                .first()
+                .and_then(|&(source, _, _)| faces.get(source as usize))
+            else {
+                continue;
+            };
+            with_source_data(db, load_by, &mut maps, |data| {
+                for &(_, index, face_index) in run {
+                    let Some(font) = swash::FontRef::from_index(data, face_index as usize) else {
+                        continue;
+                    };
+                    font.charmap().enumerate(|cp, glyph| {
+                        if glyph != 0
+                            && let Some(slot) = owner.get_mut(cp as usize)
+                            && index < *slot
+                        {
+                            *slot = index;
+                        }
+                    });
+                }
             });
         }
+        drop(members);
         let mut ranges = Vec::new();
         let mut cp = 0;
         while cp < owner.len() {
@@ -1433,10 +1476,11 @@ impl Coverage {
             target: "tessera_render",
             faces = faces.len(),
             ranges = ranges.len(),
+            maps,
             elapsed = ?started.elapsed(),
             "built the fallback coverage index"
         );
-        Self { ranges }
+        (Self { ranges }, maps)
     }
 
     fn lookup(&self, ch: char) -> Option<fontdb::ID> {
@@ -1447,6 +1491,27 @@ impl Coverage {
             .filter(|&&(first, _, _)| first <= cp)
             .map(|&(_, _, id)| id)
     }
+}
+
+/// Runs `read` over the whole data of the source (font file or in-memory
+/// font) that holds face `id`, adding one to `maps` when that memory maps a
+/// file: fontdb maps a `Source::File` for the call and unmaps it after,
+/// while shared and in-memory sources are already resident.
+fn with_source_data(
+    db: &fontdb::Database,
+    id: fontdb::ID,
+    maps: &mut usize,
+    read: impl FnOnce(&[u8]),
+) {
+    if matches!(
+        db.face(id).map(|f| &f.source),
+        Some(fontdb::Source::File(_))
+    ) {
+        *maps += 1;
+    }
+    // `None` is a file that no longer opens or maps: its faces stay out of
+    // the index, as a face that fails to parse does.
+    let _ = db.with_face_data(id, |data, _| read(data));
 }
 
 /// A swash scaler for `font` at `size_px`, with the `wght` axis (if any)
@@ -2545,5 +2610,136 @@ mod tests {
         assert!((embolden_strength(1.0) - 0.33).abs() < f32::EPSILON);
         assert!((embolden_strength(24.0) - 1.0).abs() < f32::EPSILON);
         assert!((embolden_strength(500.0) - 2.0).abs() < f32::EPSILON);
+    }
+
+    /// The per-face build #660 replaced: one `with_face_data` call, so one
+    /// map of a file-backed face, per face, each slot taken by the first
+    /// face written to it. The reference the grouped build must match.
+    fn per_face_reference(db: &fontdb::Database) -> Vec<(u32, u32, fontdb::ID)> {
+        let mut faces = Vec::new();
+        let mut owner = vec![u32::MAX; CODE_SPACE];
+        for info in db.faces() {
+            if info.families.iter().any(|(name, _)| {
+                FORBIDDEN_FAMILIES
+                    .iter()
+                    .any(|f| f.eq_ignore_ascii_case(name))
+            }) {
+                continue;
+            }
+            let index = u32::try_from(faces.len()).expect("fewer than 2^32 faces");
+            faces.push(info.id);
+            db.with_face_data(info.id, |data, face_index| {
+                let Some(font) = swash::FontRef::from_index(data, face_index as usize) else {
+                    return;
+                };
+                font.charmap().enumerate(|cp, glyph| {
+                    if glyph != 0
+                        && let Some(slot) = owner.get_mut(cp as usize)
+                        && *slot == u32::MAX
+                    {
+                        *slot = index;
+                    }
+                });
+            });
+        }
+        let mut ranges = Vec::new();
+        let mut cp = 0;
+        while cp < owner.len() {
+            let (face, start) = (owner[cp], cp);
+            while cp < owner.len() && owner[cp] == face {
+                cp += 1;
+            }
+            if face != u32::MAX {
+                let first = u32::try_from(start).expect("below CODE_SPACE");
+                let last = u32::try_from(cp - 1).expect("below CODE_SPACE");
+                ranges.push((first, last, faces[face as usize]));
+            }
+        }
+        ranges
+    }
+
+    /// The distinct files behind `db`'s file-backed, non-forbidden faces,
+    /// and how many such faces there are.
+    fn file_backed(db: &fontdb::Database) -> (usize, usize) {
+        let mut paths = std::collections::HashSet::new();
+        let mut faces = 0;
+        for info in db.faces() {
+            let forbidden = info.families.iter().any(|(name, _)| {
+                FORBIDDEN_FAMILIES
+                    .iter()
+                    .any(|f| f.eq_ignore_ascii_case(name))
+            });
+            if let (false, fontdb::Source::File(path)) = (forbidden, &info.source) {
+                paths.insert(path.clone());
+                faces += 1;
+            }
+        }
+        (paths.len(), faces)
+    }
+
+    /// #660: one build of the index over the installed fonts maps each font
+    /// file once, however many faces a collection (`.ttc`) holds, and lands
+    /// the same ranges, in the same first-face-wins order, as the per-face
+    /// build it replaced.
+    #[test]
+    fn one_index_build_maps_each_font_file_once() {
+        let system = FontSystem::new();
+        let db = system.db();
+        let (files, faces) = file_backed(db);
+        assert!(
+            files < faces,
+            "the installed fonts include a collection ({files} files, {faces} faces)"
+        );
+        let (index, maps) = Coverage::build_counting_maps(db);
+        assert_eq!(maps, files, "one map per font file ({faces} faces)");
+        assert_eq!(index.ranges, per_face_reference(db));
+    }
+
+    /// A collection whose faces are not adjacent in database order: a face
+    /// removed from it leaves a slot that a later file's face fills, so
+    /// that face comes between the collection's first face and the rest.
+    /// It still wins over those later faces of the collection, as in the
+    /// per-face build; in-memory fonts are read too, without a map.
+    #[test]
+    fn a_split_collection_keeps_first_face_wins_order() {
+        const INDIA: &str = "/System/Library/Fonts/SFIndia.ttc";
+        const ARIAL: &str = "/System/Library/Fonts/Supplemental/Arial Unicode.ttf";
+        const MENLO: &str = "/System/Library/Fonts/Menlo.ttc";
+        let mut db = fontdb::Database::new();
+        db.load_font_file(INDIA).expect("SFIndia.ttc is installed");
+        let india: Vec<fontdb::ID> = db.faces().map(|f| f.id).collect();
+        assert!(india.len() > 2, "SFIndia.ttc holds one face per script");
+        // Its Devanagari face; Arial Unicode takes its slot.
+        db.remove_face(india[1]);
+        db.load_font_file(ARIAL)
+            .expect("Arial Unicode is installed");
+        db.load_font_data(std::fs::read(MENLO).expect("Menlo.ttc is installed"));
+        let order: Vec<String> = db.faces().map(|f| f.post_script_name.clone()).collect();
+        assert_eq!(
+            order.get(1).map(String::as_str),
+            Some("ArialUnicodeMS"),
+            "{order:?}"
+        );
+        assert!(
+            matches!(
+                db.faces().last().map(|f| &f.source),
+                Some(fontdb::Source::Binary(_))
+            ),
+            "{order:?}"
+        );
+
+        let (index, maps) = Coverage::build_counting_maps(&db);
+        assert_eq!(maps, 2, "SFIndia.ttc and Arial Unicode, once each");
+        let reference = per_face_reference(&db);
+        assert_eq!(index.ranges, reference);
+        // The split matters: Arial Unicode owns Tamil (U+0B95), which a
+        // later SFIndia face also covers.
+        let arial = db.faces().nth(1).map(|f| f.id);
+        assert_eq!(index.lookup('\u{0B95}'), arial);
+        assert_eq!(
+            index.lookup('\u{0995}'),
+            Some(india[0]),
+            "Bengali stays SFIndia's first face"
+        );
     }
 }
