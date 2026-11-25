@@ -158,6 +158,15 @@ search, idle heap, full-scrollback heap; the heap cases measure a `Terminal` onl
 session, and session-level growth stays with the #216 budgets) and runs the release timing bars, and a case past its bar opens or comments
 on a `type:bug` issue naming the SHA range. It never gates a PR. `just perf-job-test` checks its logic offline.
 
+What the job enforces on its GitHub runner, and what it leaves to `just check` and local runs (#682): the absolute
+wall-time budgets come from a local Mac, so the startup budget (`startup_to_the_first_frame_stays_within_its_budget`,
+99.7 ms on the runner against 19.6 ms) is skipped there; the other release timing tests and the #216 byte budgets run
+(`--no-fail-fast`, so one red test hides none). The ratio bars (instructions at most 1.02x the baseline, heap at most
+1.02x) are comparable on any machine and are enforced, except that a runner without instruction counters (a virtual
+machine) cannot back an instruction bar: those cases are recorded as `noisy` with the wall ratio and a note, and only
+the heap bars bind there. Logs of every measuring run are uploaded as the `perf-logs` artifact. A dispatch from a
+branch measures that branch, prints the issue requests instead of filing them, and saves no state.
+
 ## Adding an escape-sequence test
 
 Emulator tests in `crates/tessera-term/tests/` feed bytes into a fresh
