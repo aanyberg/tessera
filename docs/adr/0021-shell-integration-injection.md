@@ -928,3 +928,27 @@ carries the new status rule and its limits.
   prompt's entry and the first command see bash's status. E10 (the file's
   own RETURN trap) and E13 (a syntax error on 3.2) are accepted limits.
 - `SCRIPTS_VERSION` is 14.
+
+## Amendment: a `.bashrc` that sources the script itself (#676, 2026-11-25)
+
+On the `--rcfile` route the script set the startup file's status variable
+before it sourced the file, and defined `_tessera_si_rc_end` only after.
+A `.bashrc` that sources `tessera.bash` itself ran the script's end with
+that variable set and no function yet: `_tessera_si_rc_end: command not
+found` ended that `source` with 127, which exited a `set -e` shell. The
+variable is now set once the file ran (0 when there is none to read), so
+the script sourced from inside the file does none of the route's end.
+What that load does is unchanged: with the file's own
+`TESSERA_SHELL_INTEGRATION` it is the live integration (its words hold)
+and the route's load after the file is skipped; without, the injected
+words load it after the file.
+
+- Rows `rcexit` E15-E18 cover the source with and without the file's own
+  words, followed by a command, by a failing `&&` list, or as the file's
+  last line; the first prompt's entry and the first command see bash's
+  status, and no `_tessera_si_rc_` variable, function or RETURN trap is
+  left. `a_bashrc_that_sources_the_script_keeps_the_marks` checks one
+  handshake, a C and D for every command and the file's words;
+  `a_missing_startup_file_leaves_nothing_of_the_rc_end` the route without
+  a startup file.
+- `SCRIPTS_VERSION` is 15.

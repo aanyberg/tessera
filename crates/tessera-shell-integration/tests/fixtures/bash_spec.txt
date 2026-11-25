@@ -223,3 +223,12 @@ rcexit | E13 | 3.2 | PROMPT_COMMAND='s=$?; exec 2>&1; echo "pc=$s"'\nexec 2>/dev
 # `set -E` under `shopt -s nocasematch` is not `set -e` (#659 B1): the
 # trap tests the option, not `$-`.
 rcexit | E14 | 3.2 5.1 5.3 | PROMPT_COMMAND='echo "pc=$?"'\nshopt -s nocasematch\nset -E | false\necho alive | lines: pc=0 / pc=1 / alive / pc=0
+# A `.bashrc` that sources tessera.bash itself (#676), with its own
+# TESSERA_SHELL_INTEGRATION (that load is the live one) or without (the
+# injected words load it after the file): the source is harmless under
+# `set -e`, the file's end keeps its status, and nothing of the --rcfile
+# route's end is left. The script is the one the run materialised.
+rcexit | E15 | 3.2 5.1 5.3 | PROMPT_COMMAND='echo "pc=$?"'\nset -e\nTESSERA_SHELL_INTEGRATION=enabled . "$HOME"/../scripts/*/bash/tessera.bash\necho sourced | echo "st=$? e=${-//[^e]/}"\necho "rt=[$(trap -p RETURN)] v=[$(compgen -v _tessera_si_rc_)] f=[$(compgen -A function _tessera_si_rc_)]" | lines: sourced / pc=0 / st=0 e=e / pc=0 / rt=[] v=[] f=[] / pc=0
+rcexit | E16 | 3.2 5.1 5.3 | PROMPT_COMMAND='echo "pc=$?"'\nset -e\n. "$HOME"/../scripts/*/bash/tessera.bash\nfalse && true | echo "st=$? e=${-//[^e]/}"\necho "rt=[$(trap -p RETURN)] v=[$(compgen -v _tessera_si_rc_)] f=[$(compgen -A function _tessera_si_rc_)]" | lines: pc=1 / st=1 e=e / pc=0 / rt=[] v=[] f=[] / pc=0
+rcexit | E17 | 3.2 5.1 5.3 | PROMPT_COMMAND='echo "pc=$?"'\nset -e\nTESSERA_SHELL_INTEGRATION=enabled . "$HOME"/../scripts/*/bash/tessera.bash\nfalse && true | echo "st=$? e=${-//[^e]/}" | lines: pc=1 / st=1 e=e / pc=0
+rcexit | E18 | 3.2 5.1 5.3 | PROMPT_COMMAND='echo "pc=$?"'\nset -e\nTESSERA_SHELL_INTEGRATION=enabled . "$HOME"/../scripts/*/bash/tessera.bash | echo "st=$? e=${-//[^e]/}" | lines: pc=0 / st=0 e=e / pc=0
