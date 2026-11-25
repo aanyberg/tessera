@@ -122,13 +122,16 @@ pub use session::{
     tessera_session_scroll_position, tessera_session_scroll_to, tessera_session_spawn,
     tessera_session_write,
 };
-#[cfg(feature = "test-hooks")]
-#[doc(hidden)]
-pub use surface::tessera_test_surface_panic;
 pub use surface::{
     FrameStatus, SurfaceMetrics, tessera_surface_attach, tessera_surface_detach,
     tessera_surface_metrics, tessera_surface_render, tessera_surface_resize,
     tessera_surface_set_font_size,
+};
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub use surface::{
+    tessera_test_hold_font_index, tessera_test_surface_panic,
+    tessera_test_surface_shows_provisional_faces,
 };
 
 /// Returns the core version as a NUL-terminated string.

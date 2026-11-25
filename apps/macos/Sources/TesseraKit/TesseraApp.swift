@@ -68,9 +68,17 @@ public protocol TesseraAppDelegate: AnyObject {
     /// longest (the latest of equals); a command still running when the child exits is not
     /// reported. Delivered before the exit. The default does nothing.
     func session(_ session: TesseraSession, didFinishCommand finish: TesseraCommandFinish)
+    /// The core's font fallback index finished loading in the background
+    /// (#594): rows drawn before it with a provisional face (a missing-glyph
+    /// box, or a synthetic bold) are drawn again by each view's next frame,
+    /// so ask every view for one even if nothing else changed. Once per font
+    /// database the core loads. Not sent after ``TesseraApp/shutdown()``.
+    /// The default does nothing.
+    func fontIndexDidLand()
 }
 
 extension TesseraAppDelegate {
+    public func fontIndexDidLand() {}
     public func configurationDidApply(generation: UInt64) {}
     public func configurationDidNotLoad() {}
     public func session(_ session: TesseraSession, didChangeRemote remote: TesseraRemote) {}

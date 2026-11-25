@@ -68,8 +68,12 @@ is ready, a character the chain misses draws the primary face's
 `.notdef` and is not cached, so it resolves properly
 once the index appears. `Fonts::fallback_index_ready()` turns `true`
 (once, for good) when it does; a renderer that caches shaped rows (#20)
-must watch it and re-shape the rows that held `.notdef` glyphs (glyph
-id 0), or they keep the tofu until something else redraws them.
+must watch it and re-shape the rows shaped with a provisional face
+(`.notdef`, or a chain family's synthetic bold the index may beat), or
+they keep it until something else redraws them. A host that stops
+drawing while nothing changes learns that the index landed from the
+notice `Fonts::with_index_notice` takes, which the core passes on as the
+`on_font_index_ready` callback (#594, ADR 0016).
 Terminal output is untrusted, and a per-character scan of every face
 cost about 11 ms per character. Per-character results are cached, and
 the cache is emptied when it reaches 65,536 entries. Runs are then

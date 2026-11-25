@@ -644,6 +644,31 @@ final class CallbackBridgeTests: XCTestCase {
         XCTAssertEqual(recorder.loadFailures, 0)
     }
 
+    func testFontIndexLandingsReachTheDelegateCoalesced() async throws {
+        // From the font index thread (#594): a burst is one delivery. The
+        // core calls it once per font database; the bridge holds no more.
+        onReaderThread { callbacks in
+            for _ in 0..<10_000 {
+                callbacks.on_font_index_ready!(callbacks.user_data)
+            }
+        }
+        _ = try await drained()
+        XCTAssertEqual(recorder.fontIndexLandings, 1, "10 000 callbacks, one delivery")
+        onReaderThread { callbacks in callbacks.on_font_index_ready!(callbacks.user_data) }
+        _ = try await drained()
+        XCTAssertEqual(recorder.fontIndexLandings, 2, "a later landing is a new delivery")
+        XCTAssertEqual(recorder.appearances, [], "an appearance change is a callback of its own")
+        XCTAssertEqual(recorder.loadFailures, 0)
+        XCTAssertEqual(recorder.events[session.id, default: []], [], "no session event")
+    }
+
+    func testFontIndexLandingsAfterShutdownAreDropped() async throws {
+        onReaderThread { callbacks in callbacks.on_font_index_ready!(callbacks.user_data) }
+        bridge.shutDown()
+        _ = try await drained()
+        XCTAssertEqual(recorder.fontIndexLandings, 0)
+    }
+
     func testEveryStatusMapsToItsCase() {
         let cases: [(TesseraError, TesseraCoreError?)] = [
             (TESSERA_ERROR_OK, nil),

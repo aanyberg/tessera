@@ -331,6 +331,7 @@ impl Handle {
             on_session_remote: None,
             on_config_invalid: None,
             on_session_command_finished: None,
+            on_font_index_ready: None,
         };
         // SAFETY: live handle; valid table; `outputs` outlives the handle.
         assert_eq!(

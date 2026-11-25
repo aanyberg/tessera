@@ -771,6 +771,13 @@ impl View {
         self.renderer.set_theme(theme);
     }
 
+    /// Whether a row the renderer shows was shaped with a provisional face
+    /// (tests).
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn shows_provisional_faces(&self) -> bool {
+        self.renderer.shows_provisional_faces()
+    }
+
     /// The compositing modes the surface supports; `None` for an
     /// offscreen view.
     #[cfg(any(test, feature = "test-hooks"))]

@@ -755,6 +755,13 @@ impl SessionObserver for Tee {
             inner.on_config_invalid();
         }
     }
+
+    /// Nothing for the plugins: only the frontend draws.
+    fn on_font_index_ready(&self) {
+        if let Some(inner) = &self.inner {
+            inner.on_font_index_ready();
+        }
+    }
 }
 
 /// A plugin's storage, in memory only (ADR 0047).

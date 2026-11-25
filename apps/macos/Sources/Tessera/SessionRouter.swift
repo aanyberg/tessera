@@ -90,6 +90,14 @@ final class SessionRouter: TesseraAppDelegate {
         }
     }
 
+    /// The font fallback index landed: every view draws a frame, which
+    /// redraws the rows it showed with a provisional face (#594).
+    func fontIndexDidLand() {
+        for (id, entry) in controllers {
+            entry.controller?.panes.first { $0.session.id == id }?.view.fontIndexDidLand()
+        }
+    }
+
     /// A configuration was applied: its `[keys]` may move menu shortcuts.
     func configurationDidApply(generation: UInt64) {
         onConfigurationApplied?()

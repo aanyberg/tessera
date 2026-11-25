@@ -312,11 +312,24 @@ impl Renderer {
         self.stats
     }
 
+    /// Whether a row on screen was shaped with a provisional face that the
+    /// fallback index may change (test-only, feature `test-hooks`).
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn shows_provisional_faces(&self) -> bool {
+        self.rows.iter().any(|r| r.pending_fallback)
+    }
+
     /// True when the next frame must be drawn even if nothing in it
     /// changed: no frame has been drawn yet (or the last one failed, or
     /// the theme changed), or the fallback font index became ready while a
-    /// row shows a `.notdef` glyph that it may now resolve (ADR 0007). A
-    /// host that skips frames without damage asks this first.
+    /// row shows a provisional face (`.notdef`, or a chain family's
+    /// synthetic bold the index may beat) that it may now resolve (ADR
+    /// 0007). A host that skips frames without damage asks this first; a
+    /// host that stops asking while nothing changes learns that the index
+    /// landed from the callback the fonts were loaded with
+    /// ([`crate::Fonts::with_index_notice`]).
     #[must_use]
     pub fn needs_redraw(&self) -> bool {
         self.built.is_none()
@@ -338,8 +351,10 @@ impl Renderer {
     /// change of layout (target size, font size, padding), theme or row
     /// count, a failed frame, or [`DamageRows::All`]. The cursor, focus,
     /// clear color, selection and overlays need no damage: a row whose
-    /// highlights changed rebuilds them alone. A row showing a `.notdef`
-    /// glyph is shaped again once the fallback font index is ready.
+    /// highlights changed rebuilds them alone. A row shaped with a
+    /// provisional face (`.notdef`, or a chain family's synthetic bold the
+    /// index may beat) is shaped again once the fallback font index is
+    /// ready.
     ///
     /// When the atlas runs out of room mid-frame it is reset once and the
     /// frame rebuilt ([`crate::GlyphAtlas::recover_from_full`]).
@@ -1187,7 +1202,11 @@ mod tests {
         };
         let before = glyph(&renderer);
         if !before.synthetic_bold || before.glyph_id == 0 {
-            eprintln!("skipping: a chain family has a bold U+24F5 here: {before:?}");
+            // The host's fonts do not fit the probe: a skip nextest shows
+            // (`success-output` in .config/nextest.toml), not a silent pass.
+            eprintln!(
+                "SKIP a_synthetic_bold_row_is_reshaped_with_the_real_bold_when_the_index_lands: a chain family has a bold U+24F5 here: {before:?}"
+            );
             return;
         }
         assert!(renderer.rows[0].pending_fallback, "{before:?}");
@@ -1202,7 +1221,9 @@ mod tests {
             .copied()
             .expect("a glyph for U+24F5");
         if real.synthetic_bold {
-            eprintln!("skipping: the index has no real bold U+24F5 here: {real:?}");
+            eprintln!(
+                "SKIP a_synthetic_bold_row_is_reshaped_with_the_real_bold_when_the_index_lands: the index has no real bold U+24F5 here: {real:?}"
+            );
             return;
         }
         let shaped = renderer.stats().rows_shaped;
@@ -1242,7 +1263,10 @@ mod tests {
         renderer.shaper().fonts().build_index_now();
         let expected = renderer.shaper.shape_line(&row);
         if before == 0 || expected.iter().filter(|g| g.glyph_id == 0).count() == before {
-            eprintln!("skipping: the index covers none of the probes the chain lacks");
+            // As above: a skip nextest shows.
+            eprintln!(
+                "SKIP a_notdef_row_is_reshaped_with_the_covering_face_when_the_index_lands: the index covers none of the probes the chain lacks"
+            );
             return;
         }
         assert!(renderer.rows[0].pending_fallback);

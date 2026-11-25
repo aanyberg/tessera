@@ -15,6 +15,9 @@ protocol TerminalContentView: NSView {
     /// The core re-styled the views: read the session's appearance again,
     /// make the window opaque or translucent to match its panes and redraw.
     func appearanceDidChange()
+    /// The core's font fallback index landed: draw a frame, which redraws
+    /// rows shown with a provisional face (#594).
+    func fontIndexDidLand()
 }
 
 /// What a ``TerminalWindowController`` asks of the application.

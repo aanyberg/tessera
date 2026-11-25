@@ -79,6 +79,7 @@ fn install(app: *mut App, sender: &Sender<bool>) {
         on_session_remote: None,
         on_config_invalid: None,
         on_session_command_finished: None,
+        on_font_index_ready: None,
     };
     // SAFETY: live handle and a valid table; `sender` outlives the app.
     assert_eq!(

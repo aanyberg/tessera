@@ -35,12 +35,10 @@ pub enum FrameStatus {
     /// Nothing was drawn because nothing changed since the last presented
     /// frame. Nothing is pending: the host need not render again until
     /// something gives it a frame to draw (new output (`on_output`), input,
-    /// a resize, a focus or font-size change, or a re-theme
-    /// (`on_appearance_changed`)), and may pause its display link until
-    /// then. One known gap: a row showing a missing glyph can become
-    /// drawable when the fallback font index finishes loading in the
-    /// background, with no callback; it is drawn by the next frame the host
-    /// renders for another reason.
+    /// a resize, a focus or font-size change, a re-theme
+    /// (`on_appearance_changed`), or the font fallback index landing
+    /// (`on_font_index_ready`), whose next frame draws again the rows shown
+    /// with a provisional face), and may pause its display link until then.
     Skipped = 2,
     /// Nothing was drawn because the call came too soon after the frames
     /// before it (more than 240 frames per second, or a third call within
@@ -545,6 +543,75 @@ pub unsafe extern "C" fn tessera_test_surface_panic(app: *mut App) -> Error {
         };
         app.core.panic_holding_view_lock();
         Error::Ok
+    })
+}
+
+/// Holds (`hold` true) or releases (false) every font fallback index that
+/// finishes building, process-wide, and on holding forgets `app`'s font
+/// database, so the next `tessera_surface_attach` loads one whose index
+/// lands (and calls `on_font_index_ready`) only once released (#594).
+/// Surfaces attached before keep their fonts. Release before freeing the
+/// last application, or a held index thread waits for good.
+///
+/// Test-only (feature `test-hooks`): exported to C only by a core built
+/// with that feature, and absent from the header (a test declares it).
+///
+/// # Safety
+///
+/// `app` must be `NULL` or a live handle from `tessera_app_new`.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tessera_test_hold_font_index(app: *mut App, hold: bool) -> Error {
+    ffi_guard!("tessera_test_hold_font_index", {
+        // SAFETY: the caller passes NULL or a live handle.
+        let Some(app) = (unsafe { App::from_ptr(app) }) else {
+            return Error::NullPointer;
+        };
+        app.core.hold_font_index(hold);
+        Error::Ok
+    })
+}
+
+/// Writes to `*out` whether session `session_id`'s surface shows a row
+/// shaped with a provisional face that the font fallback index may change
+/// (#594).
+///
+/// Test-only (feature `test-hooks`): exported to C only by a core built
+/// with that feature, and absent from the header (a test declares it).
+/// Returns `TESSERA_ERROR_NULL_POINTER` if `app` or `out` is `NULL`, and
+/// `TESSERA_ERROR_NO_SURFACE` without a surface.
+///
+/// # Safety
+///
+/// `app` must be `NULL` or a live handle; `out` `NULL` or writable.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tessera_test_surface_shows_provisional_faces(
+    app: *mut App,
+    session_id: u64,
+    out: *mut bool,
+) -> Error {
+    ffi_guard!("tessera_test_surface_shows_provisional_faces", {
+        if out.is_null() {
+            return Error::NullPointer;
+        }
+        // SAFETY: the caller passes NULL or a live handle.
+        let Some(app) = (unsafe { App::from_ptr(app) }) else {
+            return Error::NullPointer;
+        };
+        match app
+            .core
+            .view_shows_provisional_faces(SessionId::from_raw(session_id))
+        {
+            Some(shows) => {
+                // SAFETY: non-null and writable per the contract.
+                unsafe { out.write(shows) };
+                Error::Ok
+            }
+            None => Error::NoSurface,
+        }
     })
 }
 

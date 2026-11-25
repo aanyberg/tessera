@@ -318,6 +318,22 @@ pub trait SessionObserver: Send + Sync {
     /// again, the configuration applied clears the error. Does nothing by
     /// default.
     fn on_config_invalid(&self) {}
+
+    /// The font fallback index finished loading in the background (#594):
+    /// rows a view drew with a provisional face (a `.notdef`, or a chain
+    /// family's synthetic bold the index may beat) are drawn again by that
+    /// view's next frame, which the host must now ask for even when nothing
+    /// else changed (a host whose display link idles would otherwise keep
+    /// them until the next output). Called once per font database the
+    /// process loads (the first view's), on the index's own thread with no
+    /// lock of the `App` held but the observer slot's (if that thread cannot
+    /// be spawned: on the thread attaching that view, before the attach
+    /// returns, with the `App`'s font slot, its views lock and the observer
+    /// slot's read lock all held, so a call back into the `App` from there
+    /// deadlocks), under the rules of
+    /// [`SessionObserver::on_appearance_changed`]; not called if the index
+    /// lands while no observer is installed. Does nothing by default.
+    fn on_font_index_ready(&self) {}
 }
 
 impl<F> SessionObserver for F

@@ -146,3 +146,9 @@ slow-timeout = { period = "60s", terminate-after = 10 }
 [[profile.default.overrides]]
 filter = 'package(tessera-ffi) & binary(surface)'
 slow-timeout = { period = "60s", terminate-after = 10 }
+
+# The #555 renderer tests skip when the host's fonts do not fit their probe characters (#594): their `SKIP` line goes
+# to the log at the end of the run, where a passing test's output is otherwise hidden.
+[[profile.default.overrides]]
+filter = 'package(tessera-render) & kind(lib) & (test(=renderer::tests::a_synthetic_bold_row_is_reshaped_with_the_real_bold_when_the_index_lands) | test(=renderer::tests::a_notdef_row_is_reshaped_with_the_covering_face_when_the_index_lands))'
+success-output = "final"

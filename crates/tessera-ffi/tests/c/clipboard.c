@@ -16,7 +16,7 @@
 #include "TesseraCore.h"
 
 /* Appended after on_appearance_changed (#9); remote.c checks the table's
- * last field (on_config_invalid, #547). */
+ * last field (on_font_index_ready, #594). */
 _Static_assert(offsetof(TesseraCallbacks, on_session_clipboard) ==
                    offsetof(TesseraCallbacks, on_appearance_changed) + sizeof(void (*)(void)),
                "on_session_clipboard follows on_appearance_changed");

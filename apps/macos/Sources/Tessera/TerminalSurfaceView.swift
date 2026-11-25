@@ -575,6 +575,16 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
         updateDisplayLinkPause()
     }
 
+    /// One frame for the rows drawn before the font index landed; a view
+    /// with none to redraw gets a skipped frame, and the link idles again.
+    func fontIndexDidLand() {
+        needsRender = true
+    }
+
+    /// Whether a frame is pending (tests only: the display link idles once
+    /// it is drawn).
+    var isRenderPending: Bool { needsRender }
+
     /// The core re-styled the views (a live edit of the configuration or of
     /// the theme in use, or new display options): the pane reads its
     /// session's appearance again, the window follows every pane
