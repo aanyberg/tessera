@@ -295,7 +295,7 @@ case (a new link every cell) is one entry per column, as before.
 - Speed, `cargo xtask ab` against the merge base, an 80x24 terminal fed in
   4 KiB chunks, each corpus line plus CRLF repeated 60 000 to 120 000 times,
   plain and inside one OSC 8 link; retired instructions head/base and wall
-  time head/base, best of 15 interleaved pairs: 
+  time head/base, best of 15 interleaved pairs:
 
   | line | plain instr | plain wall | linked instr | linked wall |
   | --- | --- | --- | --- | --- |
@@ -313,10 +313,72 @@ case (a new link every cell) is one entry per column, as before.
 
   The worst case, a new `id`'d link for every cell (1 MiB of OSC 8): 1.002
   instructions printed across fresh lines, 1.075 when every cell of one line
-  is rewritten under a new link (a removal and an insertion per cell where
-  the per-column table did one of each in place)..
+  is rewritten under a new link. Both tables remove the cell's old link and
+  then write the new one (`Line::set` clears the cell first), so the
+  operations match; the run table's extra 7.5 % is its searches: about five
+  binary searches per cell (finding the run, both ends of the removal's
+  overlap, the write's overlap and its insertion point) where the per-column
+  table did two, plus the two neighbour checks that keep adjacent runs
+  merged.
 - 20 000 seeds of random edit sequences with OSC 8 opens and closes (every
   edit listed above, resizes, the alternate screen, RIS, margins) give the
   same link at every cell, the same live-link count and the same grid on
   both sides.
 - `copy_span`, DECCRA and reflow now move links a run at a time.
+
+## Amendment: edits merge only at their edges (#619, 2026-11-24)
+
+ICH and DCH (`LinkColumns::shift_right` and `delete`) and the copies between
+lines (`copy_span`: SU, SD, IL and DL between DECSLRM margins) used to cut
+runs at the edit's edges and then run a merge pass over every run of the
+line, O(runs) per edit, so a line with a link per cell paid a pass over its
+80 to 2048 runs for every inserted or deleted character. Now each edit
+splits at most the runs crossing its edges (two binary searches), moves or
+drops the runs between them, and checks for a merge only where two pieces of
+one link can meet again: `end` after an insertion, `at` after a deletion,
+and the two edges of a copied span. A copy trims the runs crossing the
+span's edges in place, as a removal does (a run holding the whole span keeps
+its head there and its tail goes in after the copied runs), lets a copied
+run that joins a neighbour at an edge extend that neighbour, and puts the
+rest of the source line's runs, clipped to the span, in with one
+`Vec::splice`, in place of a removal and a write per source run. The table
+so never holds more runs than the result, and a full table grows only where
+the result needs the room. The cost is O(log runs) plus the runs moved (S6);
+the caps (S5) are unchanged, and the tables hold the same runs as before at
+every step (a proptest against the old full merge pass, 3000 cases, and
+20 000 seeds of `cargo xtask ab diff` over OSC 8, ICH, DCH, ECH, EL, IL, DL,
+DECIC, DECDC, DECCRA, DECSTBM and SU/SD under DECSLRM, with
+`check_invariants` after every step).
+
+- Speed, `cargo xtask ab` against the merge base, retired instructions
+  head/base (the gating metric; wall time was measured at a load of 80-97
+  on a shared machine and is reported as cycles), best of 15 interleaved
+  pairs (the SU/SD row after the copy stopped cutting runs ahead of the
+  splice, at a load of 41):
+
+  | case | instructions | cycles |
+  | --- | --- | --- |
+  | ICH/DCH, a link per cell, 80 columns | 0.540 | 0.868 |
+  | ICH/DCH, a link per cell, 2048 columns | 0.308 | 0.383 |
+  | SU/SD between DECSLRM margins, 24x2048, a link per cell | 0.081 | 0.102 |
+  | ICH/DCH under one link, 80 columns | 0.988 | 0.888 |
+  | ICH/DCH under one link, 2048 columns | 0.998 | 0.998 |
+
+  Each corpus line of the #411 bench (80x24, 4 KiB chunks), printed and then
+  edited with DCH and ICH 8 cells in, plain and inside one link: plain
+  0.999-1.001 instructions, linked 0.997-1.000.
+- Memory, measured against the merge base: a counting-allocator probe over
+  every corpus line (plain, under one link, a link per character; then
+  ICH/DCH, then SU/SD between margins) gives the same heap on both sides in
+  all 99 cases, as do rows of eight 10-cell links (a full table) mixed with
+  rows under one link, scrolled once between margins 6 and 75, and a
+  24x2048 screen of a link per cell scrolled between margins and then given
+  one more link per row (3 543 984 bytes). A copy that outgrows a table
+  grows it by doubling, as writing its runs one at a time does: reserving
+  just the splice's need left an odd size that the next link doubled, about
+  twice the link heap at 24x2048. `tests/reset.rs` bars a linked row's table at twice
+  its runs' 16 bytes plus the header, checks that the edits allocate no
+  more over linked rows than over plain ones, that a scroll between
+  margins over full tables whose result fits allocates nothing, that one
+  over plain rows allocates nothing, and that a copy of 30 runs into a
+  table with room for 4 leaves room for the 32nd run, as main does.

@@ -203,6 +203,8 @@ impl Hyperlink {
     /// alive. Cells whose links are the same entity underline together.
     #[must_use]
     pub fn same_link(&self, other: &Self) -> bool {
+        #[cfg(test)]
+        tests::count_compare();
         Arc::ptr_eq(&self.0, &other.0)
     }
 }
@@ -366,9 +368,12 @@ fn has_control(uri: &str) -> bool {
 }
 
 /// `v` as a column. Every caller passes a column or length already known
-/// to fit (inside a run, or checked against `u16::MAX` on entry).
+/// to fit (inside a run, or checked against `u16::MAX` on entry); a debug
+/// build checks it, a release build caps at `u16::MAX`.
 fn col16(v: usize) -> u16 {
-    u16::try_from(v).unwrap_or(u16::MAX)
+    let col = u16::try_from(v);
+    debug_assert!(col.is_ok(), "link column or length {v} past u16::MAX");
+    col.unwrap_or(u16::MAX)
 }
 
 /// One run of linked cells: `len` columns from `col`, all of one entity.
@@ -602,33 +607,32 @@ impl LinkColumns {
     }
 
     /// Ends a run at `col`: a run that holds `col` past its first column
-    /// is split in two there.
+    /// is split in two there (the reference edits of the tests).
+    #[cfg(test)]
     fn split_at(&mut self, col: usize) {
         let Some(i) = self.find(col) else {
             return;
         };
-        let run = &mut self.0[i];
-        if run.start() == col {
-            return;
+        if self.0[i].start() != col {
+            self.split_run(i, col);
         }
-        let rest = Run {
-            col: col16(col),
-            len: col16(run.end() - col),
-            link: run.link.clone(),
-        };
-        run.len = col16(col - run.start());
-        self.0.insert(i + 1, rest);
     }
 
-    /// Joins every two adjacent runs of one entity.
-    fn merge_adjacent(&mut self) {
-        self.0.dedup_by(|next, prev| {
-            let joins = prev.end() == next.start() && prev.link.same_link(&next.link);
-            if joins {
-                prev.len = col16(next.end() - prev.start());
-            }
-            joins
-        });
+    /// Joins run `i` to run `i - 1` when they touch and share an entity:
+    /// the one boundary check an edit makes where it may have brought two
+    /// pieces of one link together (#619), instead of a pass over every
+    /// run.
+    fn merge_at(&mut self, i: usize) {
+        if i == 0 || i >= self.0.len() {
+            return;
+        }
+        let (prev, next) = (&self.0[i - 1], &self.0[i]);
+        if prev.end() == next.start() && prev.link.same_link(&next.link) {
+            let end = next.end();
+            let prev = &mut self.0[i - 1];
+            prev.len = col16(end - prev.start());
+            self.0.remove(i);
+        }
     }
 
     /// Keeps the links whose column `keep` accepts (asked once per linked
@@ -693,55 +697,254 @@ impl LinkColumns {
     /// Moves the links at columns `from..end` right by `n` (insertion of
     /// `n` cells at `from` that shifts cells up to `end`), dropping those
     /// that land at or past `end`. Links at `end` and beyond stay.
+    ///
+    /// Touches only the runs inside `from..end` and the two it may split
+    /// there; the one place two pieces of a link can meet again is `end`
+    /// (the moved part of a run cut there and the part that stays), so
+    /// that is the one boundary checked for a merge (S6: O(log runs) plus
+    /// the runs moved).
     pub(crate) fn shift_right(&mut self, from: usize, n: usize, end: usize) {
         if self.0.is_empty() || n == 0 || from >= end {
             return;
         }
-        // Every run then lies wholly before `from`, inside `from..end` or
-        // from `end` on.
-        self.split_at(from);
-        self.split_at(end);
-        self.0.retain_mut(|r| {
-            let start = r.start();
-            if start < from || start >= end {
-                return true;
+        // The runs `i..j` then lie inside `from..end`: the ones before
+        // and after it do not move.
+        let (i, j) = self.cut_out(from, end);
+        // Of them, `i..k` start short of `end` once moved and stay, the
+        // rest fall off.
+        let k = i + self.0[i..j].partition_point(|r| r.start() + n < end);
+        for run in &mut self.0[i..k] {
+            run.col = col16(run.start() + n);
+        }
+        // Only the last run kept can reach past `end`: the ones before it
+        // end where it starts or earlier.
+        if k > i {
+            let run = &mut self.0[k - 1];
+            if run.end() > end {
+                run.len = col16(end - run.start());
             }
-            let moved = start + n;
-            if moved >= end {
-                return false;
-            }
-            // Cut at `end`: `moved < end`, so some of it is left.
-            r.len = col16((r.end() + n).min(end) - moved);
-            r.col = col16(moved);
-            true
-        });
-        self.merge_adjacent();
+        }
+        if k < j {
+            self.0.drain(k..j);
+        }
+        self.merge_at(k);
     }
 
     /// Removes the links at columns `at..at + n` and moves the ones after
     /// them, up to `end`, left by `n` (deletion of `n` cells at `at` that
     /// shifts cells up to `end`). Links at `end` and beyond stay.
+    ///
+    /// Touches only the runs inside `at..end` and the three it may split
+    /// there; the one place two pieces of a link can meet again is `at`
+    /// (the part before the deletion and the first part moved onto it), so
+    /// that is the one boundary checked for a merge (S6: O(log runs) plus
+    /// the runs moved).
     pub(crate) fn delete(&mut self, at: usize, n: usize, end: usize) {
         if self.0.is_empty() || n == 0 || at >= end {
             return;
         }
         let cut = at.saturating_add(n).min(end);
-        self.split_at(at);
-        self.split_at(cut);
-        self.split_at(end);
-        self.0.retain_mut(|r| {
-            let start = r.start();
-            if start < at || start >= end {
-                true
-            } else if start < cut {
-                false
-            } else {
-                // `start - n >= at`: `start >= cut = at + n` here.
-                r.col = col16(start - n);
-                true
+        // The runs `i..j` then lie inside `at..end`; of them, `i..k` hold
+        // a column of the deleted `at..cut` and `k..j` lie inside the
+        // moved `cut..end`.
+        let (i, j) = self.cut_out(at, end);
+        let mut k = i + self.0[i..j].partition_point(|r| r.start() < cut);
+        if k > i {
+            // A run reaching past `cut` keeps its part from `cut` on.
+            let run = &mut self.0[k - 1];
+            if run.end() > cut {
+                run.len = col16(run.end() - cut);
+                run.col = col16(cut);
+                k -= 1;
             }
-        });
-        self.merge_adjacent();
+        }
+        for run in &mut self.0[k..j] {
+            // `start - n >= at`: a moved run starts at `cut = at + n` or
+            // later (none moves when `cut` is `end`).
+            run.col = col16(run.start() - n);
+        }
+        if i < k {
+            self.0.drain(i..k);
+        }
+        self.merge_at(i);
+    }
+
+    /// Splits the runs that cross `start` or `end` there and returns the
+    /// index range of the runs then inside `start..end` (`start < end`):
+    /// two binary searches and at most two insertions.
+    fn cut_out(&mut self, start: usize, end: usize) -> (usize, usize) {
+        let mut i = self.0.partition_point(|r| r.end() <= start);
+        if self.0.get(i).is_some_and(|r| r.start() < start) {
+            self.split_run(i, start);
+            i += 1;
+        }
+        let j = i + self.0[i..].partition_point(|r| r.start() < end);
+        if j > i && self.0[j - 1].end() > end {
+            self.split_run(j - 1, end);
+        }
+        (i, j)
+    }
+
+    /// Splits run `i` in two at `col`, which lies inside it past its
+    /// first column.
+    fn split_run(&mut self, i: usize, col: usize) {
+        let run = &mut self.0[i];
+        let rest = Run {
+            col: col16(col),
+            len: col16(run.end() - col),
+            link: run.link.clone(),
+        };
+        run.len = col16(col - run.start());
+        self.0.insert(i + 1, rest);
+    }
+
+    /// The runs that hold a column of `span`, uncut (the first and the
+    /// last may reach past it).
+    pub(crate) fn runs_in(&self, span: Range<usize>) -> &[Run] {
+        let i = self.0.partition_point(|r| r.end() <= span.start);
+        let j = i + self.0[i..].partition_point(|r| r.start() < span.end);
+        &self.0[i..j]
+    }
+
+    /// Replaces the links of the columns in `span` with `runs` cut to
+    /// `span`: the copy of a span of cells from another line, whose
+    /// [`LinkColumns::runs_in`] `runs` is (sorted, apart, adjacent ones of
+    /// different entities).
+    ///
+    /// The runs crossing the edges of `span` are trimmed in place, as
+    /// [`LinkColumns::remove_range`] does (a run holding all of `span`
+    /// keeps its head there and its tail goes in after the copied runs),
+    /// and a copied run that joins a neighbour at an edge extends that
+    /// neighbour instead of going in. Then one splice puts in what is
+    /// left, so the table never holds more runs than the result, and
+    /// never grows where removing and writing the runs one by one would
+    /// not (#619). Only the two edges of `span` are checked for a merge
+    /// (S6: O(log runs) plus the runs replaced and moved).
+    pub(crate) fn replace_span(&mut self, span: Range<usize>, runs: &[Run]) {
+        if span.is_empty() {
+            return;
+        }
+        let (start, end) = (span.start, span.end);
+        let clip = |r: &Run| {
+            let col = r.start().max(start);
+            Run {
+                col: col16(col),
+                len: col16(r.end().min(end) - col),
+                link: r.link.clone(),
+            }
+        };
+        // The runs `i..j` overlap `span`; `lo..hi` of them go.
+        let i = self.0.partition_point(|r| r.end() <= start);
+        let j = i + self.0[i..].partition_point(|r| r.start() < end);
+        let (mut lo, mut hi) = (i, j);
+        // The tail of a run that holds all of `span`, the piece after it.
+        let mut rest = None;
+        if i < j {
+            let head = self.0[i].start() < start;
+            let tail = self.0[j - 1].end() > end;
+            if head && tail && i + 1 == j {
+                let run = &mut self.0[i];
+                rest = Some(Run {
+                    col: col16(end),
+                    len: col16(run.end() - end),
+                    link: run.link.clone(),
+                });
+                run.len = col16(start - run.start());
+                lo += 1;
+            } else {
+                if head {
+                    let run = &mut self.0[i];
+                    run.len = col16(start - run.start());
+                    lo += 1;
+                }
+                if tail {
+                    let run = &mut self.0[j - 1];
+                    run.len = col16(run.end() - end);
+                    run.col = col16(end);
+                    hi -= 1;
+                }
+            }
+        }
+        // The copied runs `a..b` go in; one that joins the run before or
+        // after `span` extends it instead.
+        let (mut a, mut b) = (0, runs.len());
+        if a < b && lo > 0 {
+            let first = clip(&runs[a]);
+            let prev = &mut self.0[lo - 1];
+            if prev.end() == first.start() && prev.link.same_link(&first.link) {
+                prev.len = col16(first.end() - prev.start());
+                a += 1;
+            }
+        }
+        // The run after `span` is the tail kept aside, or else run `hi`.
+        if a < b {
+            let last = clip(&runs[b - 1]);
+            let next = match rest.as_mut() {
+                Some(run) => Some(run),
+                None => self.0.get_mut(hi),
+            };
+            if let Some(next) = next
+                && last.end() == next.start()
+                && last.link.same_link(&next.link)
+            {
+                next.len = col16(next.end() - last.start());
+                next.col = col16(last.start());
+                b -= 1;
+            }
+        } else if a > 0 {
+            // The one copied run joined the run before: that run may now
+            // reach the one after.
+            let prev = &self.0[lo - 1];
+            let joined = rest
+                .as_ref()
+                .or_else(|| self.0.get(hi))
+                .filter(|next| prev.end() == next.start() && prev.link.same_link(&next.link))
+                .map(Run::end);
+            if let Some(next_end) = joined {
+                let prev = &mut self.0[lo - 1];
+                prev.len = col16(next_end - prev.start());
+                if rest.take().is_none() {
+                    hi += 1;
+                }
+            }
+        }
+        // A splice that outgrows the room would reserve just what it
+        // needs, and the next insertion double that; grow the room as
+        // writing the runs one at a time would, doubling, so the table
+        // never ends larger than that would leave it (#619).
+        let needed = self.0.len() - (hi - lo) + (b - a) + usize::from(rest.is_some());
+        if needed > self.0.capacity() {
+            self.grow_to(needed);
+        }
+        // Only the first and the last copied run can reach past `span`:
+        // the others go in as they are and those two are cut after.
+        let copied = runs[a..b].iter().cloned();
+        // A chained iterator costs a check per run: only the one case that
+        // has a tail to put in after the copy pays it.
+        match rest {
+            Some(rest) => drop(self.0.splice(lo..hi, copied.chain(Some(rest)))),
+            None => drop(self.0.splice(lo..hi, copied)),
+        }
+        if a < b {
+            for k in [lo, lo + (b - a) - 1] {
+                let run = &mut self.0[k];
+                let col = run.start().max(start);
+                run.len = col16(run.end().min(end) - col);
+                run.col = col16(col);
+            }
+        }
+    }
+
+    /// Grows the room to hold `needed` runs by doubling, from at least 4,
+    /// as a run of single insertions would.
+    #[cold]
+    #[inline(never)]
+    fn grow_to(&mut self, needed: usize) {
+        let mut room = self.0.capacity().max(4);
+        while room < needed {
+            room = room.saturating_mul(2);
+        }
+        self.0.reserve_exact(room - self.0.len());
     }
 
     /// Removes every run and hands them out, by ascending column.
@@ -1274,7 +1477,32 @@ mod tests {
         Retain(u64),
         ShiftRight(usize, usize, usize),
         Delete(usize, usize, usize),
+        /// Copies columns `start..start + len` from the table that
+        /// [`source_cells`] builds from the seed.
+        CopySpan(u64, usize, usize),
         Take,
+    }
+
+    /// The per-cell model of a copy source: two bits of `seed` per column
+    /// pick link 0, 1, 2 or none.
+    fn source_cells(seed: u64) -> Vec<Option<usize>> {
+        (0..WIDTH)
+            .map(|c| match seed >> (2 * (c % 32)) & 3 {
+                3 => None,
+                l => Some(usize::try_from(l).unwrap()),
+            })
+            .collect()
+    }
+
+    /// The run table of `cells`, written cell by cell.
+    fn source_table(cells: &[Option<usize>], links: &[Hyperlink]) -> LinkColumns {
+        let mut t = LinkColumns::default();
+        for (c, l) in cells.iter().enumerate() {
+            if let Some(l) = l {
+                t.set(c, &links[*l]);
+            }
+        }
+        t
     }
 
     fn op() -> impl proptest::strategy::Strategy<Value = Op> {
@@ -1289,7 +1517,9 @@ mod tests {
             1 => any::<u64>().prop_map(Op::Retain),
             2 => (col.clone(), 0usize..6, col.clone())
                 .prop_map(|(c, n, e)| Op::ShiftRight(c, n, e)),
-            2 => (col.clone(), 0usize..6, col).prop_map(|(c, n, e)| Op::Delete(c, n, e)),
+            2 => (col.clone(), 0usize..6, col.clone()).prop_map(|(c, n, e)| Op::Delete(c, n, e)),
+            3 => (any::<u64>(), col, 0usize..WIDTH + 2)
+                .prop_map(|(seed, c, n)| Op::CopySpan(seed, c, n)),
             1 => Just(Op::Take),
         ]
     }
@@ -1344,6 +1574,11 @@ mod tests {
                     }
                 }
             }
+            Op::CopySpan(seed, start, len) => {
+                let src = source_cells(seed);
+                let span = start.min(width)..(start + len).min(width);
+                model[span.clone()].copy_from_slice(&src[span]);
+            }
             Op::Take => model.fill(None),
         }
     }
@@ -1385,6 +1620,11 @@ mod tests {
                         if at < end {
                             t.delete(at, n, end);
                         }
+                    }
+                    Op::CopySpan(seed, start, len) => {
+                        let src = source_table(&source_cells(seed), &links);
+                        let span = start..(start + len).min(WIDTH);
+                        t.replace_span(span.clone(), src.runs_in(span));
                     }
                     Op::Take => drop(t.take()),
                 }
@@ -1533,5 +1773,277 @@ mod tests {
             );
             grid.check_invariants();
         }
+    }
+
+    thread_local! {
+        /// [`Hyperlink::same_link`] calls on this thread.
+        static COMPARES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Counts one [`Hyperlink::same_link`] call.
+    pub(super) fn count_compare() {
+        COMPARES.with(|c| c.set(c.get() + 1));
+    }
+
+    /// The [`Hyperlink::same_link`] calls `f` makes.
+    fn compares(f: impl FnOnce()) -> usize {
+        let before = COMPARES.with(std::cell::Cell::get);
+        f();
+        COMPARES.with(std::cell::Cell::get) - before
+    }
+
+    /// The edits as #411 made them, with a merge pass over every run
+    /// afterwards: the reference the edge-only merges (#619) agree with,
+    /// run for run.
+    mod reference {
+        use super::super::*;
+
+        fn merge_adjacent(t: &mut LinkColumns) {
+            t.0.dedup_by(|next, prev| {
+                let joins = prev.end() == next.start() && prev.link.same_link(&next.link);
+                if joins {
+                    prev.len = col16(next.end() - prev.start());
+                }
+                joins
+            });
+        }
+
+        pub(super) fn shift_right(t: &mut LinkColumns, from: usize, n: usize, end: usize) {
+            if t.0.is_empty() || n == 0 || from >= end {
+                return;
+            }
+            t.split_at(from);
+            t.split_at(end);
+            t.0.retain_mut(|r| {
+                let start = r.start();
+                if start < from || start >= end {
+                    return true;
+                }
+                let moved = start + n;
+                if moved >= end {
+                    return false;
+                }
+                r.len = col16((r.end() + n).min(end) - moved);
+                r.col = col16(moved);
+                true
+            });
+            merge_adjacent(t);
+        }
+
+        pub(super) fn delete(t: &mut LinkColumns, at: usize, n: usize, end: usize) {
+            if t.0.is_empty() || n == 0 || at >= end {
+                return;
+            }
+            let cut = at.saturating_add(n).min(end);
+            t.split_at(at);
+            t.split_at(cut);
+            t.split_at(end);
+            t.0.retain_mut(|r| {
+                let start = r.start();
+                if start < at || start >= end {
+                    true
+                } else if start < cut {
+                    false
+                } else {
+                    r.col = col16(start - n);
+                    true
+                }
+            });
+            merge_adjacent(t);
+        }
+
+        /// `copy_span` as it was: clear the span, then set each source
+        /// run cut to it.
+        pub(super) fn copy_span(t: &mut LinkColumns, src: &LinkColumns, span: Range<usize>) {
+            t.remove_range(span.clone());
+            for (cols, link) in src.runs() {
+                let cols = cols.start.max(span.start)..cols.end.min(span.end);
+                if !cols.is_empty() {
+                    t.set_range(cols, link);
+                }
+            }
+        }
+    }
+
+    /// Every run as (first column, length, index of its entity in
+    /// `links`), so two tables compare by entity, not by URI.
+    fn shape(t: &LinkColumns, links: &[Hyperlink]) -> Vec<(usize, usize, usize)> {
+        t.0.iter()
+            .map(|r| {
+                let l = links.iter().position(|k| k.same_link(&r.link)).unwrap();
+                (r.start(), usize::from(r.len), l)
+            })
+            .collect()
+    }
+
+    /// A table of `width` columns from stretches of (length, link or
+    /// none), cut at `width`.
+    fn stretched(stretches: &[(usize, usize)], width: usize, links: &[Hyperlink]) -> LinkColumns {
+        let mut t = LinkColumns::default();
+        let mut col = 0;
+        for &(len, l) in stretches {
+            let end = (col + len).min(width);
+            if let Some(link) = links.get(l) {
+                t.set_range(col..end, link);
+            }
+            col = end;
+        }
+        t
+    }
+
+    #[derive(Debug, Clone)]
+    enum Edit {
+        Insert(usize, usize, usize),
+        Delete(usize, usize, usize),
+        Copy(Vec<(usize, usize)>, usize, usize),
+    }
+
+    fn edit(width: usize) -> impl proptest::strategy::Strategy<Value = Edit> {
+        use proptest::prelude::*;
+        let col = 0..width + 2;
+        let stretches = proptest::collection::vec((1usize..16, 0usize..6), 0..40);
+        prop_oneof![
+            (col.clone(), 0usize..20, col.clone()).prop_map(|(c, n, e)| Edit::Insert(c, n, e)),
+            (col.clone(), 0usize..20, col.clone()).prop_map(|(c, n, e)| Edit::Delete(c, n, e)),
+            (stretches, col.clone(), 0usize..width + 2).prop_map(|(s, c, n)| Edit::Copy(s, c, n)),
+        ]
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(3000))]
+
+        /// ICH, DCH and copies between lines, merging only at their edges
+        /// (#619), leave exactly the runs the full merge pass left, from
+        /// any table: long runs, per-cell runs, gaps, and two links that
+        /// are equal but different entities side by side.
+        #[test]
+        fn edge_merges_agree_with_the_full_merge_pass(
+            width in 1usize..200,
+            start in proptest::collection::vec((1usize..16, 0usize..6), 0..40),
+            edits in proptest::collection::vec(edit(200), 1..12),
+        ) {
+            let mut pool = LinkPool::new();
+            // Links 2 and 3 are equal (one URI, no id) but two entities;
+            // 4 and 5 (indexes past 3) leave gaps.
+            let links: Vec<Hyperlink> = ["https://a.bc/0", "https://a.bc/1", "https://a.bc/2", "https://a.bc/2"]
+                .iter()
+                .map(|u| open(&mut pool, u))
+                .collect();
+            let mut t = stretched(&start, width, &links);
+            let mut r = t.clone();
+            for e in &edits {
+                match e {
+                    Edit::Insert(c, n, end) => {
+                        let end = (*end).min(width);
+                        t.shift_right(*c, *n, end);
+                        reference::shift_right(&mut r, *c, *n, end);
+                    }
+                    Edit::Delete(c, n, end) => {
+                        let end = (*end).min(width);
+                        t.delete(*c, *n, end);
+                        reference::delete(&mut r, *c, *n, end);
+                    }
+                    Edit::Copy(s, c, n) => {
+                        let src = stretched(s, width, &links);
+                        let span = (*c).min(width)..(c + n).min(width);
+                        t.replace_span(span.clone(), src.runs_in(span.clone()));
+                        reference::copy_span(&mut r, &src, span);
+                    }
+                }
+                proptest::prop_assert_eq!(shape(&t, &links), shape(&r, &links), "after {:?}", e);
+                proptest::prop_assert_eq!(t.run_error(), None, "after {:?}", e);
+            }
+        }
+    }
+
+    /// A grid of `rows` x `cols` with a link of its own on every cell.
+    fn per_cell_grid(rows: u16, cols: u16) -> crate::Grid {
+        let mut grid = crate::Grid::new(rows, cols);
+        for row in 0..rows {
+            grid.goto(row, 0);
+            for col in 0..cols {
+                let id = format!("{row}-{col}");
+                grid.begin_hyperlink("https://a.bc/", Some(id.as_str()))
+                    .unwrap();
+                grid.put_char('x');
+            }
+        }
+        grid.end_hyperlink();
+        grid
+    }
+
+    #[test]
+    fn edits_on_per_cell_links_compare_links_only_at_their_edges() {
+        // S6: on rows with a link per cell, ICH, DCH and a scroll between
+        // margins (which copies spans between lines) compare a bounded
+        // number of links per edit and row, not one per run: a merge pass
+        // over every run would compare 79 or 2047.
+        for cols in [80u16, 2048] {
+            let mut grid = per_cell_grid(4, cols);
+            grid.goto(0, 8);
+            let ich = compares(|| grid.insert_chars(1));
+            grid.goto(0, 8);
+            let dch = compares(|| grid.delete_chars(3));
+            grid.set_margins(8, cols - 9);
+            grid.goto(0, 8);
+            let su = compares(|| grid.scroll_up(1));
+            let sd = compares(|| grid.scroll_down(2));
+            grid.check_invariants();
+            for (edit, n, bound) in [
+                ("ICH", ich, 2),
+                ("DCH", dch, 2),
+                ("SU", su, 8),
+                ("SD", sd, 8),
+            ] {
+                assert!(n <= bound, "{edit} on {cols} columns compared {n} links");
+            }
+            // The rows keep a run per linked cell.
+            for row in 0..4 {
+                let line = grid.line(row).unwrap();
+                let linked = (0..usize::from(cols))
+                    .filter(|&c| line.hyperlink(c).is_some())
+                    .count();
+                assert_eq!(storage(&grid, row).0, linked, "row {row}");
+            }
+        }
+    }
+
+    #[test]
+    fn edits_under_one_link_rejoin_it_at_their_edges() {
+        // One link over each row: DCH rejoins the part before the deletion
+        // with the part moved onto it, ICH the part cut at the right
+        // margin with the part past it, and a scroll between margins each
+        // copied span with the parts outside: one run per row again.
+        let cols = 80u16;
+        let mut grid = crate::Grid::new(4, cols);
+        grid.begin_hyperlink("https://a.bc/", None).unwrap();
+        for row in 0..4 {
+            grid.goto(row, 0);
+            grid.put_str(&"x".repeat(usize::from(cols)));
+        }
+        grid.end_hyperlink();
+        grid.set_margins(0, 39);
+        grid.goto(0, 8);
+        grid.insert_chars(1);
+        // Columns 0..8 and 9..40 (cut at the margin, 39 kept) and 40..80.
+        assert_eq!(storage(&grid, 0).0, 2);
+        grid.reset_margins();
+        grid.goto(0, 8);
+        grid.delete_chars(1);
+        // The blank at 8 deleted: 0..79 one link again, 79 blank.
+        assert_eq!(storage(&grid, 0).0, 1);
+        assert!(grid.line(0).unwrap().hyperlink(79).is_none());
+        grid.set_margins(10, 59);
+        grid.scroll_up(1);
+        // Rows 0..2 took row 1..3's span: one link end to end.
+        for row in 0..3 {
+            assert_eq!(storage(&grid, row).0, 1, "row {row}");
+        }
+        // Row 3's span blanked: two runs around it.
+        assert_eq!(storage(&grid, 3).0, 2);
+        grid.scroll_down(1);
+        assert_eq!(storage(&grid, 0).0, 2, "blank span on row 0");
+        assert_eq!(storage(&grid, 1).0, 1);
+        grid.check_invariants();
     }
 }
