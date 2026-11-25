@@ -64,8 +64,9 @@ a low-risk change.
 - **S7. Memory safety.** `unsafe` only in `tessera-pty` and `tessera-ffi`, each block with a `// SAFETY:` comment;
   the counting test allocators in `crates/tessera-render/tests/alloc.rs`, `crates/tessera-grid/tests/reset.rs`,
   `crates/tessera-term/tests/osc8_alloc.rs`, `crates/tessera-term/tests/mouse_alloc.rs`,
-  `crates/tessera-term/tests/screen_clears_alloc.rs`, `crates/tessera-term/tests/rect_alloc.rs` and
-  `crates/tessera-app-core/tests/keybindings.rs` are the exceptions (CONTRIBUTING.md); `scripts/verify-branch.sh`
+  `crates/tessera-term/tests/screen_clears_alloc.rs`, `crates/tessera-term/tests/rect_alloc.rs`,
+  `crates/tessera-app-core/tests/keybindings.rs` and the heap counter of the scheduled performance job,
+  `scripts/perf-cases.rs` (#612), are the exceptions (CONTRIBUTING.md); `scripts/verify-branch.sh`
   checks the rule mechanically from `scripts/unsafe-exceptions.txt` as it is on the base branch (a branch cannot exempt
   itself), which must list exactly these files. Every FFI export that can panic runs under `ffi_guard!`
   (`catch_unwind`); every pointer and length argument is checked; sessions cross the boundary as ids, never pointers.

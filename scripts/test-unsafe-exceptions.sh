@@ -14,7 +14,7 @@ ok() { printf 'ok   %s\n' "$1"; }
 not_ok() { printf 'FAIL %s\n' "$1"; failures=$((failures + 1)); }
 
 security="$here/../docs/security.md"
-s7_paths() { sed -n '/^- \*\*S7\./,/^- \*\*S8\./p' "$1" | grep -oE '(crates|apps)/[A-Za-z0-9_./-]+\.rs' | sort -u; }
+s7_paths() { sed -n '/^- \*\*S7\./,/^- \*\*S8\./p' "$1" | grep -oE '(crates|apps|scripts)/[A-Za-z0-9_./-]+\.rs' | sort -u; }
 listed_paths() { grep -vE '^[[:space:]]*(#|$)' "$1" | sort -u; }
 sync_check() { # <security.md> <exceptions file>
     [ -n "$(s7_paths "$1")" ] && [ "$(s7_paths "$1")" = "$(listed_paths "$2")" ]
