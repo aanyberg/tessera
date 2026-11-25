@@ -100,7 +100,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::load::Warning;
+use crate::load::{FileId, Warning};
 use crate::store::{ConfigStore, FromDisk};
 use crate::theme::{MAX_THEME_DIR_ENTRIES, Theme, ThemeSource};
 use crate::{Config, Error};
@@ -465,8 +465,12 @@ impl Drop for WatchGuard {
 /// `reread` says whether a load that finds the configuration unchanged
 /// reports [`ConfigEvent::Unchanged`]: yes after a change on disk, no for
 /// the catch-up when the watcher starts.
-fn settle(store: &ConfigStore, follow: impl FnOnce(&Config), reread: Reread) {
-    let outcome = store.load_from_disk();
+///
+/// Returns the `config.toml` the load went to, whether it loaded or not
+/// ([`ConfigStore::load_from_disk_identified`]), `None` when it found
+/// none.
+fn settle(store: &ConfigStore, follow: impl FnOnce(&Config), reread: Reread) -> Option<FileId> {
+    let (read, outcome) = store.load_from_disk_identified();
     match &outcome {
         Ok(from) => follow(&from.loaded.config),
         Err(_) => follow(&store.config()),
@@ -475,6 +479,7 @@ fn settle(store: &ConfigStore, follow: impl FnOnce(&Config), reread: Reread) {
         store.broadcast(&event);
     }
     report_themes(store);
+    read
 }
 
 /// Why [`settle`] re-reads the files, which decides whether a load that
@@ -1189,6 +1194,20 @@ mod native {
         /// change that no registered watch can see (a link retargeted
         /// past [`MAX_DIR_LINKS_FOLLOWED`]) is still applied.
         config_seen: super::Fingerprint,
+        /// Whether the last settle's load went to another `config.toml`
+        /// than the one `file_handle` registers, loaded or not (or found
+        /// none where one is registered): the way to it changed between
+        /// the registration and the load. The handles then do not describe
+        /// what the store holds (a configuration, or an error, from the
+        /// other file), so [`Native::chain_unchanged`] cannot vouch for
+        /// it: a retarget undone before the thread looks at the chain
+        /// would look like no change at all, and leave the store on the
+        /// target the load found (#697). The event the change raised on an
+        /// armed directory of the way re-registers and reloads instead. A
+        /// registered file that fails to load (a parse error, a file over
+        /// the size cap) does not set it: the handles still describe the
+        /// store's state, and a chain event does not reload it again.
+        load_unregistered: bool,
         /// Counts what the thread did, for tests.
         #[cfg(test)]
         probe: std::sync::Arc<tests::Probe>,
@@ -1623,6 +1642,7 @@ mod native {
                 tail_due: Instant::now(),
                 register_error: None,
                 config_seen: super::Fingerprint::Missing,
+                load_unregistered: false,
                 #[cfg(test)]
                 probe: std::sync::Arc::default(),
             };
@@ -1906,7 +1926,12 @@ mod native {
 
         /// Whether nothing that leads to `config.toml` changed (the test
         /// `changes_nothing` makes after its event): walks the chain once.
+        /// Never after a load that read another file than the one
+        /// registered ([`Native::load_unregistered`]).
         fn chain_unchanged(&self) -> bool {
+            if self.load_unregistered {
+                return false;
+            }
             let Ok(now) = self.walk_all() else {
                 return false;
             };
@@ -2131,7 +2156,13 @@ mod native {
             self.profiles_seen = seen;
             #[cfg(test)]
             self.probe.note_settle();
-            super::settle(store, |config| self.follow(config), reread);
+            let read = super::settle(store, |config| self.follow(config), reread);
+            let registered = self
+                .file_handle
+                .as_ref()
+                .and_then(|handle| handle.metadata().ok())
+                .and_then(|meta| super::FileId::of(&meta));
+            self.load_unregistered = read != registered;
         }
 
         /// Whether `config.toml` or `profiles/` changed since the last
@@ -2205,8 +2236,14 @@ mod native {
                 // the end, re-registered and reloaded only if something on
                 // the way changed (`changes_nothing`, #393 m2). They never
                 // extend the wait, so a stream of them costs one walk per
-                // `debounce` and holds back neither an edit of the file nor
+                // `debounce`, and holds back neither an edit of the file nor
                 // a change on the way (a busy `$TMPDIR` or `~` is common).
+                // The one exception is a settle whose load went to another
+                // file than the one registered (`load_unregistered`, #697):
+                // the next chain event reloads once, which registers and
+                // reads the file the way names then. A registered file that
+                // does not load is not such an exception, so a broken
+                // `config.toml` is not reloaded on each chain event.
                 let mut changed = !self.on_chain(&event);
                 let mut chain_seen = !changed;
                 if changed {
@@ -3415,6 +3452,172 @@ mod native {
             assert!(!native.changes_nothing(&event), "{event:?}");
         }
 
+        /// How long the storm test waits for a target to apply: long, since
+        /// a deaf watch never applies whatever the wait, and a thread
+        /// stalled at a load of 100, or at a background quality of
+        /// service, can take seconds to catch up with a storm (#697).
+        const NEVER_DEAF_WITHIN: Duration = Duration::from_mins(1);
+
+        /// #697: a retarget that lands between the registration and the
+        /// load (the load reads the new target, the handles name the old
+        /// one) and is undone before the thread looks at the chain is a
+        /// change: the disk names the registered target again, but the
+        /// store holds the other. Dismissed as a chain event that changed
+        /// nothing, it left the store on that target until the next change
+        /// (a state the storm test below can reach under load).
+        /// Deterministic: the retarget runs between a registration and a
+        /// settle here, and the events are read off the queue.
+        #[test]
+        fn a_retarget_undone_after_the_load_it_landed_before_is_a_change() {
+            let (_dir, base) = resolved_tempdir();
+            let home = base.join("home");
+            for generation in 0..3_u8 {
+                let tree = home.join(format!("gen{generation}")).join("tessera");
+                std::fs::create_dir_all(&tree).unwrap();
+                std::fs::write(tree.join("config.toml"), sized(10 + generation)).unwrap();
+            }
+            let link = home.join("cfg");
+            let switch = |generation: u8| {
+                std::fs::remove_file(&link).unwrap();
+                std::os::unix::fs::symlink(format!("gen{generation}"), &link).unwrap();
+            };
+            let font_size = |store: &ConfigStore| store.config().appearance.font_size;
+            // The store creates `profiles/` and `themes/` in gen0 only: in
+            // gen1 and gen2 nothing but `config.toml` tells them apart.
+            std::os::unix::fs::symlink("gen0", &link).unwrap();
+            let paths = ConfigPaths::new(link.join("tessera"));
+            let store = ConfigStore::open(paths.clone()).unwrap();
+            let (mut native, _stop) = Native::open(&paths).unwrap();
+            switch(1);
+            native.rearm();
+            native.settle(&store);
+            assert!(native.armed());
+            assert!((font_size(&store) - 11.0).abs() < f32::EPSILON);
+
+            // Registered on gen1; the load that follows reads gen2.
+            switch(2);
+            native.settle(&store);
+            assert!((font_size(&store) - 12.0).abs() < f32::EPSILON);
+            switch(1);
+            let fd = chain_fd(&native, &home);
+            let event = event_on(&mut native, fd).expect("no event for the retarget");
+            assert!(
+                !native.changes_nothing(&event),
+                "the store holds gen2, the disk names gen1: {event:?}"
+            );
+        }
+
+        /// The ways the tests below make a `config.toml` fail to load.
+        #[derive(Debug, Clone, Copy)]
+        enum Broken {
+            /// Not TOML.
+            Parse,
+            /// Not UTF-8.
+            Utf8,
+            /// One byte over [`crate::MAX_CONFIG_FILE_LEN`] (sparse).
+            OverCap,
+            /// A symbolic link whose target is missing.
+            Dangling,
+        }
+
+        /// Makes the `config.toml` at `file` fail to load as `broken` says.
+        fn break_config(file: &Path, broken: Broken) {
+            let _ = std::fs::remove_file(file);
+            match broken {
+                Broken::Parse => std::fs::write(file, "[[[broken\n").unwrap(),
+                Broken::Utf8 => std::fs::write(file, b"font_size = \"\xff\"\n").unwrap(),
+                Broken::OverCap => std::fs::File::create(file)
+                    .unwrap()
+                    .set_len(crate::MAX_CONFIG_FILE_LEN + 1)
+                    .unwrap(),
+                Broken::Dangling => std::os::unix::fs::symlink("missing.toml", file).unwrap(),
+            }
+        }
+
+        /// #697 minor 1: a registered `config.toml` that fails to load
+        /// leaves the handles describing what the store holds (the error
+        /// of that file), so an unrelated event on a directory of the
+        /// chain changes nothing: a stream of them does not reload the
+        /// broken file each round (a 13 MiB one cost 74 G instructions in
+        /// a 3 s flood). Deterministic: the events are read off the queue
+        /// here.
+        #[test]
+        fn a_registered_config_toml_that_fails_to_load_is_not_reloaded_by_chain_events() {
+            for broken in [Broken::Parse, Broken::Utf8, Broken::OverCap] {
+                let (_dir, base) = resolved_tempdir();
+                let home = base.join("home");
+                let tree = home.join("gen0").join("tessera");
+                std::fs::create_dir_all(&tree).unwrap();
+                break_config(&tree.join("config.toml"), broken);
+                std::os::unix::fs::symlink("gen0", home.join("cfg")).unwrap();
+                let paths = ConfigPaths::new(home.join("cfg").join("tessera"));
+                let store = ConfigStore::open(paths.clone()).unwrap();
+                let (mut native, _stop) = Native::open(&paths).unwrap();
+                native.settle(&store);
+                assert!(native.armed(), "{broken:?}");
+                assert!(store.last_error().is_some(), "{broken:?}: it loaded");
+
+                std::fs::write(home.join("noise"), "x").unwrap();
+                let fd = chain_fd(&native, &home);
+                let event = event_on(&mut native, fd).expect("no event for the noise");
+                assert!(
+                    native.changes_nothing(&event),
+                    "{broken:?}: the registered broken file is reloaded by a chain event"
+                );
+            }
+        }
+
+        /// #697 minor 3: a load that goes to another `config.toml` than
+        /// the one registered and fails (a broken file, or a link to a
+        /// missing one, under a retarget that lands between the
+        /// registration and the load) leaves the store holding that file's
+        /// error, which the handles do not describe: when the retarget is
+        /// undone, the event it raised is a change and reloads.
+        /// Deterministic: the retarget runs between a registration and a
+        /// settle here, and the events are read off the queue.
+        #[test]
+        fn a_failed_load_of_an_unregistered_config_toml_is_a_change() {
+            for broken in [Broken::Parse, Broken::Dangling] {
+                let (_dir, base) = resolved_tempdir();
+                let home = base.join("home");
+                for generation in 0..3_u8 {
+                    let tree = home.join(format!("gen{generation}")).join("tessera");
+                    std::fs::create_dir_all(&tree).unwrap();
+                    std::fs::write(tree.join("config.toml"), sized(10 + generation)).unwrap();
+                }
+                break_config(
+                    &home.join("gen2").join("tessera").join("config.toml"),
+                    broken,
+                );
+                let link = home.join("cfg");
+                let switch = |generation: u8| {
+                    std::fs::remove_file(&link).unwrap();
+                    std::os::unix::fs::symlink(format!("gen{generation}"), &link).unwrap();
+                };
+                std::os::unix::fs::symlink("gen0", &link).unwrap();
+                let paths = ConfigPaths::new(link.join("tessera"));
+                let store = ConfigStore::open(paths.clone()).unwrap();
+                let (mut native, _stop) = Native::open(&paths).unwrap();
+                switch(1);
+                native.rearm();
+                native.settle(&store);
+                assert!(native.armed(), "{broken:?}");
+                assert!(store.last_error().is_none(), "{broken:?}");
+
+                // Registered on gen1; the load that follows goes to gen2.
+                switch(2);
+                native.settle(&store);
+                assert!(store.last_error().is_some(), "{broken:?}: gen2 loaded");
+                switch(1);
+                let fd = chain_fd(&native, &home);
+                let event = event_on(&mut native, fd).expect("no event for the retarget");
+                assert!(
+                    !native.changes_nothing(&event),
+                    "{broken:?}: the store holds gen2's error, the disk names gen1: {event:?}"
+                );
+            }
+        }
+
         /// #417 M-A, the T4 probe (`adv retarget head native 0 ln`): a
         /// directory link retargeted by unlink and symlink in a tight loop
         /// (bounded storms), then once more: the last target applies, and
@@ -3424,6 +3627,13 @@ mod native {
         /// fails it about 1 run in 10); the deterministic guard of that
         /// case is
         /// `the_directory_of_a_missing_link_is_watched_for_its_return`.
+        /// Under load it lands a switch between a rearm and the load that
+        /// follows, the store holding a target the handles do not name
+        /// (#697); the deterministic guard of that is
+        /// `a_retarget_undone_after_the_load_it_landed_before_is_a_change`.
+        /// A deaf watch never applies, since nothing polls while it is
+        /// armed, so each wait is a backstop for a stalled thread
+        /// ([`NEVER_DEAF_WITHIN`]), not a latency bar.
         #[test]
         fn an_unlink_and_symlink_retarget_storm_never_leaves_the_watch_deaf() {
             let (_dir, base) = resolved_tempdir();
@@ -3452,20 +3662,17 @@ mod native {
                 // retarget it must see from an event.
                 let last = 6 + storm % 2;
                 assert!(
-                    applies(&running, 10 + generation, Duration::from_secs(5)),
+                    applies(&running, 10 + generation, NEVER_DEAF_WITHIN),
                     "storm {storm}: the storm's last target was not applied"
                 );
                 switch(last);
                 assert!(
-                    applies(&running, 10 + last, Duration::from_secs(5)),
+                    applies(&running, 10 + last, NEVER_DEAF_WITHIN),
                     "storm {storm}: deaf after the storm"
                 );
             }
             crate::write_atomic(&link.join("tessera").join("config.toml"), &sized(40)).unwrap();
-            assert!(
-                applies(&running, 40, Duration::from_secs(5)),
-                "deaf to an edit"
-            );
+            assert!(applies(&running, 40, NEVER_DEAF_WITHIN), "deaf to an edit");
         }
 
         /// #393 F3: a real directory above the root swapped by rename (a
