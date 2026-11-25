@@ -70,7 +70,8 @@ pub mod test_hooks {
     pub const MOST_HELD: Duration = slow_read::MOST;
 
     /// Makes every program lookup's stat of `path` block until
-    /// [`release_program_lookup`] (at most [`MOST_HELD`]).
+    /// [`release_program_lookup`] (at most [`MOST_HELD`]): a program or
+    /// `PATH` candidate, or the requested working directory (#673).
     pub fn hold_program_lookup(path: &Path) {
         slow_read::hold(path, Stage::Lookup);
     }

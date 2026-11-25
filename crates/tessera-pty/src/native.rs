@@ -256,11 +256,11 @@ impl NativePty {
     /// system, which can block (a stalled network volume, an iCloud file
     /// not yet downloaded), so both run on helper threads and the caller
     /// waits for each a bounded time. The lookup (the `stat` and
-    /// `access(2)` calls `portable-pty` makes on the program, each `PATH`
-    /// candidate and `$SHELL`) gets 5 s; without an answer by then the
-    /// spawn fails with [`PtyError::ProgramTimedOut`] before
-    /// `portable-pty`, which would make the same calls on the caller, is
-    /// called. A program found through `PATH` is handed to `portable-pty`
+    /// `access(2)` calls `portable-pty` makes on the working directory,
+    /// the program, each `PATH` candidate and `$SHELL`) gets 5 s; without
+    /// an answer by then the spawn fails with [`PtyError::ProgramTimedOut`]
+    /// before `portable-pty`, which would make the same calls on the
+    /// caller, is called. A program found through `PATH` is handed to `portable-pty`
     /// by its path, so it checks that one file again (then cached) instead
     /// of searching `PATH` again, and the child sees that path in
     /// `argv[0]`. The `#!` check (the program's first 512 bytes and a
@@ -882,7 +882,12 @@ struct Resolved {
 /// calls `portable-pty` repeats on the caller find their answers cached.
 ///
 /// It first stats the requested working directory and checks `$SHELL`
-/// for execute permission, which `portable-pty` does whatever it runs.
+/// for execute permission, which `portable-pty` does whatever it runs. A
+/// requested working directory that is not one (missing, a file) is
+/// logged as a warning with its length only (docs/security.md S8), and
+/// the child starts in `$HOME`, as `portable-pty` starts it; a profile's
+/// `working_directory` reaches the spawn unchecked, so this stat is the
+/// only one made before the bounded wait ends (#673).
 /// The login shell is `$SHELL` if executable, else the password database's
 /// shell, else `/bin/sh`. Any other program is probed ([`probe`]) as given
 /// when absolute, joined to the working directory when it starts with
@@ -893,7 +898,19 @@ struct Resolved {
 /// working directory or `PATH` is unknown here; `portable-pty` then
 /// refuses the program with its own reason.
 fn resolve_program(command: &CommandBuilder) -> Option<Resolved> {
+    #[cfg(any(test, feature = "test-hooks"))]
+    if let Some(cwd) = command.get_cwd() {
+        slow_read::pause(Path::new(cwd), slow_read::Stage::Lookup);
+    }
     let dir = working_dir(command);
+    if let Some(cwd) = command.get_cwd()
+        && dir.as_deref().map(Path::as_os_str) != Some(cwd.as_os_str())
+    {
+        tracing::warn!(
+            dir_len = cwd.len(),
+            "the requested working directory is not a directory; starting in the home directory"
+        );
+    }
     let shell = command.get_shell();
     if command.is_default_prog() {
         return Some(Resolved {
@@ -1120,9 +1137,10 @@ fn exec_bytes(command: &CommandBuilder, options: &SpawnOptions) -> ExecFootprint
 }
 
 /// Test-only stand-in for a slow file: a [`probe`] (the program lookup's
-/// stat) or [`read_header`] of a path a test names blocks until the test
-/// releases it, as on a stalled network volume or a file not yet
-/// downloaded. Only the named paths are held, each at one stage, so other
+/// stat), the lookup's stat of the requested working directory
+/// ([`resolve_program`], #673) or [`read_header`] of a path a test names
+/// blocks until the test releases it, as on a stalled network volume or a
+/// file not yet downloaded. Only the named paths are held, each at one stage, so other
 /// tests running beside it (`cargo test`) are unaffected. A held call
 /// gives up after [`slow_read::MOST`], so a regression fails its test
 /// instead of hanging. Other crates' tests reach the lookup stage through
@@ -1139,7 +1157,8 @@ pub(crate) mod slow_read {
     /// Where a path is held.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(crate) enum Stage {
-        /// The program lookup's [`super::probe`].
+        /// The program lookup's [`super::probe`], and its stat of the
+        /// requested working directory ([`super::resolve_program`], #673).
         Lookup,
         /// [`super::read_header`].
         Header,
@@ -2653,6 +2672,91 @@ mod tests {
         wait_until("the held stat did not return on release", || {
             lookup().1 == 1
         });
+    }
+
+    /// #673: a requested working directory on a volume that gives no
+    /// answer (its stat held) is stated on the lookup's helper, never on
+    /// the caller, so the spawn fails with [`PtyError::ProgramTimedOut`]
+    /// once [`SPAWN_PROGRAM_TIMEOUT`] has passed while the stat is still
+    /// blocked, and nothing is forked.
+    #[test]
+    fn a_working_directory_without_an_answer_holds_the_lookup_not_the_caller() {
+        let temp = scratch_dir("slow-cwd");
+        let dir = temp.path().join("volume");
+        std::fs::create_dir(&dir).unwrap();
+        let held = hold(&dir, slow_read::Stage::Lookup);
+        let lookup = || slow_read::calls(&dir, slow_read::Stage::Lookup);
+        let options = SpawnOptions::login_shell("slow-cwd")
+            .env("SHELL", "/bin/sh")
+            .cwd(&dir);
+
+        let start = std::time::Instant::now();
+        let spawned = NativePty::spawn(&options);
+        let took = start.elapsed();
+        let (callers, finished) = lookup();
+        assert_eq!(finished, 0, "the held stat returned before the spawn");
+        assert_eq!(callers, ["pty-spawn-program"]);
+        assert_eq!(fault::take_forked(), None, "a child was forked");
+        assert!(
+            matches!(spawned, Err(PtyError::ProgramTimedOut { .. })),
+            "not refused as timed out: {spawned:?}"
+        );
+        assert!(took >= SPAWN_PROGRAM_TIMEOUT, "refused after {took:?}");
+
+        drop(held);
+        wait_until("the held stat did not return on release", || {
+            lookup().1 == 1
+        });
+    }
+
+    /// #673: a requested working directory that is not one (missing, or a
+    /// file) is warned about once by the lookup, which starts the child in
+    /// `$HOME` as `portable-pty` does; the warning carries the path's
+    /// length, never the path (docs/security.md S8). A directory is not
+    /// warned about.
+    #[test]
+    fn a_working_directory_that_is_not_one_is_warned_about_by_length() {
+        let temp = scratch_dir("not-a-dir");
+        let file = temp.path().join("file");
+        std::fs::write(&file, "").unwrap();
+        let missing = temp.path().join("missing");
+        for (cwd, warned) in [
+            (&file, true),
+            (&missing, true),
+            (&temp.path().to_path_buf(), false),
+        ] {
+            let options = SpawnOptions::login_shell("not-a-dir")
+                .env("HOME", "/")
+                .cwd(cwd);
+            let command = build_command(&options);
+            let log = LogRecorder::default();
+            let found =
+                tracing::subscriber::with_default(log.clone(), || resolve_program(&command));
+            assert!(found.is_some(), "{cwd:?}");
+            let events = log.0.lock().unwrap().clone();
+            let warnings: Vec<_> = events
+                .iter()
+                .filter(|fields| fields.first().is_some_and(|level| level == "level=WARN"))
+                .collect();
+            if warned {
+                assert_eq!(warnings.len(), 1, "{cwd:?}: {events:?}");
+                let len = cwd.as_os_str().len();
+                assert!(
+                    warnings[0].contains(&format!("dir_len={len}")),
+                    "{events:?}"
+                );
+            } else {
+                assert!(warnings.is_empty(), "{cwd:?}: {events:?}");
+            }
+            for fields in &events {
+                assert!(
+                    !fields
+                        .iter()
+                        .any(|field| field.contains(temp.path().to_str().unwrap())),
+                    "{events:?}"
+                );
+            }
+        }
     }
 
     /// #602: with four lookups stuck on a stalled volume, a further spawn

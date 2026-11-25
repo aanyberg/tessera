@@ -21,7 +21,7 @@ pub(crate) fn apply(mut options: SpawnOptions, resolved: &ResolvedProfile) -> Sp
         && let Some(dir) = resolved.working_directory.as_deref()
     {
         let home = std::env::var_os("HOME").map(PathBuf::from);
-        options.cwd = directory_for(dir, home.as_deref());
+        options.cwd = Some(directory_for(dir, home.as_deref()));
     }
     options
 }
@@ -231,23 +231,17 @@ fn program_for(command: &str) -> Option<Program> {
 }
 
 /// The starting directory for a profile's `working_directory`: `~` and
-/// `~/...` relative to `home`. `None` (the home directory) when it is not
-/// a directory, with a warning naming it, escaped (S8).
-fn directory_for(dir: &str, home: Option<&Path>) -> Option<PathBuf> {
-    let expanded = match (dir.strip_prefix('~'), home) {
+/// `~/...` relative to `home`, any other path as written. Asks the file
+/// system nothing: this runs on the caller of the spawn, the app's main
+/// thread, where a stat of a path on a stalled volume would hold it for
+/// the whole stall (#673). The spawn's lookup stats it on a helper thread,
+/// bounded (see [`tessera_pty::NativePty::spawn`]), and starts a path
+/// that is not a directory in the home directory, with a warning.
+fn directory_for(dir: &str, home: Option<&Path>) -> PathBuf {
+    match (dir.strip_prefix('~'), home) {
         (Some(""), Some(home)) => home.to_path_buf(),
         (Some(rest), Some(home)) if rest.starts_with('/') => home.join(&rest[1..]),
         _ => PathBuf::from(dir),
-    };
-    if expanded.is_dir() {
-        Some(expanded)
-    } else {
-        tracing::warn!(
-            target: "tessera_app_core",
-            directory = %tessera_config::escaped(dir, tessera_config::MAX_WARNING_PATH_LEN),
-            "the profile's working directory is not a directory; starting in the home directory"
-        );
-        None
     }
 }
 
@@ -304,23 +298,45 @@ mod tests {
         assert_eq!(open, SpawnOptions::login_shell("1"));
     }
 
+    /// #673: `~` and `~/...` are the home directory, and the path is
+    /// handed on as written otherwise, whether or not it is a directory:
+    /// applying a profile asks the file system nothing (a stalled volume
+    /// would hold the caller, the app's main thread). The spawn's bounded
+    /// lookup stats it, and a path that is not a directory starts in the
+    /// home directory there.
     #[test]
-    fn a_tilde_is_the_home_directory_and_a_missing_directory_is_dropped() {
+    fn a_tilde_is_the_home_directory_and_no_directory_is_checked() {
         let home = tempfile::tempdir().unwrap();
-        std::fs::create_dir(home.path().join("src")).unwrap();
-        let at = |dir: &str| directory_for(dir, Some(home.path()));
-        assert_eq!(at("~").as_deref(), Some(home.path()));
-        assert_eq!(at("~/src"), Some(home.path().join("src")));
-        assert_eq!(at("~/missing"), None);
-        assert_eq!(at("/nonexistent/tessera/dir"), None);
-        // `~user` is not expanded (and here not a directory).
-        assert_eq!(at("~src"), None);
-        // A file is not a directory.
         let file = home.path().join("f");
         std::fs::write(&file, "").unwrap();
-        assert_eq!(at(file.to_str().unwrap()), None);
+        let file = file.to_str().unwrap();
+        let at = |dir: &str| directory_for(dir, Some(home.path()));
+        assert_eq!(at("~"), home.path());
+        assert_eq!(at("~/src"), home.path().join("src"));
+        assert_eq!(at("~/missing"), home.path().join("missing"));
+        assert_eq!(
+            at("/nonexistent/tessera/dir"),
+            Path::new("/nonexistent/tessera/dir")
+        );
+        // `~user` is not expanded.
+        assert_eq!(at("~src"), Path::new("~src"));
+        // A file is handed on too.
+        assert_eq!(at(file), Path::new(file));
         // Without a home directory `~` stays as written.
-        assert_eq!(directory_for("~", None), None);
+        assert_eq!(directory_for("~", None), Path::new("~"));
+    }
+
+    /// #673: a profile directory that is missing, or is a file, reaches
+    /// the spawn as written: `apply` does not stat it on the caller.
+    #[test]
+    fn a_working_directory_that_is_not_one_reaches_the_spawn() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("f");
+        std::fs::write(&file, "").unwrap();
+        for dir in ["/nonexistent/tessera/dir", file.to_str().unwrap()] {
+            let open = apply(SpawnOptions::login_shell("1"), &resolved(None, Some(dir)));
+            assert_eq!(open.cwd.as_deref(), Some(Path::new(dir)), "{dir}");
+        }
     }
 
     #[test]
@@ -563,24 +579,22 @@ mod tests {
         assert!(!notice.contains('\u{202e}'), "{notice:?}");
     }
 
-    /// The missing directory is named in its warning, escaped; the command
-    /// is never logged (docs/security.md S8).
+    /// Applying a profile logs nothing, its command least of all
+    /// (docs/security.md S8): a missing directory is warned about by the
+    /// spawn's lookup, with its length only (#673).
     #[test]
-    fn the_warning_names_the_directory_escaped_and_never_the_command() {
+    fn applying_a_profile_logs_nothing() {
         let profile = resolved(
             Some("deploy --token=s3cret"),
             Some("/nonexistent/\u{1b}[31mdir"),
         );
         let warnings = crate::session::tests::warnings(|| {
             let options = apply(SpawnOptions::login_shell("1"), &profile);
-            assert_eq!(options.cwd, None, "the home directory");
+            assert_eq!(
+                options.cwd.as_deref(),
+                Some(Path::new("/nonexistent/\u{1b}[31mdir"))
+            );
         });
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(
-            warnings[0].contains("/nonexistent/\\u{1b}[31mdir"),
-            "{warnings:?}"
-        );
-        assert!(!warnings[0].contains('\u{1b}'), "{warnings:?}");
-        assert!(!warnings[0].contains("s3cret"), "{warnings:?}");
+        assert_eq!(warnings, Vec::<String>::new());
     }
 }

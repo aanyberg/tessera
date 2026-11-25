@@ -598,17 +598,22 @@ impl App {
     /// (looked up in `PATH`), any other through `/bin/sh -c`. When
     /// `options.cwd` is `None` the session starts in the profile's
     /// `working_directory`, `~` at its start being `$HOME`; one that is not
-    /// a directory gives the home directory, with a warning. The session
-    /// is drawn with the profile's appearance, followed through every
-    /// configuration applied later (#39).
+    /// a directory gives the home directory, with a warning that carries
+    /// the path's length. The directory is first stated by the spawn's
+    /// bounded program lookup on a helper thread, not on the caller's, so
+    /// one on a stalled volume holds the caller at most the lookup's 5 s
+    /// and then falls back as below (#673). The session is drawn with the
+    /// profile's appearance, followed through every configuration applied
+    /// later (#39).
     ///
     /// When what the profile changed cannot start (a `working_directory`
     /// that exists but cannot be entered, a `command` that cannot be
     /// executed: a [`PtyError::Spawn`]; a `command` longer than the system
     /// lets a program's arguments be: a [`PtyError::ArgumentsTooLong`],
     /// #342; a pty open that gave no answer in time: a
-    /// [`PtyError::OpenTimedOut`], #568; a `command` whose lookup the file
-    /// system gave no answer in time, as on a stalled network volume: a
+    /// [`PtyError::OpenTimedOut`], #568; a `command` or
+    /// `working_directory` whose lookup the file system gave no answer in
+    /// time, as on a stalled network volume: a
     /// [`PtyError::ProgramTimedOut`], or that was not looked up because
     /// earlier lookups are still waiting: a [`PtyError::ProgramLookupBusy`],
     /// #602), the session is started once more
