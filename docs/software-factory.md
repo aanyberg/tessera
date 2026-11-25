@@ -260,7 +260,14 @@ Agents use these instead of rebuilding the setup in every run:
   `a_double_click_with_64_rules_on_2048_columns_takes_under_5_ms` (#47) and `a_slow_plugin_keeps_session_throughput`
   (#48), the `b02_*` cost bars of the rectangular operations (`crates/tessera-term/tests/rect.rs`, #251), the two
   cluster bars of `tests/rect_fixes.rs` and `an_edit_among_many_mark_like_lines_is_fast`
-  (`crates/tessera-config/tests/edit.rs`, #324) (`timing` group). A failure with the 1-minute load at or above `hw.ncpu`
+  (`crates/tessera-config/tests/edit.rs`, #324) (`timing` group), and the budgets of `tessera-ffi`'s `tests/budgets.rs`
+  (#216, each main's measurement plus 20 %, recorded beside it with the date, `hw.model` and rustc):
+  `an_idle_session_stays_within_its_heap_budget` (live Rust heap of an idle 80x24 bash after its first prompt),
+  `a_full_scrollback_stays_within_its_heap_budget` (the same session with 10 000 scrollback lines of 80 columns), and
+  `startup_to_the_first_frame_stays_within_its_budget` (`tessera_app_new` to the first off-screen frame, best of 5).
+  The milestone-lead puts memory-per-session and startup bars in every brief that touches session setup, the grid's
+  per-line storage or app start; an intended cost re-measures and raises the budget in the same change.
+  A failure with the 1-minute load at or above `hw.ncpu`
   is retried once ("failed under load, retried"), any other failure fails the gate, and so does a failed build of the
   timing tests (load does not explain it). `just quality-gate-test` checks, with a fake `cargo`, the watchdog (nextest
   and the ffi C step), that retry and that the hooks are inert without `TESSERA_GATE_SELFTEST=1`, through test hooks the
