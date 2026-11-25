@@ -8,7 +8,9 @@ name: Perf
 # 1. `check` exits early (the later steps are skipped, the job is green)
 #    when main is still at the SHA of the last run that measured, so quiet
 #    days cost a checkout and a cache restore.
-# 2. The gate's release timing bars, the #216 budget tests included.
+# 2. The gate's release timing bars, the #216 budget tests included, minus the tests whose bar is an absolute wall
+#    time measured on a local Mac (`perf-job.sh timing-filter`): this runner cannot meet those, `just check` and
+#    local runs enforce them. The byte budgets (idle and full-scrollback heap) and the ratio bars are enforced here.
 # 3. A fixed case set (feed, scroll, search, idle heap, full-scrollback
 #    heap) against the last measured SHA without a regression.
 #
@@ -20,6 +22,11 @@ name: Perf
 # for the trend. The cache, not the previous run's artifact, is the state
 # because reading an earlier run's artifact needs `actions: read` and this
 # job's token is `contents: read` and `issues: write` only.
+#
+# The step logs are uploaded as the `perf-logs` artifact on every run that reaches a measuring step, red or green.
+#
+# A dispatch from a branch other than main measures that branch and prints the issue requests instead of sending them;
+# it saves no state, so it cannot become a baseline.
 #
 # A case past its bar opens (or comments on) a `type:bug` issue naming the SHA
 # range. The job never gates a PR.
@@ -49,13 +56,14 @@ concurrency:
 jobs:
   perf:
     name: Performance and memory
-    # A dispatch from another branch would measure that branch and record it as main.
-    if: github.ref == 'refs/heads/main'
     runs-on: xcode-27
     timeout-minutes: 90
     env:
       GH_TOKEN: ${{ github.token }}
       STATE: perf-state
+      # Only main files issues; any other ref prints the request.
+      PERF_JOB_GH: ${{ github.ref == 'refs/heads/main' && 'gh' || 'echo' }}
+      PERF_JOB_WORK: /tmp/perf-work
     steps:
       # Full history: the base of the comparison is an older commit of main.
       - uses: actions/checkout@v4
@@ -99,7 +107,9 @@ jobs:
         run: |
           read -r -a packages <<< "$(scripts/perf-job.sh timing-packages)"
           filter="$(scripts/perf-job.sh timing-filter)"
-          cargo nextest run --release "${packages[@]}" -E "$filter"
+          mkdir -p perf-logs
+          cargo nextest run --release --no-fail-fast "${packages[@]}" -E "$filter" 2>&1 | tee perf-logs/timing.log
+          exit "${PIPESTATUS[0]}"
       - name: Case set against the last measured SHA
         id: cases
         # Also after a red timing step: the trend and the state must not depend on it.
@@ -115,8 +125,23 @@ jobs:
           [[ "$TIMING" == failure ]] && failed+=("release timing and budget tests")
           [[ "$CASES" == failure ]] && failed+=("case set")
           scripts/perf-job.sh failed --step "$(IFS=,; echo "${failed[*]}")" --head "$GITHUB_SHA"
+      # Logs only: the probe builds in the work dir hold target/ and base.tar (many GB) and are not uploaded.
+      - name: Collect the logs
+        if: ${{ !cancelled() && steps.check.outputs.skip != 'true' }}
+        run: |
+          mkdir -p perf-logs/cases
+          for f in "$PERF_JOB_WORK"/*.log "$PERF_JOB_WORK"/results.jsonl "$PERF_JOB_WORK"/issue.md; do
+            [[ -f "$f" ]] && cp "$f" perf-logs/cases/ || true
+          done
+      - name: Upload the logs
+        if: ${{ !cancelled() && steps.check.outputs.skip != 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-logs
+          path: perf-logs
+          if-no-files-found: warn
       - name: Save the state
-        if: ${{ !cancelled() && steps.cases.outcome == 'success' }}
+        if: ${{ !cancelled() && github.ref == 'refs/heads/main' && steps.cases.outcome == 'success' }}
         uses: actions/cache/save@v4
         with:
           path: perf-state

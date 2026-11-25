@@ -11,12 +11,15 @@
 #       the signal); nonzero when they could not be taken.
 #   scripts/perf-job.sh timing-packages | timing-filter
 #       The `-p <crate>` arguments and the nextest filter of the quality gate's release timing step (read from
-#       scripts/quality-gate.sh, so the job runs exactly the bars the gate does, the #216 budgets included).
+#       scripts/quality-gate.sh, so the job runs the gate's bars, the #216 byte budgets included, except the startup
+#       wall-time budget a runner cannot meet; see runner_skips).
 #   scripts/perf-job.sh failed --step <name> [--head <sha>] [--state <dir>]
 #       Files the same issue for a failed step of the job (the release timing bars, the budget tests).
 #
 # One line per case: {ts, sha, base, case, instructions, base_instructions, ratio, heap_bytes, base_heap_bytes, bar,
-# status, note}; status is ok, regressed or noisy (the instrument could not back a verdict). A line is a number for
+# status, note}; status is ok, regressed or noisy (the instrument could not back a verdict: a loaded machine, or one
+# without instruction counters such as a GitHub macOS runner, where `ratio` is the wall-time ratio and the heap cases
+# still bind). A line is a number for
 # the case's own kind (instructions for feed, scroll and search; heap bytes for heap_idle and heap_scrollback) and
 # null for the other.
 #
@@ -41,6 +44,11 @@ heap_cases="heap_idle heap_scrollback"
 issue_title="perf: the scheduled performance job found a regression"
 failed_title="perf: the scheduled performance job failed"
 
+# Tests that bind an absolute wall time which only a local Mac meets (the GitHub runner took 99.7 ms at best for the
+# 19.645 ms startup budget, #682); `just check` and the gate enforce them. The other timing tests have bars loose enough
+# for the runner, and the byte budgets are not machine dependent, so they stay.
+runner_skips="test(=startup_to_the_first_frame_stays_within_its_budget)"
+
 die() { echo "perf-job: $*" >&2; exit 2; }
 
 sub="${1:-}"; [[ -n "$sub" ]] || die "usage: perf-job.sh check|run|failed|timing-packages|timing-filter ..."
@@ -58,7 +66,9 @@ timing-packages)
     gate_timing_line | grep -oE -- '-p [a-z0-9-]+' | tr '\n' ' ' | sed 's/ $//'; echo
     exit 0 ;;
 timing-filter)
-    gate_timing_line | sed -n "s/.* -E '\(.*\)'\$/\1/p" | grep . || die "no -E filter in the gate's release timing line"
+    # The gate's filter minus the tests with an absolute wall-time budget measured on a local Mac (see runner_skips).
+    gate="$(gate_timing_line | sed -n "s/.* -E '\(.*\)'\$/\1/p" | grep .)" || die "no -E filter in the gate's release timing line"
+    printf '(%s) & !(%s)\n' "$gate" "$runner_skips"
     exit 0 ;;
 esac
 state="" head="" step=""
@@ -175,9 +185,17 @@ run)
             if (( measure_failed == 0 )) && $ab bench "$probe_dir" --case "$c" --pairs "$pairs" > "$out" 2>&1; then
                 row="$(awk '$1 == "instructions" { print $2, $3, $4 }' "$out" | head -n 1)"
                 problems="$(grep -c '^problem:' "$out" || true)"
-                if [[ -z "$row" ]]; then measure_failed=1; break; fi
                 # shellcheck disable=SC2086 # intentional split of the three fields of $row
                 set -- $row
+                # No usable instruction counters (a virtual machine has none: `/usr/bin/time -l` omits the line or
+                # reports 0): the bench ran, but it cannot back an instruction bar. Say so, keep the wall ratio for
+                # the trend, and do not retry another build, which would not change that.
+                if [[ -z "$row" || "${2:-}" == 0 || "${3:-}" == 0 ]] || ! awk -v r="${3:-x}" 'BEGIN { exit !(r + 0 > 0) }'; then
+                    if ! grep -q '^wall ns ' "$out"; then measure_failed=1; break; fi
+                    awk '$1 == "wall" && $2 == "ns" { print $5 }' "$out" | head -n 1 > "$work/wall-$c.txt"
+                    echo "perf-job: no instruction counters for $c on this machine (see $out); recording the wall ratio only" >&2
+                    continue
+                fi
                 if [[ "$problems" != 0 ]]; then verdict=noisy
                 elif awk -v r="$3" -v b="$bar" 'BEGIN { exit !(r <= b) }'; then verdict=ok
                 else verdict=regressed; fi
@@ -204,6 +222,11 @@ run)
 
     probe_bin="${PERF_JOB_PROBE:-$first_probe/target/release/ab-probe}"
     for c in $instr_cases; do
+        if [[ -s "$work/wall-$c.txt" ]]; then
+            line "$c" "$base" "" "" "$(cat "$work/wall-$c.txt")" "" "" noisy \
+                "no instruction counters on this machine: wall ratio only, no verdict; $note" >> "$results"
+            continue
+        fi
         # The lowest ratio over the builds is the verdict: one build under the bar clears the case.
         best="$(sort -g "$work/best-$c.txt" | head -n 1)"
         # shellcheck disable=SC2086 # intentional split of the four fields of $best
