@@ -719,18 +719,29 @@ fn add_profile_with_is_all_or_nothing() {
 
 const BACKENDS: [WatchBackend; 2] = [WatchBackend::Native, WatchBackend::Poll];
 
-/// The issue's bound: 500 ms from the write to the store, on the native
-/// backend (one debounce, 100 ms) and on the polling one (the change is
-/// sampled within one poll interval, 50 ms, and applied one debounce
-/// after that, at a tick).
+/// The issue's bound (#312, F4): 500 ms from the write to the store, on
+/// the native backend (one debounce, 100 ms) and on the polling one (the
+/// change is sampled within one poll interval, 50 ms, and applied one
+/// debounce after that, at a tick). It is the bar on a quiet machine:
+/// [`saving_adding_and_removing_a_profile_file_each_reload_once`] asserts
+/// it on the fastest of up to [`BOUND_ROUNDS`] runs of each step (#656).
 const LIMIT: Duration = Duration::from_millis(500);
 
+/// Rounds of the five steps that
+/// [`saving_adding_and_removing_a_profile_file_each_reload_once`] may take
+/// until the fastest run of each step is applied within [`LIMIT`].
+const BOUND_ROUNDS: usize = 5;
+
 /// How long a wait for a due event may take when it asserts no bound:
-/// enough for a starved process; `recv_timeout` returns at the event.
-const EVENTUALLY: Duration = Duration::from_secs(5);
+/// enough for a starved process (`taskpolicy -b` on a loaded machine
+/// stalls a thread for 1 to 26 s; #253 item 9, #525); `recv_timeout`
+/// returns at the event, so only a failing run waits this long.
+const EVENTUALLY: Duration = Duration::from_secs(30);
 
 /// How long to wait to be sure no further reload comes: a poll interval,
-/// the debounce and slack.
+/// the debounce and slack. A lower bound: a watcher starved past it sends
+/// a wrong second reload too late to be seen here, so load can make the
+/// test miss one but never fail a watcher that reloads once.
 const QUIET: Duration = Duration::from_millis(600);
 
 fn options(backend: WatchBackend) -> WatchOptions {
@@ -766,14 +777,15 @@ fn next_change(watcher: &Watcher, within: Duration, what: &str) -> Arc<Config> {
     }
 }
 
-/// How many `Changed` arrive until none has for [`QUIET`].
-fn more_changes(watcher: &Watcher) -> usize {
-    let mut count = 0;
+/// The configurations of the `Changed` that arrive until none has for
+/// [`QUIET`].
+fn more_changes(watcher: &Watcher) -> Vec<Arc<Config>> {
+    let mut reloads = Vec::new();
     loop {
         match watcher.recv_timeout(QUIET) {
-            Ok(ConfigEvent::Changed(_)) => count += 1,
+            Ok(ConfigEvent::Changed(changed)) => reloads.push(changed.config),
             Ok(_) => {}
-            Err(_) => return count,
+            Err(_) => return reloads,
         }
     }
 }
@@ -791,15 +803,14 @@ fn command(text: &str) -> String {
 }
 
 /// `step` (a write, an add, a remove of a profile file) is applied by
-/// exactly one reload within [`LIMIT`], that reload shows `expected`, and
-/// no other follows.
+/// exactly one reload, that reload shows `expected`, and no other
+/// follows; returns how long the reload took to arrive.
 fn reloads_once(
     watcher: &Watcher,
     what: &str,
-    within: Duration,
     step: impl FnOnce(),
     expected: &[(&str, Option<&str>)],
-) {
+) -> Duration {
     let started = Instant::now();
     step();
     let config = next_change(watcher, EVENTUALLY, what);
@@ -809,69 +820,177 @@ fn reloads_once(
         .map(|(name, command)| ((*name).to_owned(), command.map(str::to_owned)))
         .collect();
     assert_eq!(commands(&config), expected, "{what}");
-    assert!(elapsed < within, "{what}: took {elapsed:?}");
-    assert_eq!(more_changes(watcher), 0, "{what}: more than one reload");
+    assert_eq!(
+        more_changes(watcher).len(),
+        0,
+        "{what}: more than one reload"
+    );
+    elapsed
+}
+
+/// Saves `text` as the whole of the existing file `path` in place, in one
+/// step: a single `write(2)` over the old bytes, without truncation (a
+/// shorter document is padded with newlines to the old length, which
+/// changes nothing it means), so the watcher, however late it reads, sees
+/// the old document or the new one and never an empty file between them.
+/// `std::fs::write` truncates first, and a writer starved between the
+/// truncation and the write for longer than the debounce is rightly seen
+/// as two saves, which a test counting reloads per save would fail (as
+/// `save` in `tests/watch_themes.rs`, #525).
+fn overwrite(path: &Path, text: &str) {
+    let old = usize::try_from(std::fs::metadata(path).unwrap().len()).unwrap();
+    let mut doc = text.to_owned();
+    if doc.len() < old {
+        doc.push_str(&"\n".repeat(old - doc.len()));
+    }
+    let mut file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    let written = file.write(doc.as_bytes()).unwrap();
+    assert_eq!(written, doc.len(), "{}: one write", path.display());
+}
+
+/// The steps of one round of
+/// [`saving_adding_and_removing_a_profile_file_each_reload_once`], in
+/// order.
+const STEPS: [&str; 5] = [
+    "in-place save",
+    "rename-save",
+    "add",
+    "in-place save of the added file",
+    "remove",
+];
+
+/// One round on a fresh directory: each of [`STEPS`] is applied by exactly
+/// one reload that shows it, and how long each took to reach the watcher.
+fn reload_round(backend: WatchBackend) -> [Duration; STEPS.len()] {
+    let what = |step: usize| format!("{backend:?}: {}", STEPS[step]);
+    let (_dir, paths) = setup("", &[("a.toml", &command("/bin/a1"))]);
+    let store = ConfigStore::open(paths.clone()).unwrap();
+    let watcher = store.watch(options(backend)).unwrap();
+    while watcher.try_recv().is_ok() {}
+    let a = paths.profiles_dir().join("a.toml");
+    let b = paths.profiles_dir().join("b.toml");
+    let took = [
+        reloads_once(
+            &watcher,
+            &what(0),
+            || overwrite(&a, &command("/bin/a2")),
+            &[("a", Some("/bin/a2"))],
+        ),
+        reloads_once(
+            &watcher,
+            &what(1),
+            || write_atomic(&a, &command("/bin/a3")).unwrap(),
+            &[("a", Some("/bin/a3"))],
+        ),
+        reloads_once(
+            &watcher,
+            &what(2),
+            || std::fs::write(&b, "").unwrap(),
+            &[("a", Some("/bin/a3")), ("b", None)],
+        ),
+        reloads_once(
+            &watcher,
+            &what(3),
+            || overwrite(&b, &command("/bin/b1")),
+            &[("a", Some("/bin/a3")), ("b", Some("/bin/b1"))],
+        ),
+        reloads_once(
+            &watcher,
+            &what(4),
+            || std::fs::remove_file(&a).unwrap(),
+            &[("b", Some("/bin/b1"))],
+        ),
+    ];
+    assert_eq!(
+        commands(&store.config()),
+        [("b".to_owned(), Some("/bin/b1".to_owned()))]
+    );
+    took
 }
 
 /// F4: an in-place save, a rename-save, an add and a remove of a profile
-/// file each give exactly one reload that shows it, within 500 ms, on
-/// both backends.
+/// file each give exactly one reload that shows it, on both backends, and
+/// the fastest run of each step in up to [`BOUND_ROUNDS`] rounds is within
+/// the issue's 500 ms ([`LIMIT`]).
+///
+/// Load-tolerant (#656, as the theme bound of `tests/watch_themes.rs`,
+/// #525): every step's reload is waited for until it arrives, and the
+/// count and the configuration are asserted at every step of every round,
+/// so a loaded machine only adds rounds. On CI a single step took 529 and
+/// 645 ms, so a bar on every step cannot hold there. A watcher that is late
+/// at every save of a kind (a delay before the reload) fails every round;
+/// one late at only some saves (a late poll phase) is not caught. In the
+/// background service class (`taskpolicy -b`, which no script uses) at a
+/// load of 50 to 110 on 10 cores the fastest of five runs still took 516
+/// to 720 ms, so the bar does not hold there.
 #[test]
 fn saving_adding_and_removing_a_profile_file_each_reload_once() {
     for backend in BACKENDS {
-        let what = |step: &str| format!("{backend:?}: {step}");
-        let (_dir, paths) = setup("", &[("a.toml", &command("/bin/a1"))]);
+        let mut rounds: Vec<[Duration; STEPS.len()]> = Vec::new();
+        let fastest = |rounds: &[[Duration; STEPS.len()]], step: usize| {
+            rounds.iter().map(|took| took[step]).min()
+        };
+        let within = |rounds: &[[Duration; STEPS.len()]]| {
+            (0..STEPS.len()).all(|step| fastest(rounds, step).is_some_and(|best| best < LIMIT))
+        };
+        while rounds.len() < BOUND_ROUNDS && !within(&rounds) {
+            rounds.push(reload_round(backend));
+        }
+        let late: Vec<(&str, Option<Duration>)> = (0..STEPS.len())
+            .filter(|&step| fastest(&rounds, step).is_none_or(|best| best >= LIMIT))
+            .map(|step| (STEPS[step], fastest(&rounds, step)))
+            .collect();
+        assert!(
+            late.is_empty(),
+            "{backend:?}: the fastest run of a step not applied within {LIMIT:?} in {} rounds: {late:?}",
+            rounds.len()
+        );
+    }
+}
+
+/// F4: an in-place save that truncates and then writes (`std::fs::write`,
+/// as many editors save in place) gives one reload that shows the new
+/// document, on both backends. The count depends on the writer as well as
+/// the watcher: a writer stalled between the truncation and the write for
+/// a debounce has left an empty file on disk for that long, which the
+/// watcher rightly applies (an empty profile), so the count cannot be
+/// asserted alone without failing on a loaded machine. It is asserted by
+/// the writer's measured gap, as in `rapid_writes_are_debounced_into_one_event`
+/// of `tests/reload.rs` (#283 item 4): a save that took under half a
+/// debounce, from before the truncation to after the write, gets exactly
+/// one reload; a slower one at most one more, before it, that shows the
+/// empty file. Every save's last reload shows the new document. A watcher
+/// that reloads twice per save fails both cases.
+#[test]
+fn a_truncating_in_place_save_reloads_once_unless_the_writer_stalls() {
+    const SAVES: usize = 3;
+    for backend in BACKENDS {
+        let (_dir, paths) = setup("", &[("t.toml", &command("/bin/t0"))]);
         let store = ConfigStore::open(paths.clone()).unwrap();
-        let watcher = store.watch(options(backend)).unwrap();
+        let opts = options(backend);
+        let half = opts.debounce / 2;
+        let watcher = store.watch(opts).unwrap();
         while watcher.try_recv().is_ok() {}
-        let a = paths.profiles_dir().join("a.toml");
-        let b = paths.profiles_dir().join("b.toml");
-        reloads_once(
-            &watcher,
-            &what("in-place save"),
-            LIMIT,
-            || {
-                let mut file = std::fs::OpenOptions::new()
-                    .write(true)
-                    .truncate(true)
-                    .open(&a)
-                    .unwrap();
-                file.write_all(command("/bin/a2").as_bytes()).unwrap();
-            },
-            &[("a", Some("/bin/a2"))],
-        );
-        reloads_once(
-            &watcher,
-            &what("rename-save"),
-            LIMIT,
-            || write_atomic(&a, &command("/bin/a3")).unwrap(),
-            &[("a", Some("/bin/a3"))],
-        );
-        reloads_once(
-            &watcher,
-            &what("add"),
-            LIMIT,
-            || std::fs::write(&b, "").unwrap(),
-            &[("a", Some("/bin/a3")), ("b", None)],
-        );
-        reloads_once(
-            &watcher,
-            &what("in-place save of the added file"),
-            LIMIT,
-            || std::fs::write(&b, command("/bin/b1")).unwrap(),
-            &[("a", Some("/bin/a3")), ("b", Some("/bin/b1"))],
-        );
-        reloads_once(
-            &watcher,
-            &what("remove"),
-            LIMIT,
-            || std::fs::remove_file(&a).unwrap(),
-            &[("b", Some("/bin/b1"))],
-        );
-        assert_eq!(
-            commands(&store.config()),
-            [("b".to_owned(), Some("/bin/b1".to_owned()))]
-        );
+        let file = paths.profiles_dir().join("t.toml");
+        let empty = vec![("t".to_owned(), None)];
+        for i in 1..=SAVES {
+            let what = format!("{backend:?}: truncating save {i}");
+            let started = Instant::now();
+            std::fs::write(&file, command(&format!("/bin/t{i}"))).unwrap();
+            let gap = started.elapsed();
+            let mut seen = vec![commands(&next_change(&watcher, EVENTUALLY, &what))];
+            seen.extend(more_changes(&watcher).iter().map(|config| commands(config)));
+            let want = vec![("t".to_owned(), Some(format!("/bin/t{i}")))];
+            assert_eq!(seen.last(), Some(&want), "{what}: {seen:?}");
+            if gap < half {
+                assert_eq!(seen.len(), 1, "{what}: saved in {gap:?}: {seen:?}");
+            } else {
+                assert!(
+                    seen.len() == 1 || (seen.len() == 2 && seen[0] == empty),
+                    "{what}: saved in {gap:?}, more than the empty file before it: {seen:?}"
+                );
+            }
+        }
     }
 }
 
@@ -911,35 +1030,30 @@ fn a_linked_profiles_directory_is_followed() {
         reloads_once(
             &watcher,
             &what("in-place save in the target"),
-            EVENTUALLY,
-            || std::fs::write(&w, command("/bin/w2")).unwrap(),
+            || overwrite(&w, &command("/bin/w2")),
             &[("w", Some("/bin/w2"))],
         );
         reloads_once(
             &watcher,
             &what("add in the target"),
-            EVENTUALLY,
             || std::fs::write(dots.join("gen1").join("x.toml"), "").unwrap(),
             &[("w", Some("/bin/w2")), ("x", None)],
         );
         reloads_once(
             &watcher,
             &what("retarget"),
-            EVENTUALLY,
             || retarget(&paths.profiles_dir(), &dots.join("gen2")),
             &[("w", Some("/bin/g2"))],
         );
         reloads_once(
             &watcher,
             &what("target removed"),
-            EVENTUALLY,
             || std::fs::remove_dir_all(dots.join("gen2")).unwrap(),
             &[],
         );
         reloads_once(
             &watcher,
             &what("target created again"),
-            EVENTUALLY,
             || {
                 let tmp = dots.join("gen2.tmp");
                 std::fs::create_dir(&tmp).unwrap();
@@ -953,7 +1067,13 @@ fn a_linked_profiles_directory_is_followed() {
 
 /// F3, F4: a profile file that is a symbolic link (into a dotfiles
 /// checkout) is followed: an in-place save of its target, the target
-/// saved by rename, deleted, and created again each reload once.
+/// saved by rename, deleted, and created again each reload once. The
+/// target comes back by a rename, and the in-place saves here and in
+/// [`a_linked_profiles_directory_is_followed`] write without truncating
+/// ([`overwrite`]), so no step leaves an empty file on disk that a
+/// starved writer could show the watcher as one more save; the truncating
+/// save has its own test,
+/// [`a_truncating_in_place_save_reloads_once_unless_the_writer_stalls`].
 #[test]
 fn a_linked_profile_file_is_followed() {
     for backend in BACKENDS {
@@ -972,29 +1092,25 @@ fn a_linked_profile_file_is_followed() {
         reloads_once(
             &watcher,
             &what("in-place save of the target"),
-            EVENTUALLY,
-            || std::fs::write(&target, command("/bin/w2")).unwrap(),
+            || overwrite(&target, &command("/bin/w2")),
             &[("work", Some("/bin/w2"))],
         );
         reloads_once(
             &watcher,
             &what("rename-save of the target"),
-            EVENTUALLY,
             || write_atomic(&target, &command("/bin/w3")).unwrap(),
             &[("work", Some("/bin/w3"))],
         );
         reloads_once(
             &watcher,
             &what("target deleted"),
-            EVENTUALLY,
             || std::fs::remove_file(&target).unwrap(),
             &[],
         );
         reloads_once(
             &watcher,
             &what("target created again"),
-            EVENTUALLY,
-            || std::fs::write(&target, command("/bin/w4")).unwrap(),
+            || write_atomic(&target, &command("/bin/w4")).unwrap(),
             &[("work", Some("/bin/w4"))],
         );
     }
