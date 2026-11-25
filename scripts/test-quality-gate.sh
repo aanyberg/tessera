@@ -194,7 +194,7 @@ fi
 
 # The release timing run selects the b02_* cost bars of tessera-term's rect tests next to tessera-app-core's bars, in a
 # release build.
-if grep -q -- '--release -p tessera-app-core -p tessera-term -p tessera-config -E' "$work/cargo.calls" \
+if grep -q -- '--release -p tessera-app-core -p tessera-term -p tessera-config -p tessera-ffi -E' "$work/cargo.calls" \
     && grep -q 'package(tessera-term) & binary(=rect) & test(b02_)' "$work/cargo.calls"; then
     ok "the release timing run includes the tessera-term b02_ tests"
 else
@@ -205,6 +205,12 @@ if grep -q 'package(tessera-config) & binary(=edit) & test(=an_edit_among_many_m
     ok "the release timing run includes the tessera-config edit bar"
 else
     not_ok "the release timing run lacks the edit bar: $(< "$work/cargo.calls")"
+fi
+# ... and the memory-per-session and startup budgets (tessera-ffi, tests/budgets.rs, #216).
+if grep -q 'package(tessera-ffi) & binary(=budgets)' "$work/cargo.calls"; then
+    ok "the release timing run includes the tessera-ffi budgets"
+else
+    not_ok "the release timing run lacks the budgets: $(< "$work/cargo.calls")"
 fi
 
 # --- the ffi C tests run under the watchdog

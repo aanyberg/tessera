@@ -159,10 +159,11 @@ ffi_c_tests_step() {
 # `#[ignore]`d one-MiB run stays out), the two cluster bars of tests/rect_fixes.rs, the config edit among 20 000
 # mark-like lines (tessera-config, tests/edit.rs), the plugin host throughput, the reload capture against a plain one
 # (`a_reload_capture_costs_`, #412), the alternate-screen carry's cost bar (tests/stuck_modes.rs, a ratio of interleaved
-# runs) and the ten-million-case DECFRA differential (tests/rect_fixes.rs, no clock). Every one of them is in the
-# `timing` test group of .config/nextest.toml (one at a time; #603). A failure under load (1-min load average >= the
-# core count) is retried once; a second failure, any failure below that load and any failure of the build (`--no-run`)
-# fail the gate.
+# runs) and the ten-million-case DECFRA differential (tests/rect_fixes.rs, no clock), and the three budgets of
+# tessera-ffi's tests/budgets.rs (#216: an idle session's heap, a full scrollback's heap, startup to the first frame).
+# Every one of them is in the `timing` test group of .config/nextest.toml (one at a time; #603). A failure under load
+# (1-min load average >= the core count) is retried once; a second failure, any failure below that load and any failure
+# of the build (`--no-run`) fail the gate.
 timing_stub=(${(s:,:)${TESSERA_GATE_TEST_TIMING_RESULTS:-}})
 release_timing() {
     if [[ -n "$selftest" && -n "${TESSERA_GATE_TEST_TIMING_RESULTS:-}" ]]; then
@@ -174,7 +175,7 @@ release_timing() {
         print -r -- "-- release timing run (self-test): exit $st"
         return "$st"
     fi
-    run_nextest --release -p tessera-app-core -p tessera-term -p tessera-config -E 'kind(lib) & (test(reader_lock_hold_is_bounded) | test(view_metrics_are_fast_while_output_floods_the_terminal) | test(scrolling_through_a_long_history_is_smooth) | test(a_flood_under_a_scrolled_view_keeps_captures_short) | test(search_lock_hold_is_bounded) | test(a_million_lines_) | test(no_step_outlasts_four_budgets_and_a_quarter_second) | test(accessible_text_lock_hold_is_no_longer_than_a_capture) | test(hostile_smart_rules_)) | (binary(smart_selection) & test(=a_double_click_with_64_rules_on_2048_columns_takes_under_5_ms)) | (package(tessera-term) & binary(=rect) & test(b02_)) | (package(tessera-term) & binary(=rect_fixes) & (test(a_self_copy_of_a_screen_of_clusters_) | test(a_shifted_partial_copy_over_clusters_))) | (package(tessera-config) & binary(=edit) & test(=an_edit_among_many_mark_like_lines_is_fast)) | (package(tessera-app-core) & binary(=plugins) & test(=a_slow_plugin_keeps_session_throughput)) | (package(tessera-app-core) & kind(lib) & test(a_reload_capture_costs_)) | (package(tessera-term) & binary(=stuck_modes) & test(=the_carry_of_a_full_screen_costs_a_tenth_more_at_most)) | (package(tessera-term) & binary(=rect_fixes) & test(=decfra_fills_like_printing_for_random_charset_states))'
+    run_nextest --release -p tessera-app-core -p tessera-term -p tessera-config -p tessera-ffi -E 'kind(lib) & (test(reader_lock_hold_is_bounded) | test(view_metrics_are_fast_while_output_floods_the_terminal) | test(scrolling_through_a_long_history_is_smooth) | test(a_flood_under_a_scrolled_view_keeps_captures_short) | test(search_lock_hold_is_bounded) | test(a_million_lines_) | test(no_step_outlasts_four_budgets_and_a_quarter_second) | test(accessible_text_lock_hold_is_no_longer_than_a_capture) | test(hostile_smart_rules_)) | (binary(smart_selection) & test(=a_double_click_with_64_rules_on_2048_columns_takes_under_5_ms)) | (package(tessera-term) & binary(=rect) & test(b02_)) | (package(tessera-term) & binary(=rect_fixes) & (test(a_self_copy_of_a_screen_of_clusters_) | test(a_shifted_partial_copy_over_clusters_))) | (package(tessera-config) & binary(=edit) & test(=an_edit_among_many_mark_like_lines_is_fast)) | (package(tessera-app-core) & binary(=plugins) & test(=a_slow_plugin_keeps_session_throughput)) | (package(tessera-app-core) & kind(lib) & test(a_reload_capture_costs_)) | (package(tessera-term) & binary(=stuck_modes) & test(=the_carry_of_a_full_screen_costs_a_tenth_more_at_most)) | (package(tessera-term) & binary(=rect_fixes) & test(=decfra_fills_like_printing_for_random_charset_states)) | (package(tessera-ffi) & binary(=budgets))'
 }
 load_1min() {
     if [[ -n "$selftest" && -n "${TESSERA_GATE_TEST_LOAD:-}" ]]; then

@@ -120,6 +120,11 @@ test-group = 'timing'
 filter = 'package(tessera-app-core) & kind(lib) & test(=search::tests::the_kept_copy_and_its_spares_stay_within_the_cap)'
 test-group = 'timing'
 
+# Release-only memory-per-session and startup budgets (#216), run by the gate's release timing step.
+[[profile.default.overrides]]
+filter = 'package(tessera-ffi) & binary(=budgets)'
+test-group = 'timing'
+
 # Device loss through a full Metal command queue (#84): ~1.1 GB each.
 [[profile.default.overrides]]
 filter = '(package(tessera-app-core) & kind(lib) & test(a_loss_inside_the_frame_detaches_at_once)) | (package(tessera-render) & binary(device_loss) & test(a_device_error_loses_the_device_during_the_call_that_hit_it))'
