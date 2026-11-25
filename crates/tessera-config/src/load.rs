@@ -1182,24 +1182,63 @@ fn profile_window_warning(
 /// on the open handle and at most that many bytes are ever read, so a
 /// file that grows during the read is rejected rather than read whole.
 pub fn load_file(path: &Path) -> Result<Loaded, Error> {
-    load_file_noting_empty(path, Logging::Log).map(|(loaded, _)| loaded)
+    load_file_noting_empty(path, Logging::Log)
+        .1
+        .map(|(loaded, _)| loaded)
 }
 
-/// [`load_file`], and whether the file held nothing but whitespace after
-/// an optional byte order mark: TOML loads a BOM-only file as empty, so it
-/// counts as empty too (#287).
+/// The device and inode number of a file, from the metadata of an open
+/// handle: which file a read went to, whatever its path names since. The
+/// watcher compares the one a load read with the one it registered
+/// (#697). Unix only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FileId {
+    dev: u64,
+    ino: u64,
+}
+
+impl FileId {
+    /// The identity in `meta`; `None` where there are no inode numbers.
+    #[cfg(unix)]
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "the same signature as the non-Unix version, which has none"
+    )]
+    pub(crate) fn of(meta: &std::fs::Metadata) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt as _;
+        Some(Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+        })
+    }
+
+    /// The identity in `meta`; `None` where there are no inode numbers.
+    #[cfg(not(unix))]
+    pub(crate) fn of(_meta: &std::fs::Metadata) -> Option<Self> {
+        None
+    }
+}
+
+/// [`load_file`] and whether the file held nothing but whitespace after
+/// an optional byte order mark (TOML loads a BOM-only file as empty, so it
+/// counts as empty too, #287), with the file it went to ([`FileId`]):
+/// known for a load that fails too, unless it failed before finding a
+/// file (a missing one).
 pub(crate) fn load_file_noting_empty(
     path: &Path,
     logging: Logging,
-) -> Result<(Loaded, bool), Error> {
-    let bytes = read_capped(path, MAX_CONFIG_FILE_LEN, "config file")?;
-    let text = std::str::from_utf8(&bytes)?;
-    let empty = text
-        .strip_prefix('\u{feff}')
-        .unwrap_or(text)
-        .trim()
-        .is_empty();
-    Config::from_toml_lenient_logging(text, logging).map(|loaded| (loaded, empty))
+) -> (Option<FileId>, Result<(Loaded, bool), Error>) {
+    let (read, bytes) = read_capped_identified(path, MAX_CONFIG_FILE_LEN, "config file");
+    let loaded = bytes.and_then(|bytes| {
+        let text = std::str::from_utf8(&bytes)?;
+        let empty = text
+            .strip_prefix('\u{feff}')
+            .unwrap_or(text)
+            .trim()
+            .is_empty();
+        Config::from_toml_lenient_logging(text, logging).map(|loaded| (loaded, empty))
+    });
+    (read, loaded)
 }
 
 /// Reads the regular file at `path` whole, refusing one larger than `limit`
@@ -1207,17 +1246,47 @@ pub(crate) fn load_file_noting_empty(
 /// on a FIFO and never reads more than `limit + 1` bytes; see
 /// [`load_file`] for the checks.
 pub(crate) fn read_capped(path: &Path, limit: u64, what: &str) -> Result<Vec<u8>, Error> {
+    read_capped_identified(path, limit, what).1
+}
+
+/// [`read_capped`], with the identity of the file it went to: from the
+/// open handle once there is one, before that from the path's metadata
+/// (a file too large, or not a regular one, is refused unopened), and
+/// `None` when even that fails (a missing file).
+fn read_capped_identified(
+    path: &Path,
+    limit: u64,
+    what: &str,
+) -> (Option<FileId>, Result<Vec<u8>, Error>) {
     use std::io::Read as _;
 
-    check_regular_file(path, &std::fs::metadata(path)?, limit, what)?;
-    let file = open_nonblocking(path)?;
-    let len = check_regular_file(path, &file.metadata()?, limit, what)?;
-    let mut bytes = Vec::with_capacity(usize::try_from(len).unwrap_or(0));
-    (&file).take(limit + 1).read_to_end(&mut bytes)?;
-    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > limit {
-        return Err(too_large(path, None, limit, what).into());
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(error) => return (None, Err(error.into())),
+    };
+    let found = FileId::of(&meta);
+    if let Err(error) = check_regular_file(path, &meta, limit, what) {
+        return (found, Err(error.into()));
     }
-    Ok(bytes)
+    let file = match open_nonblocking(path) {
+        Ok(file) => file,
+        Err(error) => return (found, Err(error.into())),
+    };
+    let meta = match file.metadata() {
+        Ok(meta) => meta,
+        Err(error) => return (found, Err(error.into())),
+    };
+    let read = FileId::of(&meta);
+    let bytes = (|| {
+        let len = check_regular_file(path, &meta, limit, what)?;
+        let mut bytes = Vec::with_capacity(usize::try_from(len).unwrap_or(0));
+        (&file).take(limit + 1).read_to_end(&mut bytes)?;
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > limit {
+            return Err(too_large(path, None, limit, what).into());
+        }
+        Ok(bytes)
+    })();
+    (read, bytes)
 }
 
 /// Opens `path` read-only without blocking on a FIFO: the one open for

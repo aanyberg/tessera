@@ -3,7 +3,9 @@
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, RwLock};
 
-use crate::load::{Loaded, Logging, Warning, load_file_noting_empty, write_default_if_missing};
+use crate::load::{
+    FileId, Loaded, Logging, Warning, load_file_noting_empty, write_default_if_missing,
+};
 use crate::paths::ConfigPaths;
 use crate::theme::{ResolvedTheme, Theme};
 use crate::watch::{ConfigEvent, ThemesFingerprint, WatchOptions, Watcher};
@@ -348,43 +350,57 @@ impl ConfigStore {
     /// The loader's warnings are not logged here: [`ConfigStore::apply`]
     /// logs those the store did not hold already.
     pub(crate) fn load_from_disk(&self) -> Result<FromDisk, Error> {
-        let mut from = self.load_config_file()?;
-        crate::profile_files::load_and_merge(&mut from.loaded, &self.paths.profiles_dir());
-        Ok(from)
+        self.load_from_disk_identified().1
+    }
+
+    /// [`ConfigStore::load_from_disk`], with the `config.toml` it went to
+    /// as a handle on it names it (the final target, whatever the path
+    /// names since), whether it loaded or not; `None` for a missing file
+    /// (the defaults, or an error for a missing target) or where there are
+    /// no inode numbers. The watcher compares it with the one it
+    /// registered (#697).
+    pub(crate) fn load_from_disk_identified(&self) -> (Option<FileId>, Result<FromDisk, Error>) {
+        let (read, from) = self.load_config_file();
+        let from = from.map(|mut from| {
+            crate::profile_files::load_and_merge(&mut from.loaded, &self.paths.profiles_dir());
+            from
+        });
+        (read, from)
     }
 
     /// `config.toml` alone, for [`ConfigStore::load_from_disk`], which adds
-    /// the profile files (#312).
-    fn load_config_file(&self) -> Result<FromDisk, Error> {
+    /// the profile files (#312), and the file it went to.
+    fn load_config_file(&self) -> (Option<FileId>, Result<FromDisk, Error>) {
         let file = self.paths.config_file();
-        let loaded = load_file_noting_empty(&file, Logging::Quiet);
-        match loaded {
+        let (read, loaded) = load_file_noting_empty(&file, Logging::Quiet);
+        let from = match loaded {
             Ok((loaded, empty)) => Ok(FromDisk { loaded, empty }),
             Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
                 if std::fs::symlink_metadata(&file).is_ok() {
-                    return Err(std::io::Error::new(
+                    Err(std::io::Error::new(
                         std::io::ErrorKind::NotFound,
                         "config.toml is a symlink whose target is missing",
                     )
-                    .into());
-                }
-                if behind_dangling_link(&file) {
-                    return Err(std::io::Error::new(
+                    .into())
+                } else if behind_dangling_link(&file) {
+                    Err(std::io::Error::new(
                         std::io::ErrorKind::NotFound,
                         "the configuration directory (or one above it) is a symlink whose target is missing",
                     )
-                    .into());
+                    .into())
+                } else {
+                    Ok(FromDisk {
+                        loaded: Loaded {
+                            config: Config::default(),
+                            warnings: Vec::new(),
+                        },
+                        empty: false,
+                    })
                 }
-                Ok(FromDisk {
-                    loaded: Loaded {
-                        config: Config::default(),
-                        warnings: Vec::new(),
-                    },
-                    empty: false,
-                })
             }
             Err(e) => Err(e),
-        }
+        };
+        (read, from)
     }
 
     /// Replaces the applied configuration and clears any remembered error.
