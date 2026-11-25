@@ -556,7 +556,11 @@ impl App {
     /// first (ADR 0021): the
     /// program's file name (or, for [`Program::LoginShell`], the child's
     /// `$SHELL`) picks the shell, and the variables the injection adds count
-    /// toward the `execve` size limit below. Nothing
+    /// toward the `execve` size limit below. A start they take over that
+    /// limit is made once more without the injection, and the session's
+    /// first line says so: `[Tessera] Shell integration is off for this
+    /// session: the environment is too large (<bytes> bytes with it, more
+    /// than the <max> allowed).` (#519). Nothing
     /// changes when the child's environment already has
     /// `TESSERA_SHELL_INTEGRATION`, when the scripts cannot be written (a
     /// warning is logged), or for any other program.
@@ -570,9 +574,10 @@ impl App {
     /// [`view::MAX_VIEW_COLS`] columns: the grid allocates every row at
     /// full width, so an unbounded size could ask for gigabytes.
     /// [`PtyError::ArgumentsTooLong`] when the arguments and environment
-    /// exceed what `execve(2)` accepts. [`Error::ReaderThread`] when a
-    /// session thread (reader or input writer) cannot be created (the
-    /// child is then hung up).
+    /// exceed what `execve(2)` accepts even without the injection (its
+    /// sizes are then those of the start without it).
+    /// [`Error::ReaderThread`] when a session thread (reader or input
+    /// writer) cannot be created (the child is then hung up).
     pub fn spawn_session(&self, options: SpawnOptions) -> Result<SessionId> {
         self.spawn_session_with_profile(options, None)
     }
@@ -627,9 +632,15 @@ impl App {
         };
         let profiled = profile::apply(original.clone(), &resolved);
         let changed = profiled != original;
-        let error = match self.spawn_pty(profiled) {
-            Ok((pty, events, size)) => {
-                return self.attach_with_profile(id, pty, events, size, resolved.name, &[]);
+        let error = match self.spawn_pty(&profiled) {
+            Ok(started) => {
+                let Started {
+                    pty,
+                    events,
+                    size,
+                    notice,
+                } = started;
+                return self.attach_with_profile(id, pty, events, size, resolved.name, &notice);
             }
             Err(error) => error,
         };
@@ -646,22 +657,72 @@ impl App {
             errno = ?errno,
             "a profile's session could not start; starting the built-in profile"
         );
-        let notice = profile::fallback_notice(name, errno);
+        let mut notice = profile::fallback_notice(name, errno);
         // One retry, as the built-in profile; its failure reports the
         // profile's, the one the user asked for.
-        let (pty, events, size) = self.spawn_pty(original).map_err(|_| error)?;
+        let Started {
+            pty,
+            events,
+            size,
+            notice: started_notice,
+        } = self.spawn_pty(&original).map_err(|_| error)?;
+        notice.extend_from_slice(&started_notice);
         self.attach_with_profile(id, pty, events, size, None, &notice)
     }
 
     /// Starts `options` on a new PTY, with shell integration applied.
-    fn spawn_pty(&self, options: SpawnOptions) -> Result<(Box<dyn Pty>, PtyEvents, PtySize)> {
-        let options = shell_integration::apply(
+    ///
+    /// When the injection takes the spawn over the `execve` size limit
+    /// ([`PtyError::ArgumentsTooLong`]), `options` are started once more as
+    /// given, without it, and the session's first line says so: `[Tessera]
+    /// Shell integration is off for this session: the environment is too
+    /// large (<bytes> bytes with it, more than the <max> allowed).` The size
+    /// check comes before anything is opened or forked, so the refused
+    /// start leaves nothing behind. The warning logged carries the two
+    /// sizes only (docs/security.md S8; #519, ADR 0021).
+    ///
+    /// # Errors
+    ///
+    /// The start's error; after the retry, the retry's, which is the error
+    /// shell integration off gives (an environment too large without the
+    /// injection too is refused as it is then).
+    fn spawn_pty(&self, options: &SpawnOptions) -> Result<Started> {
+        let injected = shell_integration::injected(
             options,
             self.config().terminal.shell_integration,
             &self.paths.shell_integration_dir(),
         );
-        let (pty, events) = NativePty::spawn(&options)?;
-        Ok((Box::new(pty), events, options.size))
+        let mut notice = Vec::new();
+        if let Some(injected) = injected {
+            match NativePty::spawn(&injected) {
+                Ok((pty, events)) => {
+                    return Ok(Started {
+                        pty: Box::new(pty),
+                        events,
+                        size: injected.size,
+                        notice,
+                    });
+                }
+                Err(PtyError::ArgumentsTooLong { bytes, max }) => {
+                    tracing::warn!(
+                        target: "tessera_app_core",
+                        bytes,
+                        max,
+                        "shell integration takes the spawn over the exec size limit; \
+                         starting the session without it"
+                    );
+                    notice = shell_integration::too_large_notice(bytes, max);
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let (pty, events) = NativePty::spawn(options)?;
+        Ok(Started {
+            pty: Box::new(pty),
+            events,
+            size: options.size,
+            notice,
+        })
     }
 
     /// Registers an already spawned PTY as session `id`, of the built-in
@@ -2869,6 +2930,16 @@ impl fmt::Debug for App {
     }
 }
 
+/// A PTY [`App::spawn_pty`] started.
+struct Started {
+    pty: Box<dyn Pty>,
+    events: PtyEvents,
+    size: PtySize,
+    /// What the session's terminal is fed before the child's first byte:
+    /// empty, or the shell integration notice (#519).
+    notice: Vec<u8>,
+}
+
 /// Whether a profile's session that failed to start with `error` is
 /// started once more as the built-in profile (`Ok`), and the `errno` its
 /// notice then names (`None`: a reason without one); see
@@ -4129,6 +4200,68 @@ mod tests {
             "{result:?}"
         );
         assert_eq!(app.session_ids(), Vec::<SessionId>::new());
+    }
+
+    /// #519, docs/security.md S8: when the injection takes a start over the
+    /// exec limit, the one warning logged carries the two sizes the notice
+    /// shows and nothing of the environment, neither a variable's name nor
+    /// its value. A script named `zsh` stands in for it.
+    #[test]
+    fn the_exec_limit_retry_logs_the_sizes_only() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let zsh = root.join("zsh");
+        // zsh is injected only when it has a startup file to go back to.
+        std::fs::write(root.join(".zshrc"), "").unwrap();
+        std::fs::write(&zsh, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&zsh, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let app_of = |setting| {
+            let mut config = Config::default();
+            config.terminal.shell_integration = setting;
+            App::new(config, ConfigPaths::new(root.join("config")))
+        };
+        let off = app_of(tessera_config::ShellIntegration::Off);
+        let auto = app_of(tessera_config::ShellIntegration::Auto);
+        let name = "TESSERA_TEST_S3CRET_NAME";
+        let options = |padding: usize| {
+            SpawnOptions::command(&zsh, "x")
+                .size(PtySize::new(24, 400))
+                .env("HOME", &root)
+                .env(name, format!("s3cret{}", "p".repeat(padding)))
+        };
+        let probe = 2 * 1024 * 1024;
+        let Err(Error::Pty(PtyError::ArgumentsTooLong { bytes, max })) =
+            off.spawn_session(options(probe))
+        else {
+            panic!("a {probe}-byte variable should not fit");
+        };
+        let at_limit = probe - (bytes - max);
+        let mut started = None;
+        let warnings = session::tests::warnings(|| {
+            started = Some(auto.spawn_session(options(at_limit)).expect("started"));
+        });
+        let id = started.unwrap();
+        let notice = auto
+            .with_terminal(id, |term| term.grid().visible_lines()[0].text())
+            .unwrap();
+        let (injected, limit) = notice
+            .split_once(" (")
+            .and_then(|(_, sizes)| sizes.split_once(" bytes with it, more than the "))
+            .and_then(|(bytes, rest)| Some((bytes.to_owned(), rest.split_once(' ')?.0.to_owned())))
+            .unwrap_or_else(|| panic!("{notice:?}"));
+        assert_eq!(limit, max.to_string(), "{notice:?}");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains(&format!("bytes={injected} ")),
+            "{warnings:?}"
+        );
+        assert!(warnings[0].contains(&format!("max={max} ")), "{warnings:?}");
+        for leak in ["s3cret", "S3CRET", "ppp", root.to_str().unwrap()] {
+            assert!(!warnings[0].contains(leak), "{leak}: {warnings:?}");
+            assert!(!notice.contains(leak), "{leak}: {notice:?}");
+        }
+        auto.close_session(id).unwrap();
     }
 
     /// #568: a profile's session whose pty open gave no answer in time is

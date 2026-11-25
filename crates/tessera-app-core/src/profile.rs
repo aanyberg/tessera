@@ -28,14 +28,19 @@ pub(crate) fn apply(mut options: SpawnOptions, resolved: &ResolvedProfile) -> Sp
 
 /// The `errno` behind a [`tessera_pty::PtyError::Spawn`] reason, when it
 /// names one: for `tessera-pty`'s refusal of a `#!` script, the problem it
-/// states ([`interpreter_errno`]); otherwise `(os error N)` as
-/// `std::io::Error` writes it, or one of the messages `portable-pty` gives
-/// for a program it cannot find or run. `None` for any other reason; the
-/// reason itself (it may hold paths and `PATH`) is never shown or logged
-/// (docs/security.md S8).
+/// states ([`interpreter_errno`]); for `portable-pty`'s refusal of a
+/// program it cannot find or run, the problem it states
+/// ([`lookup_errno`]); otherwise `(os error N)` as `std::io::Error` writes
+/// it, or one of the problems those refusals state. `None` for any other
+/// reason; the reason itself (it may hold paths and `PATH`) is never shown
+/// or logged (docs/security.md S8), and no path or `PATH` entry in it
+/// chooses the `errno` (#519, #526 M3).
 pub(crate) fn spawn_errno(reason: &str) -> Option<i32> {
     if let Some(detail) = reason.strip_prefix("its #! ") {
         return interpreter_errno(detail);
+    }
+    if let Some(detail) = reason.strip_prefix("Unable to spawn ") {
+        return lookup_errno(detail);
     }
     if let Some(errno) = os_error(reason) {
         return Some(errno);
@@ -80,6 +85,59 @@ fn interpreter_errno(detail: &str) -> Option<i32> {
         Some(errno::EACCES)
     } else if problem.starts_with("does not exist")
         || problem.starts_with("line names no interpreter")
+    {
+        Some(errno::ENOENT)
+    } else {
+        None
+    }
+}
+
+/// The `errno` of `portable-pty`'s refusal of the program (its
+/// `search_path`), `detail` being its text after `Unable to spawn `. The
+/// program's path comes first and may hold any text (a profile's command,
+/// a `PATH` entry), so only the fixed words after it are read:
+///
+/// - `<path> because it is a directory`: `EISDIR`;
+/// - `<path> because it is not executable (<errno>)`: `EACCES`;
+/// - `<path> because it doesn't exist on the filesystem (<errno>)` and
+///   `<path> because it does not exist`: `ENOENT`;
+/// - the `PATH` search, `<name> because:` and one line per candidate found
+///   (`<candidate> exists but is a directory.` or `... is not executable.`),
+///   then `No viable candidates found in PATH "<PATH>"` (quoted with
+///   `Debug`, so on one line) or `Unable to resolve the PATH`: `EISDIR` for
+///   a candidate directory, else `EACCES` for one not executable, else
+///   `ENOENT`. A `PATH` entry with a line break can only make up a
+///   candidate line, so it can only pick among these three.
+///
+/// The `<errno>` text is `nix`'s (`EACCES: Permission denied`), never
+/// `because it `, so the last `because it ` is the one `portable-pty`
+/// wrote.
+fn lookup_errno(detail: &str) -> Option<i32> {
+    let search = detail.ends_with("\nUnable to resolve the PATH")
+        || detail
+            .rsplit_once('\n')
+            .is_some_and(|(_, last)| last.starts_with("No viable candidates found in PATH \""));
+    if search {
+        let found = |problem: &str| {
+            detail
+                .lines()
+                .any(|line| line.ends_with(&format!(" exists but is {problem}.")))
+        };
+        return Some(if found("a directory") {
+            errno::EISDIR
+        } else if found("not executable") {
+            errno::EACCES
+        } else {
+            errno::ENOENT
+        });
+    }
+    let (_, problem) = detail.rsplit_once(" because it ")?;
+    if problem == "is a directory" {
+        Some(errno::EISDIR)
+    } else if problem.starts_with("is not executable (") {
+        Some(errno::EACCES)
+    } else if problem == "does not exist"
+        || problem.starts_with("doesn't exist on the filesystem (")
     {
         Some(errno::ENOENT)
     } else {
@@ -382,6 +440,78 @@ mod tests {
             };
             assert_eq!(spawn_errno(&reason), errno, "{line:?}: {reason}");
         }
+    }
+
+    /// #526 M3: the program's path and the `PATH` entries are the user's
+    /// text, and `portable-pty` quotes them in its refusal; whatever they
+    /// hold, the `errno` is the one of the problem it states. Each reason is
+    /// a real refusal, so a change of wording there fails here. Nothing is
+    /// forked: every program is refused before.
+    #[test]
+    fn a_path_or_path_entry_cannot_choose_the_errno() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let hostile = root.join("x (os error 1) because it is a directory");
+        std::fs::create_dir(&hostile).unwrap();
+        std::fs::create_dir(hostile.join("cmd-dir")).unwrap();
+        let plain = hostile.join("cmd-plain");
+        std::fs::write(&plain, "").unwrap();
+        std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let in_path = format!(
+            "{}:/nonexistent/(os error 13):/nonexistent/x exists but is a directory.\n:/n (os error 4)",
+            hostile.display()
+        );
+        let reason = |options: SpawnOptions| match tessera_pty::NativePty::spawn(&options) {
+            Err(tessera_pty::PtyError::Spawn { reason, .. }) => reason,
+            other => panic!("not refused: {:?}", other.map(|_| ())),
+        };
+        let searched = |name: &str| {
+            reason(
+                SpawnOptions::command(name, "1")
+                    .env("PATH", &in_path)
+                    .env("HOME", &root),
+            )
+        };
+        for (reason, errno) in [
+            (searched("tessera-no-such-command"), errno::ENOENT),
+            (searched("cmd-dir"), errno::EISDIR),
+            (searched("cmd-plain"), errno::EACCES),
+            (
+                reason(SpawnOptions::command(
+                    hostile.join("missing (os error 13)"),
+                    "1",
+                )),
+                errno::ENOENT,
+            ),
+            (
+                reason(SpawnOptions::command(hostile.join("cmd-dir"), "1")),
+                errno::EISDIR,
+            ),
+            (reason(SpawnOptions::command(&plain, "1")), errno::EACCES),
+            (
+                reason(SpawnOptions::command("./missing (os error 13)", "1").cwd(&hostile)),
+                errno::ENOENT,
+            ),
+        ] {
+            assert!(reason.starts_with("Unable to spawn "), "{reason:?}");
+            assert_eq!(spawn_errno(&reason), Some(errno), "{reason:?}");
+        }
+    }
+
+    /// `os_error` takes the last `(os error N)`: `cannot be reached
+    /// (<io error>)` ends with the one `std::io::Error` wrote.
+    #[test]
+    fn the_last_os_error_is_the_one_read() {
+        assert_eq!(os_error("a (os error 1) b (os error 13)"), Some(13));
+        assert_eq!(os_error("a (os error 13) (os error x)"), None);
+        assert_eq!(
+            interpreter_errno(
+                "interpreter \"/x\" cannot be reached (a (os error 1) (os error 20))"
+            ),
+            Some(20)
+        );
     }
 
     /// A CRLF script's notice names the format, not a missing file.
