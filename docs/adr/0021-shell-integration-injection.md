@@ -752,3 +752,147 @@ fallback notice's `errno`. Only the fixed words after the path are read
 now (`profile::lookup_errno`), so a path can pick none of its own; a `PATH`
 entry with a line break can at most make up a candidate line, which picks
 among `EISDIR`, `EACCES` and `ENOENT`, the three a search can give.
+
+## Amendment: bash arrays are integrated with one element of ours (#613, 2026-11-25)
+
+This amendment supersedes **Arrays are not integrated** (2026-11-22) above,
+and the B5h exception stays: a login shell whose startup files make an
+array is still left to bash.
+
+- **Design.** On bash 5.1 and later an array `PROMPT_COMMAND` gets one
+  element of ours, `_tessera_si_element && builtin eval "$_tessera_si_go"
+  && _tessera_si_nop`. It is appended at index max(1, last index + 1), so it
+  is never at index 0, where a scalar assignment (`PROMPT_COMMAND=f`, or
+  starship's wrapping) would overwrite it. It is found by its exact text,
+  never by its index, and it never moves (lead decisions D1, D3).
+  - bash starts every element with the user's command's `$?` and
+    PIPESTATUS. The element reads `$?` first and then:
+    - closes the command (`D;<status>`, or a bare `D` when no C went out);
+    - reports the directory;
+    - puts A first and B last into `PS1`;
+    - appends our arming piece to `PS0` when it is missing;
+    - installs our trap at top level through the eval.
+  - **PS0 arms the trap** (lead decision L1, 2026-11-25). bash expands PS0
+    only for a command line it is about to run, after every element ran,
+    so an empty line or Ctrl-C at the prompt arms nothing. The piece
+    `${_tessera_si_none[_tessera_si_armed=1]-}` is found by its exact text
+    and appended after the user's and starship's PS0 text, which is never
+    rewritten or reordered; a command substitution before it runs unarmed.
+    The element puts it back at each prompt when it is missing, so a PS0
+    the user reassigns at a prompt costs no prompt: that line ran with the
+    old PS0 (row PS0b). An element after ours that reassigns PS0 at every
+    prompt leaves every command without C and with a bare D, never a
+    wrong status. With `shopt -u promptvars` nothing expands the piece: no
+    C, a bare D.
+  - **Stdout copies** (adversarial M5). The copies of standard output for
+    the C are opened only when a trap of ours is installed to close them.
+    When our trap fires unarmed while the prompt shows and PS0 has lost the
+    piece (or `promptvars` went off), it closes them and puts the user's
+    trap back before the command runs, so no command or child inherits
+    them (row `array_mode_leaks_no_stdout_copy`).
+    - We first armed from PS1's expansion, with the command number `\#` to
+      tell an empty line from a command. On bash 5.3, `\#` does not
+      advance for the first command after PS0 is first set, so with
+      starship the next command lost C and D. The command-number check is
+      gone, and one design serves 5.1 and 5.3.
+  - **Duplicates.** `PROMPT_COMMAND+=("${PROMPT_COMMAND[@]}")` (E9)
+    yields two copies. The copy that closes the command counts our
+    element's copies in the array, and the later copies at that prompt
+    only put the marks back (lead decision L3, 2026-11-25). The first
+    design counted prompts in an expansion inside PS1's B mark, which an
+    element's `${PS1@P}` (prompt-width code) also ran, so the second copy
+    sent a bare D after `D;<status>` and the status was lost (adversarial
+    B1, row `a_doubled_ps1_width_element_keeps_one_d_with_the_status`).
+    Limit: a Ctrl-C that stops `PROMPT_COMMAND` between two copies shifts
+    the work to the next prompt's second copy; if the copies are then
+    removed, that one prompt gets no D.
+  - A startup array that already holds our element's text (pasted from
+    `declare -p`) keeps that one copy and gets no second.
+- **KEEP and DROP** (rows of `bash_rows.rs`
+  `array_edits_keep_or_drop_the_integration`, on 5.3.20 and 5.1.16).
+  - KEEP rows: every command's `D;<status>` equals the `$?` the user's
+    elements see; every prompt has one A, B, C and OSC 7; the transcript
+    equals the same shell without Tessera. Each row's edit:
+    - E1/S4: none;
+    - E2: `unset 'PROMPT_COMMAND[0]'`;
+    - E3: `PROMPT_COMMAND[0]=f1`;
+    - E4: `+=(u3)`;
+    - E7/E8: append or prepend around ours;
+    - E9: the array doubled;
+    - E10: other in-place edits;
+    - E11: the scalar `PROMPT_COMMAND=f1`;
+    - E12: starship, which assigns element 0;
+    - E12b: `PROMPT_COMMAND=()` at startup, with ours at index 1 under
+      starship;
+    - E15: `=("${PROMPT_COMMAND[@]}")`;
+    - E16: `+=(u3 u3)`;
+    - PS0a: a PS0 set at startup;
+    - PS0b: PS0 reassigned at a prompt.
+  - E17 (`set -o pipefail`, `false | true`) gives `D;1`.
+  - DROP rows (D2: no heal): E5 `=(f1)`, E6 a whole new array, E13 `=()`
+    and E14 unsetting our element by index. The edit line gets its C and no
+    D. Later prompts keep A and B in `PS1` with no C or D, no trap of ours
+    is left, and the user's elements run as without Tessera. Our PS0 piece
+    stays and only sets a variable.
+- **bash-preexec placement** (D4). Once bash-preexec is imported, at load
+  or at a prompt, no trap of ours is set:
+  - our D and C go into `precmd_functions` and `preexec_functions`;
+  - the marks entry sits before `__bp_interactive_mode`, never after
+    bash-preexec's epilogue;
+  - our PS0 piece leaves PS0;
+  - bash-preexec 0.7 on 5.3 keeps its own PS0 hook, and its array does not
+    grow.
+  - The counters of the 0.5/0.6/0.7 matrix equal the shell without
+    Tessera.
+  - Accepted deviation: with bash-preexec 0.5 and a user array, 0.5's
+    fused epilogue runs its preexec for the user's element (its own B10
+    limit), so those shells get bare A, B and D only, no C.
+- **Spec rows.** `bash_spec.txt` rows of bash 5.1+ flip from `off` to
+  marks. Accepted deviations:
+  - X8g, X14f and X15e (bash-preexec, then oh-my-bash, `--rcfile`) leave
+    the first prompt and its command unmarked, because oh-my-bash's element
+    runs after the install in the array bash copied;
+  - X16a (login) measured fully marked, where the spec predicted an
+    unmarked first prompt.
+- **First prompt** (D5). On the `--rcfile` route the script's last command
+  returns the startup file's status, so the user's elements (and string
+  entries) at the first prompt see the `$?` and PIPESTATUS of bash without
+  Tessera. Limits (adversarial M1, deferred to #630): the status is the
+  one `source` returns, so a startup file that ends in `return N` gives
+  `$?` `N` (bash without Tessera: 0), and PIPESTATUS is `source`'s one
+  entry: a final pipeline's `0 1 0` becomes `0`, a final `! cmd` leaves the
+  negated status where bash keeps the command's own (measured on 5.1.16;
+  3.2 gives 0), and on bash 3.2 PIPESTATUS is always `0`.
+- **Readonly array** (adversarial M2). A startup file that makes
+  `PROMPT_COMMAND` a readonly array leaves the shell to bash, as before
+  arrays were integrated: no error at startup, and the first prompt's
+  elements see the startup file's status (row
+  `a_readonly_array_is_left_to_bash`).
+- **`shopt -u promptvars`** (#613 r3). bash would print our PS0 piece
+  instead of expanding it, so the piece leaves PS0 and no trap of ours is
+  armed. The user's DEBUG trap keeps running, and each command has no C and
+  a bare D. Limit: an element after ours that turns `promptvars` off does
+  so after our element ran, so that one prompt prints our B-mark and PS0
+  pieces as text, and the user's trap misses that one command.
+- **From no `PROMPT_COMMAND`.** `PROMPT_COMMAND+=(f1)` at a prompt, with
+  no `PROMPT_COMMAND` at startup, gives `([1]=f1 [2]=ours)`. Element 0 held
+  only our head and tail, so it goes. Bash without Tessera has `([0]=f1)`,
+  and `f1` runs as often. This is not a regression.
+- **Whole-array limit.** Our element lives in the user's array. Any
+  assignment that replaces the whole array without carrying it over, or
+  unsets it, ends the integration for the session (DROP above).
+- **Cost.** We counted CPU (user + sys) of 150 prompts of `:` on the
+  `--rcfile` route, best of 5 interleaved runs at load 5 to 7. The
+  3-element array `(u1 u2 u3)` was compared with the string `'u1; u2; u3'`:
+  - bash 5.3.20: 214.7 ms against 437.5 ms, ratio 0.49;
+  - bash 5.1.16: 180.3 ms against 354.4 ms, ratio 0.51.
+  The array route does less work per prompt than placing head and tail in
+  a string; the bar was 1.10.
+- **Security** (docs/security.md S5, S7, S8). There is no new buffer, queue
+  or table, and nothing from child output is read or evaluated. The eval
+  runs only `_tessera_si_go`, which our element sets to our own trap text.
+  Arrays are never exported, so `bash -c env` shows nothing of ours (S8,
+  checked at the end of every edit row).
+- `SCRIPTS_VERSION` is 13.
+- bash 5.1 rows run when `TESSERA_TEST_BASH51` names a bash 5.1. Without
+  it, they print `bash 5.1 part skipped: TESSERA_TEST_BASH51 is unset`.

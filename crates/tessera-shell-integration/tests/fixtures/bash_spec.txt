@@ -4,12 +4,12 @@
 #
 # Mark rows: id | route | startup files (tests/fixtures/bash-tools/, sourced
 # in this order) | marks of the first prompt | marks of the first command |
-# the same two on bash 5.1 and later, where PROMPT_COMMAND can be an array:
-# `off` there (both fields) is a shell left as without Tessera, because its
-# PROMPT_COMMAND is an array (bash-preexec 0.6 and later and the stand-in
-# make one, oh-my-bash appends an element): no OSC 133, no error, every
-# command's output (ADR 0021, #613). bash-preexec 0.6 makes the array at its
-# first prompt, after the handshake and that prompt's OSC 7.
+# the same two on bash 5.1 and later, where PROMPT_COMMAND can be an array
+# (bash-preexec 0.6 and later and the stand-in make one, oh-my-bash appends
+# an element). An array is integrated with one element of ours, or with
+# bash-preexec's hooks once bash-preexec is loaded (ADR 0021 amendment,
+# #613). bash-preexec 0.6 makes the array at its first prompt, after the
+# handshake and that prompt's OSC 7.
 # The route is `login` (`bash -l`: the PROMPT_COMMAND loader, files sourced
 # from .bash_profile) or `rcfile` (`bash -i`: `--rcfile`, from .bashrc);
 # `login-alone` rows are login shells the scan leaves to bash (B5h:
@@ -26,41 +26,47 @@
 # prompt, and rebuilds PS1: unmarked in the same way. (0.7.0 appends its entry
 # after oh-my-bash's, X6, so there the install runs last; 0.6.0 and 0.5.0 put
 # theirs into element 0.)
+# X8g, X14f, X15e on bash >= 5.1 (bash-preexec, then oh-my-bash, --rcfile):
+# oh-my-bash's element runs after bash-preexec's install in the array bash
+# copied for the first prompt and rebuilds PS1: that prompt and its command
+# are unmarked; marked from the second prompt on (#613, accepted deviation).
+# X16a on bash >= 5.1 (login): measured fully marked, where the #613 spec
+# predicted an unmarked first prompt (accepted deviation).
 mark | X1 | login | - | A B | C | A B | C
 mark | X2 | login | starship-init-1.27.bash | - | - | - | -
 mark | X3 | login | starship-init-master.bash | - | - | - | -
-mark | X4 | login | bash-preexec-install.sh | A B | C | off | off
+mark | X4 | login | bash-preexec-install.sh | A B | C | A B | C
 mark | X5 | login-alone | oh-my-bash-prompt.sh | A B | C | - | -
 mark | X6 | login-alone | oh-my-bash-prompt.sh bash-preexec-install.sh | A B | C | A B | C
 mark | X7 | login-alone | bash-preexec-install.sh oh-my-bash-prompt.sh | A B | C | - | -
 mark | X8a | rcfile | - | A B | C | A B | C
 mark | X8b | rcfile | starship-init-1.27.bash | A B | C | A B | C
 mark | X8c | rcfile | starship-init-master.bash | A B | C | A B | C
-mark | X8d | rcfile | bash-preexec-install.sh | A B | C | off | off
-mark | X8e | rcfile | oh-my-bash-prompt.sh | A B | C | off | off
-mark | X8f | rcfile | oh-my-bash-prompt.sh bash-preexec-install.sh | A B | C | off | off
-mark | X8g | rcfile | bash-preexec-install.sh oh-my-bash-prompt.sh | A B | C | off | off
+mark | X8d | rcfile | bash-preexec-install.sh | A B | C | A B | C
+mark | X8e | rcfile | oh-my-bash-prompt.sh | A B | C | A B | C
+mark | X8f | rcfile | oh-my-bash-prompt.sh bash-preexec-install.sh | A B | C | A B | C
+mark | X8g | rcfile | bash-preexec-install.sh oh-my-bash-prompt.sh | A B | C | - | -
 # bash-preexec with starship loaded after it (starship then uses its hook lists).
-mark | X9a | login | bash-preexec-install.sh starship-init-1.27.bash | A B | C | off | off
-mark | X9b | rcfile | bash-preexec-install.sh starship-init-1.27.bash | A B | C | off | off
+mark | X9a | login | bash-preexec-install.sh starship-init-1.27.bash | A B | C | A B | C
+mark | X9b | rcfile | bash-preexec-install.sh starship-init-1.27.bash | A B | C | A B | C
 # bash-preexec 0.5.0 and 0.6.0: another install text than 0.7.0.
-mark | X14a | login | bash-preexec-0.6.sh | A B | C | off | off
-mark | X14b | rcfile | bash-preexec-0.6.sh | A B | C | off | off
+mark | X14a | login | bash-preexec-0.6.sh | A B | C | A B | C
+mark | X14b | rcfile | bash-preexec-0.6.sh | A B | C | A B | C
 mark | X14c | login | bash-preexec-0.5.sh | A B | C | A B | C
 mark | X14d | rcfile | bash-preexec-0.5.sh | A B | C | A B | C
 mark | X14e | login-alone | oh-my-bash-prompt.sh bash-preexec-0.6.sh | A B | C | - | -
-mark | X14f | rcfile | bash-preexec-0.6.sh oh-my-bash-prompt.sh | A B | C | off | off
+mark | X14f | rcfile | bash-preexec-0.6.sh oh-my-bash-prompt.sh | A B | C | - | -
 # bash-preexec 0.7.0 on its DEBUG trap path (bash 5.1 and 5.2; 5.3 takes PS0).
-mark | X15a | login | bash-preexec-debug.sh | A B | C | off | off
-mark | X15b | rcfile | bash-preexec-debug.sh | A B | C | off | off
+mark | X15a | login | bash-preexec-debug.sh | A B | C | A B | C
+mark | X15b | rcfile | bash-preexec-debug.sh | A B | C | A B | C
 mark | X15c | login-alone | oh-my-bash-prompt.sh bash-preexec-debug.sh | A B | C | A B | C
 mark | X15d | login-alone | bash-preexec-debug.sh oh-my-bash-prompt.sh | A B | C | - | -
-mark | X15e | rcfile | bash-preexec-debug.sh oh-my-bash-prompt.sh | A B | C | off | off
+mark | X15e | rcfile | bash-preexec-debug.sh oh-my-bash-prompt.sh | A B | C | - | -
 # A theme's entry added after bash-preexec's install entry. Login on 3.2: both
 # are in the text bash is running when the loader runs, so the theme rebuilds
 # PS1 after the install. With an array the install is a later element.
-mark | X16a | login | bash-preexec-install.sh appended-theme.sh | - | - | off | off
-mark | X16b | rcfile | bash-preexec-install.sh appended-theme.sh | A B | C | off | off
+mark | X16a | login | bash-preexec-install.sh appended-theme.sh | - | - | A B | C
+mark | X16b | rcfile | bash-preexec-install.sh appended-theme.sh | A B | C | A B | C
 #
 # OSC 7 rows (M1): id | directory name (`\n` is a newline) | its encoding,
 # Terminal.app's rule: every byte outside [/._~A-Za-z0-9-] is %XX.
