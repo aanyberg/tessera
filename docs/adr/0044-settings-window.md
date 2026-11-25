@@ -883,3 +883,16 @@ This replaces the "Not covered" paragraph of the #549 amendment.
   earlier row whose old or new name is the edit's: the edit's ordinal
   counted it, so once it failed the ordinal could be another profile's
   of that name (adversarial cycle 2).
+
+## Amendment: which edit the plugin cap refuses (#590, 2026-11-25)
+
+This corrects the last sentence of "The warning" in the #560 amendment.
+
+- **Only a crossing is refused.** The core refuses an edit of
+  `[plugins] enabled` only when it takes the list from 64 ids or fewer to
+  more than 64: that edit adds the loader's cap warning. An edit of a list
+  already past the cap, which keeps the same warning, is written whether
+  it shortens the list or lengthens it (the pane still refuses a toggle
+  turned on at 64 ids or more first). The loader returns its one warning
+  on every load of such a list, and the configuration store logs it once,
+  when it first appears.

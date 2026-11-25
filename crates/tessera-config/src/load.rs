@@ -114,7 +114,9 @@ pub(crate) fn cut_prefix(text: &str) -> Option<&str> {
 /// A non-fatal problem found while loading configuration.
 ///
 /// Warnings never prevent a load; the affected value falls back to its
-/// default (or is ignored, for unknown keys).
+/// default or is clamped (or is ignored, for unknown keys), except a
+/// `[plugins] enabled` past [`crate::MAX_ENABLED_PLUGINS`], which is
+/// kept whole (see [`Warning::OutOfRange`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Warning {
@@ -130,7 +132,10 @@ pub enum Warning {
         /// How many unknown keys are not listed.
         count: usize,
     },
-    /// A value outside its valid range; it was replaced.
+    /// A value outside its valid range; it was replaced (clamped or reset),
+    /// except for `plugins.enabled`: a list longer than
+    /// [`crate::MAX_ENABLED_PLUGINS`] is kept whole, and the plugin host
+    /// reads only its first ids.
     OutOfRange {
         /// Dotted path of the field.
         path: String,
