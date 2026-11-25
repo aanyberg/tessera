@@ -19,6 +19,7 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 
 // Signal numbers are identical on every Unix this crate targets.
 const SIGHUP: i32 = 1;
+const SIGABRT: i32 = 6;
 const SIGKILL: i32 = 9;
 const SIGTERM: i32 = 15;
 
@@ -329,8 +330,8 @@ fn large_output_is_delivered_in_order() {
 }
 
 /// Number of threads in this process, from `ps -M` (one header line plus
-/// one line per thread). Only meaningful when the test runs alone in its
-/// process, as nextest runs every test.
+/// one line per thread). Only meaningful when the test runs [`alone`] in
+/// its process.
 fn thread_count() -> usize {
     let output = std::process::Command::new("ps")
         .args(["-M", "-p", &std::process::id().to_string()])
@@ -339,51 +340,133 @@ fn thread_count() -> usize {
     String::from_utf8_lossy(&output.stdout).lines().count() - 1
 }
 
-/// `true` when this process has no child at all, reaped or not; always
-/// `true` unless the test runs alone in its process (nextest), because
-/// sibling tests under `cargo test` have children of their own.
-///
-/// Must not be called while this process may have a zombie child some
-/// reader thread is about to reap: `waitpid` would reap it first.
-fn no_children() -> bool {
-    use nix::errno::Errno;
-    use nix::sys::wait::{WaitPidFlag, waitpid};
-    if std::env::var_os("NEXTEST").is_none() {
-        return true;
+/// Set in the environment of a process [`rerun_alone`] starts.
+const ALONE: &str = "TESSERA_PTY_TEST_ALONE";
+
+/// Whether this test runs alone in its process: under nextest, which runs
+/// every test in a process of its own, or re-run by [`rerun_alone`].
+/// Checks of the whole process (its children, its threads) hold only
+/// then: under plain `cargo test` sibling tests share the process and fork
+/// children of their own.
+fn alone() -> bool {
+    std::env::var_os("NEXTEST").is_some() || std::env::var_os(ALONE).is_some()
+}
+
+/// Under plain `cargo test`, runs the test `name` again in a process of
+/// its own (this test binary, with only that test selected) and fails
+/// unless it passed there; returns `true` then, so the caller skips its
+/// own run. Returns `false`, running nothing, when this process already
+/// runs [`alone`].
+fn rerun_alone(name: &str) -> bool {
+    if alone() {
+        return false;
     }
-    waitpid(None, Some(WaitPidFlag::WNOHANG)) == Err(Errno::ECHILD)
+    let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args(["--exact", name, "--nocapture", "--test-threads=1"])
+        .env(ALONE, "1")
+        .output()
+        .expect("run the test alone");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && stdout.contains("1 passed"),
+        "{name} alone: {}\n{stdout}\n{stderr}",
+        output.status
+    );
+    true
+}
+
+/// This process's children, running or not yet reaped, in no order.
+#[cfg(target_os = "macos")]
+fn children() -> Vec<i32> {
+    use nix::libc::{c_int, pid_t, proc_listchildpids};
+    let mut pids: Vec<pid_t> = vec![0; 1024];
+    let bytes = c_int::try_from(pids.len() * size_of::<pid_t>()).unwrap();
+    // SAFETY: `pids` is valid for writes of `bytes` bytes, and the call
+    // writes at most that many; it returns how many pids it wrote.
+    let listed = unsafe {
+        proc_listchildpids(
+            std::process::id().cast_signed(),
+            pids.as_mut_ptr().cast(),
+            bytes,
+        )
+    };
+    let listed = usize::try_from(listed).expect("list this process's children");
+    assert!(listed < pids.len(), "{listed} children fill the buffer");
+    pids.truncate(listed);
+    pids
+}
+
+/// This process's children, running or not yet reaped, in no order.
+#[cfg(not(target_os = "macos"))]
+fn children() -> Vec<i32> {
+    let mut pids = Vec::new();
+    for task in std::fs::read_dir("/proc/self/task").expect("list this process's threads") {
+        let listed = std::fs::read_to_string(task.unwrap().path().join("children"))
+            .expect("read a thread's children");
+        pids.extend(
+            listed
+                .split_whitespace()
+                .map(|pid| pid.parse::<i32>().unwrap()),
+        );
+    }
+    pids
+}
+
+/// Runs `f` and returns its result with the children of this process
+/// that appeared while it ran and are still there (running or not yet
+/// reaped) when it returns: a child `f` forked and left behind. A child
+/// that existed before the call is not counted, so a child of an earlier
+/// spawn, or the one a failed `posix_spawn` leaves for the kernel to reap
+/// (XNU), cannot fail the check. Only children of the calls in `f` when
+/// the test runs [`alone`].
+fn new_children<T>(f: impl FnOnce() -> T) -> (T, Vec<i32>) {
+    let before = children();
+    let result = f();
+    let mut new = children();
+    new.retain(|pid| !before.contains(pid));
+    (result, new)
+}
+
+/// Asserts that `NativePty::spawn(options)`, run alone in its process
+/// (see [`rerun_alone`]), is refused with
+/// [`PtyError::ArgumentsTooLong`], forks no child and leaves no thread.
+fn assert_too_long_before_forking(options: &SpawnOptions) -> (usize, usize) {
+    assert!(alone(), "the fork and thread checks need the process alone");
+    let threads = thread_count();
+    let (spawned, forked) = new_children(|| NativePty::spawn(options));
+    let sizes = match spawned {
+        Err(PtyError::ArgumentsTooLong { bytes, max }) => (bytes, max),
+        Err(other) => panic!("unexpected error: {other}"),
+        Ok((_pty, events)) => panic!("spawned; child {:?}", collect_all(&events).exit),
+    };
+    assert_eq!(forked, [0; 0], "children forked for refused arguments");
+    assert_eq!(thread_count(), threads, "a refused spawn left a thread");
+    sizes
 }
 
 #[test]
 fn oversized_arguments_are_refused_before_forking() {
-    let alone = std::env::var_os("NEXTEST").is_some();
-    let threads = thread_count();
+    if rerun_alone("oversized_arguments_are_refused_before_forking") {
+        return;
+    }
     // 5 MiB in one argument: more than any `ARG_MAX` this crate runs under.
     let options = sh("exit 0").arg("x".repeat(5 * 1024 * 1024));
-    match NativePty::spawn(&options) {
-        Err(PtyError::ArgumentsTooLong { bytes, max }) => {
-            assert!(bytes > 5 * 1024 * 1024, "counted {bytes} bytes");
-            assert!(max < bytes, "limit {max} not below {bytes}");
-            assert!(max > 0);
-        }
-        Err(other) => panic!("unexpected error: {other}"),
-        Ok((_pty, events)) => panic!("spawned; child {:?}", collect_all(&events).exit),
-    }
-    assert!(no_children(), "a child was forked for refused arguments");
-    if alone {
-        assert_eq!(thread_count(), threads, "a refused spawn left a thread");
-    }
+    let (bytes, max) = assert_too_long_before_forking(&options);
+    assert!(bytes > 5 * 1024 * 1024, "counted {bytes} bytes");
+    assert!(max < bytes, "limit {max} not below {bytes}");
+    assert!(max > 0);
 }
 
 #[test]
 fn oversized_environment_is_refused_before_forking() {
+    if rerun_alone("oversized_environment_is_refused_before_forking") {
+        return;
+    }
     // The environment counts against the same limit as the arguments.
     let options = sh("exit 0").env("TESSERA_HUGE", "y".repeat(5 * 1024 * 1024));
-    assert!(matches!(
-        NativePty::spawn(&options),
-        Err(PtyError::ArgumentsTooLong { .. })
-    ));
-    assert!(no_children());
+    let (bytes, _) = assert_too_long_before_forking(&options);
+    assert!(bytes > 5 * 1024 * 1024, "counted {bytes} bytes");
 }
 
 #[test]
@@ -418,12 +501,13 @@ fn arguments_well_under_the_limit_still_spawn() {
 #[test]
 fn an_argument_with_an_interior_nul_is_a_spawn_error() {
     // Only Rust callers can build one (C strings end at the NUL).
+    if rerun_alone("an_argument_with_an_interior_nul_is_a_spawn_error") {
+        return;
+    }
     let options = sh("exit 0").arg("a\0b");
-    assert!(matches!(
-        NativePty::spawn(&options),
-        Err(PtyError::Spawn { .. })
-    ));
-    assert!(no_children());
+    let (spawned, forked) = new_children(|| NativePty::spawn(&options));
+    assert!(matches!(spawned, Err(PtyError::Spawn { .. })));
+    assert_eq!(forked, [0; 0], "children forked for a NUL argument");
 }
 
 #[test]
@@ -503,16 +587,81 @@ impl Drop for TempDir {
     }
 }
 
+/// The 1-minute load average divided by the number of CPUs, at least 1.
+fn load_factor() -> f64 {
+    let mut load = [0.0f64; 1];
+    // SAFETY: `load` is valid for writes of the one sample asked for.
+    let samples = unsafe { nix::libc::getloadavg(load.as_mut_ptr(), 1) };
+    let cpus = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    if samples < 1 {
+        return 1.0;
+    }
+    #[expect(clippy::cast_precision_loss, reason = "a CPU count")]
+    let cpus = cpus as f64;
+    (load[0] / cpus).max(1.0)
+}
+
+/// How long [`refused`] keeps spawning a program whose `#!` check had no
+/// answer in time: 2 s on an idle machine, scaled by [`load_factor`]
+/// (at most tenfold). The check gets 200 ms on a helper thread, and on a
+/// loaded machine (#554 M4: 126 ms at load 100) that helper may not have
+/// run by then.
+fn check_budget() -> Duration {
+    Duration::from_secs(2).mul_f64(load_factor().min(10.0))
+}
+
+/// Most tries [`refused`] makes: a check that never answers in time must
+/// fail the test, not be retried until a lucky race lets one through.
+const REFUSAL_TRIES: usize = 5;
+
 /// Spawns `options`, which must be refused with [`PtyError::Spawn`]
-/// before any fork, and returns the reason.
+/// before any fork, and returns the error. A refusal that rests on the
+/// `#!` check comes only when the check answers within its 200 ms; when
+/// it did not, the spawn goes on and the child aborts at `exec`
+/// (`Signaled(SIGABRT)`, as documented on [`NativePty::spawn`]), and the
+/// spawn is tried again, the file now cached, [`REFUSAL_TRIES`] tries
+/// at most, within [`check_budget`].
+/// The refused call forks no child when the test runs [`alone`].
+fn refused(options: &SpawnOptions) -> PtyError {
+    let budget = check_budget();
+    let start = Instant::now();
+    let mut skipped = 0;
+    loop {
+        let (spawned, forked) = new_children(|| NativePty::spawn(options));
+        match spawned {
+            Err(err @ PtyError::Spawn { .. }) => {
+                if alone() {
+                    assert_eq!(forked, [0; 0], "children forked for a refused spawn");
+                }
+                return err;
+            }
+            Err(other) => panic!("unexpected error: {other}"),
+            Ok((_pty, events)) => {
+                let collected = collect_all(&events);
+                assert_eq!(
+                    collected.exit,
+                    Some(ExitStatus::Signaled(SIGABRT)),
+                    "spawned and ran: {:?}",
+                    collected.text
+                );
+                skipped += 1;
+                let used = start.elapsed();
+                assert!(
+                    skipped < REFUSAL_TRIES && used < budget,
+                    "not refused in {skipped} tries (at most {REFUSAL_TRIES}) and {used:?} \
+                     (budget {budget:?}): each spawn went on unchecked"
+                );
+            }
+        }
+    }
+}
+
+/// The reason [`refused`] gives.
 fn refused_reason(options: &SpawnOptions) -> String {
-    let reason = match NativePty::spawn(options) {
-        Err(PtyError::Spawn { reason, .. }) => reason,
-        Err(other) => panic!("unexpected error: {other}"),
-        Ok((_pty, events)) => panic!("spawned; child {:?}", collect_all(&events).exit),
-    };
-    assert!(no_children(), "a child was forked for a refused spawn");
-    reason
+    match refused(options) {
+        PtyError::Spawn { reason, .. } => reason,
+        other => panic!("unexpected error: {other}"),
+    }
 }
 
 #[test]
@@ -537,10 +686,13 @@ fn a_script_with_a_missing_interpreter_is_refused_before_forking() {
     let dir = TempDir::new("exec-missing");
     let script = dir.file("script", b"#!/nonexistent/interp\necho x\n", 0o755);
     let options = SpawnOptions::command(&script, "s");
-    let reason = refused_reason(&options);
+    let err = refused(&options);
+    let display = err.to_string();
+    let PtyError::Spawn { reason, .. } = err else {
+        panic!("unexpected error: {err}");
+    };
     assert!(reason.contains("\"/nonexistent/interp\""), "{reason}");
     assert!(reason.contains("ENOENT"), "{reason}");
-    let display = NativePty::spawn(&options).err().unwrap().to_string();
     assert!(
         display.starts_with(&format!("failed to spawn {}: ", script.display())),
         "{display}"
@@ -737,40 +889,11 @@ fn exec_outcome(path: &std::path::Path) -> String {
             child.wait().unwrap();
             "ok".to_owned()
         }
-        Err(err) => {
-            settle_failed_spawn();
-            match err.raw_os_error() {
-                Some(2) => "ENOENT".to_owned(),
-                Some(13) => "EACCES".to_owned(),
-                other => format!("errno {other:?}"),
-            }
-        }
-    }
-}
-
-/// Waits until the process a failed `posix_spawn` leaves behind is gone.
-/// XNU creates the child before the exec fails and then reaps it itself;
-/// until it has, `waitpid` sees a running child, which a loaded machine
-/// keeps visible long enough to trip the next row's `no_children` check.
-/// Like that check, it runs only alone in its process (under nextest).
-fn settle_failed_spawn() {
-    use nix::errno::Errno;
-    use nix::sys::wait::{WaitPidFlag, waitpid};
-    if std::env::var_os("NEXTEST").is_none() {
-        return;
-    }
-    let deadline = Instant::now() + TIMEOUT;
-    loop {
-        match waitpid(None, Some(WaitPidFlag::WNOHANG)) {
-            Err(Errno::ECHILD) => return,
-            Ok(nix::sys::wait::WaitStatus::StillAlive) | Err(Errno::EINTR) => {}
-            other => panic!("a failed spawn left a child we reaped: {other:?}"),
-        }
-        assert!(
-            Instant::now() < deadline,
-            "a failed spawn left a child behind"
-        );
-        std::thread::sleep(Duration::from_millis(1));
+        Err(err) => match err.raw_os_error() {
+            Some(2) => "ENOENT".to_owned(),
+            Some(13) => "EACCES".to_owned(),
+            other => format!("errno {other:?}"),
+        },
     }
 }
 

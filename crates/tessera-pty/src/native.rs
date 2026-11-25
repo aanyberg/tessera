@@ -268,8 +268,13 @@ impl NativePty {
     /// described below. While four earlier lookups or checks are still
     /// stuck, both give up at once: the spawn fails. A stuck helper's
     /// thread ends when its call does. `portable-pty` still stats the
-    /// working directory and `$SHELL`, and the program it is handed, on
-    /// the caller; after a lookup in time those answers are cached.
+    /// working directory and `$SHELL`, and resolves the program it is
+    /// handed, on the caller's thread before it forks; after a lookup in
+    /// time those answers are cached, but a volume that stops answering
+    /// after the lookup can still hold the caller there. Both bounds are
+    /// timed waits, which macOS may stretch for an app at background
+    /// quality of service (App Nap): there the 200 ms wait took about
+    /// 400 ms (#554).
     ///
     /// A file that is not a `#!` script and not a binary (`ENOEXEC`, such
     /// as a text file without a `#!` line or an empty file) is not refused:
@@ -685,7 +690,8 @@ const SPAWN_PROGRAM_TIMEOUT: Duration = Duration::from_secs(5);
 /// reads the program's header and stats its `#!` interpreter: a file not
 /// yet downloaded (an iCloud file) would otherwise hold the caller for as
 /// long as the download takes. Past it the check is skipped and the
-/// program left to `exec`.
+/// program left to `exec`. Under App Nap (background quality of service)
+/// the wait can stretch to about twice this.
 const SPAWN_CHECK_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// [`resolve_program`] on a `pty-spawn-program` helper thread, waited for
@@ -2146,6 +2152,17 @@ mod tests {
         assert_eq!(bytes(&command), bytes(&shell("/x/ab")) + 2);
     }
 
+    /// #554 M3: the length [`PtyError::ProgramTimedOut`] reports is the
+    /// login shell's `$SHELL`, and a command's own path otherwise.
+    #[test]
+    fn program_len_is_the_login_shells_variable_or_the_commands_path() {
+        let shell = "/x/tessera-shell";
+        let login = build_command(&SpawnOptions::login_shell("s").env("SHELL", shell));
+        assert_eq!(program_len(&login), shell.len());
+        let command = build_command(&SpawnOptions::command("/bin/sh", "s").env("SHELL", shell));
+        assert_eq!(program_len(&command), "/bin/sh".len());
+    }
+
     #[test]
     fn exec_limits_refuse_the_total_or_one_long_string() {
         let limits = ExecLimits {
@@ -2400,6 +2417,40 @@ mod tests {
         fn exit(&self, _: &tracing::span::Id) {}
     }
 
+    /// How far past [`SPAWN_CHECK_TIMEOUT`] the bounded header check may
+    /// return in [`a_slow_header_read_does_not_hold_the_caller`].
+    const CHECK_BAR_MARGIN: Duration = Duration::from_secs(2);
+
+    // A check that waited for its held read would return only after
+    // `slow_read::MOST`, which must stay past the bar for the test to see it.
+    const _: () = assert!(
+        slow_read::MOST.as_nanos() > SPAWN_CHECK_TIMEOUT.as_nanos() + CHECK_BAR_MARGIN.as_nanos()
+    );
+
+    /// Holds `path` at `stage` (see [`slow_read::hold`]) until dropped,
+    /// so a test that fails before its release does not leave helpers
+    /// blocked for [`slow_read::MOST`] (under `cargo test` they hold slots
+    /// of the process's helpers that other tests need).
+    struct Held {
+        path: PathBuf,
+        stage: slow_read::Stage,
+    }
+
+    impl Drop for Held {
+        fn drop(&mut self) {
+            slow_read::release(&self.path, self.stage);
+        }
+    }
+
+    /// [`slow_read::hold`], released when the returned guard drops.
+    fn hold(path: &Path, stage: slow_read::Stage) -> Held {
+        slow_read::hold(path, stage);
+        Held {
+            path: path.to_path_buf(),
+            stage,
+        }
+    }
+
     /// #554: a program whose header read blocks (a file not yet
     /// downloaded) is checked on a helper, and the spawn goes on without
     /// the check once [`SPAWN_CHECK_TIMEOUT`] has passed, logging only the
@@ -2407,11 +2458,11 @@ mod tests {
     /// spawn returns while the read is still blocked); the wall-time bar is
     /// on the bounded wait alone, since the rest of a spawn (`openpty`,
     /// `fork`) takes what a loaded machine gives it. Its upper end is
-    /// [`SPAWN_CHECK_TIMEOUT`] plus 2 s (#607): a held read blocks for
-    /// [`slow_read::MOST`] (10 s), so a check that waited for it still fails
-    /// the bar, while a loaded CI runner, which took 310 ms and 322 ms
-    /// against the 300 ms of a 100 ms margin, wakes the timed-out caller
-    /// well inside it.
+    /// [`SPAWN_CHECK_TIMEOUT`] plus [`CHECK_BAR_MARGIN`] (#607): a held
+    /// read blocks for [`slow_read::MOST`] (10 s, held above the bar by a
+    /// const assert), so a check that waited for it still fails the bar,
+    /// while a loaded CI runner, which took 310 ms and 322 ms, over the old
+    /// 300 ms bar, wakes the timed-out caller well inside it.
     #[test]
     fn a_slow_header_read_does_not_hold_the_caller() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -2419,7 +2470,7 @@ mod tests {
         let script = dir.join("script");
         std::fs::write(&script, "#!/bin/sh\nexit 7\n").unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        slow_read::hold(&script, slow_read::Stage::Header);
+        let held = hold(&script, slow_read::Stage::Header);
         let header = || slow_read::calls(&script, slow_read::Stage::Header);
         let options = SpawnOptions::command(&script, "slow");
 
@@ -2429,7 +2480,7 @@ mod tests {
         let took = start.elapsed();
         assert_eq!(checked, Ok(()), "a check without an answer passes");
         assert!(
-            took >= SPAWN_CHECK_TIMEOUT && took < SPAWN_CHECK_TIMEOUT + Duration::from_secs(2),
+            took >= SPAWN_CHECK_TIMEOUT && took < SPAWN_CHECK_TIMEOUT + CHECK_BAR_MARGIN,
             "the bounded check took {took:?}"
         );
 
@@ -2492,7 +2543,7 @@ mod tests {
             );
         }
         drop(pty);
-        slow_read::release(&script, slow_read::Stage::Header);
+        drop(held);
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while header().1 < 2 {
             assert!(
@@ -2528,7 +2579,7 @@ mod tests {
         let script = dir.join("script");
         std::fs::write(&script, "#!/bin/sh\nexit 7\n").unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        slow_read::hold(&script, slow_read::Stage::Lookup);
+        let held = hold(&script, slow_read::Stage::Lookup);
         let lookup = || slow_read::calls(&script, slow_read::Stage::Lookup);
         let options = SpawnOptions::command(&script, "slow");
 
@@ -2553,7 +2604,7 @@ mod tests {
         assert!(!shown.contains(dir.to_str().unwrap()), "{shown}");
         assert!(took >= SPAWN_PROGRAM_TIMEOUT, "refused after {took:?}");
 
-        slow_read::release(&script, slow_read::Stage::Lookup);
+        drop(held);
         wait_until("the held stat did not return on release", || {
             lookup().1 == 1
         });
@@ -2756,7 +2807,13 @@ mod tests {
 
         let (release, released) = mpsc::channel::<()>();
         let released = Arc::new(Mutex::new(released));
-        for _ in 0..MAX_STUCK_HELPERS {
+        for stuck in 0..MAX_STUCK_HELPERS {
+            // One short of the cap, a call still runs (#554 M3).
+            assert_eq!(
+                run_bounded("pty-spawn-check", Duration::from_secs(5), || 1),
+                Ok(1),
+                "{stuck} stuck lookups refused a call"
+            );
             let released = Arc::clone(&released);
             let result = run_bounded("pty-spawn-check", Duration::ZERO, move || {
                 let _ = lock_ignoring_poison(&released).recv_timeout(Duration::from_secs(30));
@@ -2788,7 +2845,7 @@ mod tests {
 
         // The first candidate is probed first, through the seam.
         let candidate = held.join("sh");
-        slow_read::hold(&candidate, slow_read::Stage::Lookup);
+        let held = hold(&candidate, slow_read::Stage::Lookup);
         let command = build_command(&options);
         let lookup = thread::spawn(move || resolve_program(&command));
         wait_until("the first candidate was not probed", || {
@@ -2797,7 +2854,7 @@ mod tests {
                 .len()
                 == 1
         });
-        slow_read::release(&candidate, slow_read::Stage::Lookup);
+        drop(held);
         assert_eq!(
             lookup.join().unwrap(),
             Some(Resolved {
