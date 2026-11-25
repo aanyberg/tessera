@@ -1263,6 +1263,112 @@ final class TerminalScrollerTests: XCTestCase {
         XCTAssertEqual(try render(scroller).bytes, legacy.bytes, "legacy again: AppKit's knob only")
     }
 
+    /// The #695 adversary's restyle during the fade: the pointer leaves
+    /// an overlay scroller, and it is restyled to legacy and back before
+    /// the fade would have ended. Legacy style shows it for good, which
+    /// forgets the fade's end, so the restyle narrows the knob, without an
+    /// animation, and the next hover widens it anew (#706).
+    func testARestyleDuringTheFadeAfterAHoverNarrowsTheKnobAndTheNextHoverWidensIt() throws {
+        let (scroller, window) = makeScroller()
+        defer { window.close() }
+        let layers = try knobLayers(scroller)
+        let narrowKnob = layers.knob.frame
+        try enter(scroller)
+        let first = try XCTUnwrap(widening(layers.knob, "bounds.size.width"), "the first hover's widening")
+        CATransaction.flush()
+        try exit(scroller)
+        clock += 0.5
+        scroller.preferredStyleOverride = .legacy
+        clock += 0.2
+        scroller.preferredStyleOverride = .overlay
+        XCTAssertFalse(scroller.isRevealed)
+        XCTAssertEqual(layers.knob.frame, narrowKnob, "narrow after the restyle")
+        XCTAssertTrue(layers.slot.isHidden, "no slot behind it")
+        runScheduledHides()
+        // Committed, so that an implicit animation would show.
+        CATransaction.flush()
+        XCTAssertEqual(layers.knob.frame, narrowKnob, "still narrow after the fade's end")
+        XCTAssertEqual(try overlayAnimations(scroller).keys.sorted(), [], "narrowed without an animation")
+
+        try enter(scroller)
+        let next = try XCTUnwrap(widening(layers.knob, "bounds.size.width"), "the next hover animates")
+        XCTAssertFalse(next === first, "a new widening")
+        XCTAssertEqual(startFrame(layers.knob), narrowKnob, "from the narrow knob")
+    }
+
+    /// The #695 adversary's round trip: restyled to legacy under the
+    /// pointer, which then leaves, and back to overlay. The restyle back
+    /// narrows the knob, and the next hover widens it anew (#706).
+    func testAPointerThatLeftInLegacyStyleLeavesANarrowKnobBackInOverlayStyle() throws {
+        let (scroller, window) = makeScroller()
+        defer { window.close() }
+        let layers = try knobLayers(scroller)
+        let narrowKnob = layers.knob.frame
+        try enter(scroller)
+        scroller.preferredStyleOverride = .legacy
+        try exit(scroller)
+        runScheduledHides()
+        scroller.preferredStyleOverride = .overlay
+        runScheduledHides()
+        XCTAssertEqual(layers.knob.frame, narrowKnob, "narrow back in overlay style")
+        XCTAssertTrue(layers.slot.isHidden, "no slot behind it")
+        CATransaction.flush()
+        let prior = widening(layers.knob, "bounds.size.width")
+        try enter(scroller)
+        let fresh = widening(layers.knob, "bounds.size.width")
+        XCTAssertTrue(fresh != nil && fresh !== prior, "the hover after the round trip animates anew")
+        XCTAssertEqual(startFrame(layers.knob), narrowKnob, "from the narrow knob")
+    }
+
+    /// The #695 adversary's legacy hover: the pointer enters and leaves a
+    /// legacy scroller, which changes nothing on screen, then the style
+    /// becomes overlay ("Automatically" and the mouse unplugged). The knob
+    /// is narrow, and the first overlay hover widens it (#706).
+    func testAHoverInLegacyStyleLeavesTheFirstOverlayHoverItsWidening() throws {
+        let (scroller, window) = makeScroller(style: .legacy)
+        defer { window.close() }
+        try enter(scroller)
+        try exit(scroller)
+        scroller.preferredStyleOverride = .overlay
+        runScheduledHides()
+        let layers = try knobLayers(scroller)
+        let narrowKnob = drawn(scroller.rect(for: .knob), wide: false, in: scroller).insetBy(dx: -1, dy: -1)
+        XCTAssertEqual(layers.knob.frame, narrowKnob, "narrow in overlay style")
+        XCTAssertTrue(layers.slot.isHidden, "no slot behind it")
+        try enter(scroller)
+        XCTAssertNotNil(widening(layers.knob, "bounds.size.width"), "the first overlay hover animates")
+        XCTAssertEqual(startFrame(layers.knob), narrowKnob, "from the narrow knob")
+    }
+
+    /// A restyle under the pointer, or while the knob is held, leaves the
+    /// knob wide, and so does a style notification that changes no style
+    /// during the fade: only a change of style with the pointer outside
+    /// and the knob not held narrows it (#706).
+    func testOnlyAChangeOfStyleWithThePointerOutsideAndTheKnobNotHeldNarrowsIt() throws {
+        let (scroller, window) = makeScroller(style: .legacy)
+        defer { window.close() }
+        try enter(scroller)
+        scroller.preferredStyleOverride = .overlay
+        try assertWideKnobAtTheMiddle(scroller, "restyled under the pointer")
+        let layers = try knobLayers(scroller)
+        let knob = scroller.rect(for: .knob)
+        let wideKnob = drawn(knob, wide: true, in: scroller).insetBy(dx: -1, dy: -1)
+        let narrowKnob = drawn(knob, wide: false, in: scroller).insetBy(dx: -1, dy: -1)
+        try exit(scroller)
+        scroller.preferredStyleOverride = .overlay
+        XCTAssertTrue(scroller.isRevealed, "fading")
+        XCTAssertEqual(layers.knob.frame, wideKnob, "the style unchanged: wide through the fade")
+        runScheduledHides()
+        XCTAssertEqual(layers.knob.frame, narrowKnob, "narrow once the fade ended")
+
+        scroller.beginTracking()
+        scroller.preferredStyleOverride = .legacy
+        scroller.preferredStyleOverride = .overlay
+        XCTAssertEqual(layers.knob.frame, wideKnob, "restyled while held: wide")
+        XCTAssertFalse(layers.slot.isHidden, "over its slot")
+        scroller.endTracking()
+    }
+
     func testAScrollerThatLostItsHistoryShowsNoKnobInLegacyStyle() throws {
         // Hidden without history in overlay style, shown again by legacy
         // style: no overlay knob from before.
