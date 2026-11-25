@@ -120,6 +120,11 @@ impl Probe {
         self.seen.lock().unwrap().events.clone()
     }
 
+    /// How many events it has been handed, without copying them.
+    fn events_len(&self) -> usize {
+        self.seen.lock().unwrap().events.len()
+    }
+
     fn activations(&self) -> usize {
         self.seen.lock().unwrap().activations
     }
@@ -1083,27 +1088,83 @@ fn the_frontend_reads_the_plugins_of_the_applied_configuration() {
 }
 
 /// A plugin that sleeps 100 ms per event under the same flood: the queue
-/// never holds more than its cap and the session reads on.
+/// fills to its cap and never past it, the overflow is dropped, and the
+/// session reads on.
+///
+/// Bounded by the plugin's work and the queue's cap, not by a deadline
+/// (#686). It used to require the plugin to have taken fewer than 100
+/// events when the flood ended: one event per 100 ms sleep, so a 10 s
+/// deadline on the flood, which a stall of the reader or of `cat` on a
+/// loaded host overruns (an 11 s pause in the middle of the flood fails it
+/// every time). The session reading on is now that it has dropped an event
+/// before the plugin has taken a full queue's worth: a reader that waited
+/// for room (or ran the plugin itself) would have the plugin take a full
+/// queue's worth and more, and would drop none. A slow flood that has
+/// dropped is not held to any time (the flood takes 0.4-0.6 s idle and
+/// 1.5-4.3 s at load 19-33). A reader that only sometimes waits for room
+/// still drops, so it is left to the release throughput bar,
+/// `a_slow_plugin_keeps_session_throughput`. The wait gives up once the
+/// plugin has taken a full queue's worth with nothing dropped, or once the
+/// session has queued and dropped nothing for [`ATTEMPTS`] polls (a
+/// stalled reader).
 #[test]
 fn a_slow_plugin_under_a_title_flood_keeps_the_queue_capped() {
+    const TITLES: usize = 6000;
     let root = tempfile::tempdir().unwrap();
     let flood = root.path().join("flood");
-    titled_flood(&flood, 6000);
+    titled_flood(&flood, TITLES);
     let slow = Probe::new(Spec::new("test.flood.slow", &[Capability::Sessions]));
     slow.delay.store(100, Ordering::Relaxed);
     let app = app(&root, &["test.flood.slow"], vec![slow.factory()]);
     wait_for_state(&app, "test.flood.slow", PluginState::Active);
+    let start = Instant::now();
     let id = spawn(
         &app,
         &format!("cat '{}'; echo flood-done; sleep 600", flood.display()),
     );
-    wait("the end of the flood", || {
-        screen_holds(&app, id, "flood-done")
-    });
+    // Every event the session has handed the queue so far: taken by the
+    // plugin, queued or dropped.
+    let pushed = || {
+        let stats = app.plugin_queue_stats();
+        slow.events_len() as u64 + stats.queued as u64 + stats.dropped
+    };
+    let (mut most, mut idle) = (pushed(), 0);
+    while !screen_holds(&app, id, "flood-done") {
+        let taken = slow.events_len();
+        let stats = app.plugin_queue_stats();
+        assert!(
+            taken < MAX_PLUGIN_EVENTS || stats.dropped > 0,
+            "the plugin took {taken} events and the session dropped none ({:?} in): the \
+             session waited for it; {stats:?}",
+            start.elapsed(),
+        );
+        let now = pushed();
+        (most, idle) = if now > most {
+            (now, 0)
+        } else {
+            (most, idle + 1)
+        };
+        assert!(
+            idle < ATTEMPTS,
+            "the session queued nothing for {ATTEMPTS} polls ({:?} in); {:?}",
+            start.elapsed(),
+            app.plugin_queue_stats()
+        );
+        thread::sleep(POLL);
+    }
     let stats = app.plugin_queue_stats();
-    assert!(stats.high_water <= MAX_PLUGIN_EVENTS, "{stats:?}");
+    let taken = slow.events_len();
+    eprintln!(
+        "flood of {TITLES} titles ended after {:?}, the plugin took {taken}; {stats:?}",
+        start.elapsed()
+    );
+    // Filled to the cap (so the cap was tested) and never past it.
+    assert_eq!(stats.high_water, MAX_PLUGIN_EVENTS, "{stats:?}");
     assert!(stats.dropped > 0, "{stats:?}");
-    assert!(slow.events().len() < 100, "{}", slow.events().len());
+    assert!(
+        taken < MAX_PLUGIN_EVENTS || stats.dropped > 0,
+        "{taken}; {stats:?}"
+    );
 }
 
 /// Reads `path` through a session and returns how long the read took, or
