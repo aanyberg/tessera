@@ -78,6 +78,12 @@ a process that scans the fonts and builds the index peaks 0.4 MiB higher
 in resident memory and 0.8 MiB higher in footprint, out of 14 MiB). A file that changes under the build reads short or with
 other bytes: its faces are left out of the index, or index what the
 file holds then, until the next build; an atomic rename was always safe.
+A path that is no longer a regular file when the build reaches it (a
+FIFO, socket or device put there after fontdb's scan) is skipped without
+blocking (#669): the open is non-blocking (`O_NONBLOCK`, `O_NOCTTY`) and
+the descriptor is checked with `fstat` before anything is read, so a
+FIFO with no writer cannot hold the index thread, and the index lands
+from the other files.
 Shaping and rasterisation still read a face through the map cosmic-text
 keeps for it (`make_shared_face_data`), so a font truncated in place
 while in use can still raise `SIGBUS` there. The index

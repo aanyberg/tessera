@@ -2510,6 +2510,7 @@ version = "0.2.1"
 dependencies = [
  "bytemuck",
  "cosmic-text",
+ "libc",
  "png",
  "pollster",
  "raw-window-handle",

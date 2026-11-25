@@ -1547,13 +1547,15 @@ enum CmapRead {
 /// The faces `faces` (index into the coverage build's face list, face
 /// index in the file) of the font file at `path`, each handed to `index`
 /// as a font holding only its `cmap`. The file is opened once and read,
-/// never mapped (#668); a face that cannot be read is skipped.
+/// never mapped (#668); a face that cannot be read is skipped, and so is
+/// the whole path when it is no longer a regular file (#669, see
+/// [`open_regular_file`]).
 fn index_file(
     path: &std::path::Path,
     faces: impl Iterator<Item = (u32, u32)>,
     mut index: impl FnMut(u32, swash::FontRef<'_>),
 ) {
-    let mut file = match std::fs::File::open(path) {
+    let mut file = match open_regular_file(path) {
         Ok(file) => file,
         Err(error) => {
             tracing::debug!(
@@ -1591,6 +1593,40 @@ fn index_file(
             }
         }
     }
+}
+
+/// Opens the font file at `path` for reading, refusing anything that is
+/// not a regular file without blocking on it (#669).
+///
+/// The path was a font when fontdb scanned it, but another process may
+/// have put a FIFO, socket or device there since. A plain open of a FIFO
+/// waits for a writer, forever if none comes, and would leave the index
+/// thread blocked and the index unlanded. So the open is non-blocking
+/// (`O_NONBLOCK`; `O_NOCTTY` so a terminal device never becomes the
+/// controlling terminal), and the descriptor, not the path, is checked
+/// with `fstat`, so a swap between the check and the open cannot slip
+/// through. A regular file reads the same with `O_NONBLOCK` set. Opening
+/// a socket fails by itself.
+fn open_regular_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(path)?;
+    let kind = file.metadata()?.file_type();
+    if kind.is_file() {
+        return Ok(file);
+    }
+    let kind = if kind.is_fifo() {
+        "a FIFO"
+    } else if kind.is_char_device() || kind.is_block_device() {
+        "a device"
+    } else if kind.is_dir() {
+        "a directory"
+    } else {
+        "not a regular file"
+    };
+    Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, kind))
 }
 
 /// Reads face `face_index`'s `cmap` table from `file` into `buf`, laid out
@@ -3178,6 +3214,111 @@ mod tests {
             read_face_cmap(&mut file, 0, &mut buf, &mut loaded),
             CmapRead::Missing
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// How long the #669 tests wait for an open or a build that a FIFO
+    /// could block: far past a two-file build even under load, and well
+    /// inside nextest's 300 s termination, so a blocked open fails the
+    /// test instead of hanging the run.
+    const FIFO_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// Makes a FIFO at `path` (the `mkfifo` tool: this crate forbids
+    /// `unsafe`).
+    fn mkfifo(path: &std::path::Path) {
+        let status = std::process::Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success(), "mkfifo {}", path.display());
+    }
+
+    /// Lets an open of the FIFO at `path` that is blocked waiting for a
+    /// writer return (it then reads end of file), so a failed test does
+    /// not leave a thread blocked. A non-blocking write open: it fails at
+    /// once when nobody waits to read.
+    fn release_fifo_reader(path: &std::path::Path) {
+        use std::os::unix::fs::OpenOptionsExt;
+        let _ = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path);
+    }
+
+    /// #669: a font path that fontdb scanned as a font and that is a FIFO
+    /// when the index builds does not block the index thread: the build
+    /// skips it, indexes the other file and lands. A plain open of the
+    /// FIFO waits for a writer forever; here that fails after
+    /// [`FIFO_WAIT`].
+    #[test]
+    fn a_fifo_swapped_in_after_the_scan_does_not_block_the_index() {
+        const MENLO: &str = "/System/Library/Fonts/Menlo.ttc";
+        const MONACO: &str = "/System/Library/Fonts/Monaco.ttf";
+        let dir = font_scratch("fifo");
+        let copy = dir.join("Menlo.ttc");
+        std::fs::copy(MENLO, &copy).expect("Menlo.ttc is installed");
+        let mut db = fontdb::Database::new();
+        db.load_font_file(&copy).expect("the copy loads");
+        db.load_font_file(MONACO).expect("Monaco is installed");
+        let monaco = db.faces().last().map(|f| f.id);
+        std::fs::remove_file(&copy).expect("remove the copy");
+        mkfifo(&copy);
+        let slot = Arc::new(OnceLock::new());
+        let (landed, wait) = std::sync::mpsc::channel();
+        spawn_coverage_build(
+            db,
+            &slot,
+            Some(Box::new(move || {
+                let _ = landed.send(());
+            })),
+        );
+        if wait.recv_timeout(FIFO_WAIT).is_err() {
+            release_fifo_reader(&copy);
+            panic!("the index did not land in {FIFO_WAIT:?}: the build blocked on the FIFO");
+        }
+        let index = slot.get().expect("the index landed");
+        assert_eq!(index.lookup('A'), monaco, "the FIFO's faces are left out");
+        assert!(
+            index.ranges.iter().all(|&(_, _, id)| Some(id) == monaco),
+            "{:?}",
+            index.ranges
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #669: the index's open refuses a FIFO, a device, a socket and a
+    /// directory, at once, and opens a regular file. Each open runs on a
+    /// helper thread so one that blocks fails after [`FIFO_WAIT`].
+    #[test]
+    fn the_index_open_refuses_what_is_not_a_regular_file() {
+        let dir = font_scratch("kinds");
+        let fifo = dir.join("fifo.ttf");
+        mkfifo(&fifo);
+        let socket = dir.join("socket.ttf");
+        let _listener =
+            std::os::unix::net::UnixListener::bind(&socket).expect("bind a socket file");
+        let regular = dir.join("regular.ttf");
+        std::fs::write(&regular, b"not a font").expect("write a file");
+        let subdir = dir.join("dir.ttf");
+        std::fs::create_dir(&subdir).expect("make a directory");
+        for (path, regular) in [
+            (fifo.clone(), false),
+            (std::path::PathBuf::from("/dev/null"), false),
+            (socket, false),
+            (subdir, false),
+            (regular, true),
+        ] {
+            let (done, wait) = std::sync::mpsc::channel();
+            let target = path.clone();
+            std::thread::spawn(move || {
+                let _ = done.send(open_regular_file(&target).map(drop));
+            });
+            let Ok(opened) = wait.recv_timeout(FIFO_WAIT) else {
+                release_fifo_reader(&path);
+                panic!("opening {} blocked for {FIFO_WAIT:?}", path.display());
+            };
+            assert_eq!(opened.is_ok(), regular, "{}: {opened:?}", path.display());
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
