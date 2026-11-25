@@ -33,8 +33,9 @@ import TesseraKit
 ///   knob is wide, over AppKit's slot drawn as wide, and stays so until
 ///   the scroller has faded out after the pointer left. It widens as
 ///   AppKit's does (``knobExpandDuration``), the slot with it, and narrows
-///   at once when the fade ends (#695); under Reduce Motion it widens at
-///   once.
+///   at once when the fade ends (#695), or when the style changes with the
+///   pointer outside and the knob not held (#706); under Reduce Motion it
+///   widens at once.
 /// - Input: dragging the knob or clicking the track reports where to go
 ///   through ``onScroll``; the terminal view moves the session's view.
 @MainActor
@@ -353,15 +354,24 @@ final class TerminalScroller: NSScroller {
         }
     }
 
-    /// Restyles it for the current style and tells the terminal view.
+    /// Restyles it for the current style and tells the terminal view. A
+    /// change of style with the pointer outside and the knob not held
+    /// narrows the knob (#706): legacy style shows the scroller for good,
+    /// which forgets a fade's end that would have narrowed it, and a hover
+    /// in legacy style widens it unseen, so back in overlay style the next
+    /// hover widens it anew.
     private func styleChanged() {
         let style = effectiveStyle
+        let restyled = applied?.style != style
         if scrollerStyle != style {
             scrollerStyle = style
         }
         applyStripBackground()
         applyOverlayColors()
         applyHidden()
+        if restyled, !isPointerInside, !isTracking {
+            setExpanded(false)
+        }
         if hasHistory, let position {
             applyKnob(position)
         }
@@ -490,8 +500,9 @@ final class TerminalScroller: NSScroller {
     /// from the narrow ones (``animateWidening(from:)``), unless under
     /// Reduce Motion. A narrowing, reached only when the fade ends
     /// (``hideAfterFlash()``), while the scroller is faded out (``flash()``)
-    /// or hidden (``applyHidden()``), is not animated, as AppKit's is not,
-    /// and ends a widening still in flight.
+    /// or hidden (``applyHidden()``), or on a change of style with the
+    /// pointer outside (``styleChanged()``), is not animated, as AppKit's is
+    /// not, and ends a widening still in flight.
     private func setExpanded(_ expanded: Bool) {
         guard expanded != isExpanded else { return }
         let before = overlayRects
