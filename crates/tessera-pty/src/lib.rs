@@ -51,6 +51,50 @@ mod native;
 pub use foreground::{ForegroundProcess, MAX_FOREGROUND_NAME_BYTES};
 pub use native::{IoThreads, NativePty, WRITE_QUEUE_BYTES, set_thread_start_hook};
 
+/// Seams for other crates' tests (feature `test-hooks`, never on in a
+/// release build): a program lookup that gets no answer, as on a stalled
+/// network volume, and a helper thread that cannot start (#602).
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub mod test_hooks {
+    use std::path::Path;
+    use std::time::Duration;
+
+    use crate::native::slow_read::{self, Stage};
+
+    /// How long [`crate::NativePty::spawn`] waits for a program lookup
+    /// before it fails with [`crate::PtyError::ProgramTimedOut`].
+    pub const PROGRAM_LOOKUP_TIMEOUT: Duration = crate::native::SPAWN_PROGRAM_TIMEOUT;
+
+    /// Longest a held lookup blocks without [`release_program_lookup`].
+    pub const MOST_HELD: Duration = slow_read::MOST;
+
+    /// Makes every program lookup's stat of `path` block until
+    /// [`release_program_lookup`] (at most [`MOST_HELD`]).
+    pub fn hold_program_lookup(path: &Path) {
+        slow_read::hold(path, Stage::Lookup);
+    }
+
+    /// Lets the held lookups of `path`, and every later one, return.
+    pub fn release_program_lookup(path: &Path) {
+        slow_read::release(path, Stage::Lookup);
+    }
+
+    /// The names of the threads that started a lookup stat of `path` while
+    /// it was held, and how many of those stats have returned.
+    #[must_use]
+    pub fn program_lookup_calls(path: &Path) -> (Vec<String>, usize) {
+        slow_read::calls(path, Stage::Lookup)
+    }
+
+    /// Makes the next helper thread started for a spawn on this thread (a
+    /// program lookup first) fail to start with `errno`, as when the
+    /// process is out of threads (`EAGAIN`).
+    pub fn fail_next_helper_start(errno: i32) {
+        crate::bounded::fail_next_start(errno);
+    }
+}
+
 /// This machine's host name (`gethostname(3)`), with any byte sequence that
 /// is not UTF-8 replaced by U+FFFD, or an empty string when it cannot be
 /// read. Read anew on every call: macOS changes it with the network.
@@ -219,8 +263,11 @@ pub enum PtyError {
     /// The child could not be started: the program is missing, a
     /// directory or not executable, it is a `#!` script whose interpreter
     /// is missing, not a regular file or not executable (a script saved
-    /// with CRLF line endings names `/bin/sh\r`), or an argument or
-    /// variable holds a NUL byte. All of these are found before the fork.
+    /// with CRLF line endings names `/bin/sh\r`), an argument or variable
+    /// holds a NUL byte, or a helper thread that looks the program up or
+    /// checks it could not be started (`reason` then ends in `(os error
+    /// N)`, `EAGAIN` when the process is out of threads). All of these are
+    /// found before the fork.
     /// An `exec` that fails after the fork for any other reason, such as
     /// a FIFO or device with an execute bit named as the program, is not
     /// reported here: the spawn succeeds and the child ends at once (see
@@ -242,6 +289,19 @@ pub enum PtyError {
         "the program ({path_bytes}-byte path) could not be looked up: the file system gave no answer in time"
     )]
     ProgramTimedOut {
+        /// Bytes in the program's path as given.
+        path_bytes: usize,
+    },
+    /// The program was not looked up: four earlier lookups or `#!` checks
+    /// are still waiting for the file system (or every helper stayed busy
+    /// with earlier ones for 5 s), so no helper was free to ask it (#602).
+    /// Nothing was opened or forked. As for
+    /// [`PtyError::ProgramTimedOut`], the path is left out and `path_bytes`
+    /// is its length as given.
+    #[error(
+        "the program ({path_bytes}-byte path) could not be looked up: too many earlier program checks are still waiting"
+    )]
+    ProgramLookupBusy {
         /// Bytes in the program's path as given.
         path_bytes: usize,
     },

@@ -63,6 +63,7 @@ impl From<&CoreError> for Error {
                 | PtyError::Spawn { .. }
                 | PtyError::ArgumentsTooLong { .. }
                 | PtyError::ProgramTimedOut { .. }
+                | PtyError::ProgramLookupBusy { .. }
                 | PtyError::OpenTimedOut => Self::SpawnFailed,
                 PtyError::InvalidSize(_) => Self::InvalidArgument,
                 PtyError::Resize(_) | PtyError::Io(_) => Self::Io,
@@ -146,6 +147,10 @@ mod tests {
             ),
             (
                 CoreError::Pty(PtyError::ProgramTimedOut { path_bytes: 1 }),
+                Error::SpawnFailed,
+            ),
+            (
+                CoreError::Pty(PtyError::ProgramLookupBusy { path_bytes: 1 }),
                 Error::SpawnFailed,
             ),
             (CoreError::Pty(PtyError::OpenTimedOut), Error::SpawnFailed),

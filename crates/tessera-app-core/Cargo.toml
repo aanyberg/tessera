@@ -51,8 +51,8 @@ default = ["plugin-hello"]
 # acceptance test (ADR 0047).
 plugin-hello = ["dep:tessera-plugin-hello"]
 # Exposes `App::panic_holding_session_lock` and `App::lose_gpu_for_test`
-# for tests of the FFI layer.
-test-hooks = ["tessera-render/test-hooks"]
+# for tests of the FFI layer, and `tessera_pty::test_hooks` (#602).
+test-hooks = ["tessera-render/test-hooks", "tessera-pty/test-hooks"]
 
 [lints]
 workspace = true

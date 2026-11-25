@@ -154,8 +154,9 @@ fn os_error(text: &str) -> Option<i32> {
 
 /// The `errno` values [`spawn_errno`] maps `portable-pty`'s and
 /// `tessera-pty`'s own messages to (the same on every Unix Tessera builds
-/// for, but for `ETIMEDOUT`), and the one a refused
-/// [`tessera_pty::PtyError::ArgumentsTooLong`] stands for.
+/// for, but for `ETIMEDOUT` and `EAGAIN`), and the ones a refused
+/// [`tessera_pty::PtyError::ArgumentsTooLong`] and the waits that got no
+/// answer stand for.
 pub(crate) mod errno {
     /// `Argument list too long`.
     pub(crate) const E2BIG: i32 = 7;
@@ -164,14 +165,24 @@ pub(crate) mod errno {
     pub(super) const ENOEXEC: i32 = 8;
     pub(super) const EACCES: i32 = 13;
     pub(super) const EISDIR: i32 = 21;
-    /// `Operation timed out`, for a pty open that gave no answer in time
-    /// ([`tessera_pty::PtyError::OpenTimedOut`], #568). Unlike the others
+    /// `Operation timed out`, for a pty open or a program lookup that gave
+    /// no answer in time ([`tessera_pty::PtyError::OpenTimedOut`], #568;
+    /// [`tessera_pty::PtyError::ProgramTimedOut`], #602). Unlike the others
     /// its number differs between Unix systems: 60 on macOS and the BSDs.
     #[cfg(not(target_os = "linux"))]
     pub(crate) const ETIMEDOUT: i32 = 60;
     /// `Connection timed out`, as Linux words `ETIMEDOUT`.
     #[cfg(target_os = "linux")]
     pub(crate) const ETIMEDOUT: i32 = 110;
+    /// `Resource temporarily unavailable`, for a program lookup refused
+    /// because earlier ones are still waiting
+    /// ([`tessera_pty::PtyError::ProgramLookupBusy`], #602). Its number
+    /// differs between Unix systems too: 35 on macOS and the BSDs.
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) const EAGAIN: i32 = 35;
+    /// `Resource temporarily unavailable` on Linux.
+    #[cfg(target_os = "linux")]
+    pub(crate) const EAGAIN: i32 = 11;
 }
 
 /// The line written into a session that started on the built-in profile
