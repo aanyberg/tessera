@@ -6,7 +6,9 @@
 # (a Thread Sanitizer lock, a host that ignores SIGTERM) xcodebuild waits for it and the run stalls until CI's step
 # limit. This wrapper follows the command's output (passed through unchanged). Once a test has started
 # ("Test Case '-[X y]' started.") and no test line has followed for TESSERA_APP_TEST_HANG_SECONDS (default 150, 30 s
-# past xcodebuild's 120 s allowance; with -test-iterations the line reads "started (Iteration n of m)."), it:
+# past xcodebuild's 120 s allowance; with -test-iterations the line reads "started (Iteration n of m)."), or at once
+# when xcodebuild reports the test past its allowance ("Test Case '-[X y]' exceeded execution time allowance": it
+# then samples and kills the host, keeping neither its sample nor the run going, #644), it:
 #   - writes a `sample` (10 s) of each test host to the sample log (default apps/macos/build/app-test-hang-sample.log,
 #     appended to, never truncated: `just app-test` removes it before its first run). A `sample` that has not returned
 #     after TESSERA_APP_TEST_SAMPLE_SECONDS (default 60) is killed and the log says "sample timed out";
@@ -203,7 +205,8 @@ monitor() {
         my $sel = IO::Select->new($r);
         # $progress: a test started since the last host was killed.
         # $final: the run'"'"'s last suite result was printed; $polled: when the hosts were last looked for then.
-        my ($buf, $current, $finished, $last, $fired, $progress, $failing, $final, $polled) = ("", undef, 0, undef, 0, 0, 0, 0, 0);
+        # $allowance: xcodebuild reported the current test past its execution time allowance.
+        my ($buf, $current, $finished, $last, $fired, $progress, $failing, $final, $polled, $allowance) = ("", undef, 0, undef, 0, 0, 0, 0, 0, 0);
         sub note { my ($file, $text) = @_; open(my $f, ">>", "$state/$file") or die; print $f "$text\n"; close $f; }
         my $open = 1;
         my ($status, $exited);
@@ -230,6 +233,12 @@ monitor() {
                             ($current, $finished, $last, $progress, $final) = ($1, 0, time, 1, 0);
                         }
                         elsif ($line =~ /^Test Case \x27(-\[.+\])\x27 (passed|failed|skipped)/) { $finished = 1; $last = time if defined $last; }
+                        # The allowance of xcodebuild ran out: it samples the host and then kills it, which leaves no host
+                        # to sample at the limit (#644). Sample it now, while it still hangs. A line for a test that never
+                        # printed "started" ($last undefined: no clock armed) is ignored on purpose: no test to blame.
+                        elsif ($line =~ /^Test Case \x27(-\[.+\])\x27 exceeded execution time allowance/ && defined $last) {
+                            ($current, $finished, $allowance) = ($1, 0, 1); $last = time - $limit - 1;
+                        }
                         # The run'"'"'s last tests ended: xcodebuild may take minutes to write its results after restarts, so
                         # from here the clock runs only while a test host is alive (see $final below).
                         elsif ($line =~ /^(\*\* TEST |Test session results|Test Suite \x27(All|Selected) tests\x27 (passed|failed))/) { ($final, $last) = (1, time); }
@@ -296,9 +305,11 @@ monitor() {
             # that does not go on is stopped at the next check.
             ($fired, $progress) = ($fired + 1, 0);
             my $what = $final ? "the test host kept running for more than $limit s after the run'"'"'s last test result"
+                     : $allowance ? "$current exceeded xcodebuild'"'"'s execution time allowance"
                      : $finished ? "the test host stalled for more than $limit s after $current ended"
                                  : "$current ran longer than $limit s";
             open(my $t, ">>", "$state/test") or die; print $t (($final ? "(after the last test)" : $current) . "\t$what\n"); close $t;
+            $allowance = 0;
             my ($kids, $args, @h) = hosts();
             # Each hang'"'"'s samples in a file of their own (hang-<n>, n as in $state/test), classified on their own.
             my $hang = "$state/hang-$fired";
