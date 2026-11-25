@@ -426,16 +426,20 @@ final class TerminalSelectionTests: XCTestCase {
 
         /// Everything the child received so far: a key sent now arrives after
         /// whatever was sent before, so the recorder holds it all once it
-        /// ends with that key.
-        func receivedInput() async throws -> [UInt8] {
+        /// ends with that key, past `expected` bytes, which can contain
+        /// `~` themselves (#648).
+        func receivedInput(expecting expected: Int) async throws -> [UInt8] {
             try session.send(key: .init(key: .char, codepoint: "~", text: "~"))
             let deadline = ContinuousClock.now + .seconds(10)
+            var received: [UInt8] = []
             while ContinuousClock.now < deadline {
-                let received = (try? Array(Data(contentsOf: recording))) ?? []
-                if received.last == UInt8(ascii: "~") { return received.dropLast() }
+                received = (try? Array(Data(contentsOf: recording))) ?? []
+                if received.count > expected, received.last == UInt8(ascii: "~") { return received.dropLast() }
                 try await Task.sleep(for: .milliseconds(10))
             }
-            throw RowFailure(message: "the sentinel key never arrived")
+            let hex = received.map { String(format: "%02x", $0) }.joined(separator: " ")
+            throw RowFailure(
+                message: "the sentinel key did not arrive after \(expected) bytes; received \(received.count): \(hex)")
         }
 
         /// `none`: nothing the gesture did reached the child. A key sent

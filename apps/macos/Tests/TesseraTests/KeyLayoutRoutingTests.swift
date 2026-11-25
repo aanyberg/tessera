@@ -176,7 +176,8 @@ final class KeyLayoutRoutingTests: XCTestCase {
     }
 
     /// Asserts that exactly `expected` reached the PTY since the last
-    /// check, up to a sentinel key sent after it.
+    /// check, up to a sentinel key sent after it: a `~` past all of
+    /// `expected`, which can contain `~` itself (#648).
     private func assertBytes(
         _ expected: [UInt8], _ message: String = "", file: StaticString = #filePath, line: UInt = #line
     ) async throws {
@@ -185,7 +186,7 @@ final class KeyLayoutRoutingTests: XCTestCase {
         let previous = checkedLength
         try await waitUntil("the sentinel arrives", timeout: .seconds(20)) {
             received = (try? Array(Data(contentsOf: self.file))) ?? []
-            return received.count > previous && received.last == UInt8(ascii: "~")
+            return received.count > previous + expected.count && received.last == UInt8(ascii: "~")
         }
         let segment = Array(received[min(previous, received.count)..<max(previous, received.count - 1)])
         checkedLength = received.count

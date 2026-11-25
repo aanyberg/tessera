@@ -469,6 +469,33 @@ final class TerminalSurfaceViewTests: XCTestCase {
         try await assertBytes(expected)
     }
 
+    /// A recorder that takes its input a byte at a time ends its file with
+    /// Delete's own `~` for a while before the Tab after it arrives, as a
+    /// descheduled `cat` on a loaded runner did (#648): the check waits past
+    /// that `~` for the sentinel, and compares all of it.
+    func testTheByteCheckWaitsPastATildeInTheExpectedBytes() async throws {
+        let slow = FileManager.default.temporaryDirectory.appendingPathComponent("tessera-view-\(UUID()).bin")
+        let script = #"stty raw -echo; : >> "$0"; printf R; "#
+            + #"while dd bs=1 count=1 >> "$0" 2>/dev/null; do sleep 0.1; done"#
+        appDelegate.spawnOptions = .init(program: "/bin/sh", arguments: ["-c", script, slow.path])
+        let pane = try appDelegate.newWindow().focusedPane
+        let slowWindow = KeyControlledWindow(contentRect: pane.view.frame)
+        extraWindows.append(slowWindow)
+        slowWindow.contentView = pane.view
+        _ = slowWindow.makeFirstResponder(pane.view)
+        try await waitForRecorder(of: pane.view, recordingTo: slow)
+        // The checks read ``file``; tear-down removes it.
+        try? FileManager.default.removeItem(at: file)
+        // Tear-down releases ``view``'s pasteboard: setUp's private one,
+        // never the user's clipboard that a new view starts with.
+        pane.view.pasteboard = view.pasteboard
+        view = pane.view
+        file = slow
+        press(key("\u{f728}", code: 117, [.function])) { $0.doCommand(by: #selector(NSResponder.deleteForward(_:))) }
+        press(key("\t", code: 48)) { $0.doCommand(by: #selector(NSResponder.insertTab(_:))) }
+        try await assertBytes(Array("\u{1b}[3~\t".utf8))
+    }
+
     func testD3SelectorsNameKeysWhoseKeyCodeNamesNothing() async throws {
         // A key code no layout uses, as a remapped key or custom key binding
         // would produce: the selector decides.
@@ -1893,16 +1920,32 @@ final class TerminalSurfaceViewTests: XCTestCase {
     /// and compares everything before it. Input reaches the recorder in
     /// order, so once the new sentinel is in the file, so is everything sent
     /// before it. The file still ends with the previous call's sentinel until
-    /// then: only a `~` past ``checkedLength`` is the new one.
+    /// then: only a `~` past ``checkedLength`` is the new one. Nor is a `~`
+    /// the new sentinel before the file holds all of `expected` (everything
+    /// since the session started, earlier sentinels included) and one byte
+    /// more: the expected bytes can contain `~` themselves (Delete is
+    /// `ESC [ 3 ~`), and a read that ended at that one compared a part of
+    /// them (#648; #346 in TesseraKitTests). The wait allows a
+    /// ``ChildStartBudget``, so a loaded host does not fail it on its own;
+    /// a recorder that got fewer bytes fails after the budget, with what it
+    /// got.
     private func assertBytes(
         _ expected: [UInt8], _ message: String = "", file: StaticString = #filePath, line: UInt = #line
     ) async throws {
         try view.session.send(key: .init(key: .char, codepoint: "~", text: "~"))
         var received: [UInt8] = []
         let previous = checkedLength
-        try await waitUntil("the sentinel arrives", timeout: .seconds(20)) {
+        var budget = ChildStartBudget()
+        while true {
             received = (try? Array(Data(contentsOf: self.file))) ?? []
-            return received.count > previous && received.last == UInt8(ascii: "~")
+            if received.count > max(previous, expected.count), received.last == UInt8(ascii: "~") { break }
+            guard !budget.isSpent() else {
+                XCTFail(
+                    "the sentinel did not arrive after \(expected.count) bytes \(budget.summary)", file: file,
+                    line: line)
+                break
+            }
+            try await Task.sleep(for: .milliseconds(10))
         }
         checkedLength = received.count
         // The recorder's own "R" is output, not input: the file holds input only.
