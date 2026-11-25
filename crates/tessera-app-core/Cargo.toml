@@ -28,7 +28,7 @@ tessera-search.workspace = true
 # Smart selection matching (ADR 0042).
 regex.workspace = true
 # Each smart-selection rule's attempt bounded by construction (#518).
-regex-automata.workspace = true
+regex-automata = { workspace = true, features = ["nfa-pikevm"] }
 thiserror.workspace = true
 tracing.workspace = true
 # Whether a remote host shows anything (a character that takes a cell, #358).

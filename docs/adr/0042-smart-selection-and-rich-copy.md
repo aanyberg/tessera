@@ -130,7 +130,7 @@ one is short), and a copy past the cap is `TESSERA_ERROR_REFUSED` with only
 | Input | Cap |
 |---|---|
 | Rules | 64 (`MAX_SMART_RULES`), later ones dropped with one warning |
-| Pattern | 1024 bytes (`MAX_SMART_RULE_PATTERN_LEN`); compiled program and lazy DFA cache 1 MiB each (`SMART_RULE_SIZE_LIMIT`), nesting 50 (`SMART_RULE_NEST_LIMIT`); a rule that breaks one, does not compile or matches the empty string is left out with a warning naming its index |
+| Pattern | 1024 bytes (`MAX_SMART_RULE_PATTERN_LEN`); compiled program 1 MiB (`SMART_RULE_SIZE_LIMIT`), each lazy DFA cache of the regex crate's 512 KiB (`SMART_RULE_REGEX_CACHE_BYTES`, #649), nesting 50 (`SMART_RULE_NEST_LIMIT`); a rule that breaks one, does not compile or matches the empty string is left out with a warning naming its index |
 | Scan | 8192 characters of the logical line around the click (`SMART_SCAN_LEN`: 4096 before it, the rest after) and 32 KiB (`SMART_SCAN_BYTES`: 16 KiB before it, 16 KiB from it on, #433) |
 | Click time | 50 ms (`SMART_RULE_BUDGET`), checked before each rule, the first rule included (#433), and after each costly search and every 16th match (`SMART_CLOCK_STRIDE`, #557) |
 | Formatted copy | 16 MiB of HTML and of RTF (`MAX_RICH_COPY_LEN`), counted while the runs are built; past it the formatted copy is refused and the plain copy still works |
@@ -379,17 +379,19 @@ These caches hold at most 64 rules x 2 directions x 1 MiB = 128 MiB, the
 same ceiling the regex crate's cache pool had. That is not the whole worst
 case: a rule that takes the fallback also keeps the regex crate's own cache
 in its pool, one per thread that clicks, about 0.6 MiB per `\b` rule
-measured. Its ceiling is that crate's limits plus the slot gate of #590:
-its lazy DFA 1 MiB per direction (`dfa_size_limit`), the bounded
-backtracker's 256 KiB, the PikeVM's slot tables within
-`SMART_FALLBACK_SLOT_BYTES` (512 KiB) and its sparse sets and stack
-(about 32 bytes per state, at most 16 384 states within that cap), about
-3.3 MiB per rule. With 64 fallback rules and one clicking thread the worst
-case is then about 128 + 64 x 3.3, about 336 MiB, under the 384 MiB bar
-(assuming one clicking thread and leaving out the regex crate's
-reverse-inner lazy DFA cache, which #649 bounds);
-the most measured for 64 rules on one thread is 95.6 MiB kept (see the
-#590 amendment).
+measured. Its ceiling is that crate's limits plus the slot gate of #590
+(the #649 amendment names each term):
+three lazy DFA caches (forward, reverse and reverse-inner) of 512 KiB each
+(`SMART_RULE_REGEX_CACHE_BYTES`, the rule compiler's `dfa_size_limit`),
+the bounded backtracker's 256 KiB visited set, the PikeVM's slot tables
+within `SMART_FALLBACK_SLOT_BYTES` (512 KiB) and its sparse sets and stack
+(32 bytes per state, at most 16 384 states within that cap, 512 KiB):
+1536 + 256 + 512 + 512 KiB, 2.75 MiB per rule.
+With 64 fallback rules and one clicking thread the worst case is then
+128 + 64 x 2.75 = 304 MiB, under the 384 MiB bar;
+each further thread that clicks adds 176 MiB (two threads 480 MiB).
+The most measured for 64 rules on one thread is 187 MiB kept (see the #649
+amendment).
 
 **Behaviour change.** A rule whose search gives up (its cache would
 thrash) or whose fallback is over the gate selects nothing for that click,
@@ -508,7 +510,307 @@ regex crate's on a mixed one, 1.57 MiB for both, a built-in rule at most
 0.14 MiB. Sixty-four rules on one thread, each scanned once: 64 at the cap
 kept 70.5 MiB (peak RSS 109 MiB), 64 thrashing rules 95.6 MiB (peak RSS
 299 MiB, of which 168 MiB is the 64 compiled rules themselves). By the
-limits a rule keeps at most about 5.3 MiB: 2 MiB of its own DFA caches and
+limits a rule kept at most about 5.3 MiB: 2 MiB of its own DFA caches and
 about 3.3 MiB of the regex crate's (Warm caches), 336 MiB for 64 rules
 on one clicking thread, leaving out the regex crate's reverse-inner lazy
-DFA cache (#649).
+DFA cache (the #649 amendment counts it and lowers the total).
+
+## Amendment: the regex crate's lazy DFA caches bounded at 512 KiB (#649, 2026-11-25)
+
+Superseded by the next amendment: the fallback no longer runs the regex
+crate's engine, and the ceiling counts allocated bytes.
+
+**The term left out.** The regex crate (1.x, on regex-automata 0.4) gives
+`RegexBuilder::dfa_size_limit` to its meta engine as
+`hybrid_cache_capacity`, and every lazy DFA that engine builds takes that
+capacity: the forward and reverse ones of its core strategy and the
+reverse one of its reverse-inner strategy (regex-automata's
+`meta/wrappers.rs`, `HybridEngine` and `ReverseHybridEngine`, each with
+`skip_cache_capacity_check(false)`, so a cache past it is cleared, and
+after three clears at under 10 bytes a state the search gives up to the
+PikeVM or backtracker, same matches). The reverse-inner cache was
+therefore bounded at 1 MiB all along; the #590 ceiling only left it out.
+Counted, 64 rules on one thread reached 128 + 64 x 4.25 = 400 MiB by the
+limits, over the 384 MiB bar.
+
+**The bound.** The rule compiler now gives the regex crate
+`dfa_size_limit(SMART_RULE_REGEX_CACHE_BYTES)`, 512 KiB, instead of the
+1 MiB program bound. Per fallback rule, one clicking thread:
+
+| Term | Bytes |
+|---|---|
+| Forward, reverse and reverse-inner lazy DFA caches, `SMART_RULE_REGEX_CACHE_BYTES` each | 1536 KiB |
+| Bounded backtracker's visited set (regex-automata's default `visited_capacity`) | 256 KiB |
+| PikeVM slot tables, within `SMART_FALLBACK_SLOT_BYTES` | 512 KiB |
+| PikeVM sparse sets and stack, 32 bytes x 16 384 states (the most within the slot cap) | 512 KiB |
+
+That is 1536 + 256 + 512 + 512 KiB, 2.75 MiB per rule, and with the
+click engine's own DFAs (64 rules x 2 x 1 MiB):
+128 + 64 x 2.75 = 304 MiB, under the 384 MiB bar.
+The regex crate keeps one cache per thread that searches with a rule, so
+the figure assumes one clicking thread (the Swift main thread today); each
+further thread that clicks adds 176 MiB (two threads 480 MiB).
+A const assert in `smart_engine.rs` holds the total under the bar, and a
+test checks that these phrases match the constants. Left out: the
+backtracker's stack and the one-pass DFA's and capture slots (a few bytes
+per slot), and the regex crate's cache from the loader's one empty-text
+check per rule, which has searched nothing.
+
+**What the figures count.** Every term is the crates' own count of a cache
+(`memory_usage`, its tables' lengths). A cleared lazy DFA cache keeps its
+tables' capacity, which can reach about twice that count: 64 fallback
+rules filling their caches over 400 clicks kept 2.9 MiB a rule (below).
+
+**Matches and give-ups.** A smaller cache changes no match: past it the
+regex crate falls back to an engine with the same matches. No built-in
+rule gives up at 512 KiB (tested: each Unicode-`\b` built-in rule, in the
+meta engine's lazy DFA configuration and without its prefilter, searched
+from every start its fallback searches from on 32 KiB CJK, mixed, ASCII
+and multi-script windows, quits on non-ASCII and never gives up, even at
+16 KiB; a 64-class filler in the same configuration does give up, so the
+search would show one).
+
+**Measured (release, a counting allocator, kept heap after the clicks).**
+One `\b` rule whose fallback fills its forward cache (2^15 DFA states, 64
+byte classes, 8000 characters): 1.18 MB kept, against 1.81 MB at 1 MiB and
+2.94 MB at the crate's default 2 MiB; tessera-ffi's `smart_selection_heap`
+test holds it under three times `SMART_RULE_REGEX_CACHE_BYTES`, so removing
+the limit or raising it back to 1 MiB fails (the mutant the #351 amendment
+left alive is now killed). For 64 rules, before and after:
+
+| Set | Kept before | Kept after | Peak RSS before | Peak RSS after |
+|---|---|---|---|---|
+| 64 at the slot cap (`\bx(?:(a?)(a?)){681}`), 8 clicks | 47.2 MiB | 47.2 MiB | 62.9 MB | 62.9 MB |
+| 32 thrashing own-DFA rules and 32 fallback fillers, 400 clicks | 90.3 MiB | 90.3 MiB | 113.9 MB | 113.0 MB |
+| 64 fallback fillers (`\b(?:[ab]*a[ab]{14})`, 30 000 characters), 400 clicks | 218.2 MiB | 187.4 MiB | 236.9 MB | 189.3 MB |
+
+The click budget skips rules, so a set's kept heap grows with the number
+of clicks until every rule has filled its caches; the fillers had not
+saturated at 400 clicks.
+
+## Amendment: the fallback runs the rule's DFA and a PikeVM; the ceiling in allocated bytes (#649, 2026-11-25)
+
+**Why.** The regex crate's bounded backtracker grows its stack without a
+bound: `\b(?:ab|[qQ]|[rR]|...)+` (150 classes) on `ab` x 3990 + `é` kept
+10.5 MiB for one rule, and 64 such rules 625 MiB. The lead also set the
+384 MiB bar on bytes allocated, not on the crates' `memory_usage` counts,
+which a filled lazy DFA cache's allocations exceed by up to 2.59 times by
+construction (below).
+
+**The fallback.** A rule that falls back no longer runs `regex::Regex`.
+Each search of its `find_iter` runs the rule's own DFA until it quits (a
+byte that is not ASCII at a Unicode word boundary) or gives up, and then a
+`PikeVM` (`regex_automata::nfa::thompson::pikevm`) on the DFA's forward
+program, which it shares; after a give-up the DFA's cache is replaced with
+an empty one and the rest of the scan is the PikeVM's, so a scan fills that cache once at most.
+That is what the regex crate's meta engine does with its lazy DFA and
+PikeVM, so the matches are the same; there is no backtracker, no second
+compile of the program and none of the meta engine's three more lazy DFA
+caches. The PikeVM's cache is one per rule behind a leaf lock (the DFA's
+cache lock is taken after it), not one per thread. app-core's
+regex-automata dependency gains the `nfa-pikevm` feature (the regex crate
+already enables it). Built with `regex_automata::meta` and
+`backtrack(false)` instead, a rule would keep a second program (about
+1.1 MiB measured) and three more lazy DFA caches (6 x their capacity in
+allocated bytes), so the DFA caches would have had to drop to about
+192 KiB a direction to stay under the bar.
+
+**The bound, in bytes allocated.** `SMART_RULE_CACHE_BYTES` drops from
+1 MiB to 512 KiB per direction. regex-automata raises a direction's
+capacity to its minimum for the program when that is larger, about 27
+bytes an NFA state (two sparse sets of 8 bytes, a stack of 4, room for two
+states of 5 bytes per NFA state): past 512 KiB only for a program of more
+than about 19 000 states, 0.84 MiB at the most (32 768 states, all that
+`SMART_RULE_SIZE_LIMIT` allows at the compiler's 32 bytes a state).
+A rule whose capacity is raised in either direction has no fallback: it
+matches wherever its DFA completes, on every line that is all ASCII, and
+selects nothing on a line that is not when it would fall back, with one
+warning per rule index when its engines are built. That is a behaviour
+change, for rules such as `\b\w{20}`, whose reverse program has about
+28 700 states while its forward one is within the slot gate: with a
+PikeVM cache beside a raised DFA cache a rule's terms would reach
+1.30 + 1.79 + 1.25 + 2 = 6.34 MiB, and 64 rules 406 MiB. No built-in rule
+is raised (tested). tessera-config keeps the pattern string of a rule, not
+its compiled `Regex` (`CompiledRule::pattern`): the `Regex` is dropped
+after the load-time checks, which are unchanged. Per rule:
+
+| Term | Bytes allocated |
+|---|---|
+| The DFA's two caches, at most 2.59 times their capacity each by construction: 2 x 2.59 x 512 KiB = 2.59 MiB | 2.59 MiB |
+| The PikeVM's cache, by the slot gate 16 384 states of 80 bytes (1.25 MiB): two slot tables of two 8-byte slots, two sparse sets of two 4-byte ids, a 16-byte stack frame grown by doubling | 1.25 MiB |
+| Programs: the DFA's forward and reverse NFAs, which the PikeVM shares, each within `SMART_RULE_SIZE_LIMIT`: 2 x 1 MiB = 2 MiB | 2 MiB |
+| The DFA's literal prefilter, which the PikeVM shares, kept only when its count (`Prefilter::memory_usage`) is at most 128 KiB (`SMART_PREFILTER_BYTES`), with 32 KiB for the structs the count leaves out: 128 + 32 KiB = 0.156 MiB | 0.156 MiB |
+
+So 2.59 + 1.25 + 2 + 0.156 = 5.996 MiB per rule and 64 x 5.996 = 383.76 MiB,
+under the 384 MiB bar. The cache factor holds by construction. A state counts
+4s + 36 + l bytes against the capacity: its transition row (4 bytes for
+each of s classes, s at least 2), 16 bytes in the state list, 20 in the
+state map and its own l bytes (at least 9). It allocates at most
+8s + 112.15 + l: twice its row and list entry (both grow by doubling),
+2.29 map buckets of 25 bytes (a std `HashMap` just after it doubles) and
+its bytes behind a 16-byte `Arc` header rounded up to 8. That is at most
+137.15 / 53 = 2.59 times its count; the sparse sets, stack and scratch
+allocate what they count. regex-automata's `Cache::reset` keeps every
+table's capacity, so a fill of many small states followed by a fill of
+large ones would allocate up to three times the capacity (the adversarial
+run measured 2.90 on `x(?-u:a){4200}|(?-u:b){1000}`): a give-up therefore
+replaces the cache with a new one, whose tables hold one fill only
+(1.01 MiB kept for that rule, programs included, against 2.08 MiB with a
+reset; tested). A raised direction allocates at most its sparse sets plus
+2.59 times the rest, 8 + 2.59 x 19 bytes an NFA state, 1.79 MiB at 32 768
+states; such a rule has no PikeVM cache, so its terms are at most
+2 x 1.79 + 2 + 0.156 = 5.74 MiB.
+
+The prefilter term is new in the second adversarial run, which found that
+no term held it. The regex crate keeps an exact literal set of up to 250
+literals as the prefix it searches for, and past 64 literals regex-automata
+builds an Aho-Corasick DFA for it with a 256-wide row per state: the
+117-byte `\b[0-9]{2}[ab]` followed by 97 bytes of ASCII and two-byte
+characters (200 literals of 100 bytes) loads, and its prefilter alone kept
+19.1 MiB, 64 such rules 1222 MiB, the same on the base. A rule whose
+prefilter counts more than 128 KiB is now built without one, so its DFA
+searches without skipping ahead, as it does when no prefix can be found;
+its matches do not change (tested). Every built-in rule keeps its
+prefilter (tested). The count is the automaton's tables; what it leaves
+out, the automaton's own structs and their `Arc`, came to at most 6.3 KiB
+over 1005 prefilters of literal sets and prefixes (up to 250 literals of
+up to 100 bytes, counting 2.8 KiB to 23.8 MiB), so the term allows 32 KiB
+for it. Dropping every
+prefilter was rejected: a small one is cheap and its speed is real.
+
+The bar is for the steady state. When the rules change, the app builds
+the new engines while it still holds the old ones, so a reload peaks at
+both sets: 277.8 MiB over the baseline as measured for 64 rules, about
+twice the ceiling at worst. Dropping the old engines first is #688.
+
+Every cache is one per rule whatever thread clicks: the app holds one `SmartEngines`, an `Arc` that every session and thread shares and that is rebuilt only when the rules change; each rule's DFA cache and PikeVM cache sit behind that rule's own `Mutex`; and no engine keeps a per-thread pool (the regex crate's pool is searched only by tessera-config's load-time empty-match check, on the loading thread, and dropped with its `Regex`). So a further clicking thread waits for the rule's lock and adds 0 MiB; a reload while another thread clicks keeps the old engines until that click returns (only the main thread clicks today). The program term follows from the size limit: it bounds the compiler's count of each program (32 bytes a state plus its transitions), and the finished NFA is smaller than that count (regex-automata boxes the compiler's vectors). The
+largest pair of programs measured over families of patterns at their
+largest size that loads allocated 1.86 MiB, 0.93 MiB an NFA (a class of
+64 one-byte members repeated 1820 times, found by the adversarial run;
+`\b(?-u:[cegikmoqsuwyCEGIKMOQSUWY02468]){3541}` 1.73 MiB,
+`\b(?-u:a){32760}` 1.50 MiB, `\b\w{20}` 1.07 MiB, `\bx[a-z]{14559}`
+0.67 MiB, mixes of these with `[ab]*a[ab]{14}` 1.65 MiB). tessera-config's
+compile of the rule allocated as much again, which is why it is no longer
+kept: with it the term would be 4 MiB. A const assert holds the total
+under the bar and a test checks these phrases against the constants.
+
+**Matches and give-ups.** A smaller cache changes no match: past it the
+regex crate falls back to an engine with the same matches. No built-in
+rule gives up at 512 KiB (tested: each Unicode-`\b` built-in rule, in the
+meta engine's lazy DFA configuration and without its prefilter, searched
+from every start its fallback searches from on 32 KiB CJK, mixed, ASCII
+and multi-script windows, quits on non-ASCII and never gives up, even at
+16 KiB; a 64-class filler in the same configuration does give up, so the
+search would show one).
+
+**Measured (release, a counting allocator, kept heap after the clicks).**
+One `\b` rule whose fallback fills its forward cache (2^15 DFA states, 64
+byte classes, 8000 characters): 1.18 MB kept, against 1.81 MB at 1 MiB and
+2.94 MB at the crate's default 2 MiB; tessera-ffi's `smart_selection_heap`
+test holds it under three times `SMART_RULE_REGEX_CACHE_BYTES`, so removing
+the limit or raising it back to 1 MiB fails (the mutant the #351 amendment
+left alive is now killed). For 64 rules, before and after:
+
+| Set | Kept before | Kept after | Peak RSS before | Peak RSS after |
+|---|---|---|---|---|
+| 64 at the slot cap (`\bx(?:(a?)(a?)){681}`), 8 clicks | 47.2 MiB | 47.2 MiB | 62.9 MB | 62.9 MB |
+| 32 thrashing own-DFA rules and 32 fallback fillers, 400 clicks | 90.3 MiB | 90.3 MiB | 113.9 MB | 113.0 MB |
+| 64 fallback fillers (`\b(?:[ab]*a[ab]{14})`, 30 000 characters), 400 clicks | 218.2 MiB | 187.4 MiB | 236.9 MB | 189.3 MB |
+
+The click budget skips rules, so a set's kept heap grows with the number
+of clicks until every rule has filled its caches; the fillers had not
+saturated at 400 clicks.
+
+## Amendment: the fallback runs the rule's DFA and a PikeVM; the ceiling in allocated bytes (#649, 2026-11-25)
+
+**Why.** The regex crate's bounded backtracker grows its stack without a
+bound: `\b(?:ab|[qQ]|[rR]|...)+` (150 classes) on `ab` x 3990 + `é` kept
+10.5 MiB for one rule, and 64 such rules 625 MiB. The lead also set the
+384 MiB bar on bytes allocated, not on the crates' `memory_usage` counts,
+which a filled lazy DFA cache's allocations exceed by up to 2.59 times by
+construction (below).
+
+**The fallback.** A rule that falls back no longer runs `regex::Regex`.
+Each search of its `find_iter` runs the rule's own DFA until it quits (a
+byte that is not ASCII at a Unicode word boundary) or gives up, and then a
+`PikeVM` (`regex_automata::nfa::thompson::pikevm`) on the DFA's forward
+program, which it shares; after a give-up the DFA's cache is replaced with
+an empty one and the rest of the scan is the PikeVM's, so a scan fills that cache once at most.
+That is what the regex crate's meta engine does with its lazy DFA and
+PikeVM, so the matches are the same; there is no backtracker, no second
+compile of the program and none of the meta engine's three more lazy DFA
+caches. The PikeVM's cache is one per rule behind a leaf lock (the DFA's
+cache lock is taken after it), not one per thread. app-core's
+regex-automata dependency gains the `nfa-pikevm` feature (the regex crate
+already enables it). Built with `regex_automata::meta` and
+`backtrack(false)` instead, a rule would keep a second program (about
+1.1 MiB measured) and three more lazy DFA caches (6 x their capacity in
+allocated bytes), so the DFA caches would have had to drop to about
+192 KiB a direction to stay under the bar.
+
+**The bound, in bytes allocated.** `SMART_RULE_CACHE_BYTES` drops from
+1 MiB to 512 KiB per direction. regex-automata raises a direction's
+capacity to its minimum for the program when that is larger (two sparse
+sets of 8 bytes an NFA state and room for a few DFA states): past 512 KiB
+only for a program of more than about 19 000 states, 0.84 MiB counted for
+`\b(?-u:a){32760}`, the most states within the size limit.
+tessera-config keeps the pattern string of a rule, not its compiled
+`Regex` (`CompiledRule::pattern`): the `Regex` is dropped after the
+load-time checks, which are unchanged. Per rule:
+
+| Term | Bytes allocated |
+|---|---|
+| The DFA's two caches, up to twice their count each: 2 x 2 x 512 KiB = 2 MiB | 2 MiB |
+| The PikeVM's cache, by the slot gate 16 384 states of 80 bytes (1.25 MiB): two slot tables of two 8-byte slots, two sparse sets of two 4-byte ids, a 16-byte stack frame grown by doubling | 1.25 MiB |
+| Programs: the DFA's forward and reverse NFAs, which the PikeVM shares, 1.75 MiB at most as measured | 1.75 MiB |
+
+So 2 + 1.25 + 1.75 = 5 MiB per rule and 64 x 5 = 320 MiB, under the
+384 MiB bar. A program whose minimum raises the capacity has (as measured) more than
+16 384 states, so it never falls back and has no PikeVM cache; its caches
+allocate at most their sparse sets (allocated exactly) plus twice the
+rest, 2 x (0.5 + 2 x 0.34) = 2.38 MiB, under 2 + 1.25 MiB. Every cache is one per rule whatever thread clicks: the app holds one `SmartEngines`, an `Arc` that every session and thread shares and that is rebuilt only when the rules change; each rule's DFA cache and PikeVM cache sit behind that rule's own `Mutex`; and no engine keeps a per-thread pool (the regex crate's pool is searched only by tessera-config's load-time empty-match check, on the loading thread, and dropped with its `Regex`). So a further clicking thread waits for the rule's lock and adds 0 MiB; a reload while another thread clicks keeps the old engines until that click returns (only the main thread clicks today). The program term is measured, not a limit: the
+largest pair of programs over families of patterns at their largest size
+within `SMART_RULE_SIZE_LIMIT` allocated 1.73 MiB
+(`\b(?-u:[cegikmoqsuwyCEGIKMOQSUWY02468]){3541}`; `\b(?-u:a){32760}`
+1.50 MiB, `\b\w{20}` 1.07 MiB, `\bx[a-z]{14559}` 0.67 MiB, mixes of
+these with `[ab]*a[ab]{14}` 1.65 MiB). tessera-config's compile of the
+rule allocated as much again, which is why it is no longer kept: with it
+the term would be 3.5 MiB. A const assert holds the total under the bar
+and a test checks these phrases against the constants.
+
+**Matches and give-ups.** No built-in rule's DFA gives up at 512 KiB on
+32 KiB ASCII, CJK, mixed and multi-script windows (tested from every
+start a scan searches from; a 64-class filler does give up there). The
+existing tests, which compare every engine with the regex crate's
+`find_iter`, pass unchanged.
+
+**Measured (release, counting allocator, kept heap after 16 clicks).**
+The stack filler kept 10.50 MiB for one rule and 108.8 MiB for 64 before
+(6d937db), 0.24 MiB and 5.3 MiB after. After, for 64 rules, with
+tessera-config's compile still kept (73136a1): fallback fillers
+(`\b(?:[ab]*a[ab]{14})`) 27.6 MiB, own-DFA fillers (`[ab]*a[ab]{14}`)
+62.1 MiB, `\b\w{20}` 174.2 MiB, rules at the slot gate
+(`\bx[a-z]{14559}`) 142.1 MiB. Without it, the critic's mix of a large
+program and a cache filler
+(`\b(?:(?-u:[cegikmoqsuwyCEGIKMOQSUWY02468]){2000}|(?-u:q){12000}|[ab]*a[ab]{14})`)
+kept 2.67 MiB alone, and 64 rules mixing it with the largest programs,
+`\b\w{20}`, slot-gate rules, cache fillers and stack fillers 96.3 MiB.
+tessera-ffi's `smart_selection_heap` test holds the stack filler under
+3.25 MiB, the mixed rule under 5 MiB, the 1820-member class within the
+2 MiB program term (1.94 MiB kept after one click; it fails against the
+1.75 MiB this ADR stated before), the refill under 1.5 MiB, the literal
+set within its rule's 5.996 MiB (it fails with the prefilter kept) and the
+mixed set of 64 under the 383.76 MiB ceiling.
+
+**The work gate on the PikeVM.** `SMART_FALLBACK_UNITS` stays 8 000 000
+states x bytes. Re-measured on the fallback's PikeVM, one search costs
+4.3 ns a unit with every state live at every byte (`[ab]*a[ab]{300}` and
+`[ab]*a[ab]{1000}` on random `a` and `b`), 34 ms at the gate, against
+22 ms for the regex crate's engine before. A state whose class is many
+single bytes costs more, since the PikeVM scans such a class one member
+at a time: the adversarial run's `\b C*bC{990}` (C a class of 64 one-byte
+members, written without the spaces) costs 14.8 ns a unit, about 120 ms a
+search and 150 ms a click on 8000 characters, three times
+`SMART_RULE_ATTEMPT_BOUND` (50 ms). That is not new (the regex crate's
+engine took 115 ms on it before), but the attempt bound does not hold for
+a fallback search; #687 restores it.
