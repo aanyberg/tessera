@@ -30,6 +30,7 @@ final class AccessibleTextTests: XCTestCase {
     private func start(config: String? = nil) throws {
         if let config {
             let dir = FileManager.default.temporaryDirectory.appendingPathComponent("tessera-a11y-\(UUID().uuidString)")
+            addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
             XCTAssertTrue(dir.path.hasPrefix("/"), "an absolute configuration directory")
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
             try config.write(to: dir.appendingPathComponent("config.toml"), atomically: true, encoding: .utf8)

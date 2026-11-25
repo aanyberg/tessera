@@ -66,6 +66,7 @@ final class KeysPaneTests: XCTestCase {
     /// `monitor`.
     private func openKeys(config: String, monitor: FakeKeyMonitor) throws -> SettingsWindowController {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("tessera-keys-\(UUID().uuidString)")
+        addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
         XCTAssertTrue(dir.path.hasPrefix("/"), "an absolute TESSERA_CONFIG_DIR")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         self.dir = dir

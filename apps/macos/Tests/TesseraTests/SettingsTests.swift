@@ -102,6 +102,7 @@ final class SettingsTests: XCTestCase {
     @discardableResult
     private func openSettings(config: String, files: [String: String] = [:]) throws -> SettingsModel {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("tessera-settings-\(UUID().uuidString)")
+        addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
         XCTAssertTrue(dir.path.hasPrefix("/"), "an absolute TESSERA_CONFIG_DIR")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         self.dir = dir
@@ -1095,6 +1096,7 @@ final class SettingsTests: XCTestCase {
     /// release-build check covers.
     func testAOneMebibyteConfigOpensTheWindowWithinTwoAndThreeQuarterTimesAMinimalOneAndUnderASecond() throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("tessera-settings-\(UUID().uuidString)")
+        addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         self.dir = dir
         setenv("TESSERA_CONFIG_DIR", dir.path, 1)

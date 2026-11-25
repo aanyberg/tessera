@@ -190,6 +190,7 @@ final class ProfileMenuTests: XCTestCase {
 
     private func configDir() throws -> URL {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("tessera-profile-menu-\(UUID().uuidString)")
+        addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         self.dir = dir
         return dir

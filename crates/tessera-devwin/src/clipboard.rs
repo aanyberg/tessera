@@ -345,8 +345,12 @@ mod tests {
 
     #[test]
     fn a_hung_tool_times_out_and_is_killed() {
-        let dir = std::env::temp_dir().join(format!("tessera-clip-hang-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        // Removed when the test ends, passing or failing.
+        let temp = tempfile::Builder::new()
+            .prefix("tessera-clip-hang-")
+            .tempdir()
+            .unwrap();
+        let dir = temp.path();
         let pid_file = dir.join("pid");
         let script = format!("echo $$ > '{}'; exec sleep 30", pid_file.display());
         let started = Instant::now();
@@ -361,13 +365,16 @@ mod tests {
         assert!(elapsed < timeout + Duration::from_secs(2), "{elapsed:?}");
         let pid = std::fs::read_to_string(&pid_file).unwrap();
         assert!(eventually_gone(pid.trim()), "the hung tool was not killed");
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
     fn a_grandchild_holding_the_pipe_is_killed_with_its_group() {
-        let dir = std::env::temp_dir().join(format!("tessera-clip-gc-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        // Removed when the test ends, passing or failing.
+        let temp = tempfile::Builder::new()
+            .prefix("tessera-clip-gc-")
+            .tempdir()
+            .unwrap();
+        let dir = temp.path();
         let pid_file = dir.join("pid");
         // The tool prints and exits at once, but its background child keeps
         // stdout open.
@@ -381,7 +388,6 @@ mod tests {
         assert!(started.elapsed() < timeout + Duration::from_secs(2));
         let pid = std::fs::read_to_string(&pid_file).unwrap();
         assert!(eventually_gone(pid.trim()), "the grandchild was not killed");
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Each failing tool alone fits in the timeout; together they do not.
@@ -401,10 +407,13 @@ mod tests {
     /// count a correct read was seen to take 14 s, and 30.6 s at load 26.
     #[test]
     fn the_deadline_covers_all_commands() {
-        let dir = std::env::temp_dir().join(format!("tessera-clip-all-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        // Removed when the test ends, passing or failing.
+        let temp = tempfile::Builder::new()
+            .prefix("tessera-clip-all-")
+            .tempdir()
+            .unwrap();
+        let dir = temp.path();
         let marker = dir.join("third-started");
-        let _ = std::fs::remove_file(&marker);
         let third = format!("touch '{}'; exec sleep 30", marker.display());
         let timeout = Duration::from_secs(1);
         let commands = [sh("sleep 0.9; exit 1"), sh("sleep 0.9; exit 1"), sh(&third)];
@@ -412,7 +421,6 @@ mod tests {
         let result = read(&commands, 1024, timeout);
         let elapsed = started.elapsed();
         let third_started = marker.exists();
-        let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(result, Err(ClipboardError::TimedOut(timeout)));
         assert!(!third_started, "the third command started ({elapsed:?})");
         assert!(elapsed >= timeout, "{elapsed:?}");

@@ -2998,12 +2998,14 @@ mod tests {
             "Bengali stays SFIndia's first face"
         );
     }
-    /// A fresh directory for one test's font copies.
-    fn font_scratch(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("tessera-font-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        dir
+    /// A fresh directory for one test's font copies (`tessera-font-<name>-*`
+    /// in the temporary directory), removed when the guard drops: when the
+    /// test passes and when it fails.
+    fn font_scratch(name: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("tessera-font-{name}-"))
+            .tempdir()
+            .expect("temp dir")
     }
 
     /// Truncates the file at `path` in place to `len` bytes.
@@ -3024,7 +3026,8 @@ mod tests {
     fn a_font_file_truncated_during_the_index_build_is_skipped() {
         const MENLO: &str = "/System/Library/Fonts/Menlo.ttc";
         const MONACO: &str = "/System/Library/Fonts/Monaco.ttf";
-        let dir = font_scratch("truncated");
+        let temp = font_scratch("truncated");
+        let dir = temp.path();
         let copy = dir.join("Menlo.ttc");
         std::fs::copy(MENLO, &copy).expect("Menlo.ttc is installed");
         let mut db = fontdb::Database::new();
@@ -3046,7 +3049,6 @@ mod tests {
             "{:?}",
             index.ranges
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// #668: a collection cut short or rewritten with another font's bytes
@@ -3058,7 +3060,8 @@ mod tests {
         const MONACO: &str = "/System/Library/Fonts/Monaco.ttf";
         let monaco_bytes = std::fs::read(MONACO).expect("Monaco is installed");
         for rewrite in [false, true] {
-            let dir = font_scratch(if rewrite { "rewritten" } else { "cut" });
+            let temp = font_scratch(if rewrite { "rewritten" } else { "cut" });
+            let dir = temp.path();
             let copy = dir.join("Menlo.ttc");
             std::fs::copy(MENLO, &copy).expect("Menlo.ttc is installed");
             let mut db = fontdb::Database::new();
@@ -3079,7 +3082,6 @@ mod tests {
             let index = Coverage::build(&db);
             test_read_hook::set(None);
             assert_eq!(index.lookup('A'), Some(menlo[0]), "rewrite {rewrite}");
-            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 
@@ -3089,7 +3091,8 @@ mod tests {
     #[test]
     fn index_builds_survive_a_file_rewritten_in_place_meanwhile() {
         const SOURCE: &str = "/System/Library/Fonts/SFIndia.ttc";
-        let dir = font_scratch("race");
+        let temp = font_scratch("race");
+        let dir = temp.path();
         let copy = dir.join("SFIndia.ttc");
         std::fs::copy(SOURCE, &copy).expect("SFIndia.ttc is installed");
         let bytes = std::fs::read(&copy).expect("read the copy");
@@ -3120,7 +3123,6 @@ mod tests {
         let rewrites = writer.join().expect("the writer finishes");
         assert!(rewrites > 0, "the file was rewritten during the builds");
         eprintln!("{whole} of 40 builds saw the whole file, {rewrites} rewrites");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Writes a one-table font whose `cmap` record says `len` bytes, the
@@ -3147,7 +3149,8 @@ mod tests {
     /// is read into a buffer of the cap plus the header.
     #[test]
     fn the_index_cmap_read_is_capped() {
-        let dir = font_scratch("cap");
+        let temp = font_scratch("cap");
+        let dir = temp.path();
         let path = dir.join("big.ttf");
         for (len, expected) in [
             (
@@ -3182,7 +3185,6 @@ mod tests {
                 assert_eq!(loaded, Some((28, len)));
             }
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// #668: a file whose `cmap` record runs past its end (cut short
@@ -3190,7 +3192,8 @@ mod tests {
     /// a record at offset 0, which swash reads as no table.
     #[test]
     fn a_cmap_past_the_end_of_the_file_or_at_zero_is_missing() {
-        let dir = font_scratch("short");
+        let temp = font_scratch("short");
+        let dir = temp.path();
         let path = dir.join("short.ttf");
         font_with_cmap_len(&path, 4096);
         truncate(&path, 28 + 100);
@@ -3214,7 +3217,6 @@ mod tests {
             read_face_cmap(&mut file, 0, &mut buf, &mut loaded),
             CmapRead::Missing
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// How long the #669 tests wait for an open or a build that a FIFO
@@ -3254,7 +3256,8 @@ mod tests {
     fn a_fifo_swapped_in_after_the_scan_does_not_block_the_index() {
         const MENLO: &str = "/System/Library/Fonts/Menlo.ttc";
         const MONACO: &str = "/System/Library/Fonts/Monaco.ttf";
-        let dir = font_scratch("fifo");
+        let temp = font_scratch("fifo");
+        let dir = temp.path();
         let copy = dir.join("Menlo.ttc");
         std::fs::copy(MENLO, &copy).expect("Menlo.ttc is installed");
         let mut db = fontdb::Database::new();
@@ -3283,7 +3286,6 @@ mod tests {
             "{:?}",
             index.ranges
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// #669: the index's open refuses a FIFO, a device, a socket and a
@@ -3291,7 +3293,8 @@ mod tests {
     /// helper thread so one that blocks fails after [`FIFO_WAIT`].
     #[test]
     fn the_index_open_refuses_what_is_not_a_regular_file() {
-        let dir = font_scratch("kinds");
+        let temp = font_scratch("kinds");
+        let dir = temp.path();
         let fifo = dir.join("fifo.ttf");
         mkfifo(&fifo);
         let socket = dir.join("socket.ttf");
@@ -3319,6 +3322,5 @@ mod tests {
             };
             assert_eq!(opened.is_ok(), regular, "{}: {opened:?}", path.display());
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

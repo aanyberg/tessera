@@ -363,6 +363,36 @@ trailer_check 'an exact --session that the tip lacks fails' squashed-wip fail --
 trailer_check 'an exact --session the tip has passes (the lower wip commit warns)' squashed-wip pass+warn --session https://example.com/s/1 --coauthor 'Co-Authored-By: A <a@example.com>'
 trailer_check 'a single commit without trailers fails' app-core-lib fail
 
+# #698: a run that passed removes its logs from $TMPDIR; a failing one keeps them and names them on its last line. A
+# copy of verify-branch.sh next to a stub quality-gate.sh (exit $FAKE_GATE_RC) decides the gate's result.
+mkdir -p "$work/stub-gate"
+cp "$script" "$work/stub-gate/verify-branch.sh"
+printf '#!/bin/sh\nexit "${FAKE_GATE_RC:-0}"\n' > "$work/stub-gate/quality-gate.sh"
+chmod +x "$work/stub-gate/verify-branch.sh" "$work/stub-gate/quality-gate.sh"
+logs_check() { # <case> <gate exit status>: through bash and zsh, on a branch whose other checks pass
+    name="$1" gate_rc="$2"
+    git -C "$repo" switch -q squashed-wip
+    for runner in bash zsh; do
+        before="$(find "$TMPDIR" -maxdepth 1 -name 'verify-branch.*' | sort)"
+        rc=0
+        FAKE_GATE_RC="$gate_rc" "$runner" "$work/stub-gate/verify-branch.sh" "$repo" --no-load \
+            --session https://example.com/s/1 --coauthor 'Co-Authored-By: A <a@example.com>' > "$work/logs.log" 2>&1 || rc=$?
+        after="$(find "$TMPDIR" -maxdepth 1 -name 'verify-branch.*' | sort)"
+        dir="$(sed -n 's/^logs: //p' "$work/logs.log")"
+        kept="$(tail -n 1 "$work/logs.log" | sed -n 's/^logs kept: //p')"
+        if [ "$gate_rc" -eq 0 ]; then
+            if [ "$rc" -eq 0 ] && [ -n "$dir" ] && [ ! -e "$dir" ] && [ "$before" = "$after" ] && [ -z "$kept" ]; then
+                ok "$name ($runner)"
+            else not_ok "$name ($runner): exit $rc, logs [$dir] kept [$kept]: $(cat "$work/logs.log")"; fi
+        elif [ "$rc" -eq 1 ] && [ -n "$dir" ] && [ "$kept" = "$dir" ] && [ -f "$dir/gate.log" ]; then
+            ok "$name ($runner)"
+            rm -rf "$dir"
+        else not_ok "$name ($runner): exit $rc, logs [$dir] kept [$kept]: $(cat "$work/logs.log")"; fi
+    done
+}
+logs_check 'a run that passes removes its logs' 0
+logs_check 'a run that fails keeps its logs and names them last' 1
+
 # bodies and unsafe: the PASS/WARN/FAIL line of one check, through bash and zsh. --no-load skips the load check; the
 # fixture's gate fails (fake cargo) and is not looked at.
 trailers='Co-Authored-By: A <a@example.com>

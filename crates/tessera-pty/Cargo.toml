@@ -24,6 +24,8 @@ libc.workspace = true
 [dev-dependencies]
 # `waitpid` proves a refused spawn left no child behind.
 nix = { workspace = true, features = ["feature", "hostname", "process", "signal"] }
+# Scratch directories removed when a test ends, failing or not (#698).
+tempfile = "3"
 
 [features]
 # Exposes `test_hooks` (a program lookup held as on a stalled volume, a

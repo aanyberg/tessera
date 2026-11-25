@@ -53,8 +53,32 @@ nextest_log="$(mktemp)"
 # `> gate.log`), the lines that belong together are still findable, and a log with no `exit` line for a run never
 # finished. Give each run its own log: `log="$(mktemp -t gate-<task>)"` (docs/software-factory.md).
 run_id="pid $$ head $(git rev-parse --short HEAD 2> /dev/null || print unknown)"
-finish() { local rc=$?; rm -f "$nextest_log"; print -r -- "quality gate run ($run_id) exit $rc"; }
+# finish [status]: removes the log above and prints the last line (the exit status, or the given one).
+finish() { local rc=${1:-$?}; rm -f "$nextest_log"; print -r -- "quality gate run ($run_id) exit $rc"; }
 trap finish EXIT
+# zsh skips the EXIT trap when a signal kills it (a `timeout`, Ctrl-C, a closed terminal), which left the log above in
+# $TMPDIR (#698). A signal stops the watchdog's command, runs finish with 128 + the signal's number and then kills
+# the gate with the same signal (INT, TERM), so its caller sees the signal. zsh holds a trap back until a foreground command
+# ends, so the watchdog (nextest, the C tests: up to TESSERA_GATE_NEXTEST_MINUTES) runs in the background and is
+# waited for; a signal during the other steps (fmt, clippy, the builds) acts once that step ends.
+watchdog_pid=""
+on_signal() {
+    setopt localoptions noerrexit
+    local sig=$1
+    trap - EXIT HUP INT TERM
+    if [[ -n "$watchdog_pid" ]]; then
+        # TERM whatever the signal: a background process may ignore SIGINT; the watchdog stops its command on TERM.
+        kill -TERM "$watchdog_pid" 2> /dev/null
+        wait "$watchdog_pid" 2> /dev/null
+    fi
+    finish $(( 128 + $(kill -l "$sig") ))
+    # zsh's own HUP handler would exit 1 instead: HUP exits 129.
+    [[ "$sig" == HUP ]] || kill -"$sig" $$
+    exit $(( 128 + $(kill -l "$sig") ))
+}
+trap 'on_signal HUP' HUP
+trap 'on_signal INT' INT
+trap 'on_signal TERM' TERM
 print -r -- "quality gate run ($run_id) started $(date -u +%Y-%m-%dT%H:%M:%SZ) in $PWD"
 # `build` while the test binaries compile, `run` while they run; report_nextest_failure reads it.
 nextest_phase=""
@@ -62,7 +86,8 @@ nextest_phase=""
 # Runs <command> in its own process group and kills the group and its descendants after <seconds>. Output goes to
 # the terminal and the log. Exit status: the command's own, or 124 when the watchdog fired. The watchdog polls
 # getppid() and exits without acting once the gate is gone (a SIGKILLed gate leaves it orphaned, #166), so an
-# orphaned alarm never kills a later run's processes.
+# orphaned alarm never kills a later run's processes. It runs in the background (watchdog_pid) so that a signal to the
+# gate ends the wait at once (on_signal), and pipes its own output through tee, so its exit status is $!'s.
 # Usage: watchdog <seconds> <command> [args]...
 watchdog() {
     local st
@@ -71,8 +96,12 @@ watchdog() {
     # Through tee, nextest's stdout is not a tty, so its live progress bar is hidden: only result lines appear.
     perl -e '
         use POSIX ":sys_wait_h";
-        my ($secs, @cmd) = @ARGV;
+        my ($log, $secs, @cmd) = @ARGV;
         my $parent = getppid();
+        open(STDOUT, "|-", "tee", "-a", $log) or die "tee: $!";
+        open(STDERR, ">&", \*STDOUT) or die "stderr: $!";
+        # Closing STDOUT waits for tee to write out the last of the output; STDERR holds the pipe too.
+        sub done { close STDERR; close STDOUT; exit $_[0]; }
         my $pid = fork() // die "fork: $!";
         if (!$pid) { setpgrp(0, 0); exec @cmd or die "exec $cmd[0]: $!"; }
         sub descendants {
@@ -91,19 +120,23 @@ watchdog() {
         }
         my $fired = 0;
         $SIG{ALRM} = sub { $fired = 1; stop(); };
-        $SIG{INT} = $SIG{TERM} = sub { stop(); exit 130; };
+        $SIG{INT} = $SIG{TERM} = sub { stop(); done(130); };
         alarm($secs);
         my $r;
         while (1) {
             $r = waitpid($pid, WNOHANG);
             last if $r == $pid || $r == -1 || $fired;
-            if (getppid() != $parent) { alarm(0); exit 1; }
+            # Not done: tee would wait for the command, which an orphan leaves running.
+            if (getppid() != $parent) { alarm(0); POSIX::_exit(1); }
             select(undef, undef, undef, 0.2);
         }
-        if ($fired) { exit 124; }
-        exit($? & 127 ? 128 + ($? & 127) : $? >> 8);
-    ' "$@" 2>&1 | tee -a "$nextest_log"
-    st=${pipestatus[1]}
+        if ($fired) { done(124); }
+        done($? & 127 ? 128 + ($? & 127) : $? >> 8);
+    ' "$nextest_log" "$@" &
+    watchdog_pid=$!
+    wait "$watchdog_pid"
+    st=$?
+    watchdog_pid=""
     set -e
     return $st
 }

@@ -746,8 +746,12 @@ mod tests {
     #[test]
     fn the_child_sees_one_release_per_reported_press() {
         use winit::event::MouseButton as Winit;
-        let dir = std::env::temp_dir().join(format!("tessera-devwin-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("temporary directory");
+        // Removed when the test ends, passing or failing.
+        let temp = tempfile::Builder::new()
+            .prefix("tessera-devwin-")
+            .tempdir()
+            .expect("temporary directory");
+        let dir = temp.path();
         let log = dir.join("input");
         let app = App::new(Config::default(), ConfigPaths::new(dir.join("config")));
         let geometry = CellGeometry {
@@ -812,7 +816,6 @@ mod tests {
             "\x1b[<0;2;2M\x1b[<0;2;2mEND"
         );
         app.close_session(id).expect("close");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// #194.12: press left, press right, release right: the motion after

@@ -913,24 +913,26 @@ mod tests {
 
     #[test]
     fn run_writes_then_checks() {
-        let dir = std::env::temp_dir().join(format!("xtask-config-docs-{}", std::process::id()));
+        // Removed when the test ends, passing or failing.
+        let temp = tempfile::Builder::new()
+            .prefix("xtask-config-docs-")
+            .tempdir()
+            .unwrap();
+        let dir = temp.path();
         fs::create_dir_all(dir.join("docs")).unwrap();
         let path = dir.join(DOC_PATH);
-        let _ = fs::remove_file(&path);
 
-        assert!(matches!(run(&dir, true).unwrap(), Outcome::Stale { .. }));
-        assert_eq!(run(&dir, false).unwrap(), Outcome::Written);
-        assert_eq!(run(&dir, false).unwrap(), Outcome::Unchanged);
-        assert_eq!(run(&dir, true).unwrap(), Outcome::UpToDate);
+        assert!(matches!(run(dir, true).unwrap(), Outcome::Stale { .. }));
+        assert_eq!(run(dir, false).unwrap(), Outcome::Written);
+        assert_eq!(run(dir, false).unwrap(), Outcome::Unchanged);
+        assert_eq!(run(dir, true).unwrap(), Outcome::UpToDate);
 
         let text = fs::read_to_string(&path).unwrap();
         fs::write(&path, text.replacen("Tessera Dark", "Tessera Light", 1)).unwrap();
-        let Outcome::Stale { diff } = run(&dir, true).unwrap() else {
+        let Outcome::Stale { diff } = run(dir, true).unwrap() else {
             panic!("an altered document must be stale");
         };
         assert!(diff.contains("Tessera Light") && diff.contains("Tessera Dark"));
-
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

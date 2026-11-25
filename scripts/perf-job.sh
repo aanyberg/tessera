@@ -146,6 +146,8 @@ check)
 failed)
     [[ -n "$step" ]] || die "--step is required"
     body="$(mktemp)"
+    # Removed however the script ends: a failing `gh` call no longer leaves it in $TMPDIR (#698).
+    trap 'rm -f "$body"' EXIT
     {
         echo "The scheduled performance job's step \`$step\` failed at \`$head\`."
         echo
@@ -157,7 +159,14 @@ failed)
 
 run)
     mkdir -p "$state"
-    work="${PERF_JOB_WORK:-$(mktemp -d)}"
+    if [[ -n "${PERF_JOB_WORK:-}" ]]; then
+        work="$PERF_JOB_WORK"
+    else
+        # A work directory of its own (a local run; the workflow sets PERF_JOB_WORK) goes when the run succeeds; a
+        # failed run keeps it for its logs and names it last, instead of leaving every run's in $TMPDIR (#698).
+        work="$(mktemp -d)"
+        trap 'rc=$?; if (( rc == 0 )); then rm -rf "$work"; else echo "perf-job: logs kept in $work" >&2; fi' EXIT
+    fi
     mkdir -p "$work"
     base="$(last_good)"
     note=""

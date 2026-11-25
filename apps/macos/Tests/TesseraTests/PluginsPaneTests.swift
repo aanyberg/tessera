@@ -64,6 +64,7 @@ final class PluginsPaneTests: XCTestCase {
     /// directory and opens Settings on its Plugins pane, as the menu does.
     private func openPlugins(config: String) throws -> SettingsWindowController {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("tessera-plugins-\(UUID().uuidString)")
+        addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
         XCTAssertTrue(dir.path.hasPrefix("/"), "an absolute TESSERA_CONFIG_DIR")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         self.dir = dir

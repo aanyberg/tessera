@@ -18,5 +18,9 @@ tessera-config = { workspace = true, features = ["schema"] }
 thiserror.workspace = true
 toml = "0.9"
 
+[dev-dependencies]
+# Scratch directories removed when a test ends, failing or not (#698).
+tempfile = "3"
+
 [lints]
 workspace = true

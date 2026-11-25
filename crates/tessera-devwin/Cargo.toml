@@ -19,6 +19,8 @@ winit.workspace = true
 serde_json.workspace = true
 # Tests check the bytes a mapped key encodes to.
 tessera-term.workspace = true
+# Scratch directories removed when a test ends, failing or not (#698).
+tempfile = "3"
 
 [lints]
 workspace = true

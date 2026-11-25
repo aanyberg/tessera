@@ -44,14 +44,17 @@
 #                  integrator's final run, without the flag, still checks it.
 # --parallel <N>   load check: at most N test runs in flight, per target and in total (targets run one
 #                  after another). Default 3 so a busy machine is not exhausted; 1-8 accepted. A run that records
-#                  no exit status FAILs. Ctrl-C (or TERM/HUP) stops the runs in flight and exits 130 (143/129).
+#                  no exit status FAILs. Ctrl-C (or TERM/HUP) stops the runs in flight; see the signals below.
 # --closes <list>  bodies check: the issue numbers the task may close (from the brief's PR lines), comma separated.
 # --body <file>    bodies check: also scan this PR body file. Together with --closes, every listed number must have a
 #                  closing reference in it. Re-run with `--body <file> --closes <list> --no-load` on the integrator's
 #                  body before `gh pr create`: the gate is a recorded-pass hit then, so only the `bodies` line is new.
 # --list-targets   print the effective parallelism as a `# parallel: N` line, then the derived load targets
 #                  (`crate:kind`, one per line, sorted), and exit 0. Runs no check and builds nothing.
-# Exit 0 when nothing FAILs, 1 otherwise, 2 on a usage error. Logs go to the directory printed on the first line.
+# Exit 0 when nothing FAILs, 1 otherwise, 2 on a usage error. Logs go to the directory printed on the first line; a
+# run that passes deletes it, and a run that FAILs or is stopped keeps it and prints `logs kept: <dir>` last.
+# INT or TERM (Ctrl-C, `kill`) stops the gate run or the load runs in flight, keeps the logs and kills the script with
+# the same signal (zsh's own SIGINT handler can turn INT into exit status 130); HUP does the same and exits 129.
 # The script is zsh; started from bash or sh it re-executes itself under zsh.
 [ -n "${ZSH_VERSION:-}" ] || exec zsh "$0" "$@"
 set -uo pipefail
@@ -211,6 +214,37 @@ fi
 logs="$(mktemp -d "${${TMPDIR:-/tmp}%/}/verify-branch.XXXXXX")"
 print "logs: $logs"
 failed=0
+# A run that passed removes its logs, so passing runs no longer pile `verify-branch.*` folders up in $TMPDIR (#698).
+# A run that failed or was stopped keeps them (every FAIL line names its log) and says so last; an empty one goes.
+# zsh skips the EXIT trap when a signal kills it, so a signal runs on_signal (the load check's stop_runs replaces it
+# while its runs are in flight, and ends in it): it stops the gate run in flight, keeps the logs and kills the script
+# with the same signal. zsh holds a trap back until a foreground command ends, so the gate runs in the background
+# and is waited for (gate_pid).
+# logs_on_exit [status]: the exit status, or the given one.
+logs_on_exit() {
+    local rc=${1:-$?}
+    if (( rc == 0 && failed == 0 )); then rm -rf "$logs"
+    elif ! rmdir "$logs" 2> /dev/null; then print -r -- "logs kept: $logs"; fi
+}
+trap logs_on_exit EXIT
+gate_pid=""
+on_signal() {
+    setopt localoptions noerrexit
+    local sig=$1
+    trap - EXIT HUP INT TERM
+    if [[ -n "$gate_pid" ]]; then
+        # TERM whatever the signal: a background process may ignore SIGINT; the gate stops its tests on TERM.
+        kill -TERM "$gate_pid" 2> /dev/null
+        wait "$gate_pid" 2> /dev/null
+    fi
+    logs_on_exit $(( 128 + $(kill -l "$sig") ))
+    # zsh's own HUP handler would exit 1 instead: HUP exits 129.
+    [[ "$sig" == HUP ]] || kill -"$sig" $$
+    exit $(( 128 + $(kill -l "$sig") ))
+}
+trap 'on_signal HUP' HUP
+trap 'on_signal INT' INT
+trap 'on_signal TERM' TERM
 pass() { print -P "%F{green}PASS%f $1"; }
 warn() { print -P "%F{yellow}WARN%f $1"; }
 skip() { print -P "%F{cyan}skip%f $1"; }
@@ -237,8 +271,11 @@ if [[ -n "$(git status --porcelain)" ]]; then
 fi
 
 # gate
-"$script_dir/quality-gate.sh" "$PWD" > "$logs/gate.log" 2>&1
+"$script_dir/quality-gate.sh" "$PWD" > "$logs/gate.log" 2>&1 &
+gate_pid=$!
+wait "$gate_pid"
 rc=$?
+gate_pid=""
 if (( rc == 0 )); then pass "gate"; else fail "gate (exit $rc): $logs/gate.log"; tail -20 "$logs/gate.log"; fi
 
 # clean
@@ -453,11 +490,11 @@ if [[ -z "$no_load" ]]; then
             local p
             for p in $pids; do pkill -TERM -P "$p" 2>/dev/null; kill -TERM "$p" 2>/dev/null; done
             print -ru2 -- "interrupted: stopped ${#pids} load run(s); logs: $logs"
-            exit "$1"
+            on_signal "$1"
         }
-        trap 'stop_runs 130' INT
-        trap 'stop_runs 143' TERM
-        trap 'stop_runs 129' HUP
+        trap 'stop_runs INT' INT
+        trap 'stop_runs TERM' TERM
+        trap 'stop_runs HUP' HUP
         for target in ${(ko)targets}; do
             crate="${target%%:*}" what="${target#*:}"
             d="$logs/load-${crate}-${what//\//-}"; mkdir -p "$d"

@@ -93,6 +93,7 @@ final class TerminalSurfaceViewTests: XCTestCase {
     /// how it ended and the stage it reached.
     func testARecorderThatExitsFailsItsWaitAtOnceWithItsStage() async throws {
         let other = FileManager.default.temporaryDirectory.appendingPathComponent("tessera-view-\(UUID()).bin")
+        addTeardownBlock { try? FileManager.default.removeItem(at: other) }
         appDelegate.spawnOptions = .init(program: "/bin/sh", arguments: ["-c", "exit 5"])
         let pane = try appDelegate.newWindow().focusedPane
         let started = ContinuousClock.now
@@ -180,6 +181,7 @@ final class TerminalSurfaceViewTests: XCTestCase {
     /// at its budget, naming that stage.
     func testARecorderThatNeverRecordsTimesOutNamingRawMode() async throws {
         let other = FileManager.default.temporaryDirectory.appendingPathComponent("tessera-view-\(UUID()).bin")
+        addTeardownBlock { try? FileManager.default.removeItem(at: other) }
         appDelegate.spawnOptions = .init(
             program: "/bin/sh", arguments: ["-c", #"stty raw -echo; printf R; exec sleep 100"#])
         let pane = try appDelegate.newWindow().focusedPane
