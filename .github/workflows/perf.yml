@@ -1,0 +1,130 @@
+name: Perf
+
+# Scheduled performance and memory regression job (#612, ADR 0049): every
+# other day, and on demand. The logic lives in scripts/perf-job.sh
+# (`just perf-job`, self-test `just perf-job-test`); this file only wires it
+# to the runner.
+#
+# 1. `check` exits early (the later steps are skipped, the job is green)
+#    when main is still at the SHA of the last run that measured, so quiet
+#    days cost a checkout and a cache restore.
+# 2. The gate's release timing bars, the #216 budget tests included.
+# 3. A fixed case set (feed, scroll, search, idle heap, full-scrollback
+#    heap) against the last measured SHA without a regression.
+#
+# A red timing step does not stop the case set, the state or the trend; it is
+# reported as its own issue ("failed", not "found a regression").
+#
+# State is one JSON file (perf-state/perf.jsonl, a line per case and run) kept
+# in the Actions cache between runs and uploaded as the `perf-trend` artifact
+# for the trend. The cache, not the previous run's artifact, is the state
+# because reading an earlier run's artifact needs `actions: read` and this
+# job's token is `contents: read` and `issues: write` only.
+#
+# A case past its bar opens (or comments on) a `type:bug` issue naming the SHA
+# range. The job never gates a PR.
+
+on:
+  schedule:
+    - cron: '0 5 */2 * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Measure even when main has not moved since the last run
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  perf:
+    name: Performance and memory
+    # A dispatch from another branch would measure that branch and record it as main.
+    if: github.ref == 'refs/heads/main'
+    runs-on: xcode-27
+    timeout-minutes: 90
+    env:
+      GH_TOKEN: ${{ github.token }}
+      STATE: perf-state
+    steps:
+      # Full history: the base of the comparison is an older commit of main.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Restore the state
+        uses: actions/cache/restore@v4
+        with:
+          path: perf-state
+          key: perf-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: perf-state-
+      - name: Skip when main has not moved
+        id: check
+        env:
+          FORCE: ${{ inputs.force }}
+        run: |
+          if [[ "$FORCE" == true ]]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          else
+            scripts/perf-job.sh check --state "$STATE" --head "$GITHUB_SHA"
+          fi
+      - name: Select Xcode
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          sudo xcode-select -s /Applications/Xcode_27.1.app
+          xcodebuild -version
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.check.outputs.skip != 'true'
+      - uses: Swatinem/rust-cache@v2
+        if: steps.check.outputs.skip != 'true'
+      - uses: taiki-e/install-action@v2
+        if: steps.check.outputs.skip != 'true'
+        with:
+          tool: cargo-nextest
+      # The packages and filter are read from the gate's release timing step
+      # (scripts/quality-gate.sh), so the job and the gate run the same bars;
+      # the #216 budgets (tessera-ffi tests/budgets.rs) are among them.
+      - name: Release timing and budget tests
+        id: timing
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          read -r -a packages <<< "$(scripts/perf-job.sh timing-packages)"
+          filter="$(scripts/perf-job.sh timing-filter)"
+          cargo nextest run --release "${packages[@]}" -E "$filter"
+      - name: Case set against the last measured SHA
+        id: cases
+        # Also after a red timing step: the trend and the state must not depend on it.
+        if: ${{ !cancelled() && steps.check.outputs.skip != 'true' }}
+        run: scripts/perf-job.sh run --state "$STATE" --head "$GITHUB_SHA"
+      - name: Report a failed step
+        if: ${{ failure() && (steps.timing.outcome == 'failure' || steps.cases.outcome == 'failure') }}
+        env:
+          TIMING: ${{ steps.timing.outcome }}
+          CASES: ${{ steps.cases.outcome }}
+        run: |
+          failed=()
+          [[ "$TIMING" == failure ]] && failed+=("release timing and budget tests")
+          [[ "$CASES" == failure ]] && failed+=("case set")
+          scripts/perf-job.sh failed --step "$(IFS=,; echo "${failed[*]}")" --head "$GITHUB_SHA"
+      - name: Save the state
+        if: ${{ !cancelled() && steps.cases.outcome == 'success' }}
+        uses: actions/cache/save@v4
+        with:
+          path: perf-state
+          key: perf-state-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Upload the trend
+        if: ${{ !cancelled() && steps.cases.outcome == 'success' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-trend
+          path: perf-state/perf.jsonl
+          if-no-files-found: error

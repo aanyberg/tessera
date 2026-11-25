@@ -180,6 +180,7 @@ factory-test:
     zsh scripts/test-toolchain-check.sh
     bash scripts/test-unsafe-exceptions.sh
     bash scripts/test-ci-app-affected.sh
+    bash scripts/test-perf-job.sh
 
 # #417
 # Warn (exit 0) when the local stable rustc is behind the current stable that CI installs; run in the factory pre-flight. Never updates anything
@@ -190,6 +191,16 @@ toolchain-check:
 # Check scripts/quality-gate.sh's nextest watchdog (build outside it, orphan exit) and release timing retry, with a fake cargo
 quality-gate-test:
     zsh scripts/test-quality-gate.sh
+
+# #612
+# The scheduled performance and memory job (#612, ADR 0049): measure HEAD against the last measured SHA in <state> (a directory holding perf.jsonl); a case past its bar files an issue through `gh`, so try it with PERF_JOB_GH=echo
+perf-job state:
+    scripts/perf-job.sh run --state {{quote(state)}}
+
+# #612
+# Check scripts/perf-job.sh offline: early exit, one JSON line per case, the three-build rule, the issue request (cargo xtask ab, the probe and gh stubbed)
+perf-job-test:
+    scripts/test-perf-job.sh
 
 # #14
 # Fuzz one cargo-fuzz target (parser, terminal, chunking or resize) for <minutes> on nightly; corpus in fuzz/corpus, crashes in fuzz/artifacts
