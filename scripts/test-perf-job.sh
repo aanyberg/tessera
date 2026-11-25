@@ -44,7 +44,9 @@ bench)
     echo "metric              base best      head best head/base    base median    head median"
     echo "wall ns              79386334       89326917     1.125       87168167       89713375"
     head=$(awk -v r="$ratio" 'BEGIN { printf "%d", 1000000000 * r }')
-    echo "instructions       1000000000     $head     $ratio     1000000000     $head"
+    if [[ ! -f "$stub/no-counters" ]]; then
+        echo "instructions       1000000000     $head     $ratio     1000000000     $head"
+    fi
     if [[ -f "$stub/problem-$case_name" ]]; then echo "problem: case too small"; fi
     ;;
 esac
@@ -142,6 +144,19 @@ run "$s" "$B" || fail "fallback run failed: $(cat "$tmp/out.log")"
 jq -e --arg b "$B" 'select(.sha == $b and .case == "feed") | .base == $b and (.note | test("does not build"))' "$s/perf.jsonl" > /dev/null \
     || fail "a case set that does not build at the baseline falls back to a baseline run"
 
+# 7b. A machine without instruction counters (a virtual machine): the case set is still taken, the instruction cases
+# are `noisy` with the wall ratio and a note (no failure, no retry), and the heap cases still bind.
+reset
+s="$tmp/s7b"
+touch "$stub/no-counters"
+echo 1030 > "$stub/heap-head-heap_idle"
+run "$s" "$A" || fail "a run without counters must not fail: $(cat "$tmp/out.log")"
+[[ "$(wc -l < "$s/perf.jsonl" | tr -d ' ')" == 5 ]] || fail "no counters: expected 5 lines"
+jq -e 'select(.case == "feed") | .status == "noisy" and .instructions == null and .ratio == 1.125 and (.note | test("no instruction counters"))' \
+    "$s/perf.jsonl" > /dev/null || fail "no counters: feed must be noisy with the wall ratio and a note"
+[[ "$(grep -c '^init' "$stub/ab.log")" == 1 ]] || fail "no counters: no second probe build"
+jq -e 'select(.case == "heap_idle") | .status == "regressed"' "$s/perf.jsonl" > /dev/null || fail "no counters: the heap bar still binds"
+
 # 8. The gate's release timing step is what the job runs: its packages and filter come out of quality-gate.sh.
 pk="$("$script" timing-packages)"
 [[ "$pk" == *"-p tessera-ffi"* && "$pk" != *"'"* ]] || fail "timing-packages: '$pk'"
@@ -155,6 +170,20 @@ grep -q '^issue create --title perf: the scheduled performance job failed --labe
 grep -q 'found a regression' "$stub/gh.log" && fail "a failed step must not use the regression title"
 grep -q 'in:title "perf: the scheduled performance job failed"' "$stub/gh.log" || fail "the failed issue is looked up by its own title"
 grep -q "release timing and budget tests" "$stub"/body-*.md || fail "the failed issue names the step"
+
+[[ "$flt" == *"!(test(=startup_to_the_first_frame_stays_within_its_budget))" ]] || fail "timing-filter must skip the startup wall-time budget: '$flt'"
+[[ "$flt" == *"(package(tessera-ffi) & binary(=budgets))"* ]] || fail "timing-filter must keep the byte budgets: '$flt'"
+grep -q -- '--no-fail-fast' "$(dirname "$script")/../.github/workflows/perf.yml" || fail "the workflow must run nextest with --no-fail-fast"
+wf_file="$(dirname "$script")/../.github/workflows/perf.yml"
+if ! grep -q 'upload-artifact' "$wf_file" || ! grep -q 'name: perf-logs' "$wf_file"; then
+    fail "the workflow must upload the logs"
+fi
+# The upload is logs only: the probe build trees (target/, base.tar, many GB) live outside the uploaded directory.
+if ! grep -q '^ *path: perf-logs$' "$wf_file"; then fail "the logs artifact must upload exactly perf-logs"; fi
+if grep 'PERF_JOB_WORK:' "$wf_file" | grep -q 'perf-logs'; then
+    fail "PERF_JOB_WORK must be outside perf-logs, or the artifact carries the probe builds"
+fi
+grep -q 'PERF_JOB_WORK"/\*\.log' "$wf_file" || fail "the workflow must copy the case-set *.log files into perf-logs"
 
 # 10. The workflow keeps measuring and saving after a red timing step: the case set, the cache save and the upload
 # do not depend on `success()` of the steps before them (a red release timing step would skip them).
