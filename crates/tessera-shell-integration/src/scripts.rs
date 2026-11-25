@@ -20,7 +20,7 @@ use std::time::{Duration, SystemTime};
 /// half-updated set and a new one writes its scripts next to the old ones; a
 /// test compares [`digest`] with a recorded value and fails until it is
 /// bumped.
-pub const SCRIPTS_VERSION: u32 = 9;
+pub const SCRIPTS_VERSION: u32 = 12;
 
 /// The version the scripts announce in their handshake
 /// (`OSC 1337 ; ShellIntegrationVersion=<n> ; shell=<name> ST`). It changes

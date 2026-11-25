@@ -260,6 +260,37 @@ impl GraphemeTable {
         });
     }
 
+    /// Replaces the clusters and hyperlinks of the columns in `span` with
+    /// those `src` (another line's table) has there: the table half of
+    /// copying a span of cells between lines. The links go in one splice,
+    /// merged with their neighbours only at the edges of `span` (#619).
+    pub(crate) fn copy_span(&mut self, src: &Self, span: Range<usize>) {
+        self.edit(|side| {
+            let entries = &mut side.clusters;
+            let start = entries.partition_point(|e| usize::from(e.col) < span.start);
+            let end = start + entries[start..].partition_point(|e| usize::from(e.col) < span.end);
+            entries.drain(start..end);
+        });
+        for (col, text) in src.iter() {
+            if span.contains(&col) {
+                self.set(col, text.into());
+            }
+        }
+        let runs = src
+            .entries
+            .as_deref()
+            .map_or(&[][..], |side| side.links.runs_in(span.clone()));
+        if runs.is_empty() {
+            // Nothing to copy: a line without a table keeps none.
+            self.edit(|side| side.links.remove_range(span));
+        } else {
+            self.entries
+                .get_or_insert_with(Box::default)
+                .links
+                .replace_span(span, runs);
+        }
+    }
+
     /// Keeps the clusters and hyperlinks whose column `keep` accepts and
     /// drops the others, in one pass over each kind.
     pub(crate) fn retain_cols(&mut self, mut keep: impl FnMut(usize) -> bool) {
