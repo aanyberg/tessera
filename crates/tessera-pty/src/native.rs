@@ -23,7 +23,7 @@ use nix::sys::signal::{self, Signal};
 use nix::unistd::Pid;
 use portable_pty::{CommandBuilder, MasterPty, PtyPair, native_pty_system};
 
-use crate::bounded::{MAX_STUCK_HELPERS, Pool, TimedOut, run_bounded, run_bounded_in};
+use crate::bounded::{MAX_STUCK_HELPERS, Pool, Unanswered, run_bounded, run_bounded_in};
 use crate::foreground::{self, ForegroundProcess};
 use crate::{ExitStatus, Program, Pty, PtyError, PtyEvent, PtyEvents, PtySize, SpawnOptions};
 
@@ -240,6 +240,8 @@ impl NativePty {
     /// an argument or variable contains a NUL byte,
     /// [`PtyError::ProgramTimedOut`] if the file system gave no answer
     /// within 5 s while the program was looked up (see below),
+    /// [`PtyError::ProgramLookupBusy`] if the lookup was not made because
+    /// four earlier lookups or checks are still stuck (see below),
     /// [`PtyError::OpenTimedOut`] if opening the PTY gave no answer within
     /// 5 s or four earlier opens are still without one (the open runs on
     /// a helper thread, so a `grantpt(3)` that never returns fails this
@@ -266,10 +268,14 @@ impl NativePty {
     /// the check is skipped and the program left to `exec`, so a script
     /// with a broken interpreter then spawns and its child ends at once as
     /// described below. While four earlier lookups or checks are still
-    /// stuck, both give up at once: the spawn fails. A stuck helper's
-    /// thread ends when its call does. `portable-pty` still stats the
-    /// working directory and `$SHELL`, and resolves the program it is
-    /// handed, on the caller's thread before it forks; after a lookup in
+    /// stuck, the lookup is not made and the spawn fails at once with
+    /// [`PtyError::ProgramLookupBusy`] (#602). A helper thread that cannot
+    /// be started fails the spawn with [`PtyError::Spawn`], its reason that
+    /// error's text with its `(os error N)` (`EAGAIN` when the process is
+    /// out of threads). A stuck helper's thread ends when its call does.
+    /// `portable-pty` still stats the working directory and `$SHELL`, and
+    /// resolves the program it is handed, on the caller's thread before it
+    /// forks; after a lookup in
     /// time those answers are cached, but a volume that stops answering
     /// after the lookup can still hold the caller there. Both bounds are
     /// timed waits, which macOS may stretch for an app at background
@@ -666,12 +672,26 @@ fn check_exec_size(command: &CommandBuilder, options: &SpawnOptions) -> Result<(
 fn checked_command(options: &SpawnOptions) -> Result<CommandBuilder, PtyError> {
     let mut command = build_command(options);
     check_exec_size(&command, options)?;
-    let program = resolve_program_bounded(&mut command)?;
-    check_interpreter_bounded(program, &command).map_err(|reason| PtyError::Spawn {
+    let refused = |reason| PtyError::Spawn {
         program: describe_program(&options.program),
         reason,
+    };
+    let program = resolve_program_bounded(&mut command).map_err(|err| match err {
+        Refused::Lookup(err) => err,
+        Refused::NotStarted(reason) => refused(reason),
     })?;
+    check_interpreter_bounded(program, &command).map_err(refused)?;
     Ok(command)
+}
+
+/// Why [`resolve_program_bounded`] refused a spawn.
+#[derive(Debug)]
+enum Refused {
+    /// [`PtyError::ProgramTimedOut`] or [`PtyError::ProgramLookupBusy`].
+    Lookup(PtyError),
+    /// The lookup's helper thread could not be started; the reason, with
+    /// its `(os error N)`, for [`PtyError::Spawn`].
+    NotStarted(String),
 }
 
 /// How long [`NativePty::spawn`] waits for the program to be looked up
@@ -684,7 +704,11 @@ fn checked_command(options: &SpawnOptions) -> Result<CommandBuilder, PtyError> {
 /// paths again on the caller. Longer than [`SPAWN_CHECK_TIMEOUT`] because
 /// a lookup that ends late still lets the spawn go on, where a skipped
 /// header check only loses a better error.
-const SPAWN_PROGRAM_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const SPAWN_PROGRAM_TIMEOUT: Duration = Duration::from_secs(5);
+
+// The docs of `NativePty::spawn`, `PtyError::ProgramTimedOut`, ADR 0037
+// and docs/security.md state this wait as 5 s.
+const _: () = assert!(SPAWN_PROGRAM_TIMEOUT.as_nanos() == 5_000_000_000);
 
 /// How long [`NativePty::spawn`] waits for [`check_interpreter`], which
 /// reads the program's header and stats its `#!` interpreter: a file not
@@ -696,22 +720,30 @@ const SPAWN_CHECK_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// [`resolve_program`] on a `pty-spawn-program` helper thread, waited for
 /// at most [`SPAWN_PROGRAM_TIMEOUT`] (see [`run_bounded`]). Without an
-/// answer in time, or with [`crate::bounded::MAX_STUCK_HELPERS`] earlier
-/// lookups or checks still stuck, the spawn fails with
-/// [`PtyError::ProgramTimedOut`] before `portable-pty` is called; the
-/// lookup's late answer is dropped on its helper.
+/// answer in time the spawn fails with [`PtyError::ProgramTimedOut`]
+/// before `portable-pty` is called, and the lookup's late answer is
+/// dropped on its helper. With [`crate::bounded::MAX_STUCK_HELPERS`]
+/// earlier lookups or checks still stuck (or every helper busy with
+/// earlier ones for the whole wait) the lookup is not made and the spawn
+/// fails with [`PtyError::ProgramLookupBusy`]; when the helper thread
+/// cannot be started, with that error's reason (#602).
 ///
 /// A program found through a `PATH` search replaces `argv[0]` with its
 /// path, so `portable-pty` checks that one file instead of searching
 /// `PATH` again on the caller (the child sees the path in `argv[0]`). The
 /// program as `exec` will run it, if it was found.
-fn resolve_program_bounded(command: &mut CommandBuilder) -> Result<Option<PathBuf>, PtyError> {
+fn resolve_program_bounded(command: &mut CommandBuilder) -> Result<Option<PathBuf>, Refused> {
     let lookup = command.clone();
     let resolved = run_bounded("pty-spawn-program", SPAWN_PROGRAM_TIMEOUT, move || {
         resolve_program(&lookup)
     })
-    .map_err(|TimedOut| PtyError::ProgramTimedOut {
-        path_bytes: program_len(command),
+    .map_err(|err| {
+        let path_bytes = program_len(command);
+        match err {
+            Unanswered::TimedOut => Refused::Lookup(PtyError::ProgramTimedOut { path_bytes }),
+            Unanswered::Busy => Refused::Lookup(PtyError::ProgramLookupBusy { path_bytes }),
+            Unanswered::NotStarted(reason) => Refused::NotStarted(reason),
+        }
     })?;
     Ok(resolved.map(|Resolved { path, searched }| {
         if searched && let Some(program) = command.get_argv_mut().first_mut() {
@@ -728,8 +760,11 @@ fn resolve_program_bounded(command: &mut CommandBuilder) -> Result<Option<PathBu
 /// check is skipped and the program left to `exec`, which runs it or fails
 /// after the fork as described on [`NativePty::spawn`]. The skip is logged
 /// at debug with the length of the program's path only (docs/security.md
-/// S8). A program that was not found (`None`) is left to `portable-pty`,
-/// which refuses it with its own reason.
+/// S8). A helper thread that cannot be started refuses the spawn with that
+/// error's reason (`EAGAIN` when the process is out of threads, #602): the
+/// reader and writer threads the spawn needs could not start either. A
+/// program that was not found (`None`) is left to `portable-pty`, which
+/// refuses it with its own reason.
 fn check_interpreter_bounded(
     program: Option<PathBuf>,
     command: &CommandBuilder,
@@ -742,12 +777,15 @@ fn check_interpreter_bounded(
     run_bounded("pty-spawn-check", SPAWN_CHECK_TIMEOUT, move || {
         check_interpreter(&program, &check)
     })
-    .unwrap_or_else(|TimedOut| {
-        tracing::debug!(
-            program_len,
-            "the spawn check had no answer in time; leaving the program to exec"
-        );
-        Ok(())
+    .unwrap_or_else(|err| match err {
+        Unanswered::TimedOut | Unanswered::Busy => {
+            tracing::debug!(
+                program_len,
+                "the spawn check had no answer in time; leaving the program to exec"
+            );
+            Ok(())
+        }
+        Unanswered::NotStarted(reason) => Err(reason),
     })
 }
 
@@ -894,7 +932,7 @@ fn resolve_program(command: &CommandBuilder) -> Option<Resolved> {
 /// `portable-pty`'s `search_path` asks: a stat (`is_dir`), then
 /// `access(X_OK)`, then `access(F_OK)` when that fails.
 fn probe(path: &Path) -> bool {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     slow_read::pause(path, slow_read::Stage::Lookup);
     if path.is_dir() {
         return false;
@@ -947,7 +985,7 @@ fn access(path: &Path, mode: nix::libc::c_int) -> bool {
 /// read-only, non-blocking and without becoming a controlling terminal,
 /// and symbolic links are followed, as `exec` follows them.
 fn read_header(program: &Path) -> [u8; SHEBANG_HEADER_BYTES] {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     slow_read::pause(program, slow_read::Stage::Header);
     let mut header = [0u8; SHEBANG_HEADER_BYTES];
     if !std::fs::metadata(program).is_ok_and(|meta| meta.is_file()) {
@@ -1087,19 +1125,20 @@ fn exec_bytes(command: &CommandBuilder, options: &SpawnOptions) -> ExecFootprint
 /// downloaded. Only the named paths are held, each at one stage, so other
 /// tests running beside it (`cargo test`) are unaffected. A held call
 /// gives up after [`slow_read::MOST`], so a regression fails its test
-/// instead of hanging.
-#[cfg(test)]
-mod slow_read {
+/// instead of hanging. Other crates' tests reach the lookup stage through
+/// [`crate::test_hooks`] (feature `test-hooks`, #602).
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) mod slow_read {
     use std::path::{Path, PathBuf};
     use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
     use std::time::Duration;
 
     /// Longest a held call blocks without a release.
-    pub(super) const MOST: Duration = Duration::from_secs(10);
+    pub(crate) const MOST: Duration = Duration::from_secs(10);
 
     /// Where a path is held.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub(super) enum Stage {
+    pub(crate) enum Stage {
         /// The program lookup's [`super::probe`].
         Lookup,
         /// [`super::read_header`].
@@ -1131,7 +1170,7 @@ mod slow_read {
     }
 
     /// Makes every call at `stage` on `path` block until [`release`].
-    pub(super) fn hold(path: &Path, stage: Stage) {
+    pub(crate) fn hold(path: &Path, stage: Stage) {
         let mut holds = lock();
         holds.retain(|hold| hold.path != path || hold.stage != stage);
         holds.push(Hold {
@@ -1145,7 +1184,7 @@ mod slow_read {
 
     /// Lets the held calls at `stage` on `path`, and every later one,
     /// return.
-    pub(super) fn release(path: &Path, stage: Stage) {
+    pub(crate) fn release(path: &Path, stage: Stage) {
         if let Some(hold) = find(&mut lock(), path, stage) {
             hold.held = false;
         }
@@ -1154,7 +1193,7 @@ mod slow_read {
 
     /// The names of the threads that started a call at `stage` on `path`,
     /// and how many of those calls have returned.
-    pub(super) fn calls(path: &Path, stage: Stage) -> (Vec<String>, usize) {
+    pub(crate) fn calls(path: &Path, stage: Stage) -> (Vec<String>, usize) {
         find(&mut lock(), path, stage).map_or_default(|hold| (hold.callers.clone(), hold.finished))
     }
 
@@ -1429,7 +1468,9 @@ static OPEN_HELPERS: Pool = Pool::new(MAX_STUCK_HELPERS);
 /// [`PTY_OPEN_TIMEOUT`] (see [`run_bounded_in`]). Without an answer in
 /// time, or with [`MAX_STUCK_HELPERS`] earlier opens still stuck (the
 /// spawn then fails at once and starts no thread), the spawn fails with
-/// [`PtyError::OpenTimedOut`] before anything is forked. An open that
+/// [`PtyError::OpenTimedOut`] before anything is forked; a helper thread
+/// that cannot be started fails it with [`PtyError::Open`] and that
+/// error's reason (`EAGAIN` when the process is out of threads). An open that
 /// returns after its caller gave up drops its result on the helper, which
 /// closes both ends of the pty it opened.
 fn open_pair(size: PtySize) -> Result<PtyPair, PtyError> {
@@ -1445,9 +1486,12 @@ fn open_pair(size: PtySize) -> Result<PtyPair, PtyError> {
             opened
         },
     )
-    .map_err(|TimedOut| {
-        tracing::warn!("opening a pty gave no answer in time; failing the spawn");
-        PtyError::OpenTimedOut
+    .map_err(|err| match err {
+        Unanswered::TimedOut | Unanswered::Busy => {
+            tracing::warn!("opening a pty gave no answer in time; failing the spawn");
+            PtyError::OpenTimedOut
+        }
+        Unanswered::NotStarted(reason) => PtyError::Open(reason),
     })?
     .map_err(|err| PtyError::Open(err.to_string()))
 }
@@ -2611,6 +2655,113 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #602: with four lookups stuck on a stalled volume, a further spawn
+    /// fails at once, before any lookup (no fifth helper starts), with an
+    /// error of its own that says why: earlier checks are still waiting,
+    /// not "the file system gave no answer", since nothing was asked. Fills
+    /// the process's own helpers, so it runs only alone in its process (as
+    /// under nextest).
+    #[test]
+    fn a_spawn_refused_at_the_lookup_cap_says_earlier_checks_are_waiting() {
+        if std::env::var_os("NEXTEST").is_none() {
+            eprintln!("skipped: fills the process-wide helper pool; run under nextest");
+            return;
+        }
+        let (release, released) = mpsc::channel::<()>();
+        let released = Arc::new(Mutex::new(released));
+        for _ in 0..MAX_STUCK_HELPERS {
+            let released = Arc::clone(&released);
+            let result = run_bounded("pty-spawn-program", Duration::ZERO, move || {
+                let _ = lock_ignoring_poison(&released).recv_timeout(Duration::from_secs(30));
+            });
+            assert_eq!(result, Err(Unanswered::TimedOut));
+        }
+        let program = "/bin/sh";
+        let start = std::time::Instant::now();
+        let spawned = NativePty::spawn(&SpawnOptions::command(program, "busy"));
+        let took = start.elapsed();
+        assert_eq!(fault::take_forked(), None, "a child was forked");
+        let err = match spawned {
+            Err(err @ PtyError::ProgramLookupBusy { .. }) => err,
+            other => panic!("not refused as busy: {other:?}"),
+        };
+        assert!(
+            matches!(err, PtyError::ProgramLookupBusy { path_bytes }
+                if path_bytes == program.len()),
+            "{err:?}"
+        );
+        let shown = err.to_string();
+        assert!(
+            shown.ends_with("too many earlier program checks are still waiting"),
+            "{shown}"
+        );
+        assert!(!shown.contains("no answer"), "{shown}");
+        assert!(took < SPAWN_PROGRAM_TIMEOUT, "refused after {took:?}");
+        drop(release);
+        wait_until("the stuck lookups did not finish", || {
+            crate::bounded::HELPERS.running() == 0
+        });
+        let (pty, events) = NativePty::spawn(&exiting(4)).expect("spawn once the lookups returned");
+        assert_eq!(exit_of(&events), ExitStatus::Exited(4));
+        drop(pty);
+    }
+
+    /// #602: a program lookup whose helper thread cannot start (the
+    /// process out of threads) refuses the spawn as a spawn error that
+    /// keeps the thread start's `EAGAIN`, so a caller can map it, not as a
+    /// lookup that timed out; nothing is forked.
+    #[test]
+    fn a_lookup_helper_that_cannot_start_refuses_the_spawn_with_its_errno() {
+        let eagain = nix::errno::Errno::EAGAIN as i32;
+        crate::bounded::fail_next_start(eagain);
+        let spawned = NativePty::spawn(&SpawnOptions::command("/bin/sh", "no-thread"));
+        assert_eq!(fault::take_forked(), None, "a child was forked");
+        match spawned {
+            Err(PtyError::Spawn { program, reason }) => {
+                assert_eq!(program, "/bin/sh");
+                assert_eq!(reason, io::Error::from_raw_os_error(eagain).to_string());
+                assert!(
+                    reason.ends_with(&format!("(os error {eagain})")),
+                    "{reason}"
+                );
+            }
+            other => panic!("not refused with the errno: {other:?}"),
+        }
+        let (pty, events) = NativePty::spawn(&exiting(3)).expect("the next spawn starts");
+        assert_eq!(exit_of(&events), ExitStatus::Exited(3));
+        drop(pty);
+    }
+
+    /// #602: a `#!` check whose helper thread cannot start refuses the
+    /// spawn with that start's reason (`EAGAIN`) instead of skipping the
+    /// check, and a pty open whose helper cannot start fails with it too.
+    #[test]
+    fn check_and_open_helpers_that_cannot_start_keep_their_errno() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let eagain = nix::errno::Errno::EAGAIN as i32;
+        let expected = io::Error::from_raw_os_error(eagain).to_string();
+        let dir = scratch_dir("no-check-thread");
+        let script = dir.join("script");
+        std::fs::write(&script, "#!/bin/sh\nexit 7\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let options = SpawnOptions::command(&script, "no-thread");
+        crate::bounded::fail_next_start(eagain);
+        let checked = check_interpreter_bounded(Some(script.clone()), &build_command(&options));
+        assert_eq!(checked, Err(expected.clone()));
+        assert_eq!(
+            check_interpreter_bounded(Some(script.clone()), &build_command(&options)),
+            Ok(()),
+            "the next check runs"
+        );
+
+        crate::bounded::fail_next_start(eagain);
+        match open_pair(PtySize::new(24, 80)) {
+            Err(PtyError::Open(reason)) => assert_eq!(reason, expected),
+            other => panic!("not refused with the errno: {:?}", other.err()),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A short-lived child that exits with `code`.
     fn exiting(code: u8) -> SpawnOptions {
         SpawnOptions::command("/bin/sh", "open").args(["-c", &format!("exit {code}")])
@@ -2637,7 +2788,7 @@ mod tests {
             let result = run_bounded_in(pool, "pty-open", Duration::ZERO, move || {
                 let _ = lock_ignoring_poison(&released).recv_timeout(Duration::from_secs(30));
             });
-            assert_eq!(result.err(), Some(TimedOut));
+            assert_eq!(result.err(), Some(Unanswered::TimedOut));
         }
         release
     }
@@ -2818,11 +2969,11 @@ mod tests {
             let result = run_bounded("pty-spawn-check", Duration::ZERO, move || {
                 let _ = lock_ignoring_poison(&released).recv_timeout(Duration::from_secs(30));
             });
-            assert_eq!(result, Err(TimedOut));
+            assert_eq!(result, Err(Unanswered::TimedOut));
         }
         assert_eq!(
             run_bounded("pty-spawn-check", Duration::from_secs(5), || 1),
-            Err(TimedOut),
+            Err(Unanswered::Busy),
             "the lookup pool is not full"
         );
         let pair = open_pair(size).expect("stuck lookups refused an open");

@@ -576,6 +576,11 @@ impl App {
     /// [`PtyError::ArgumentsTooLong`] when the arguments and environment
     /// exceed what `execve(2)` accepts even without the injection (its
     /// sizes are then those of the start without it).
+    /// [`PtyError::ProgramTimedOut`] when the file system gave no answer
+    /// within 5 s while the program was looked up (a stalled network
+    /// volume), and [`PtyError::ProgramLookupBusy`] when the lookup was not
+    /// made because four earlier lookups or `#!` checks are still waiting
+    /// for the file system (#602).
     /// [`Error::ReaderThread`] when a session thread (reader or input
     /// writer) cannot be created (the child is then hung up).
     pub fn spawn_session(&self, options: SpawnOptions) -> Result<SessionId> {
@@ -602,7 +607,11 @@ impl App {
     /// executed: a [`PtyError::Spawn`]; a `command` longer than the system
     /// lets a program's arguments be: a [`PtyError::ArgumentsTooLong`],
     /// #342; a pty open that gave no answer in time: a
-    /// [`PtyError::OpenTimedOut`], #568), the session is started once more
+    /// [`PtyError::OpenTimedOut`], #568; a `command` whose lookup the file
+    /// system gave no answer in time, as on a stalled network volume: a
+    /// [`PtyError::ProgramTimedOut`], or that was not looked up because
+    /// earlier lookups are still waiting: a [`PtyError::ProgramLookupBusy`],
+    /// #602), the session is started once more
     /// as the built-in profile would start it (the caller's `options`: the
     /// login shell in the home directory) and drawn with `[appearance]`. Its
     /// first line then says so: `[Tessera] profile "<name>" could not start
@@ -610,6 +619,13 @@ impl App {
     /// bidirectional formatting characters and at most
     /// [`edit::MAX_DISPLAY_NAME_LEN`] bytes. The warning logged names the
     /// profile by its index and the `errno` only (#333).
+    ///
+    /// Limit (#602): while four earlier program lookups are stuck (the
+    /// helper cap), the built-in start's own lookup is refused too, so no
+    /// default shell starts and the tab fails with the profile's
+    /// [`PtyError::ProgramLookupBusy`] ("too many earlier program checks
+    /// are still waiting"). Once a stuck lookup ends, both starts run
+    /// again. Keeping a helper free for the built-in start is #661.
     ///
     /// # Errors
     ///
@@ -655,7 +671,7 @@ impl App {
             target: "tessera_app_core",
             profile = ?index,
             errno = ?errno,
-            "a profile's session could not start; starting the built-in profile"
+            "a profile's session could not start; trying the built-in profile once"
         );
         let mut notice = profile::fallback_notice(name, errno);
         // One retry, as the built-in profile; its failure reports the
@@ -2948,7 +2964,10 @@ fn fallback_errno(error: &Error) -> Result<Option<i32>, ()> {
     match error {
         Error::Pty(PtyError::Spawn { reason, .. }) => Ok(profile::spawn_errno(reason)),
         Error::Pty(PtyError::ArgumentsTooLong { .. }) => Ok(Some(profile::errno::E2BIG)),
-        Error::Pty(PtyError::OpenTimedOut) => Ok(Some(profile::errno::ETIMEDOUT)),
+        Error::Pty(PtyError::OpenTimedOut | PtyError::ProgramTimedOut { .. }) => {
+            Ok(Some(profile::errno::ETIMEDOUT))
+        }
+        Error::Pty(PtyError::ProgramLookupBusy { .. }) => Ok(Some(profile::errno::EAGAIN)),
         _ => Err(()),
     }
 }
@@ -4282,11 +4301,26 @@ mod tests {
         );
         for refused in [
             PtyError::Open("x".to_owned()),
-            PtyError::ProgramTimedOut { path_bytes: 1 },
             PtyError::InvalidSize(PtySize::new(0, 1)),
         ] {
             assert_eq!(fallback_errno(&Error::Pty(refused)), Err(()));
         }
+    }
+
+    /// #602: a profile's session whose program lookup gave no answer in
+    /// time falls back with `ETIMEDOUT`, as a timed-out open does; one
+    /// refused because earlier lookups are still waiting with `EAGAIN`.
+    #[test]
+    fn a_timed_out_or_refused_program_lookup_falls_back() {
+        let errno = fallback_errno(&Error::Pty(PtyError::ProgramTimedOut { path_bytes: 1 }));
+        assert_eq!(errno, Ok(Some(nix::errno::Errno::ETIMEDOUT as i32)));
+        let errno = fallback_errno(&Error::Pty(PtyError::ProgramLookupBusy { path_bytes: 1 }));
+        assert_eq!(errno, Ok(Some(nix::errno::Errno::EAGAIN as i32)));
+        let notice = String::from_utf8(profile::fallback_notice("p", errno.unwrap())).unwrap();
+        assert_eq!(
+            notice,
+            "[Tessera] profile \"p\" could not start (Resource temporarily unavailable); started the default shell.\r\n"
+        );
     }
 
     #[test]

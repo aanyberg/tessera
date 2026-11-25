@@ -19,22 +19,32 @@ use std::time::{Duration, Instant};
 /// Most helper threads [`run_bounded`] runs at once, and so most that can
 /// be left running past their caller's timeout (docs/security.md S5). With
 /// this many outstanding past their timeout, [`run_bounded`] returns
-/// [`TimedOut`] at once without starting a thread; with fewer stuck but
-/// every helper busy, a caller waits (within its own timeout) for one to
-/// finish.
+/// [`Unanswered::Busy`] at once without starting a thread; with fewer
+/// stuck but every helper busy, a caller waits (within its own timeout)
+/// for one to finish.
 pub(crate) const MAX_STUCK_HELPERS: usize = 4;
 
-/// [`run_bounded`] has no answer: the helper did not finish within the
-/// timeout, [`MAX_STUCK_HELPERS`] helpers are already stuck, no helper
-/// came free within the timeout, or the helper thread could not be
-/// started. The call may still be running on its helper.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct TimedOut;
+/// Why [`run_bounded`] has no answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Unanswered {
+    /// The helper did not finish within the timeout. The call may still be
+    /// running on its helper, which then counts as stuck.
+    TimedOut,
+    /// The call was never made: [`MAX_STUCK_HELPERS`] earlier helpers are
+    /// stuck (refused at once), or every helper stayed busy with an earlier
+    /// call for the whole timeout (#602).
+    Busy,
+    /// The call was never made: its helper thread could not be started.
+    /// The reason is the [`std::io::Error`]'s text, `(os error N)` included
+    /// (`EAGAIN` when the process is out of threads), so a spawn error
+    /// built from it keeps the `errno` (#602).
+    NotStarted(String),
+}
 
 /// The process's helpers for [`run_bounded`]. Calls that must not share
 /// a cap with these (the pty opens of [`crate::NativePty::spawn`], #568)
 /// have a [`Pool`] of their own and use [`run_bounded_in`].
-static HELPERS: Pool = Pool::new(MAX_STUCK_HELPERS);
+pub(crate) static HELPERS: Pool = Pool::new(MAX_STUCK_HELPERS);
 
 /// Runs `f` on a helper thread named `name` that first runs the crate's
 /// thread start hook (see [`crate::set_thread_start_hook`]), and waits up
@@ -49,12 +59,12 @@ static HELPERS: Pool = Pool::new(MAX_STUCK_HELPERS);
 ///
 /// # Errors
 ///
-/// [`TimedOut`] when there is no result within `timeout` (see there).
+/// [`Unanswered`] when there is no result within `timeout` (see there).
 pub(crate) fn run_bounded<T: Send + 'static>(
     name: &str,
     timeout: Duration,
     f: impl FnOnce() -> T + Send + 'static,
-) -> Result<T, TimedOut> {
+) -> Result<T, Unanswered> {
     run_bounded_in(&HELPERS, name, timeout, f)
 }
 
@@ -65,14 +75,14 @@ pub(crate) fn run_bounded<T: Send + 'static>(
 ///
 /// # Errors
 ///
-/// [`TimedOut`] when there is no result within `timeout` (see there),
+/// [`Unanswered`] when there is no result within `timeout` (see there),
 /// `pool` standing in for the shared helpers.
 pub(crate) fn run_bounded_in<T: Send + 'static>(
     pool: &'static Pool,
     name: &str,
     timeout: Duration,
     f: impl FnOnce() -> T + Send + 'static,
-) -> Result<T, TimedOut> {
+) -> Result<T, Unanswered> {
     pool.run(name, timeout, f)
 }
 
@@ -179,18 +189,18 @@ impl Pool {
         name: &str,
         timeout: Duration,
         f: impl FnOnce() -> T + Send + 'static,
-    ) -> Result<T, TimedOut> {
+    ) -> Result<T, Unanswered> {
         let deadline = Instant::now().checked_add(timeout);
         let mut counts = self.lock();
         loop {
             if counts.stuck >= self.cap {
-                return Err(TimedOut);
+                return Err(Unanswered::Busy);
             }
             if counts.waited + counts.stuck < self.cap {
                 break;
             }
             if past(deadline) {
-                return Err(TimedOut);
+                return Err(Unanswered::Busy);
             }
             counts = self.wait(counts, deadline);
         }
@@ -203,18 +213,25 @@ impl Pool {
             state: Arc::clone(&state),
             value: None,
         };
-        let spawned = thread::Builder::new().name(name.to_owned()).spawn(move || {
+        let body = move || {
             let mut finish = finish;
             crate::native::run_thread_start_hook();
             finish.value = Some(f());
-        });
+        };
+        let spawned = match start_fault::take() {
+            Some(err) => {
+                drop(body);
+                Err(err)
+            }
+            None => thread::Builder::new().name(name.to_owned()).spawn(body),
+        };
         let helper = match spawned {
             Ok(helper) => helper,
             Err(err) => {
                 // The closure, and the `Finish` in it, was dropped without
                 // running, which released the helper's place.
                 tracing::debug!(%err, "cannot start a helper thread");
-                return Err(TimedOut);
+                return Err(Unanswered::NotStarted(err.to_string()));
             }
         };
         #[cfg(test)]
@@ -249,7 +266,7 @@ impl Pool {
                 // A caller waiting for a free helper returns at once if
                 // this filled the cap.
                 self.changed.notify_all();
-                return Err(TimedOut);
+                return Err(Unanswered::TimedOut);
             }
             drop(call);
             counts = self.wait(counts, deadline);
@@ -299,6 +316,44 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 fn past(deadline: Option<Instant>) -> bool {
     deadline.is_some_and(|deadline| Instant::now() >= deadline)
 }
+
+/// Test-only failure of a helper's thread start (#602): the next
+/// [`run_bounded`] on a thread that armed it gets `errno` where
+/// [`thread::Builder::spawn`] would have started the helper, as when the
+/// process is out of threads. Only the arming thread's next start fails, so
+/// other tests running beside it (`cargo test`) are unaffected. Outside
+/// tests (and the `test-hooks` feature) nothing is armed.
+mod start_fault {
+    use std::io;
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    thread_local! {
+        static NEXT: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// Makes the next helper start on this thread fail with `errno`.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn fail_next(errno: i32) {
+        NEXT.with(|next| next.set(Some(errno)));
+    }
+
+    /// The armed failure, disarmed.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(super) fn take() -> Option<io::Error> {
+        NEXT.with(std::cell::Cell::take)
+            .map(io::Error::from_raw_os_error)
+    }
+
+    /// Nothing is ever armed.
+    #[cfg(not(any(test, feature = "test-hooks")))]
+    #[inline]
+    pub(super) const fn take() -> Option<io::Error> {
+        None
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) use start_fault::fail_next as fail_next_start;
 
 /// Joins a helper that has delivered its result, so it is gone when the
 /// caller returns. It cannot have panicked: the start hook's panics are
@@ -396,7 +451,7 @@ mod tests {
             7
         });
         let waited = start.elapsed();
-        assert_eq!(result, Err(TimedOut));
+        assert_eq!(result, Err(Unanswered::TimedOut));
         assert!(waited >= timeout, "gave up after {waited:?}");
         assert!(waited < SLACK, "held the caller for {waited:?}");
         assert_eq!(
@@ -426,7 +481,7 @@ mod tests {
                 RAN.fetch_add(1, Ordering::SeqCst);
                 lock(&released).recv_timeout(SLACK * 2).ok();
             });
-            assert_eq!(result, Err(TimedOut));
+            assert_eq!(result, Err(Unanswered::TimedOut));
         }
         assert_eq!(
             counts(&POOL),
@@ -443,7 +498,7 @@ mod tests {
             RAN.fetch_add(100, Ordering::SeqCst);
         });
         let waited = start.elapsed();
-        assert_eq!(fifth, Err(TimedOut));
+        assert_eq!(fifth, Err(Unanswered::Busy));
         assert!(waited < SLACK, "the fifth call waited {waited:?}");
         assert_eq!(started(&POOL), MAX_STUCK_HELPERS, "a fifth helper started");
         if alone {
@@ -523,7 +578,10 @@ mod tests {
             .expect("busy helper started");
         let timeout = Duration::from_millis(100);
         let start = Instant::now();
-        assert_eq!(POOL.run("bounded-test", timeout, || 2), Err(TimedOut));
+        assert_eq!(
+            POOL.run("bounded-test", timeout, || 2),
+            Err(Unanswered::Busy)
+        );
         let waited = start.elapsed();
         assert!(waited >= timeout, "gave up after {waited:?}");
         assert!(waited < SLACK, "waited {waited:?}");
@@ -553,10 +611,13 @@ mod tests {
             .recv_timeout(SLACK)
             .expect("busy helper started");
         let start = Instant::now();
-        assert_eq!(POOL.run("bounded-test", SLACK * 2, || 2), Err(TimedOut));
+        assert_eq!(
+            POOL.run("bounded-test", SLACK * 2, || 2),
+            Err(Unanswered::Busy)
+        );
         let waited = start.elapsed();
         assert!(waited < SLACK, "waited {waited:?} for a full cap");
-        assert_eq!(busy.join().unwrap(), Err(TimedOut));
+        assert_eq!(busy.join().unwrap(), Err(Unanswered::TimedOut));
         assert_eq!(started(&POOL), 1, "a second helper started");
         release.send(()).unwrap();
         wait_idle(&POOL);
@@ -588,6 +649,43 @@ mod tests {
         }
     }
 
+    /// #602: a helper thread that cannot start (the process out of
+    /// threads) gives the start's error with its `errno`, not a timeout;
+    /// `f` never runs, no thread is counted, the helper's place is free
+    /// again, and only the arming thread's next start fails.
+    #[test]
+    fn a_helper_that_cannot_start_reports_its_errno_and_frees_its_place() {
+        static POOL: Pool = Pool::new(1);
+        static RAN: AtomicBool = AtomicBool::new(false);
+        let eagain = nix::errno::Errno::EAGAIN as i32;
+        fail_next_start(eagain);
+        let result = POOL.run("bounded-test", SLACK, || RAN.store(true, Ordering::SeqCst));
+        assert_eq!(
+            result,
+            Err(Unanswered::NotStarted(
+                std::io::Error::from_raw_os_error(eagain).to_string()
+            ))
+        );
+        assert!(!RAN.load(Ordering::SeqCst), "the call ran");
+        assert_eq!(started(&POOL), 0);
+        assert_eq!(counts(&POOL), Counts::default());
+        assert_eq!(POOL.run("bounded-test", SLACK, || 8), Ok(8));
+        fail_next_start(eagain);
+        let other = thread::spawn(|| POOL.run("bounded-test", SLACK, || 9));
+        assert_eq!(
+            other.join().unwrap(),
+            Ok(9),
+            "another thread's start failed"
+        );
+        assert!(
+            matches!(
+                POOL.run("bounded-test", SLACK, || 10),
+                Err(Unanswered::NotStarted(_))
+            ),
+            "this thread's start did not fail"
+        );
+    }
+
     #[test]
     fn a_panic_in_the_call_is_resumed_on_the_caller() {
         static POOL: Pool = Pool::new(MAX_STUCK_HELPERS);
@@ -613,8 +711,8 @@ mod tests {
             released.recv_timeout(SLACK * 2).ok();
             panic::panic_any("deliberate stuck helper panic")
         });
-        assert_eq!(result, Err(TimedOut));
-        assert_eq!(POOL.run("bounded-test", SLACK, || 5), Err(TimedOut));
+        assert_eq!(result, Err(Unanswered::TimedOut));
+        assert_eq!(POOL.run("bounded-test", SLACK, || 5), Err(Unanswered::Busy));
         release.send(()).unwrap();
         wait_idle(&POOL);
         assert_eq!(POOL.run("bounded-test", SLACK, || 6), Ok(6));
