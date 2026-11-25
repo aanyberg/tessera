@@ -540,6 +540,60 @@ final class TerminalScrollTests: XCTestCase {
         XCTAssertFalse(view.scroller.isHidden)
     }
 
+    /// A knob widened by the pointer before the alternate screen opens is
+    /// narrow once the child leaves it, and the next hover widens it again
+    /// with its animation (#634): the history drops to 0 and comes back
+    /// through the session's output and rendered frames, as with `less`.
+    /// The pointer enters through the scroller's handler (a window never
+    /// on screen gets no tracking-area events); its overlay knob is the
+    /// layer at z 2.
+    func testAKnobWideBeforeTheAlternateScreenIsNarrowAfterItAndTheNextHoverWidensIt() async throws {
+        try await open()
+        try requireSurface()
+        tick()
+        let scroller = view.scroller
+        scroller.reducesMotion = false
+        let knob = try XCTUnwrap(scroller.layer?.sublayers?.first { $0.zPosition == 2 }, "the overlay knob")
+        let slot = try XCTUnwrap(scroller.layer?.sublayers?.first { $0.zPosition == 1 }, "the slot")
+        let narrow = knob.frame.width
+        XCTAssertFalse(knob.isHidden)
+        let hover = { () throws -> Void in
+            let point = NSPoint(x: scroller.bounds.maxX - 12, y: scroller.rect(for: .knob).midY)
+            let event = try XCTUnwrap(
+                NSEvent.enterExitEvent(
+                    with: .mouseEntered, location: scroller.convert(point, to: nil), modifierFlags: [],
+                    timestamp: 0, windowNumber: self.window.windowNumber, context: nil, eventNumber: 0,
+                    trackingNumber: 0, userData: nil))
+            scroller.mouseEntered(with: event)
+        }
+        let widening = { () -> CAAnimation? in
+            (knob.animationKeys() ?? []).lazy.compactMap { knob.animation(forKey: $0) as? CABasicAnimation }
+                .first { $0.keyPath == "bounds.size.width" }
+        }
+        try hover()
+        XCTAssertGreaterThan(knob.frame.width, narrow, "the pointer widened it")
+        let first = try XCTUnwrap(widening(), "the first widening")
+        CATransaction.flush()
+
+        try view.session.write(Array("\u{1b}[?1049h".utf8))
+        try await waitUntil("the alternate screen is shown") { (try? self.position.history) == 0 }
+        tick()
+        XCTAssertTrue(scroller.isHidden, "the alternate screen has no history")
+        try view.session.write(Array("\u{1b}[?1049l".utf8))
+        try await waitUntil("the primary screen is back") { (try? self.position.history) ?? 0 > 0 }
+        tick()
+        XCTAssertFalse(scroller.isHidden)
+        XCTAssertEqual(knob.frame.width, narrow, "narrow after the alternate screen")
+        XCTAssertTrue(slot.isHidden, "no slot behind it")
+        XCTAssertNil(widening(), "the first widening ended")
+
+        try hover()
+        XCTAssertGreaterThan(knob.frame.width, narrow, "the next hover widens it")
+        XCTAssertFalse(slot.isHidden)
+        let next = try XCTUnwrap(widening(), "with its animation")
+        XCTAssertFalse(next === first, "a new widening")
+    }
+
     func testTheScrollerShowsWhenScrolledAndStaysShownWhenTheSettingSaysAlways() async throws {
         try await open()
         try requireSurface()

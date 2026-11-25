@@ -749,6 +749,78 @@ final class TerminalScrollerTests: XCTestCase {
         XCTAssertEqual(startFrame(layers.slot).width, narrowKnob.width - 2)
     }
 
+    /// Hidden without history while wide, as when the alternate screen
+    /// opens under the pointer, the knob is narrow once history is back
+    /// (#634) with no scroll to narrow it, and the next hover widens it
+    /// with its animation.
+    func testHiddenWhileWideTheKnobComesBackNarrowAndTheNextHoverWidensIt() throws {
+        let (scroller, window) = makeScroller()
+        defer { window.close() }
+        let layers = try knobLayers(scroller)
+        let narrowKnob = layers.knob.frame
+        try enter(scroller)
+        XCTAssertGreaterThan(layers.knob.frame.width, narrowKnob.width, "the pointer widened it")
+        CATransaction.flush()
+
+        scroller.update(.init(offset: 0, history: 0, rows: 24))
+        XCTAssertTrue(scroller.isHidden)
+        XCTAssertEqual(try overlayAnimations(scroller).keys.sorted(), [], "the widening ended")
+        scroller.update(Self.middle)
+        XCTAssertFalse(scroller.isHidden)
+        XCTAssertEqual(layers.knob.frame, narrowKnob, "narrow before any scroll")
+        XCTAssertTrue(layers.slot.isHidden, "no slot behind it")
+        XCTAssertNotEqual(
+            scroller.testPart(scroller.convert(hoverPoint(scroller), to: nil)), .knob,
+            "the narrow knob's hit area")
+        XCTAssertEqual(try overlayAnimations(scroller).keys.sorted(), [])
+
+        // No scroll in between, which would narrow it on its own.
+        try enter(scroller)
+        XCTAssertEqual(
+            layers.knob.frame, drawn(scroller.rect(for: .knob), wide: true, in: scroller).insetBy(dx: -1, dy: -1),
+            "the next hover widens it")
+        XCTAssertFalse(layers.slot.isHidden)
+        XCTAssertNotNil(widening(layers.knob, "bounds.size.width"), "with its animation")
+        XCTAssertEqual(startFrame(layers.knob), narrowKnob, "from the narrow knob")
+    }
+
+    /// A knob held across a hide stays wide while held (ADR 0032): shown
+    /// again with the button still down, it is the wide knob over its
+    /// slot. Released while hidden, it comes back narrow, and the next
+    /// hover widens it with its animation (#634).
+    func testAKnobHeldAcrossAHideStaysWideUntilReleased() throws {
+        let (scroller, window) = makeScroller()
+        defer { window.close() }
+        let layers = try knobLayers(scroller)
+        let narrowKnob = layers.knob.frame
+        let wideKnob = drawn(scroller.rect(for: .knob), wide: true, in: scroller).insetBy(dx: -1, dy: -1)
+        scroller.beginTracking()
+        XCTAssertEqual(layers.knob.frame, wideKnob, "held: wide")
+        scroller.update(.init(offset: 0, history: 0, rows: 24))
+        XCTAssertTrue(scroller.isHidden)
+        scroller.update(Self.middle)
+        XCTAssertEqual(layers.knob.frame, wideKnob, "still held: wide")
+        XCTAssertFalse(layers.slot.isHidden, "over its slot")
+        scroller.endTracking()
+        XCTAssertEqual(layers.knob.frame, wideKnob, "released: wide through the fade")
+
+        // Held into a hide and released while hidden.
+        clock += 10
+        scroller.flash()
+        XCTAssertEqual(layers.knob.frame, narrowKnob)
+        scroller.beginTracking()
+        CATransaction.flush()
+        scroller.update(.init(offset: 0, history: 0, rows: 24))
+        scroller.endTracking()
+        XCTAssertEqual(try overlayAnimations(scroller).keys.sorted(), [], "the widening ended")
+        scroller.update(Self.middle)
+        XCTAssertEqual(layers.knob.frame, narrowKnob, "released while hidden: narrow")
+        XCTAssertTrue(layers.slot.isHidden)
+        try enter(scroller)
+        XCTAssertEqual(layers.knob.frame, wideKnob, "the next hover widens it")
+        XCTAssertEqual(startFrame(layers.knob), narrowKnob, "with its animation, from the narrow knob")
+    }
+
     func testUnderReduceMotionThePointerWidensTheKnobAtOnce() throws {
         let (scroller, window) = makeScroller()
         defer { window.close() }

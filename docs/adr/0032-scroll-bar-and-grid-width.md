@@ -293,7 +293,8 @@ wheel and clicks) left for 0.3.0. In overlay style:
   and composes. The knob's rim is a 1 pt border, whose corner radius
   animates with it. The narrowing is not animated: AppKit narrows only
   once its fade has ended, and this scroller narrows only while faded
-  out, which ends a widening still in flight. Under Reduce Motion the
+  out or hidden (no history; a held knob once released), which ends a
+  widening still in flight. Under Reduce Motion the
   knob widens at once.
 
 The view's layout is unchanged: an overlay scroller still takes no grid
