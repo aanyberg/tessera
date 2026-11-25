@@ -9,6 +9,8 @@
 //!   terminator, B5, and what the entries after it see, B6);
 //! - `rcfile`: launches whose `--rcfile` some bash does not read leave no
 //!   `TESSERA_` variable in the shell (M10);
+//! - `rcexit`: the end of the `--rcfile` route's `.bashrc` under `set -e`,
+//!   and the status the first prompt sees (#659);
 //! - `hold` and `scan` name the tests elsewhere that cover them; a test here
 //!   checks that those exist.
 
@@ -464,6 +466,59 @@ fn rcfile_row(id: &str) {
     }
 }
 
+/// #659: the `.bashrc` is the row's field exactly, so the file ends with
+/// its last line; the injected shell and the same bash without the
+/// injection both print the row's lines (`lines: -`: nothing, as both exit
+/// before their first prompt), or the row is a `limit:`.
+fn rcexit_row(id: &str) {
+    let fields = row("rcexit", id);
+    let [versions, bashrc, commands, expected] = &fields[..] else {
+        panic!("{id}: {fields:?}")
+    };
+    let lines: Vec<&str> = commands.split('\n').collect();
+    let mut failures = Vec::new();
+    for program in bashes(versions, id) {
+        let run = |injected| {
+            Run {
+                program: &program,
+                route: Route::Rcfile,
+                injected,
+                startup: "",
+                args: None,
+                env: &[],
+                ahead: false,
+            }
+            .lines_with(&lines, &[(".bashrc", bashrc.as_str())])
+        };
+        let what = format!("{id} {}", program.display());
+        let injected = run(true);
+        let base = run(false);
+        if !injected.injected {
+            failures.push(format!("{what}: nothing injected"));
+        }
+        let Some(want) = expected.strip_prefix("lines: ") else {
+            if let Err(failure) = check(&what, expected, &injected, &base) {
+                failures.push(failure);
+            }
+            continue;
+        };
+        let want: Vec<&str> = match want {
+            "-" => Vec::new(),
+            want => want.split(" / ").collect(),
+        };
+        for (who, output) in [("injected", &injected), ("base", &base)] {
+            let got = transcript(&output.text);
+            if got != want {
+                failures.push(format!(
+                    "{what} {who}: got {got:?}, want {want:?}: {:?}",
+                    output.text
+                ));
+            }
+        }
+    }
+    report(id, &failures);
+}
+
 macro_rules! row_tests {
     ($runner:ident: $($name:ident => $id:literal),* $(,)?) => {
         $(
@@ -514,12 +569,25 @@ mod rcfile {
     );
 }
 
+mod rcexit {
+    use super::*;
+    pub(super) const TESTED: &[&str] = &[
+        "E1", "E2", "E3", "E4", "E5", "E6", "E7", "E8", "E9", "E10", "E11", "E12", "E13", "E14",
+    ];
+    row_tests!(rcexit_row:
+        e1 => "E1", e2 => "E2", e3 => "E3", e4 => "E4", e5 => "E5", e6 => "E6", e7 => "E7",
+        e8 => "E8", e9 => "E9", e10 => "E10", e11 => "E11", e12 => "E12", e13 => "E13",
+        e14 => "E14",
+    );
+}
+
 #[test]
 fn every_row_has_its_test() {
     for (kind, tested) in [
         ("pipestatus", pipestatus::TESTED),
         ("pc", pc::TESTED),
         ("rcfile", rcfile::TESTED),
+        ("rcexit", rcexit::TESTED),
     ] {
         assert_eq!(ids(kind), tested, "{kind}");
     }

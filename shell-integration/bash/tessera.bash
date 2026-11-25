@@ -100,11 +100,17 @@
 #   with PROMPT_COMMAND entries after the loader (starship's init wraps or
 #   moves PROMPT_COMMAND and rewrites PS1 after the loader ran), the first prompt has no marks and the first command no C and
 #   no D; from the second prompt on every prompt and command is marked;
-# - on the --rcfile route the first prompt's PROMPT_COMMAND sees the status
-#   `source` returned for the startup file: one ending in `return N` gives
-#   $? N (bash alone: 0); PIPESTATUS is source's single entry (a final
+# - on the --rcfile route the first prompt's PROMPT_COMMAND sees the
+#   startup file's last status, as bash alone does (`return N` leaves the
+#   status before it), but PIPESTATUS is that single status (a final
 #   pipeline's statuses collapse, a final `! cmd` leaves the negated
-#   status, not the command's own; always 0 on bash 3.2);
+#   status, not the command's own; always 0 on bash 3.2). After a syntax
+#   error in the file the status is source's (bash alone's 2 on 5.x; 1 on
+#   3.2, where bash alone has 258). A startup file that sets or clears a
+#   RETURN trap of its own gets source's status (`return N` gives N), and
+#   its `set -e` then exits the shell when the file ends in a failing `&&`
+#   list or a failing `return` (bash alone keeps it). While the file runs,
+#   `trap -p` in it shows that RETURN trap of ours (bash alone: none);
 # - a login shell whose startup files assign PROMPT_COMMAND (rather than
 #   add to it) is started without the loader, so it is not integrated. An
 #   assignment Tessera cannot see (behind a computed `source` path or in
@@ -264,8 +270,40 @@ elif [[ -n "${TESSERA_BASH_INJECT-}" ]]; then
     # without Tessera; `source` leaves PIPESTATUS that one status).
     _tessera_si_rc_status=0
     if [[ -f "$_tessera_si_rc" && -r "$_tessera_si_rc" ]]; then
+        # bash reads its own startup file outside any command, so the
+        # file's last status never trips `set -e`; `source` returning it
+        # does (a file that runs `set -e` and ends in `false && true`, or in
+        # `return N`, exited the shell). `source` stays a plain command: in
+        # an `||` context bash 5 runs the file with `set -e` off (measured
+        # on 5.1 and 5.3; that `builtin source` there keeps it is a quirk
+        # not leaned on). Instead a RETURN trap, which runs once the file
+        # is done and before bash checks source's status, takes the status
+        # bash itself would leave (the last command's: `return N` does not
+        # change it) and turns `set -e` off for that check; it goes back on
+        # right after. The trap only acts for this `source` (BASH_SOURCE as
+        # deep as here, not a file the startup file sources or a function
+        # it traces), and removes itself. Limit: a startup file that sets or
+        # clears a RETURN trap of its own keeps it (bash alone would never
+        # run it at the end of the file), and the status is then source's,
+        # which `set -e` acts on as before.
+        _tessera_si_rc_depth=${#BASH_SOURCE[@]}
+        builtin trap '_tessera_si_rc_q=$?
+if [[ ${#BASH_SOURCE[@]} == "${_tessera_si_rc_depth-}" ]]; then
+    _tessera_si_rc_seen=$_tessera_si_rc_q
+    if [[ -o errexit ]]; then _tessera_si_rc_e=1; builtin set +e; fi
+    builtin trap - RETURN
+fi' RETURN
         builtin source "$_tessera_si_rc"
         _tessera_si_rc_status=$?
+        # (Above 255 the trap saw bash's internal status for a syntax error,
+        # 257 or 258, where bash alone shows source's 2 on 5.x.)
+        if [[ -n "${_tessera_si_rc_seen+x}" && "$_tessera_si_rc_seen" -lt 256 ]]; then
+            _tessera_si_rc_status=$_tessera_si_rc_seen
+        fi
+        if [[ -n "${_tessera_si_rc_e-}" ]]; then
+            builtin set -e
+        fi
+        builtin unset _tessera_si_rc_depth _tessera_si_rc_q _tessera_si_rc_seen _tessera_si_rc_e
     fi
     # The --rcfile route's last command: returns the startup file's status.
     _tessera_si_rc_end() {

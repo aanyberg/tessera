@@ -857,12 +857,23 @@ array is still left to bash.
 - **First prompt** (D5). On the `--rcfile` route the script's last command
   returns the startup file's status, so the user's elements (and string
   entries) at the first prompt see the `$?` and PIPESTATUS of bash without
-  Tessera. Limits (adversarial M1, deferred to #630): the status is the
-  one `source` returns, so a startup file that ends in `return N` gives
-  `$?` `N` (bash without Tessera: 0), and PIPESTATUS is `source`'s one
-  entry: a final pipeline's `0 1 0` becomes `0`, a final `! cmd` leaves the
-  negated status where bash keeps the command's own (measured on 5.1.16;
-  3.2 gives 0), and on bash 3.2 PIPESTATUS is always `0`.
+  Tessera. The status is the one a RETURN trap reads as `source` finishes
+  (#659), which is bash's own: a startup file that ends in `return N`
+  leaves the status before the `return`, as without Tessera. That trap
+  also turns `set -e` off for bash's check of `source`'s status and back
+  on after it, so a startup file that runs `set -e` and ends in a failing
+  `&&` list or `return N` keeps the shell, as bash alone does, while
+  `set -e` stays live inside the file (no `&&`, `||`, `!` or `if` around
+  `source`). Limits (adversarial M1): PIPESTATUS is that one status: a
+  final pipeline's `0 1 0` becomes `0`, a final `! cmd` leaves the negated
+  status where bash keeps the command's own (measured on 5.1.16; 3.2 gives
+  0), and on bash 3.2 PIPESTATUS is always `0`. After a syntax error in
+  the file the status is `source`'s (bash's 2 on 5.x; 1 on 3.2, where bash
+  alone has 258). A startup file that sets or clears its own RETURN trap
+  replaces ours: the status is then `source`'s (`return N` gives `N`) and
+  its `set -e` exits the shell at those endings, as before #659. While
+  the file runs, `trap -p` in it shows our RETURN trap (bash without
+  Tessera has none there).
 - **Readonly array** (adversarial M2). A startup file that makes
   `PROMPT_COMMAND` a readonly array leaves the shell to bash, as before
   arrays were integrated: no error at startup, and the first prompt's
@@ -896,3 +907,24 @@ array is still left to bash.
 - `SCRIPTS_VERSION` is 13.
 - bash 5.1 rows run when `TESSERA_TEST_BASH51` names a bash 5.1. Without
   it, they print `bash 5.1 part skipped: TESSERA_TEST_BASH51 is unset`.
+
+## Amendment: the `--rcfile` route's startup file ends as without Tessera (#659, 2026-11-25)
+
+The script sources the user's `.bashrc` with a plain `builtin source`, so
+the status `source` returns went through bash's `set -e` check, where bash
+reading the file itself checks nothing: a `.bashrc` that ran `set -e` and
+ended in a failing `&&` list (or `return N` with N > 0) exited the shell at
+once. A RETURN trap, set just before the `source` and removed by itself,
+now runs as the file finishes: it reads bash's own status of the file and
+turns `set -e` off for the check; the script turns it back on right after.
+`source` gets no `&&`, `||` or `if` around it, which on bash 5 would run the
+file with `set -e` off. The D5 paragraph of the #613 amendment above
+carries the new status rule and its limits.
+
+- Rows `rcexit` E1-E13 in `bash_spec.txt` (tests/bash_rows.rs) compare the
+  injected shell with bash alone on 3.2, 5.1 (`TESSERA_TEST_BASH51`) and
+  5.3: the shell survives such endings, still exits at a failing command
+  inside the file (also inside a function it calls), and the first
+  prompt's entry and the first command see bash's status. E10 (the file's
+  own RETURN trap) and E13 (a syntax error on 3.2) are accepted limits.
+- `SCRIPTS_VERSION` is 14.
