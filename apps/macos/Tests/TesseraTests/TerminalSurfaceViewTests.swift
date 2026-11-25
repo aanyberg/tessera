@@ -102,9 +102,78 @@ final class TerminalSurfaceViewTests: XCTestCase {
         } catch let failure as PollTimedOut {
             let text = failure.description
             XCTAssertTrue(text.hasPrefix("the recorder did not start: it exited (shell exited with code 5) "), text)
-            XCTAssertTrue(text.contains("stage: it has not printed R: raw mode is not set yet"), text)
+            XCTAssertTrue(text.contains("stage: it has not printed R; the host's children: "), text)
         }
         XCTAssertLessThan(ContinuousClock.now - started, ChildStartBudget.base, "not after the whole budget")
+    }
+
+    /// A recorder stuck before R times out naming the processes it runs
+    /// (#664): an empty screen alone cannot tell which command it is in.
+    func testARecorderStuckBeforeRawModeTimesOutNamingItsProcesses() async throws {
+        let other = FileManager.default.temporaryDirectory.appendingPathComponent("tessera-view-\(UUID()).bin")
+        appDelegate.spawnOptions = .init(program: "/bin/sh", arguments: ["-c", "sleep 100; true"])
+        let pane = try appDelegate.newWindow().focusedPane
+        do {
+            try await waitForRecorder(
+                of: pane.view, recordingTo: other, budget: ChildStartBudget(base: .seconds(3), cap: .seconds(3)))
+            XCTFail("a recorder that never printed R got ready")
+        } catch let failure as PollTimedOut {
+            let text = failure.description
+            XCTAssertTrue(text.hasPrefix("the recorder did not start: timed out after "), text)
+            // The shell, then its sleep under it.
+            XCTAssertNotNil(
+                text.range(
+                    of: #"pid \d+ (sh|bash|dash|zsh) > pid \d+ sleep( |;)"#,
+                    options: .regularExpression), text)
+            XCTAssertTrue(text.hasSuffix(#"screen ending """#), text)
+        }
+    }
+
+    /// The processes a stuck recorder names carry a stopped child's and an
+    /// unreaped one's state, one `>` per level (#664).
+    func testARecorderStuckBeforeRawModeNamesStoppedAndUnreapedChildren() async throws {
+        let other = FileManager.default.temporaryDirectory.appendingPathComponent("tessera-view-\(UUID()).bin")
+        // `sleep 0` exits and `sleep 100` stops (perhaps still the forked
+        // shell, before its exec); the exec'd sleep never reaps either.
+        appDelegate.spawnOptions = .init(
+            program: "/bin/sh", arguments: ["-c", "sleep 0 & sleep 100 & kill -STOP $!; exec sleep 100"])
+        let pane = try appDelegate.newWindow().focusedPane
+        var text = ""
+        do {
+            try await waitForRecorder(
+                of: pane.view, recordingTo: other, budget: ChildStartBudget(base: .seconds(3), cap: .seconds(3)))
+            XCTFail("a recorder that never printed R got ready")
+        } catch let failure as PollTimedOut {
+            text = failure.description
+        }
+        XCTAssertNotNil(
+            text.range(of: #"pid \d+ sleep > pid \d+ (sleep|sh|bash|dash|zsh) \(stopped\)"#, options: .regularExpression),
+            text)
+        XCTAssertNotNil(
+            text.range(of: #" > pid \d+ sleep \(exited, not reaped\)"#, options: .regularExpression), text)
+        // The stopped child (stopped before or after its exec of sleep)
+        // outlives a hang-up; end it here.
+        if let match = text.firstMatch(of: /pid (\d+) \w+ \(stopped\)/), let pid = pid_t(match.1) {
+            kill(pid, SIGKILL)
+        }
+    }
+
+    /// The list puts one `>` per level and stops at its limit with how many
+    /// it left out.
+    func testChildProcessesNestsByLevelAndCountsWhatItLeavesOut() async throws {
+        appDelegate.spawnOptions = .init(program: "/bin/sh", arguments: ["-c", "sh -c 'sleep 100; true'; true"])
+        let pane = try appDelegate.newWindow().focusedPane
+        var text = ""
+        for _ in 0..<500 where text.range(of: "sleep", options: []) == nil {
+            text = childProcesses()
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertNotNil(
+            text.range(of: #"pid \d+ \w+ > pid \d+ \w+ > > pid \d+ sleep"#, options: .regularExpression), text)
+        let all = childProcesses(limit: 100).components(separatedBy: "pid ").count - 1
+        XCTAssertGreaterThan(all, 2, text)
+        XCTAssertTrue(childProcesses(limit: 2).hasSuffix(" and \(all - 2) more"), childProcesses(limit: 2))
+        _ = pane
     }
 
     /// A recorder in raw mode whose `cat` never opens its file times out
@@ -1864,6 +1933,12 @@ final class TerminalSurfaceViewTests: XCTestCase {
 /// its `cat` opened `file`. It throws, so that a test whose recorder never
 /// started fails once, at once if the child exited, and with the stage the
 /// child reached, rather than again in every check after it.
+///
+/// Before R, the screen alone cannot tell a child that never ran from one
+/// that is stuck in a command or whose output the core has not shown (#664:
+/// an empty screen after 72 s, which no loaded rerun reproduced), so that
+/// stage names the host's child processes as ``childProcesses(limit:)`` reports
+/// them.
 @MainActor
 func waitForRecorder(
     of view: TerminalSurfaceView, recordingTo file: URL, budget: ChildStartBudget = ChildStartBudget()
@@ -1881,7 +1956,7 @@ func waitForRecorder(
             let stage =
                 printedR()
                 ? "it printed R (raw mode is set), but its cat has not opened \(file.lastPathComponent)"
-                : "it has not printed R: raw mode is not set yet"
+                : "it has not printed R; the host's children: \(childProcesses())"
             let text = String(screen().trimmingCharacters(in: .whitespacesAndNewlines).suffix(200))
             throw PollTimedOut(
                 description: "the recorder did not start: "
@@ -1890,6 +1965,57 @@ func waitForRecorder(
         }
         try await Task.sleep(for: .milliseconds(10))
     }
+}
+
+/// The test host's child processes and their descendants, at most
+/// `limit` of them: each one's pid and program, and its state when it is
+/// stopped or an unreaped zombie, as `pid 123 bash > pid 124 seq (stopped)`
+/// (a process before its children, one `>` per level below the host's
+/// child), or "none". Newest first at each level, so the child a test just
+/// started is listed before the others; past `limit`, the list ends with
+/// how many more there are. A child still running this host's executable
+/// was forked but has not exec'd its program yet.
+func childProcesses(limit: Int = 8) -> String {
+    func children(of parent: pid_t) -> [pid_t] {
+        var pids = [pid_t](repeating: 0, count: 64)
+        let count = proc_listchildpids(parent, &pids, Int32(pids.count * MemoryLayout<pid_t>.stride))
+        return Array(pids.prefix(Int(max(0, count)))).filter { $0 > 0 }.sorted(by: >)
+    }
+    func describe(_ pid: pid_t) -> String {
+        var info = proc_bsdinfo()
+        let size = Int32(MemoryLayout<proc_bsdinfo>.stride)
+        // Argument 1 also finds a zombie (xnu looks zombies up only then).
+        guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 1, &info, size) == size else { return "pid \(pid) (gone)" }
+        // macOS reports a sleeping process as running: only these stand out.
+        let state =
+            switch Int32(info.pbi_status) {
+            case SIDL: " (starting)"
+            case SSTOP: " (stopped)"
+            case SZOMB: " (exited, not reaped)"
+            default: ""
+            }
+        var path = [CChar](repeating: 0, count: Int(MAXPATHLEN) * 4)
+        let program =
+            proc_pidpath(pid, &path, UInt32(path.count)) > 0
+            ? URL(fileURLWithPath: String(decoding: path.prefix { $0 != 0 }.map(UInt8.init(bitPattern:)), as: UTF8.self))
+                .lastPathComponent
+            : withUnsafeBytes(of: info.pbi_comm) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) }
+        let host = Bundle.main.executableURL?.lastPathComponent
+        return "pid \(pid) \(program)\(state)" + (program == host ? " (forked, not exec'd yet)" : "")
+    }
+    var lines: [String] = []
+    var more = 0
+    func walk(_ pid: pid_t, depth: Int) {
+        if lines.count < limit {
+            lines.append(String(repeating: "> ", count: depth) + describe(pid))
+        } else {
+            more += 1
+        }
+        for child in children(of: pid) { walk(child, depth: depth + 1) }
+    }
+    for child in children(of: getpid()) { walk(child, depth: 0) }
+    if more > 0 { lines.append("and \(more) more") }
+    return lines.isEmpty ? "none" : lines.joined(separator: " ")
 }
 
 /// A window whose key state the test sets. It is never ordered on screen and
