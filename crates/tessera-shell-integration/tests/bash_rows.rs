@@ -573,11 +573,12 @@ mod rcexit {
     use super::*;
     pub(super) const TESTED: &[&str] = &[
         "E1", "E2", "E3", "E4", "E5", "E6", "E7", "E8", "E9", "E10", "E11", "E12", "E13", "E14",
+        "E15", "E16", "E17", "E18",
     ];
     row_tests!(rcexit_row:
         e1 => "E1", e2 => "E2", e3 => "E3", e4 => "E4", e5 => "E5", e6 => "E6", e7 => "E7",
         e8 => "E8", e9 => "E9", e10 => "E10", e11 => "E11", e12 => "E12", e13 => "E13",
-        e14 => "E14",
+        e14 => "E14", e15 => "E15", e16 => "E16", e17 => "E17", e18 => "E18",
     );
 }
 
@@ -1281,6 +1282,92 @@ fn a_copy_of_our_element_at_startup_is_not_appended_again() {
         }
     }
     report("array copy", &failures);
+}
+
+/// #676: a `set -e` `.bashrc` that sources tessera.bash itself keeps the
+/// marks on the `--rcfile` route. With its own `TESSERA_SHELL_INTEGRATION`
+/// that load is the live one (its `no-cwd` holds: no OSC 7); without, the
+/// injected words load it after the file. Either way one handshake, a C
+/// for every command and each command's D status, and no error (`set +e`
+/// after the source, so `rc 5` does not end the shell).
+#[test]
+fn a_bashrc_that_sources_the_script_keeps_the_marks() {
+    let source = ". \"$HOME\"/../scripts/*/bash/tessera.bash";
+    let mut failures = Vec::new();
+    for program in bashes("3.2 5.3", "#676 marks") {
+        for (words, osc7) in [
+            ("TESSERA_SHELL_INTEGRATION='enabled no-cwd' ", false),
+            ("", true),
+        ] {
+            let startup =
+                format!("rc() {{ return $1; }}\nset -e\n{words}{source}\necho sourced\nset +e");
+            let output = Run {
+                program: &program,
+                route: Route::Rcfile,
+                injected: true,
+                startup: &startup,
+                args: None,
+                env: &[],
+                ahead: false,
+            }
+            .lines(&["rc 5", "true"]);
+            let text = &output.text;
+            let handshakes = text.matches("\x1b]1337;ShellIntegrationVersion=").count();
+            let c = text.matches("\x1b]133;C").count();
+            let d = d_marks(text);
+            let cwd = text.contains("\x1b]7;");
+            let got = transcript(text);
+            if !output.injected
+                || handshakes != 1
+                || c != 3
+                || d != ["5", "0"]
+                || cwd != osc7
+                || got != ["sourced"]
+            {
+                failures.push(format!(
+                    "{} {words:?}: {handshakes} handshakes, {c} C, D {d:?}, OSC 7 {cwd}, \
+                     got {got:?}: {text:?}",
+                    program.display()
+                ));
+            }
+        }
+    }
+    report("#676 marks", &failures);
+}
+
+/// #676: the --rcfile route's end runs also when there is no startup file
+/// to read (the status is set when the file ran, and otherwise to 0): the
+/// first command sees 0 and nothing of that end is left, as bash alone.
+#[test]
+fn a_missing_startup_file_leaves_nothing_of_the_rc_end() {
+    let args = ["--rcfile", "/nonexistent-676/bashrc", "-i"];
+    let line = "echo \"st=$? v=[$(compgen -v _tessera_si_rc_)] \
+                f=[$(compgen -A function _tessera_si_rc_)]\"";
+    let want = ["st=0 v=[] f=[]"];
+    let mut failures = Vec::new();
+    for program in bashes("3.2 5.3", "#676 no startup file") {
+        for injected in [true, false] {
+            let output = Run {
+                program: &program,
+                route: Route::Rcfile,
+                injected,
+                startup: "",
+                args: Some(&args),
+                env: &[],
+                ahead: false,
+            }
+            .lines(&[line]);
+            let got = transcript(&output.text);
+            if output.injected != injected || got != want {
+                failures.push(format!(
+                    "{} injected {injected}: got {got:?}: {:?}",
+                    program.display(),
+                    output.text
+                ));
+            }
+        }
+    }
+    report("#676 no startup file", &failures);
 }
 
 /// An empty line in array mode: no command line, so PS0 is not expanded

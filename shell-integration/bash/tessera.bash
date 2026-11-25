@@ -267,8 +267,11 @@ elif [[ -n "${TESSERA_BASH_INJECT-}" ]]; then
         _tessera_si_rc=~/.bashrc
     fi
     # The startup file's status, for the first prompt's PROMPT_COMMAND (as
-    # without Tessera; `source` leaves PIPESTATUS that one status).
-    _tessera_si_rc_status=0
+    # without Tessera; `source` leaves PIPESTATUS that one status), set
+    # once the file ran (0 when there is none): this script sourced from
+    # inside the file (#676) then runs none of the --rcfile route's end
+    # (it called _tessera_si_rc_end, not defined yet, and its 127 exited
+    # a `set -e` shell).
     if [[ -f "$_tessera_si_rc" && -r "$_tessera_si_rc" ]]; then
         # bash reads its own startup file outside any command, so the
         # file's last status never trips `set -e`; `source` returning it
@@ -304,6 +307,8 @@ fi' RETURN
             builtin set -e
         fi
         builtin unset _tessera_si_rc_depth _tessera_si_rc_q _tessera_si_rc_seen _tessera_si_rc_e
+    else
+        _tessera_si_rc_status=0
     fi
     # The --rcfile route's last command: returns the startup file's status.
     _tessera_si_rc_end() {
