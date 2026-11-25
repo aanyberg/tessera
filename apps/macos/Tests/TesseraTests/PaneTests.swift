@@ -946,9 +946,31 @@ final class PaneTests: XCTestCase {
         view.occlusionOverride = true
         view.metrics = Self.linkMetrics
         view.scroller.preferredStyleOverride = .overlay
-        try await waitUntil("the link is printed") { try view.session.link(col: 0, row: 0) != nil }
+        try await waitForTheLink(in: view)
         tab.tabGroup?.selectedWindow = tab
         return (view, tab, other)
+    }
+
+    /// Waits until the core finds the link `openLinkTabs` prints at the
+    /// grid's top left, for at most a ``ChildStartBudget`` (#627): the
+    /// child is a shell started under the test's load, so a fixed 10 s
+    /// failed when another run loaded the machine. It throws at once if
+    /// the child exited, and otherwise with the budget and what the
+    /// screen shows.
+    private func waitForTheLink(in view: TerminalSurfaceView) async throws {
+        var budget = ChildStartBudget()
+        while try view.session.link(col: 0, row: 0) == nil {
+            let exited = view.status
+            guard exited == nil, !budget.isSpent() else {
+                let screen = ((try? view.session.accessibleText().string) ?? "")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                throw PollTimedOut(
+                    description: "no link at the grid's top left: "
+                        + (exited.map { "the child exited (\($0))" } ?? "timed out") + " \(budget.summary); "
+                        + "screen \(String(screen.suffix(200)).debugDescription)")
+            }
+            try await Task.sleep(for: .milliseconds(20))
+        }
     }
 
     private func mouse(

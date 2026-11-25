@@ -78,6 +78,50 @@ final class AppAppearanceTests: XCTestCase {
         }
     }
 
+    /// Waits until each of `targets` draws as `dark` says, read from its
+    /// effective appearance, the state the assertions after it check, for
+    /// at most a ``ChildStartBudget`` of 10 s scaled by the load per core
+    /// up to 30 s (#609), so that a failed value ends the test within its
+    /// allowance. A missing target is left to those assertions. It throws
+    /// with the targets that still draw otherwise.
+    private func waitUntilEach(
+        draws dark: Bool, _ what: String, _ targets: () -> [(name: String, item: (any NSAppearanceCustomization)?)]
+    ) async throws {
+        var budget = ChildStartBudget(base: .seconds(10), cap: .seconds(30))
+        func wrong() -> [String] {
+            targets().compactMap { target in
+                guard let item = target.item, Self.isDark(item.effectiveAppearance) != dark else { return nil }
+                return "\(target.name) (\(item.effectiveAppearance.name.rawValue))"
+            }
+        }
+        var still = wrong()
+        while !still.isEmpty {
+            guard !budget.isSpent() else {
+                throw PollTimedOut(
+                    description: "\(what): still not \(dark ? "dark" : "light") \(budget.summary): "
+                        + still.joined(separator: ", "))
+            }
+            try await Task.sleep(for: .milliseconds(10))
+            still = wrong()
+        }
+    }
+
+    /// What ``assertEveryWindowDraws(dark:translucent:_:file:line:)``
+    /// checks the appearance of: every terminal window and, once its panes
+    /// have a renderer, its title bar's blur and tint and its panes' blurs.
+    private func everyWindowsTargets() -> [(name: String, item: (any NSAppearanceCustomization)?)] {
+        appDelegate.windowControllers.enumerated().flatMap { index, controller in
+            let name = "window \(index)"
+            var targets: [(name: String, item: (any NSAppearanceCustomization)?)] = [(name, controller.window)]
+            let content = controller.window?.contentView as? TerminalWindowContentView
+            guard controller.panes.allSatisfy(\.view.surface.isAttached) else { return targets }
+            targets += [("\(name): the title bar's blur", content?.titlebarBackdrop)]
+            targets += [("\(name): the title bar's tint", content?.titlebarTint)]
+            targets += controller.panes.map { ("\(name): the pane's blur", $0.view.backdrop) }
+            return targets
+        }
+    }
+
     /// The system's own Light or Dark setting, read from the defaults, not
     /// from AppKit, which the app's appearance overrides.
     private static var systemIsDark: Bool {
@@ -218,11 +262,13 @@ final class AppAppearanceTests: XCTestCase {
             let tab = try appDelegate.newTab(in: window)
             XCTAssertTrue(tab.window?.tabGroup === window.tabGroup, "\(what): a tab of the window")
             let dark = Self.drawsDark(value)
+            try await waitUntilEach(draws: dark, what) { [("the app", NSApp)] + everyWindowsTargets() }
             XCTAssertEqual(Self.isDark(NSApp.effectiveAppearance), dark, "\(what): the app draws")
             assertEveryWindowDraws(dark: dark, what)
 
             let view = first.focusedPane.view
             view.showFindBar(nil)
+            try await waitUntilEach(draws: dark, what) { [("the find bar", view.findBar)] }
             assertDraws(dark: dark, view.findBar, "\(what): the find bar")
             assertFindBarBorder(dark: dark, view.findBar, "\(what): the find bar")
             assertAdaptiveMaterials(in: view.findBar, "\(what): the find bar")
@@ -231,10 +277,14 @@ final class AppAppearanceTests: XCTestCase {
                 CloseConfirmation(scope: .tab, processNames: ["sleep"]), sheetFor: window
             ) { _ in }
             let sheet = try XCTUnwrap(window.attachedSheet, "\(what): the alert is a sheet of the window")
+            try await waitUntilEach(draws: dark, what) { [("the sheet", sheet)] }
             assertDraws(dark: dark, sheet, "\(what): the sheet")
             window.endSheet(sheet, returnCode: .alertSecondButtonReturn)
 
             MainMenu.run(command: "settings")
+            try await waitUntilEach(draws: dark, what) {
+                [("Settings", appDelegate.settingsWindowController?.window)]
+            }
             assertDraws(dark: dark, appDelegate.settingsWindowController?.window, "\(what): Settings")
             appDelegate.settingsWindowController?.close()
 
