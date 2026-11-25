@@ -1381,24 +1381,34 @@ impl Coverage {
     /// the first face in database order that has a glyph for it (what a
     /// per-character linear search would find).
     fn build(db: &fontdb::Database) -> Self {
-        Self::build_counting_maps(db).0
+        Self::build_counting_opens(db).0
     }
 
-    /// [`Self::build`], also returning how many font files it memory
-    /// mapped. It reads each file through one call to fontdb's
-    /// `with_face_data`, which maps a file-backed source for the call and
-    /// unmaps it after: every face of a collection (`.ttc`) is read from
-    /// that one map, not mapped again per face (#660: each map and unmap
-    /// costs the Thread Sanitizer's shadow-memory hooks, which crashed the
-    /// app's test host). Nothing outlives the build: each map is gone when
-    /// its file is done.
-    fn build_counting_maps(db: &fontdb::Database) -> (Self, usize) {
+    /// [`Self::build`], also returning how many font files it opened.
+    ///
+    /// A font file is read with `read(2)`, never memory mapped: another
+    /// process may truncate or rewrite an installed font in place while
+    /// the index builds, and touching a mapped page past a file's new end
+    /// raises `SIGBUS`, which kills the app (#668). A read of a file that
+    /// changes under it only comes back short or with other bytes, which
+    /// leaves the face out of the index or indexes what the file now
+    /// holds; it never takes the process down.
+    ///
+    /// Each file is opened once, however many faces a collection (`.ttc`)
+    /// holds (#660), and only what the index needs is read from it: the
+    /// collection header, each face's table directory (a binary search of
+    /// 16-byte records, as swash does) and its `cmap` table, at most
+    /// [`MAX_INDEX_CMAP_BYTES`] of it. One buffer per file holds the `cmap`
+    /// being read, reused by the next face when the faces share it, and
+    /// is dropped before the next file opens; files are read one at a
+    /// time. In-memory fonts (`Source::Binary`) are read where they are.
+    fn build_counting_opens(db: &fontdb::Database) -> (Self, usize) {
         let started = std::time::Instant::now();
         let mut faces: Vec<fontdb::ID> = Vec::new();
         // One entry per face: (its source, index into `faces`, face index
         // in the source). A source is named by the index of its first face:
         // one per font file, keyed by path, and one per face for data held
-        // in memory (`Source::Binary`), which needs no map.
+        // in memory (`Source::Binary`).
         let mut members: Vec<(u32, u32, u32)> = Vec::new();
         let mut by_path: HashMap<&std::path::Path, u32> = HashMap::new();
         for info in db.faces() {
@@ -1430,7 +1440,17 @@ impl Coverage {
         // face, so a slot takes the lowest index that covers it, not the
         // first one written: first face wins in database order.
         let mut owner = vec![u32::MAX; CODE_SPACE];
-        let mut maps = 0;
+        let mut index_face = |index: u32, font: swash::FontRef<'_>| {
+            font.charmap().enumerate(|cp, glyph| {
+                if glyph != 0
+                    && let Some(slot) = owner.get_mut(cp as usize)
+                    && index < *slot
+                {
+                    *slot = index;
+                }
+            });
+        };
+        let mut opens = 0;
         for run in members.chunk_by(|a, b| a.0 == b.0) {
             let Some(&load_by) = run
                 .first()
@@ -1438,21 +1458,28 @@ impl Coverage {
             else {
                 continue;
             };
-            with_source_data(db, load_by, &mut maps, |data| {
-                for &(_, index, face_index) in run {
-                    let Some(font) = swash::FontRef::from_index(data, face_index as usize) else {
-                        continue;
-                    };
-                    font.charmap().enumerate(|cp, glyph| {
-                        if glyph != 0
-                            && let Some(slot) = owner.get_mut(cp as usize)
-                            && index < *slot
-                        {
-                            *slot = index;
+            let faces_of_run = run
+                .iter()
+                .map(|&(_, index, face_index)| (index, face_index));
+            match db.face(load_by).map(|f| &f.source) {
+                Some(fontdb::Source::File(path) | fontdb::Source::SharedFile(path, _)) => {
+                    opens += 1;
+                    index_file(path, faces_of_run, &mut index_face);
+                }
+                Some(fontdb::Source::Binary(_)) => {
+                    // Resident data: `with_face_data` maps nothing for it.
+                    let _ = db.with_face_data(load_by, |data, _| {
+                        for (index, face_index) in faces_of_run {
+                            if let Some(font) =
+                                swash::FontRef::from_index(data, face_index as usize)
+                            {
+                                index_face(index, font);
+                            }
                         }
                     });
                 }
-            });
+                None => {}
+            }
         }
         drop(members);
         let mut ranges = Vec::new();
@@ -1476,11 +1503,11 @@ impl Coverage {
             target: "tessera_render",
             faces = faces.len(),
             ranges = ranges.len(),
-            maps,
+            opens,
             elapsed = ?started.elapsed(),
             "built the fallback coverage index"
         );
-        (Self { ranges }, maps)
+        (Self { ranges }, opens)
     }
 
     fn lookup(&self, ch: char) -> Option<fontdb::ID> {
@@ -1493,25 +1520,214 @@ impl Coverage {
     }
 }
 
-/// Runs `read` over the whole data of the source (font file or in-memory
-/// font) that holds face `id`, adding one to `maps` when that memory maps a
-/// file: fontdb maps a `Source::File` for the call and unmaps it after,
-/// while shared and in-memory sources are already resident.
-fn with_source_data(
-    db: &fontdb::Database,
-    id: fontdb::ID,
-    maps: &mut usize,
-    read: impl FnOnce(&[u8]),
+/// Largest `cmap` table the coverage index reads from a font file: 2 MiB,
+/// about six times the largest installed on macOS 26 (Songti's 312 KiB).
+/// A face whose `cmap` is larger is left out of the index, with one
+/// warning per file (#668); the read buffer never grows past this plus a
+/// 28-byte header.
+const MAX_INDEX_CMAP_BYTES: u32 = 2 << 20;
+
+/// Bytes in front of a `cmap` in the buffer [`read_face_cmap`] fills: an
+/// sfnt header (12) and one table record (16).
+const CMAP_FONT_HEADER: usize = 28;
+
+/// What [`read_face_cmap`] found for one face.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CmapRead {
+    /// The buffer holds the face's `cmap` as a one-table font.
+    Read,
+    /// No `cmap` to index: not a font, no such face, no `cmap` table, or
+    /// a read that failed or came back short (the file changed).
+    Missing,
+    /// The `cmap` is this many bytes, more than [`MAX_INDEX_CMAP_BYTES`];
+    /// nothing was read.
+    TooLarge(u32),
+}
+
+/// The faces `faces` (index into the coverage build's face list, face
+/// index in the file) of the font file at `path`, each handed to `index`
+/// as a font holding only its `cmap`. The file is opened once and read,
+/// never mapped (#668); a face that cannot be read is skipped.
+fn index_file(
+    path: &std::path::Path,
+    faces: impl Iterator<Item = (u32, u32)>,
+    mut index: impl FnMut(u32, swash::FontRef<'_>),
 ) {
-    if matches!(
-        db.face(id).map(|f| &f.source),
-        Some(fontdb::Source::File(_))
-    ) {
-        *maps += 1;
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) => {
+            tracing::debug!(
+                target: "tessera_render",
+                path = %path.display(),
+                %error,
+                "a font file did not open for the coverage index"
+            );
+            return;
+        }
+    };
+    let mut cmap = Vec::new();
+    let mut loaded = None;
+    let mut warned = false;
+    for (face, face_index) in faces {
+        #[cfg(test)]
+        test_read_hook::before_face(path);
+        match read_face_cmap(&mut file, face_index, &mut cmap, &mut loaded) {
+            CmapRead::Read => {
+                if let Some(font) = swash::FontRef::from_offset(&cmap, 0) {
+                    index(face, font);
+                }
+            }
+            CmapRead::Missing => {}
+            CmapRead::TooLarge(len) => {
+                if !std::mem::replace(&mut warned, true) {
+                    tracing::warn!(
+                        target: "tessera_render",
+                        path = %path.display(),
+                        cmap_bytes = len,
+                        cap = MAX_INDEX_CMAP_BYTES,
+                        "a font's character map is too large for the fallback index; its faces are left out"
+                    );
+                }
+            }
+        }
     }
-    // `None` is a file that no longer opens or maps: its faces stay out of
-    // the index, as a face that fails to parse does.
-    let _ = db.with_face_data(id, |data, _| read(data));
+}
+
+/// Reads face `face_index`'s `cmap` table from `file` into `buf`, laid out
+/// as a font with that one table (an sfnt header, one table record, then
+/// the table) so swash parses it as it would the whole file: offsets
+/// inside a `cmap` are relative to its start. `loaded` names the file
+/// range `buf` holds, so faces of a collection that share one `cmap` read
+/// it once. Only the collection header, the face's table directory
+/// records the binary search visits and the `cmap` are read; the `cmap`
+/// at most [`MAX_INDEX_CMAP_BYTES`].
+fn read_face_cmap(
+    file: &mut std::fs::File,
+    face_index: u32,
+    buf: &mut Vec<u8>,
+    loaded: &mut Option<(u32, u32)>,
+) -> CmapRead {
+    const TTCF: u32 = u32::from_be_bytes(*b"ttcf");
+    const CMAP: u32 = u32::from_be_bytes(*b"cmap");
+    let Some((start, len)) = (|| {
+        // swash's `raw_data::offset`: a single font is at 0 whatever the
+        // index below its count of one.
+        let head = read_u32s::<3>(file, 0)?;
+        let base = if is_sfnt(head[0]) {
+            (face_index == 0).then_some(0)?
+        } else if head[0] == TTCF && face_index < head[2] {
+            read_u32s::<1>(file, 12 + 4 * u64::from(face_index))?[0]
+        } else {
+            return None;
+        };
+        let [tag, tables, _] = read_u32s::<3>(file, u64::from(base))?;
+        if !is_sfnt(tag) {
+            return None;
+        }
+        // swash's `table_range`: a binary search of the records.
+        let records = u64::from(base) + 12;
+        let (mut low, mut high) = (0, u64::from(tables >> 16));
+        while low < high {
+            let mid = u64::midpoint(low, high);
+            let [record_tag, _, start, len] = read_u32s::<4>(file, records + 16 * mid)?;
+            match CMAP.cmp(&record_tag) {
+                std::cmp::Ordering::Less => high = mid,
+                std::cmp::Ordering::Greater => low = mid + 1,
+                std::cmp::Ordering::Equal => {
+                    start.checked_add(len)?;
+                    // A table at 0 is no table to swash.
+                    return (start != 0).then_some((start, len));
+                }
+            }
+        }
+        None
+    })() else {
+        return CmapRead::Missing;
+    };
+    if len > MAX_INDEX_CMAP_BYTES {
+        return CmapRead::TooLarge(len);
+    }
+    if *loaded == Some((start, len)) {
+        return CmapRead::Read;
+    }
+    *loaded = None;
+    // `len` is at most MAX_INDEX_CMAP_BYTES, so this fits usize.
+    let needed = CMAP_FONT_HEADER + len as usize;
+    if buf.capacity() < needed {
+        // Free the smaller table first: growing in place would hold both
+        // while it copies.
+        *buf = Vec::new();
+        buf.reserve_exact(needed);
+    }
+    buf.clear();
+    buf.extend_from_slice(&0x0001_0000_u32.to_be_bytes());
+    buf.extend_from_slice(&1_u16.to_be_bytes());
+    buf.extend_from_slice(&[0; 6]);
+    buf.extend_from_slice(&CMAP.to_be_bytes());
+    buf.extend_from_slice(&[0; 4]);
+    buf.extend_from_slice(&u32::try_from(CMAP_FONT_HEADER).unwrap_or(0).to_be_bytes());
+    buf.extend_from_slice(&len.to_be_bytes());
+    buf.resize(needed, 0);
+    if read_exact_at(file, u64::from(start), &mut buf[CMAP_FONT_HEADER..]).is_err() {
+        return CmapRead::Missing;
+    }
+    *loaded = Some((start, len));
+    CmapRead::Read
+}
+
+/// Whether `tag` opens an sfnt table directory (swash's `is_font`).
+fn is_sfnt(tag: u32) -> bool {
+    matches!(&tag.to_be_bytes(), [0, 1, 0, 0] | b"OTTO" | b"true")
+}
+
+/// `N` big-endian `u32`s read from `file` at `offset`; `None` when the
+/// read fails or the file ends first.
+fn read_u32s<const N: usize>(file: &mut std::fs::File, offset: u64) -> Option<[u32; N]> {
+    let mut bytes = [0; 16];
+    let bytes = bytes.get_mut(..4 * N)?;
+    read_exact_at(file, offset, bytes).ok()?;
+    let mut words = [0; N];
+    for (word, chunk) in words.iter_mut().zip(bytes.as_chunks::<4>().0) {
+        *word = u32::from_be_bytes(*chunk);
+    }
+    Some(words)
+}
+
+/// Fills `out` from `file` at `offset` with `read(2)`; a file that ends
+/// first is an error.
+fn read_exact_at(file: &mut std::fs::File, offset: u64, out: &mut [u8]) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    file.seek(SeekFrom::Start(offset))?;
+    file.read_exact(out)
+}
+
+/// Test-only hook the coverage build calls before it reads each face of
+/// a font file, on the building thread (#668: a test truncates the file
+/// there).
+#[cfg(test)]
+mod test_read_hook {
+    use std::cell::RefCell;
+    use std::path::Path;
+
+    type Hook = Box<dyn FnMut(&Path)>;
+
+    thread_local! {
+        static BEFORE_FACE: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    /// Runs `hook` before each face read on this thread until the next
+    /// call; `None` removes it.
+    pub(super) fn set(hook: Option<Hook>) {
+        BEFORE_FACE.with(|slot| *slot.borrow_mut() = hook);
+    }
+
+    pub(super) fn before_face(path: &Path) {
+        BEFORE_FACE.with(|slot| {
+            if let Some(hook) = slot.borrow_mut().as_mut() {
+                hook(path);
+            }
+        });
+    }
 }
 
 /// A swash scaler for `font` at `size_px`, with the `wght` axis (if any)
@@ -2669,7 +2885,9 @@ mod tests {
                     .iter()
                     .any(|f| f.eq_ignore_ascii_case(name))
             });
-            if let (false, fontdb::Source::File(path)) = (forbidden, &info.source) {
+            if let (false, fontdb::Source::File(path) | fontdb::Source::SharedFile(path, _)) =
+                (forbidden, &info.source)
+            {
                 paths.insert(path.clone());
                 faces += 1;
             }
@@ -2677,12 +2895,13 @@ mod tests {
         (paths.len(), faces)
     }
 
-    /// #660: one build of the index over the installed fonts maps each font
-    /// file once, however many faces a collection (`.ttc`) holds, and lands
-    /// the same ranges, in the same first-face-wins order, as the per-face
-    /// build it replaced.
+    /// #660: one build of the index over the installed fonts opens each
+    /// font file once (#668: and reads it, where #660 mapped it once),
+    /// however many faces a collection (`.ttc`) holds, and lands the same
+    /// ranges, in the same first-face-wins order, as the per-face build it
+    /// replaced, which read each whole face through a map.
     #[test]
-    fn one_index_build_maps_each_font_file_once() {
+    fn one_index_build_opens_each_font_file_once() {
         let system = FontSystem::new();
         let db = system.db();
         let (files, faces) = file_backed(db);
@@ -2690,8 +2909,8 @@ mod tests {
             files < faces,
             "the installed fonts include a collection ({files} files, {faces} faces)"
         );
-        let (index, maps) = Coverage::build_counting_maps(db);
-        assert_eq!(maps, files, "one map per font file ({faces} faces)");
+        let (index, opens) = Coverage::build_counting_opens(db);
+        assert_eq!(opens, files, "one open per font file ({faces} faces)");
         assert_eq!(index.ranges, per_face_reference(db));
     }
 
@@ -2699,7 +2918,8 @@ mod tests {
     /// removed from it leaves a slot that a later file's face fills, so
     /// that face comes between the collection's first face and the rest.
     /// It still wins over those later faces of the collection, as in the
-    /// per-face build; in-memory fonts are read too, without a map.
+    /// per-face build; in-memory fonts are read too, without opening a
+    /// file.
     #[test]
     fn a_split_collection_keeps_first_face_wins_order() {
         const INDIA: &str = "/System/Library/Fonts/SFIndia.ttc";
@@ -2728,8 +2948,8 @@ mod tests {
             "{order:?}"
         );
 
-        let (index, maps) = Coverage::build_counting_maps(&db);
-        assert_eq!(maps, 2, "SFIndia.ttc and Arial Unicode, once each");
+        let (index, opens) = Coverage::build_counting_opens(&db);
+        assert_eq!(opens, 2, "SFIndia.ttc and Arial Unicode, once each");
         let reference = per_face_reference(&db);
         assert_eq!(index.ranges, reference);
         // The split matters: Arial Unicode owns Tamil (U+0B95), which a
@@ -2741,5 +2961,223 @@ mod tests {
             Some(india[0]),
             "Bengali stays SFIndia's first face"
         );
+    }
+    /// A fresh directory for one test's font copies.
+    fn font_scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("tessera-font-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    /// Truncates the file at `path` in place to `len` bytes.
+    fn truncate(path: &std::path::Path, len: u64) {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .and_then(|file| file.set_len(len))
+            .expect("truncate the font copy");
+    }
+
+    /// #668: a font file truncated in place while the index reads it
+    /// cannot kill the process. The hook truncates a copy of Menlo.ttc
+    /// after the file is opened and before its first face is read: a map
+    /// taken then would raise SIGBUS on the first page read. Its faces are
+    /// left out and the next file's face takes their characters.
+    #[test]
+    fn a_font_file_truncated_during_the_index_build_is_skipped() {
+        const MENLO: &str = "/System/Library/Fonts/Menlo.ttc";
+        const MONACO: &str = "/System/Library/Fonts/Monaco.ttf";
+        let dir = font_scratch("truncated");
+        let copy = dir.join("Menlo.ttc");
+        std::fs::copy(MENLO, &copy).expect("Menlo.ttc is installed");
+        let mut db = fontdb::Database::new();
+        db.load_font_file(&copy).expect("the copy loads");
+        db.load_font_file(MONACO).expect("Monaco is installed");
+        let monaco = db.faces().last().map(|f| f.id);
+        let target = copy.clone();
+        test_read_hook::set(Some(Box::new(move |path| {
+            if path == target {
+                truncate(path, 0);
+            }
+        })));
+        let (index, opens) = Coverage::build_counting_opens(&db);
+        test_read_hook::set(None);
+        assert_eq!(opens, 2);
+        assert_eq!(index.lookup('A'), monaco, "Menlo's faces are left out");
+        assert!(
+            index.ranges.iter().all(|&(_, _, id)| Some(id) == monaco),
+            "{:?}",
+            index.ranges
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #668: a collection cut short or rewritten with another font's bytes
+    /// between two of its faces: the faces read before stay indexed, the
+    /// rest index whatever the file holds then, and nothing crashes.
+    #[test]
+    fn a_collection_rewritten_between_its_faces_is_read_as_it_is_then() {
+        const MENLO: &str = "/System/Library/Fonts/Menlo.ttc";
+        const MONACO: &str = "/System/Library/Fonts/Monaco.ttf";
+        let monaco_bytes = std::fs::read(MONACO).expect("Monaco is installed");
+        for rewrite in [false, true] {
+            let dir = font_scratch(if rewrite { "rewritten" } else { "cut" });
+            let copy = dir.join("Menlo.ttc");
+            std::fs::copy(MENLO, &copy).expect("Menlo.ttc is installed");
+            let mut db = fontdb::Database::new();
+            db.load_font_file(&copy).expect("the copy loads");
+            let menlo: Vec<fontdb::ID> = db.faces().map(|f| f.id).collect();
+            assert!(menlo.len() > 1, "Menlo.ttc is a collection");
+            let mut seen = 0;
+            let bytes = monaco_bytes.clone();
+            test_read_hook::set(Some(Box::new(move |path| {
+                seen += 1;
+                if seen == 2 {
+                    truncate(path, 0);
+                    if rewrite {
+                        std::fs::write(path, &bytes).expect("rewrite in place");
+                    }
+                }
+            })));
+            let index = Coverage::build(&db);
+            test_read_hook::set(None);
+            assert_eq!(index.lookup('A'), Some(menlo[0]), "rewrite {rewrite}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// #668: builds while another thread rewrites the font file in place
+    /// (truncate, then write the bytes back) all finish, and a build that
+    /// read the whole file lands what the intact file gives.
+    #[test]
+    fn index_builds_survive_a_file_rewritten_in_place_meanwhile() {
+        const SOURCE: &str = "/System/Library/Fonts/SFIndia.ttc";
+        let dir = font_scratch("race");
+        let copy = dir.join("SFIndia.ttc");
+        std::fs::copy(SOURCE, &copy).expect("SFIndia.ttc is installed");
+        let bytes = std::fs::read(&copy).expect("read the copy");
+        let mut db = fontdb::Database::new();
+        db.load_font_file(&copy).expect("the copy loads");
+        let intact = Coverage::build(&db).ranges;
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let (stop, copy) = (Arc::clone(&stop), copy.clone());
+            std::thread::spawn(move || {
+                let mut rewrites = 0_u32;
+                while !stop.load(Ordering::Relaxed) {
+                    truncate(&copy, 0);
+                    std::fs::write(&copy, &bytes).expect("rewrite in place");
+                    rewrites += 1;
+                }
+                rewrites
+            })
+        };
+        let mut whole = 0;
+        for _ in 0..40 {
+            let ranges = Coverage::build(&db).ranges;
+            if ranges == intact {
+                whole += 1;
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        let rewrites = writer.join().expect("the writer finishes");
+        assert!(rewrites > 0, "the file was rewritten during the builds");
+        eprintln!("{whole} of 40 builds saw the whole file, {rewrites} rewrites");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Writes a one-table font whose `cmap` record says `len` bytes, the
+    /// file extended (sparse) to hold them.
+    fn font_with_cmap_len(path: &std::path::Path, len: u32) {
+        let mut head = Vec::new();
+        head.extend_from_slice(&0x0001_0000_u32.to_be_bytes());
+        head.extend_from_slice(&1_u16.to_be_bytes());
+        head.extend_from_slice(&[0; 6]);
+        head.extend_from_slice(b"cmap");
+        head.extend_from_slice(&[0; 4]);
+        head.extend_from_slice(&28_u32.to_be_bytes());
+        head.extend_from_slice(&len.to_be_bytes());
+        std::fs::write(path, &head).expect("write the font");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .and_then(|file| file.set_len(28 + u64::from(len)))
+            .expect("extend the font");
+    }
+
+    /// #668, S5: the `cmap` read is capped at `MAX_INDEX_CMAP_BYTES`. A
+    /// larger one is refused before anything is allocated; one at the cap
+    /// is read into a buffer of the cap plus the header.
+    #[test]
+    fn the_index_cmap_read_is_capped() {
+        let dir = font_scratch("cap");
+        let path = dir.join("big.ttf");
+        for (len, expected) in [
+            (
+                MAX_INDEX_CMAP_BYTES + 1,
+                CmapRead::TooLarge(MAX_INDEX_CMAP_BYTES + 1),
+            ),
+            (u32::MAX - 28, CmapRead::TooLarge(u32::MAX - 28)),
+            (MAX_INDEX_CMAP_BYTES, CmapRead::Read),
+        ] {
+            let flood = len > MAX_INDEX_CMAP_BYTES;
+            // The file holds at most the cap and a byte; the record says
+            // `len`.
+            font_with_cmap_len(&path, len.min(MAX_INDEX_CMAP_BYTES + 1));
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .expect("open");
+            std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(24)).expect("seek");
+            std::io::Write::write_all(&mut file, &len.to_be_bytes()).expect("write");
+            let mut file = std::fs::File::open(&path).expect("open");
+            let (mut buf, mut loaded) = (Vec::new(), None);
+            assert_eq!(
+                read_face_cmap(&mut file, 0, &mut buf, &mut loaded),
+                expected,
+                "{len}"
+            );
+            if flood {
+                assert_eq!(buf.capacity(), 0, "nothing allocated for {len}");
+                assert_eq!(loaded, None);
+            } else {
+                assert_eq!(buf.len(), CMAP_FONT_HEADER + MAX_INDEX_CMAP_BYTES as usize);
+                assert_eq!(loaded, Some((28, len)));
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #668: a file whose `cmap` record runs past its end (cut short
+    /// after the scan) reads as no `cmap`, not as a short table; so does
+    /// a record at offset 0, which swash reads as no table.
+    #[test]
+    fn a_cmap_past_the_end_of_the_file_or_at_zero_is_missing() {
+        let dir = font_scratch("short");
+        let path = dir.join("short.ttf");
+        font_with_cmap_len(&path, 4096);
+        truncate(&path, 28 + 100);
+        let mut file = std::fs::File::open(&path).expect("open");
+        let (mut buf, mut loaded) = (Vec::new(), None);
+        assert_eq!(
+            read_face_cmap(&mut file, 0, &mut buf, &mut loaded),
+            CmapRead::Missing
+        );
+        assert_eq!(loaded, None);
+
+        font_with_cmap_len(&path, 64);
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open");
+        std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(20)).expect("seek");
+        std::io::Write::write_all(&mut file, &0_u32.to_be_bytes()).expect("write");
+        assert_eq!(
+            read_face_cmap(&mut file, 0, &mut buf, &mut loaded),
+            CmapRead::Missing
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
