@@ -859,10 +859,17 @@ final class PaneTests: XCTestCase {
         XCTAssertEqual(controller.panes, [left], "only that pane closed")
         XCTAssertTrue(controller.focusedPane === left)
 
-        // Through the router, from the shell itself.
+        // Through the router, from the shell itself, started under the
+        // test's load: a ``ChildStartBudget`` (#674), not a fixed 10 s.
         let third = try split(controller, .below)
         try third.session.write(Array("exit\n".utf8))
-        try await waitUntil("the exiting pane closes") { controller.panes == [left] }
+        var budget = ChildStartBudget()
+        while controller.panes != [left] {
+            guard !budget.isSpent() else {
+                throw PollTimedOut(description: "the exiting pane did not close \(budget.summary)")
+            }
+            try await Task.sleep(for: .milliseconds(20))
+        }
         XCTAssertTrue(appDelegate.windowControllers.contains { $0 === controller }, "the tab stays")
         controller.session(left.session, didExitWithCode: 1, signal: 0)
         XCTAssertEqual(controller.panes, [left], "a failed exit keeps the pane, showing it")
@@ -2260,12 +2267,14 @@ extension PaneTests {
 
         /// 0: wait for the drag to track, then drag 100 points; 1: once the
         /// divider moved, exit the bottom right shell; 2: once its pane is
-        /// gone from the tree, drag 100 more and let go; 3: done.
+        /// gone from the tree, drag 100 more and let go; 3: done. Step 2
+        /// waits on a shell started under the test's load, so the steps get
+        /// a ``ChildStartBudget`` (#674), not a fixed 10 s.
         let driver = DragDriver()
-        let deadline = ContinuousClock.now + .seconds(10)
+        var budget = ChildStartBudget()
         driver.onTick = { [unowned driver] in
-            guard ContinuousClock.now < deadline else {
-                driver.failure = "timed out at step \(driver.step)"
+            guard !budget.isSpent() else {
+                driver.failure = "timed out at step \(driver.step) \(budget.summary)"
                 post(.leftMouseUp, x: start - 200)
                 return driver.step = 3
             }
@@ -2321,7 +2330,7 @@ extension PaneTests {
                 repeats: true),
             forMode: .default)
 
-        try await waitUntil("the drag ends") {
+        try await waitUntil("the drag ends", timeout: ChildStartBudget.cap + .seconds(10)) {
             driver.failure != nil || (driver.step == 3 && !container.isTrackingDividerDrag)
         }
         XCTAssertNil(downDriver.failure)
@@ -2356,7 +2365,9 @@ extension PaneTests {
     /// does, and runs `steps` in turn from an event-tracking Timer: each is
     /// retried every 10 ms until it returns `true`, and gets a function that
     /// posts a mouse event at an x. Returns once every step ran and the
-    /// drag stopped tracking (or the container is gone).
+    /// drag stopped tracking (or the container is gone). The steps get a
+    /// ``ChildStartBudget`` (#674), not a fixed 10 s: they wait on shells
+    /// started under the test's load to exit and their panes to close.
     private func trackDividerDrag(
         at x: CGFloat, in container: PaneContainerView, window: NSWindow,
         steps: [(_ post: (NSEvent.EventType, CGFloat) -> Void) -> Bool]
@@ -2375,11 +2386,11 @@ extension PaneTests {
             NSApp.postEvent(event, atStart: false)
         }
         let driver = DragDriver()
-        let deadline = ContinuousClock.now + .seconds(10)
+        var budget = ChildStartBudget()
         var next = 0
         driver.onTick = { [unowned driver] in
-            guard ContinuousClock.now < deadline else {
-                driver.failure = "timed out at step \(next)"
+            guard !budget.isSpent() else {
+                driver.failure = "timed out at step \(next) \(budget.summary)"
                 post(.leftMouseUp, x)
                 return driver.step = 3
             }
@@ -2410,7 +2421,7 @@ extension PaneTests {
                 timeInterval: 0, target: downDriver, selector: #selector(DragDriver.fire(_:)), userInfo: nil,
                 repeats: true),
             forMode: .default)
-        try await waitUntil("the drag ends") {
+        try await waitUntil("the drag ends", timeout: ChildStartBudget.cap + .seconds(10)) {
             driver.failure != nil || (driver.step == 3 && weakContainer?.isTrackingDividerDrag != true)
         }
         XCTAssertNil(downDriver.failure)
@@ -2646,25 +2657,30 @@ extension PaneTests {
         XCTAssertTrue(controller.toggleZoom())
 
         // From a Timer, as AppKit's loops run: the test's task would wait
-        // for the mode to end.
+        // for the mode to end. The shell was started under the test's load,
+        // so it gets a ``ChildStartBudget`` (#674), not a fixed 10 s.
         var gone = false
+        var spun: String?
         let spinner = DragDriver()
-        let deadline = ContinuousClock.now + .seconds(10)
+        var budget = ChildStartBudget()
         spinner.onTick = { [unowned spinner] in
             spinner.step = 3
             try? below.session.write(Array("exit\n".utf8))
-            while controller.panes.contains(below), ContinuousClock.now < deadline {
+            while controller.panes.contains(below), !budget.isSpent() {
                 _ = CFRunLoopRunInMode(CFRunLoopMode(RunLoop.Mode.eventTracking.rawValue as CFString), 0.02, false)
             }
             gone = !controller.panes.contains(below)
+            spun = budget.summary
         }
         RunLoop.main.add(
             Timer(
                 timeInterval: 0, target: spinner, selector: #selector(DragDriver.fire(_:)), userInfo: nil,
                 repeats: true),
             forMode: .default)
-        try await waitUntil("the shell exits in the event-tracking mode") { gone || ContinuousClock.now > deadline }
-        XCTAssertTrue(gone, "the pane left the tree")
+        try await waitUntil(
+            "the shell exits in the event-tracking mode", timeout: ChildStartBudget.cap + .seconds(10)
+        ) { spun != nil }
+        XCTAssertTrue(gone, "the pane left the tree \(spun ?? "")")
         try await waitUntil("its view leaves the tab") { closingView?.window == nil }
         XCTAssertEqual(controller.panes, [left, right])
         XCTAssertEqual(splitViews(in: container), 1, "no stale split view")
@@ -2921,13 +2937,16 @@ extension PaneTests {
         // The exception skips the end of the drag Timer's fire: its steps
         // stop it themselves.
         var raised = Array(repeating: false, count: drags.count)
+        /// A step can wait on a shell started under the test's load to exit
+        /// and its pane to close, so the steps get a ``ChildStartBudget``
+        /// (#674), not a fixed 10 s.
         let driver = DragDriver()
-        let deadline = ContinuousClock.now + .seconds(10)
+        var budget = ChildStartBudget()
         var next = 0
         driver.onTick = { [unowned driver] in
             guard !raised[current] else { return }
-            guard ContinuousClock.now < deadline else {
-                driver.failure = "timed out at drag \(current) step \(next)"
+            guard !budget.isSpent() else {
+                driver.failure = "timed out at drag \(current) step \(next) \(budget.summary)"
                 post(.leftMouseUp, drags[current].start)
                 raised[current] = true
                 return
@@ -2982,7 +3001,7 @@ extension PaneTests {
                 timeInterval: 0, target: downDriver, selector: #selector(DragDriver.fire(_:)), userInfo: nil,
                 repeats: true),
             forMode: .default)
-        try await waitUntil("the drags end") { downDriver.step == 3 }
+        try await waitUntil("the drags end", timeout: ChildStartBudget.cap + .seconds(10)) { downDriver.step == 3 }
         XCTAssertNil(downDriver.failure)
         XCTAssertNil(driver.failure)
         XCTAssertEqual(raised, Array(repeating: true, count: drags.count), "each drag's exception was raised")
