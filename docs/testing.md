@@ -12,7 +12,7 @@ Pick the cheapest check that covers the change while you work; the full gate run
 | Iterating | `cargo nextest run -p <crate>` | one crate |
 | After a change | `just test-affected` (`--clippy` to lint too; `--base <ref>`; `-- <nextest args>`) | every crate your change touches since the merge base with `main` (committed, staged, unstaged and untracked), plus every crate that depends on them |
 | Swift or `tessera-ffi` surface | `just app-test` (all suites) or `just app-test-only <scheme> <Target/Class[/test]>...` (a test, a class, a mutation run) | the XCTest suites (Xcode, Thread Sanitizer); the gate does not run them, CI does |
-| Docs, scripts, CI | the matching check: `actionlint`, `just config-docs-check`; for the factory scripts `just factory-test`, `just verify-branch-test`, `just quality-gate-test` | no Rust test is affected |
+| Docs, scripts, CI | the matching check: `actionlint`, `just config-docs-check`; for the factory scripts `just factory-test`, `just verify-branch-test`, `just quality-gate-test`, `just perf-job-test` | no Rust test is affected |
 | `shell-integration/` | `just test-affected` (selects those two crates and their dependents: `tessera-shell-integration` and `tessera-term` read it), plus `just terminfo-check` for the terminfo entry | the shell scripts and the terminfo entry |
 | Before any push or PR | `scripts/quality-gate.sh <worktree>` | everything: fmt, clippy, workspace tests, rustdoc, deny, FFI build and C tests, release timing tests, fuzz fmt and clippy |
 
@@ -130,6 +130,28 @@ plugin host throughput and the rectangle cost bars: the `b02_*` tests of `tests/
 `cargo nextest list --release --run-ignored all -E 'test(<name>)'` shows that the filter finds it.
 `scripts/verify-branch.sh` runs the suites such an override names, in a changed package, ten times each, so a new bar is
 exercised under load before it merges.
+
+## Performance and memory bars
+
+Memory efficiency is a first-class goal next to speed. When a brief names no bar, these are the defaults:
+
+- **Instructions.** A hot path may not retire more than 2 % more instructions than main: `cargo xtask ab bench
+  --max-ratio 1.02` on a named corpus. The 1.02 bar counts as met only when three independent probe builds (a fresh
+  `ab init` each) all measure at or under 1.02 (the noise-floor rule in `docs/software-factory.md`).
+- **Memory.** The live heap of an idle session, and of a session per 10 000 scrollback lines, may not grow more than
+  2 % over the budgets of `crates/tessera-ffi/tests/budgets.rs` (#216), as measured on main when the change started.
+- **A larger regression** needs an explicit justification in the PR description and a note in the ADR of the area (or
+  a new one); raising a budget constant in the same change without that is a blocker.
+- **A new hot path gets an absolute bar** (a time, an instruction count or a byte count on a named corpus) in the same
+  change, so the next change has something to compare against.
+- **Briefs.** `milestone-lead` puts a memory bar in every brief that touches per-session, per-line or per-cell
+  storage.
+
+These bars bind at review time. The scheduled `perf.yml` job (ADR 0049, `docs/software-factory.md`) catches what
+slips past them: every other day it measures main against the last measured SHA on a fixed case set (feed, scroll,
+search, idle heap, full-scrollback heap; the heap cases measure a `Terminal` only, about a third of an idle
+session, and session-level growth stays with the #216 budgets) and runs the release timing bars, and a case past its bar opens or comments
+on a `type:bug` issue naming the SHA range. It never gates a PR. `just perf-job-test` checks its logic offline.
 
 ## Adding an escape-sequence test
 
