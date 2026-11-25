@@ -24,6 +24,8 @@ mod common;
 #[allow(dead_code)] // Shared with tests/csi.rs.
 mod spec;
 
+use std::time::Duration;
+
 use common::Chunking;
 use tessera_grid::{DamageRows, Point};
 use tessera_term::Terminal;
@@ -216,56 +218,92 @@ fn all_clusters() -> Terminal {
     term
 }
 
-/// The shortest of `runs` runs of `op` on [`all_clusters`] screens.
-fn best_of(runs: usize, op: &[u8]) -> std::time::Duration {
+/// The least CPU time of the calling thread over `runs` runs of `op`, each
+/// on a new [`all_clusters`] screen (not measured).
+///
+/// CPU time, not wall time (#678): time the thread spends preempted does
+/// not count, so a loaded machine cannot fail the bars below the way it
+/// failed the shifted copy's wall-clock bar at a 1-minute load of 60-70.
+fn best_of(runs: usize, op: &[u8]) -> Duration {
     (0..runs)
         .map(|_| {
             let mut term = all_clusters();
-            let start = std::time::Instant::now();
+            let start = common::thread_cpu_time();
             term.advance(op);
-            start.elapsed()
+            common::thread_cpu_time().saturating_sub(start)
         })
         .min()
         .expect("a run")
 }
 
-/// #430 20.1 M2's bar (release only, where timing means something): the
+/// #430 20.1 M2's bar (release only, where cost means something): the
 /// full-screen self copy on a 1024x2048 screen of clusters takes at most
 /// twice a DECALN on the same screen, best of five (it took 127 ms, every
 /// cluster's text copied). DECALN drops every cluster, so that bar alone
 /// passes the full copy too (50 ms against 540 ms); the second bar, at
 /// most ten one-cell DECERAs plus a millisecond, is the one the copy
-/// fails (the no-op takes microseconds).
+/// fails (the no-op takes microseconds). Both are on the thread's CPU time
+/// ([`best_of`]).
 #[test]
-#[cfg_attr(debug_assertions, ignore = "timing: release only")]
+#[cfg_attr(debug_assertions, ignore = "cost bar: release only")]
 fn a_self_copy_of_a_screen_of_clusters_costs_no_more_than_decaln() {
     let copy = best_of(5, b"\x1b[1;1;1024;2048;1;1;1;1$v");
     let decaln = best_of(5, b"\x1b#8");
     let one_cell = best_of(5, b"\x1b[1;1;1;1$z");
     eprintln!(
-        "self copy of 1024x2048 clusters: {copy:?}, DECALN: {decaln:?}, one-cell DECERA: {one_cell:?}"
+        "self copy of 1024x2048 clusters: {copy:?}, DECALN: {decaln:?}, one-cell DECERA: {one_cell:?} \
+         (thread CPU time)"
     );
     assert!(copy <= decaln * 2, "{copy:?} vs DECALN {decaln:?}");
     assert!(
-        copy <= one_cell * 10 + std::time::Duration::from_millis(1),
+        copy <= one_cell * 10 + Duration::from_millis(1),
         "{copy:?} vs one-cell DECERA {one_cell:?}: the self copy did work per cell"
     );
 }
+
+/// Interleaved rounds of the shifted copy's bar, each three runs of ED 2
+/// and three of the copy.
+const SHIFTED_COPY_ROUNDS: usize = 3;
 
 /// The partial copy `tests/rect.rs` B02 times over clusters and links
 /// (also one column to the right since the self copy became a no-op), here
 /// over the all-cluster screen of the self-copy bar: each
 /// destination row keeps entries left and right of the copy and the cost
-/// stays a constant per cell, within 10 times ED 2 on the same screen.
+/// stays a constant per cell, under 10 times ED 2 on the same screen.
+///
+/// The ratio is of CPU times ([`best_of`]) taken in
+/// [`SHIFTED_COPY_ROUNDS`] interleaved rounds: the lowest copy over all
+/// nine runs divided by the lowest ED 2 over all nine. Load still moves
+/// the ratio (lower clocks with every core busy, an efficiency core): the
+/// copy reads 2.0 to 3.6 times ED 2, but not past the bar for a constant
+/// cost. 2026-11-25, Mac16,10: the copy is about 3.3 times ED 2 (43 ms
+/// against 13 ms); one more pass over the row per copied cell is about 23
+/// times quiet and 12 times under load, and setting the copied clusters
+/// one by one in front of the row's own entries 21 to 31 times.
 #[test]
-#[cfg_attr(debug_assertions, ignore = "timing: release only")]
+#[cfg_attr(debug_assertions, ignore = "cost bar: release only")]
 fn a_shifted_partial_copy_over_clusters_costs_a_constant_per_cell() {
-    let copy = best_of(3, b"\x1b[1;1;1024;1024;1;1;2;1$v");
-    let erase = best_of(3, b"\x1b[2J");
-    eprintln!("left half one column right over clusters: {copy:?}, ED 2: {erase:?}");
+    let rounds: Vec<(Duration, Duration)> = (0..SHIFTED_COPY_ROUNDS)
+        .map(|_| {
+            let erase = best_of(3, b"\x1b[2J");
+            let copy = best_of(3, b"\x1b[1;1;1024;1024;1;1;2;1$v");
+            (copy, erase)
+        })
+        .collect();
+    let copy = rounds.iter().map(|&(copy, _)| copy).min().expect("a round");
+    let erase = rounds
+        .iter()
+        .map(|&(_, erase)| erase)
+        .min()
+        .expect("a round");
+    let ratio = copy.as_secs_f64() / erase.as_secs_f64().max(f64::MIN_POSITIVE);
+    eprintln!(
+        "left half one column right over clusters vs ED 2 (thread CPU time): {rounds:?}, \
+         lowest copy {copy:?} over lowest ED 2 {erase:?}: {ratio:.2}"
+    );
     assert!(
-        copy < erase * 10 + std::time::Duration::from_millis(5),
-        "{copy:?} vs ED 2 {erase:?}"
+        ratio < 10.0,
+        "the shifted copy cost {ratio:.2} times ED 2 at best (copy, ED 2: {rounds:?})"
     );
 }
 
