@@ -120,11 +120,16 @@ Other work on the machine still preempts the test, so a bar on the cost of code 
 `tessera-app-core`) or counts work, and compares costs taken side by side, since the cores differ in speed (#520, #521).
 A latency bar on a watcher, which a stall of the watcher's thread breaks whatever the group, is asserted on the fastest
 of a few rounds while every round asserts the events themselves (`tests/watch_themes.rs`, #525;
-`tests/profile_files.rs`, #656). Add an override with a `filter` that names the package, the binary and the test, and a
-one-line comment that says what the bar is and which issue set it. The groups today cover the config reload (with the
-profile-file bound, #656), shaping, close and writer bounds, the DECSCUSR flood, the theme-edit bound, the search caps
-(including `the_kept_copy_and_its_spares_stay_within_the_cap`, which failed at load 35 before it fixed its budget), the
-plugin host throughput and the rectangle cost bars: the `b02_*` tests of `tests/rect.rs` and the two cluster bars of
+`tests/profile_files.rs`, #656). The startup budget of `tessera-ffi`'s `tests/budgets.rs` is both: the calling thread's
+CPU time from `tessera_app_new` to the first frame, best of five fresh processes, since that thread does about nine
+tenths of the work the first frame waits for (#672). Its bar keeps #655's 19.6 ms, which is above main's 13.3 ms plus
+20 % for a regression and as much again for load (19.1 ms): load still moves CPU time a little (lower clocks with every
+core busy, efficiency cores). The reasoning and the measurements are beside the constant. Add an override with a
+`filter` that names the package, the binary and the test, and a one-line comment that says what the bar is and which
+issue set it. The groups today cover the config reload (with the profile-file bound, #656), shaping, close and writer
+bounds, the DECSCUSR flood, the theme-edit bound, the search caps (including
+`the_kept_copy_and_its_spares_stay_within_the_cap`, which failed at load 35 before it fixed its budget), the plugin host
+throughput and the rectangle cost bars: the `b02_*` tests of `tests/rect.rs` and the two cluster bars of
 `tests/rect_fixes.rs`. Release-only bars are also listed in the quality gate's release timing step (`release_timing` in
 `scripts/quality-gate.sh`); a bar added to one place belongs in the other, and
 `cargo nextest list --release --run-ignored all -E 'test(<name>)'` shows that the filter finds it.

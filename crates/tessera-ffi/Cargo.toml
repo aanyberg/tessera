@@ -26,6 +26,8 @@ tessera-ffi = { path = ".", features = ["test-hooks"] }
 tessera-config.workspace = true
 # Temporary configuration directories (`TESSERA_CONFIG_DIR`).
 tempfile = "3"
+# The thread CPU clock of the startup budget (`tests/budgets.rs`).
+nix = { workspace = true, features = ["time"] }
 
 [lints]
 workspace = true

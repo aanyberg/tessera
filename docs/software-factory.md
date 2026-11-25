@@ -264,7 +264,8 @@ Agents use these instead of rebuilding the setup in every run:
   (#216, each main's measurement plus 20 %, recorded beside it with the date, `hw.model` and rustc):
   `an_idle_session_stays_within_its_heap_budget` (live Rust heap of an idle 80x24 bash after its first prompt),
   `a_full_scrollback_stays_within_its_heap_budget` (the same session with 10 000 scrollback lines of 80 columns), and
-  `startup_to_the_first_frame_stays_within_its_budget` (`tessera_app_new` to the first off-screen frame, best of 5).
+  `startup_to_the_first_frame_stays_within_its_budget` (`tessera_app_new` to the first off-screen frame in the calling
+  thread's CPU time, best of 5, with an allowance for load beside the 20 %, #672).
   The milestone-lead puts memory-per-session and startup bars in every brief that touches session setup, the grid's
   per-line storage or app start; an intended cost re-measures and raises the budget in the same change.
   A failure with the 1-minute load at or above `hw.ncpu`
