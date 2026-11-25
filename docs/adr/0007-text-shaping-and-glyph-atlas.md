@@ -58,11 +58,29 @@ background thread started by `Fonts::new` from a clone of the font
 database, by walking every face's character map one font file at a
 time (about 20 ms in a release build, 120 ms in debug, on a stock macOS
 install) and kept as sorted code-point ranges, so misses are a binary
-search. The build maps each font file once and reads every face of a
-collection (`.ttc`) from that one map, unmapped when the file is done
-(#660: about 600 maps for 1,000 faces, where a map per face churned the
-Thread Sanitizer's `munmap` hook in the app's test host); a code point
-still goes to the first covering face in database order. The index
+search. The build opens each font file once and reads every face of a
+collection (`.ttc`) from it, closed when the file is done (#660: about
+600 files for 1,000 faces, where a map per face churned the Thread
+Sanitizer's `munmap` hook in the app's test host); a code point still
+goes to the first covering face in database order. The build reads font
+files with `read(2)`, never through a memory map (#668): another process
+may truncate or rewrite an installed font in place while the index
+builds, and touching a mapped page past a file's new end raises
+`SIGBUS`, which killed the app. It reads only what the index needs: the
+collection header, the table records a binary search of each face's
+table directory visits, and the face's `cmap` table, at most 2 MiB of it
+(`MAX_INDEX_CMAP_BYTES`; the largest installed is Songti's 312 KiB). A
+face with a larger `cmap` is left out with one warning per file. One
+buffer, reused by the faces of a collection that share a `cmap`, is
+dropped before the next file opens, and files are read one at a time, so
+the build's peak memory stays close to the mapped build's (on macOS 26,
+a process that scans the fonts and builds the index peaks 0.4 MiB higher
+in resident memory and 0.8 MiB higher in footprint, out of 14 MiB). A file that changes under the build reads short or with
+other bytes: its faces are left out of the index, or index what the
+file holds then, until the next build; an atomic rename was always safe.
+Shaping and rasterisation still read a face through the map cosmic-text
+keeps for it (`make_shared_face_data`), so a font truncated in place
+while in use can still raise `SIGBUS` there. The index
 records the first covering face, often a Bold cut, so the style is
 drawn from that face's family: the face for the requested style if it
 covers the character, else (for italic) the upright face at the
