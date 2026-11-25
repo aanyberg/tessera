@@ -66,7 +66,10 @@ final class MouseReportingTests: XCTestCase {
         files.append(file)
         appDelegate.spawnOptions = .init(
             program: "/bin/sh",
-            arguments: ["-c", #"printf "$1"; seq 1 "$2"; stty raw -echo; exec cat > "$0""#, file.path, modes, "\(Self.lines)"])
+            arguments: [
+                "-c", #"printf "$1"; seq 1 "$2"; stty raw -echo; printf R; exec cat > "$0""#, file.path, modes,
+                "\(Self.lines)",
+            ])
         return file
     }
 
@@ -89,14 +92,16 @@ final class MouseReportingTests: XCTestCase {
 
     /// Waits until ``view``'s child has set its modes, printed its lines and
     /// started recording to ``file``, and checks that nothing reached it.
+    /// The child prints R after its lines once raw mode is set, so the
+    /// core has parsed the modes and lines once R shows
+    /// (``waitForRecorder(of:recordingTo:budget:)``, which throws: a test whose
+    /// recorder never started fails there, once).
     private func waitForRecorder() async throws {
         checkedLength = 0
-        // 30 s: the child's first output can stall that long on a loaded host.
-        try await waitUntil("the modes and lines are parsed and the recorder runs", timeout: .seconds(30)) {
-            guard let position = try? self.view.session.scrollPosition else { return false }
-            return position.history + UInt64(position.rows) > UInt64(Self.lines)
-                && FileManager.default.fileExists(atPath: self.file.path)
-        }
+        try await TesseraTests.waitForRecorder(of: view, recordingTo: file)
+        let position = try view.session.scrollPosition
+        XCTAssertGreaterThan(
+            position.history + UInt64(position.rows), UInt64(Self.lines), "the lines are in before the R")
         // The core may still have the focus report (DECSET 1004 is off, so
         // none) or anything else queued; start the byte checks clean.
         try await assertBytes([], "nothing before the first event")
