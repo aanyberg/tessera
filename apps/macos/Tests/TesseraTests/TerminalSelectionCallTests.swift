@@ -453,7 +453,7 @@ final class TerminalSelectionCallTests: XCTestCase {
                 rig.view.selectionCalls,
                 [.begin(col: 2, row: 0, granularity: .character, block: false), .extend(col: 5, row: 0)],
                 "and the click went on as a selection")
-            let received = try await rig.receivedInput()
+            let received = try await rig.receivedInput(expecting: Array("あ".utf8).count)
             XCTAssertEqual(received, Array("あ".utf8), "the marked text was committed, not dropped")
         }
 
@@ -472,7 +472,7 @@ final class TerminalSelectionCallTests: XCTestCase {
             XCTAssertTrue(rig.view.hasMarkedText(), "the input method keeps its composition")
             XCTAssertEqual(rig.view.selectionCalls, [], "and the click selects nothing")
             XCTAssertEqual(rig.view.sentMouseCount, 0, "nor reaches the core")
-            let received = try await rig.receivedInput()
+            let received = try await rig.receivedInput(expecting: 0)
             XCTAssertEqual(received, [])
         }
     #endif

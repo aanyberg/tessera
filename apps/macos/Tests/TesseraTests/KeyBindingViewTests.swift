@@ -234,7 +234,9 @@ final class KeyBindingViewTests: XCTestCase {
     }
 
     /// Asserts that exactly `expected` reached the PTY, up to a sentinel
-    /// key sent after it (input reaches the recorder in order).
+    /// key sent after it (input reaches the recorder in order). The file holds
+    /// everything since the session started, so its sentinel is a `~` past
+    /// all of `expected`, which can contain `~` itself (#648).
     private func assertBytes(
         _ expected: [UInt8], _ message: String = "", file: StaticString = #filePath, line: UInt = #line
     ) async throws {
@@ -243,7 +245,7 @@ final class KeyBindingViewTests: XCTestCase {
         let previous = checkedLength
         try await waitUntil("the sentinel arrives", timeout: .seconds(20)) {
             received = (try? Array(Data(contentsOf: self.file))) ?? []
-            return received.count > previous && received.last == UInt8(ascii: "~")
+            return received.count > max(previous, expected.count) && received.last == UInt8(ascii: "~")
         }
         checkedLength = received.count
         let hex = { (bytes: [UInt8]) in bytes.map { String(format: "%02x", $0) }.joined(separator: " ") }

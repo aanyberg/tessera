@@ -678,7 +678,7 @@ final class MouseReportingTests: XCTestCase {
         // Every report reached the program, or the core dropped some when
         // its input queue was full (never blocking); either way the
         // sentinel after them arrives.
-        let received = try await receivedBytes()
+        let received = try await receivedBytes(expecting: 0)
         let report = Self.sgr("35;1;1M") + Self.sgr("35;2;1M")
         XCTAssertEqual(received.count % (report.count / 2), 0, "whole reports only")
         XCTAssertLessThanOrEqual(received.count, 10_000 * report.count)
@@ -690,14 +690,14 @@ final class MouseReportingTests: XCTestCase {
     // MARK: Helpers
 
     /// Length of the recorder's file, up to and including the last sentinel
-    /// ``receivedBytes()`` saw.
+    /// ``receivedBytes(expecting:)`` saw.
     private var checkedLength = 0
 
     /// Asserts that exactly `expected` reached the PTY since the last check.
     private func assertBytes(
         _ expected: [UInt8], _ message: String = "", file: StaticString = #filePath, line: UInt = #line
     ) async throws {
-        let received = try await receivedBytes()
+        let received = try await receivedBytes(expecting: expected.count)
         let hex = { (bytes: [UInt8]) in bytes.map { String(format: "%02x", $0) }.joined(separator: " ") }
         XCTAssertEqual(hex(received), hex(expected), message, file: file, line: line)
     }
@@ -705,14 +705,16 @@ final class MouseReportingTests: XCTestCase {
     /// What reached the PTY since the last check: sends a sentinel key and
     /// returns everything before it. Input reaches the recorder in order,
     /// so once the new sentinel is in the file, so is everything sent before
-    /// it; only a `~` past ``checkedLength`` is the new one.
-    private func receivedBytes() async throws -> [UInt8] {
+    /// it; only a `~` past ``checkedLength`` and at least `expected` bytes
+    /// more is the new one, since those bytes can contain `~` themselves
+    /// (#648).
+    private func receivedBytes(expecting expected: Int) async throws -> [UInt8] {
         try view.session.send(key: .init(key: .char, codepoint: "~", text: "~"))
         var received: [UInt8] = []
         let previous = checkedLength
         try await waitUntil("the sentinel arrives", timeout: .seconds(20)) {
             received = (try? Array(Data(contentsOf: self.file))) ?? []
-            return received.count > previous && received.last == UInt8(ascii: "~")
+            return received.count > previous + expected && received.last == UInt8(ascii: "~")
         }
         checkedLength = received.count
         return Array(received[min(previous, received.count)...].dropLast())
