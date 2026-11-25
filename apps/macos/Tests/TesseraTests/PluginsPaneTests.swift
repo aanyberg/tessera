@@ -368,8 +368,8 @@ final class PluginsPaneTests: XCTestCase {
 
     /// A flood of `[plugins] enabled` ids (S5): the footer lists at most
     /// ``SettingsModel/maxUnknownPluginsShown`` of the ids the host reads
-    /// and a line for the rest, and the host's warning says how many it
-    /// ignores; the pane renders it in a bounded time.
+    /// and a line for the rest, and the pane's skip warning says how many
+    /// the host ignores; the pane renders it in a bounded time.
     func testTenThousandIdsShowACappedFooterAndTheSkipWarning() throws {
         let ids = (0..<10_000).map { "flood.\($0)" }
         let (model, _, _, _) = try fakeModel(enabled: ids, plugins: [Self.plugin("dev.a")])
@@ -631,9 +631,9 @@ final class PluginsPaneTests: XCTestCase {
     }
 
     /// At 64 ids Hello's toggle is refused with the pane's message, the
-    /// file keeps its bytes and nothing waits; with 65 the host's warning
-    /// shows, and Hello, the 65th, shows off as the host has it (#489 48b
-    /// B1). On the app's core.
+    /// file keeps its bytes and nothing waits; with 65 the pane's skip
+    /// warning shows, and Hello, the 65th, shows off as the host has it
+    /// (#489 48b B1). On the app's core.
     func testAtSixtyFourIdsTheToggleIsRefusedAndSixtyFiveShowTheSkipWarning() async throws {
         let unknown = (0..<TesseraPlugin.maxEnabled).map { "x.\($0)" }
         let config = Self.enabledTOML(unknown)
