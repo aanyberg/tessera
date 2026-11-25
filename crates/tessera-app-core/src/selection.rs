@@ -3812,6 +3812,10 @@ mod tests {
     /// once for its index.
     #[test]
     fn hostile_smart_rules_over_the_fallback_gate_select_nothing_at_once() {
+        // Its program raises the DFA cache (#649), so the one warning may
+        // come when the engines are built: count from before that.
+        crate::smart_engine::FALLBACK_RUNS.with(|runs| runs.set(0));
+        crate::smart_engine::WARNINGS.with(|warnings| warnings.set(0));
         let rules = smart_rules(&[(r"\b(?:(?:[^X]{0,50}){0,20}X|a)", Precision::Normal)]);
         let mut term = Terminal::new(2, 200);
         term.set_max_scrollback(1_000);
@@ -3825,8 +3829,6 @@ mod tests {
         let window = ScanWindow::around(&lines, mid, last.unwrap());
         let units = rules.fallback_units(0, window.text.len()).unwrap();
         assert!(units > SMART_FALLBACK_UNITS, "{units} units");
-        crate::smart_engine::FALLBACK_RUNS.with(|runs| runs.set(0));
-        crate::smart_engine::WARNINGS.with(|warnings| warnings.set(0));
         let mut fastest = Duration::MAX;
         for _ in 0..3 {
             let started = crate::thread_cpu_time();

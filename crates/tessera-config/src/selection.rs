@@ -12,15 +12,16 @@
 //!
 //! Bounds (security rule S5): at most [`MAX_SMART_RULES`] rules, each
 //! pattern at most [`MAX_SMART_RULE_PATTERN_LEN`] bytes, compiled with a
-//! [`SMART_RULE_SIZE_LIMIT`] program and lazy-DFA cache and a nesting depth
-//! of [`SMART_RULE_NEST_LIMIT`]. A rule that breaks a bound, does not
+//! [`SMART_RULE_SIZE_LIMIT`] program, [`SMART_RULE_REGEX_CACHE_BYTES`] for
+//! each of its lazy-DFA caches and a nesting depth of
+//! [`SMART_RULE_NEST_LIMIT`]. A rule that breaks a bound, does not
 //! compile or matches the empty string is left out with a warning; the
 //! others still apply.
 
 use std::fmt;
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 
-use regex::{Regex, RegexBuilder};
+use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
 
 use crate::Warning;
@@ -33,9 +34,22 @@ pub const MAX_SMART_RULES: usize = 64;
 /// with a warning.
 pub const MAX_SMART_RULE_PATTERN_LEN: usize = 1024;
 
-/// The size limit of a compiled smart selection pattern and of its lazy
-/// DFA cache, in bytes (`RegexBuilder::size_limit` and `dfa_size_limit`).
+/// The size limit of a compiled smart selection pattern, in bytes
+/// (`RegexBuilder::size_limit`).
 pub const SMART_RULE_SIZE_LIMIT: usize = 1 << 20;
+
+/// The bytes each lazy DFA cache of a compiled smart selection pattern may
+/// hold (`RegexBuilder::dfa_size_limit`, S5, #649). The regex crate gives
+/// that capacity to every lazy DFA it builds for the pattern (regex-automata
+/// 0.4's `meta::Config::hybrid_cache_capacity`): the forward and reverse
+/// ones and the reverse one of the reverse-inner strategy. Only the load
+/// time check that a rule does not match the empty string searches with
+/// that `Regex`, which is dropped after the checks
+/// ([`CompiledRule::pattern`]); tessera-app-core's click engine builds its
+/// own DFAs and `PikeVM` from the pattern, bounded by its
+/// `SMART_RULE_CACHE_BYTES` and `SMART_FALLBACK_SLOT_BYTES`. A smaller
+/// cache gives the same matches.
+pub const SMART_RULE_REGEX_CACHE_BYTES: usize = 512 * 1024;
 
 /// The deepest nesting of groups and repetitions a smart selection pattern
 /// may have (`RegexBuilder::nest_limit`).
@@ -160,15 +174,18 @@ pub enum RuleCheck {
 /// One compiled smart selection rule.
 #[derive(Debug, Clone)]
 pub struct CompiledRule {
-    regex: Regex,
+    pattern: Box<str>,
     precision: Precision,
     check: RuleCheck,
 }
 
 impl CompiledRule {
-    /// The compiled pattern.
-    pub fn regex(&self) -> &Regex {
-        &self.regex
+    /// The pattern, as written. It passed the load-time checks (it
+    /// compiles within the bounds and does not match the empty string);
+    /// the compiled `Regex` is dropped after them, so a rule keeps no
+    /// program here (S5, #649: tessera-app-core compiles its own engines).
+    pub fn pattern(&self) -> &str {
+        &self.pattern
     }
 
     /// The rule's precision.
@@ -341,11 +358,10 @@ fn compile(rule: &SmartRule) -> Result<CompiledRule, RuleError> {
     }
     let regex = RegexBuilder::new(&rule.regex)
         .size_limit(SMART_RULE_SIZE_LIMIT)
-        // Bounds the lazy DFA's cache. No test can tell it from the
-        // default (#351 m3): past its limit the regex crate falls back to a
-        // slower engine with the same matches, so the mutant that drops it
-        // survives; it bounds memory, not the result.
-        .dfa_size_limit(SMART_RULE_SIZE_LIMIT)
+        // Bounds the lazy DFA caches of the empty-match check below. Past it
+        // the regex crate runs a slower engine with the same matches, so no
+        // test here can tell it from the default (#351 m3).
+        .dfa_size_limit(SMART_RULE_REGEX_CACHE_BYTES)
         .nest_limit(SMART_RULE_NEST_LIMIT)
         .build()
         .map_err(|error| match error {
@@ -355,8 +371,10 @@ fn compile(rule: &SmartRule) -> Result<CompiledRule, RuleError> {
     if regex.is_match("") {
         return Err(RuleError::MatchesEmpty);
     }
+    // The checks passed: keep the pattern, not the compiled program (#649).
+    drop(regex);
     Ok(CompiledRule {
-        regex,
+        pattern: rule.regex.as_str().into(),
         precision: rule.precision,
         check: check_for(&rule.regex),
     })
@@ -431,7 +449,14 @@ pub struct Selection {
     /// (ADR 0042 lists their patterns). A list replaces them all. At most
     /// 64 rules are read; a rule whose pattern is longer than 1024 bytes,
     /// does not compile, is too complex or matches the empty string is
-    /// ignored with a warning.
+    /// ignored with a warning. A rule with a Unicode word boundary whose
+    /// program is very large, such as `\b\w{20}`, matches on lines that are
+    /// all ASCII but selects nothing on a line with other characters, with
+    /// one warning, logged by the first double-click after the rules load.
+    /// Like every rule, it can also select nothing on an ASCII line when its
+    /// search would need more memory than a rule may keep. A rule that is a
+    /// large set of exact strings (more than about 64) may skip the literal
+    /// search shortcut to stay within that memory; its matches are the same.
     pub smart_rules: Option<Vec<SmartRule>>,
     /// Whether Copy drops the blanks after the last text of each line (and
     /// blank lines at the end of the selection). Off, each row keeps its
@@ -531,6 +556,8 @@ impl Selection {
 
 #[cfg(test)]
 mod tests {
+    use regex::Regex;
+
     use super::*;
     use crate::Config;
 
@@ -679,7 +706,7 @@ mod tests {
         );
         let compiled = loaded.config.selection.compiled_rules();
         assert_eq!(compiled.len(), 1);
-        assert!(compiled.rules()[0].regex().is_match("ok"));
+        assert_eq!(compiled.rules()[0].pattern(), "ok");
     }
 
     /// The size limit is the 1 MiB bound, not the regex crate's 10 MiB
@@ -776,6 +803,100 @@ mod tests {
         assert_eq!(loaded.config.selection.compiled_rules().len(), 1);
     }
 
+    /// Patterns at and past every load-time bound, the rules #649 measured
+    /// at their largest and the built-in ones.
+    fn bound_fixtures() -> Vec<String> {
+        let mut rules = vec![
+            "(unclosed".to_owned(),
+            r"\w{1000}\w{1000}".to_owned(),
+            format!("{}a{}", "(".repeat(60), ")".repeat(60)),
+            format!("{}a{}", "(".repeat(50), ")".repeat(50)),
+            "a".repeat(MAX_SMART_RULE_PATTERN_LEN),
+            format!("<{}", "a".repeat(MAX_SMART_RULE_PATTERN_LEN)),
+            r"\w{50}".to_owned(),
+            r"[\p{L}\p{N}]{200}x".to_owned(),
+            r"(?-u)\w{50}".to_owned(),
+            r"[a-z0-9_]{50}".to_owned(),
+            "a*".to_owned(),
+            "^".to_owned(),
+            "x?".to_owned(),
+            r"\b(?:(?-u:[cegikmoqsuwyCEGIKMOQSUWY02468]){2000}|(?-u:q){12000}|[ab]*a[ab]{14})"
+                .to_owned(),
+            r"\b(?-u:[cegikmoqsuwyCEGIKMOQSUWY02468]){3541}".to_owned(),
+            r"\b(?-u:[cegikmoqsuwyCEGIKMOQSUWY02468]){3600}".to_owned(),
+            r"\b(?-u:a){32760}".to_owned(),
+            r"\b(?-u:a){33000}".to_owned(),
+            r"\b\w{20}".to_owned(),
+            r"\b\w{21}".to_owned(),
+            r"\bx[a-z]{14559}".to_owned(),
+            r"[ab]*a[ab]{14}".to_owned(),
+            "ok".to_owned(),
+        ];
+        rules.extend(DEFAULT_SMART_RULES.iter().map(|(p, _)| (*p).to_owned()));
+        rules
+    }
+
+    /// What loading `rules` gives: each warning, then the index of each rule
+    /// kept, as the loader and as setting the rules (a reload) compile them.
+    fn load_outcome(rules: &[String]) -> String {
+        let loaded = Config::from_toml_lenient(&rules_toml(rules)).unwrap();
+        let mut out: Vec<String> = loaded.warnings.iter().map(ToString::to_string).collect();
+        let kept = |compiled: &SmartRules| -> Vec<usize> {
+            let mut from = 0;
+            compiled
+                .rules()
+                .iter()
+                .map(|rule| {
+                    let at = from
+                        + rules[from..]
+                            .iter()
+                            .position(|p| p == rule.pattern())
+                            .expect("a kept rule is one of the rules");
+                    from = at + 1;
+                    at
+                })
+                .collect()
+        };
+        let on_load = kept(&loaded.config.selection.compiled_rules());
+        let mut reloaded = Config::default();
+        reloaded.selection.smart_rules = Some(
+            rules
+                .iter()
+                .map(|p| SmartRule::new(p, Precision::Normal))
+                .collect(),
+        );
+        assert_eq!(kept(&reloaded.selection.compiled_rules()), on_load);
+        out.push(format!("kept {on_load:?}"));
+        out.join("\n")
+    }
+
+    /// #649: dropping the compiled `Regex` after the load-time checks
+    /// changes no outcome: the same warnings and the same rules kept as
+    /// 73136a1, which kept it (this table was produced there).
+    #[test]
+    fn the_load_time_checks_keep_their_outcomes() {
+        let outcome = load_outcome(&bound_fixtures());
+        eprintln!("{outcome}");
+        assert_eq!(outcome, EXPECTED_LOAD_OUTCOME);
+    }
+
+    /// [`the_load_time_checks_keep_their_outcomes`], as 73136a1 printed it.
+    const EXPECTED_LOAD_OUTCOME: &str = concat!(
+        "`selection.smart_rules[0].regex` out of range: the pattern ignored: not a valid regular expression, or too complex\n",
+        "`selection.smart_rules[1].regex` out of range: the pattern ignored: too large once compiled, usually from counted repetition of a Unicode class; use ASCII classes or (?-u)\n",
+        "`selection.smart_rules[2].regex` out of range: the pattern ignored: not a valid regular expression, or too complex\n",
+        "`selection.smart_rules[5].regex` out of range: a pattern of 1025 bytes ignored (at most 1024)\n",
+        "`selection.smart_rules[6].regex` out of range: the pattern ignored: too large once compiled, usually from counted repetition of a Unicode class; use ASCII classes or (?-u)\n",
+        "`selection.smart_rules[7].regex` out of range: the pattern ignored: too large once compiled, usually from counted repetition of a Unicode class; use ASCII classes or (?-u)\n",
+        "`selection.smart_rules[10].regex` out of range: the pattern ignored: it matches the empty string\n",
+        "`selection.smart_rules[11].regex` out of range: the pattern ignored: it matches the empty string\n",
+        "`selection.smart_rules[12].regex` out of range: the pattern ignored: it matches the empty string\n",
+        "`selection.smart_rules[15].regex` out of range: the pattern ignored: too large once compiled, usually from counted repetition of a Unicode class; use ASCII classes or (?-u)\n",
+        "`selection.smart_rules[17].regex` out of range: the pattern ignored: too large once compiled, usually from counted repetition of a Unicode class; use ASCII classes or (?-u)\n",
+        "`selection.smart_rules[19].regex` out of range: the pattern ignored: too large once compiled, usually from counted repetition of a Unicode class; use ASCII classes or (?-u)\n",
+        "kept [3, 4, 8, 9, 13, 14, 16, 18, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37]"
+    );
+
     #[test]
     fn compiled_rules_are_shared_until_the_rules_change() {
         let loaded = Config::from_toml_lenient(&rules_toml(&["a+".into()])).unwrap();
@@ -788,7 +909,7 @@ mod tests {
         config.selection.smart_rules = Some(vec![SmartRule::new("b+", Precision::High)]);
         let changed = config.selection.compiled_rules();
         assert!(!Arc::ptr_eq(&first, &changed));
-        assert!(changed.rules()[0].regex().is_match("b"));
+        assert_eq!(changed.rules()[0].pattern(), "b+");
         assert!(Arc::ptr_eq(
             &Config::default().selection.compiled_rules(),
             &Config::default().selection.compiled_rules()

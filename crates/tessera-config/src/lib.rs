@@ -107,8 +107,8 @@ pub use profile_files::{
 };
 pub use selection::{
     CompiledRule, DEFAULT_SMART_RULES, MAX_SMART_RULE_PATTERN_LEN, MAX_SMART_RULES, Precision,
-    RuleCheck, SMART_RULE_NEST_LIMIT, SMART_RULE_SIZE_LIMIT, Selection, SmartRule, SmartRules,
-    default_rules,
+    RuleCheck, SMART_RULE_NEST_LIMIT, SMART_RULE_REGEX_CACHE_BYTES, SMART_RULE_SIZE_LIMIT,
+    Selection, SmartRule, SmartRules, default_rules,
 };
 pub use store::ConfigStore;
 pub use watch::{
