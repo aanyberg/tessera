@@ -745,11 +745,11 @@ final class PluginsPaneTests: XCTestCase {
     /// Opened, shown for a pass of the run loop, then edited and closed,
     /// each step in a pool of its own (as
     /// ``testClosingTheWindowWhileHelloSettlesFreesTheControllerAndModel``).
-    /// Observed, not explained (#598): opened and closed in one pass, the
-    /// model sometimes outlived the 10 s wait, and 30 s more, under TSan
-    /// and load, with the controller, window list and waiting model all
-    /// gone. Something keeps the model alive until a run-loop turn passes
-    /// between open and close; the holder is not identified (see #604).
+    /// Opened and closed in one pass, the model sometimes outlived the
+    /// test (#598, about one run in eight to ten under load): AppKit lets
+    /// go of the panes' tab items on a later pass through an autoreleased
+    /// binding, which in an async test can land in XCTest's wait's pool,
+    /// kept until the test ends. Not the app's: ADR 0044, #604 amendment.
     func testTheKeptModelIsFreedOnceItsEditLands() async throws {
         appDelegate.settingsClock = ManualClock()
         let opened = try autoreleasepool {

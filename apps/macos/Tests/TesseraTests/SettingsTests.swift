@@ -1023,6 +1023,56 @@ final class SettingsTests: XCTestCase {
         return opened
     }
 
+    /// ⌘, and then ⌘W typed ahead close Settings before its first display
+    /// pass (#604): opened as the menu opens it, nothing posted, and closed
+    /// as Close Tab closes the key window, in the same pass of the run
+    /// loop; the controller and model are freed within a budget scaled by
+    /// the load. Not an async test: AppKit lets go of the panes' tab items
+    /// on a later pass, through an autoreleased binding, and in an async
+    /// test that pass runs in XCTest's wait, whose autorelease pool lasts
+    /// as long as the test (ADR 0044, #604 amendment). The run loop runs
+    /// here a pass at a time in a pool of its own, as `NSApplication`'s
+    /// passes do.
+    func testSettingsClosedBeforeItsFirstDisplayPassFreesItsModel() throws {
+        // A first open and close on a core of its own, a pass apart, so
+        // the open under test pays no first use.
+        let budget = ChildStartBudget.budget(
+            atLoadPerCore: ChildStartBudget.loadPerCore(), base: .seconds(5), cap: .seconds(30))
+        let first = try autoreleasepool {
+            let model = try openSettings(config: "")
+            return Opened(controller: appDelegate.settingsWindowController, model: model, window: nil)
+        }
+        XCTAssertFalse(runLoop(for: .milliseconds(100)) { false })
+        autoreleasepool { first.controller?.close() }
+        XCTAssertTrue(runLoop(for: budget) { first.model == nil }, "the first window's model is freed")
+
+        let closed = try autoreleasepool {
+            MainMenu.run(command: "settings")
+            let controller = try XCTUnwrap(appDelegate.settingsWindowController)
+            let window = try XCTUnwrap(controller.window)
+            XCTAssertTrue(window.isVisible, "shown")
+            window.performClose(nil)
+            return Opened(controller: controller, model: controller.model, window: nil)
+        }
+        XCTAssertNil(appDelegate.settingsWindowController)
+        XCTAssertNil(appDelegate.waitingSettingsModel, "nothing waits for an edit")
+        XCTAssertTrue(
+            runLoop(for: budget) { closed.controller == nil && closed.model == nil },
+            "the controller and model are freed within \(budget)")
+    }
+
+    /// Runs the main run loop a pass at a time, each pass in an autorelease
+    /// pool of its own as `NSApplication`'s are, until `condition` holds or
+    /// `budget` has passed; whether it held.
+    private func runLoop(for budget: Duration, until condition: () -> Bool) -> Bool {
+        let deadline = ContinuousClock.now + budget
+        while !autoreleasepool(invoking: condition) {
+            guard ContinuousClock.now < deadline else { return false }
+            autoreleasepool { _ = RunLoop.main.run(mode: .default, before: Date(timeIntervalSinceNow: 0.01)) }
+        }
+        return true
+    }
+
     /// What a 1 MiB configuration (256 profiles) adds to opening the window:
     /// the config read and the model and panes built from it. The product
     /// bar, the window open within 200 ms on such a config (#347), is a

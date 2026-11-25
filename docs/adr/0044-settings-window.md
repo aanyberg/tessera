@@ -896,3 +896,39 @@ This corrects the last sentence of "The warning" in the #560 amendment.
   turned on at 64 ids or more first). The loader returns its one warning
   on every load of such a list, and the configuration store logs it once,
   when it first appears.
+
+## Amendment: Settings closed before its first display pass (#604, 2026-11-25)
+
+Settings closed in the same pass of the run loop that opened it (⌘, and
+then ⌘W typed ahead) frees its controller and model in the app.
+The model that outlived a hosted async test (#598) was kept by XCTest,
+not by the app.
+
+- **The chain.** `leaks --traceTree` on a non-TSan Debug test host whose
+  model outlived a 30 s wait (2026-11-25): an autorelease pool entry on
+  the main thread → `NSObjectParameterBinder` →
+  `_NSBindingInfo._retainedController` → `NSTabViewItem` →
+  `_NSTabViewItemAuxiliary._viewController` → `NSHostingController` →
+  `NSHostingView._rootView` → the pane's `AnyViewStorage.model` →
+  `SettingsModel`. The binder is the one
+  `NSTabViewControllerToolbarUIProvider` binds each toolbar item to its
+  tab item with, made in `NSWindow(contentViewController:)`. The window
+  and the tab view controller were already freed. AppKit lets go of the
+  tab items on a later pass, and that pass's autoreleases land in
+  whatever pool is current. An async test's awaits run the main run loop
+  inside `XCTWaiter`, with no pool per pass, so they stay until the test
+  ends.
+- **The app frees it.** On the same Debug build, launched as an app,
+  Settings was opened and closed in one main-thread call while the app
+  was idle (lldb, no event between): `heap` counted no `SettingsModel`,
+  `NSHostingController` or `NSObjectParameterBinder` right after, and
+  none 14 s later. Left open, the same call left one model and six
+  hosting controllers. `NSApplication`'s event loop drains a pool per
+  pass.
+- **Tests.** `SettingsTests.testSettingsClosedBeforeItsFirstDisplayPassFreesItsModel`
+  opens Settings through the menu and closes it as Close Tab does, in
+  one pass with nothing posted. It is a synchronous test that runs the
+  run loop a pass at a time in a pool of its own, and it sees the model
+  freed within a budget scaled by the load. An async test that must free
+  a Settings model opens it, lets a pass run (`Task.sleep`), then closes
+  it, as the PluginsPane tests do.
