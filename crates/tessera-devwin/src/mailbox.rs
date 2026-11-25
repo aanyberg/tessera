@@ -285,7 +285,13 @@ mod tests {
     /// two, however many output events the reader thread produces.
     #[test]
     fn a_flooding_session_keeps_wake_ups_bounded() {
-        let dir = std::env::temp_dir().join(format!("tessera-devwin-{}", std::process::id()));
+        // A configuration directory that does not exist yet, in one removed
+        // when the test ends, passing or failing.
+        let temp = tempfile::Builder::new()
+            .prefix("tessera-devwin-")
+            .tempdir()
+            .unwrap();
+        let dir = temp.path().join("config");
         let app = App::new(Config::default(), ConfigPaths::new(&dir));
         let mailbox = Arc::new(Mailbox::default());
         let posted = Arc::new(AtomicUsize::new(0));
@@ -335,6 +341,5 @@ mod tests {
             "the flood produced more events than frames"
         );
         assert!(max <= 2, "{max} wake-ups outstanding");
-        let _ = std::fs::remove_dir_all(dir);
     }
 }

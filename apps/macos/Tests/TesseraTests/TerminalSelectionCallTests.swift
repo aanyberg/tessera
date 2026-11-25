@@ -309,6 +309,7 @@ final class TerminalSelectionCallTests: XCTestCase {
     /// A directory with one of each kind of local file a link can name.
     private func makeFiles() throws -> URL {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("tessera-links-\(UUID().uuidString)")
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
         let manager = FileManager.default
         try manager.createDirectory(at: directory, withIntermediateDirectories: true)
         func file(_ name: String, mode: Int = 0o644, _ contents: String = "x") throws {

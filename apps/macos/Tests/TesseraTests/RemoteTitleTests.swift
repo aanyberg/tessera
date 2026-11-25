@@ -58,6 +58,7 @@ final class RemoteTitleTests: XCTestCase {
     /// temporary directory.
     private func startCore(config: String) throws -> URL {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("tessera-remote-\(UUID().uuidString)")
+        addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
         XCTAssertTrue(dir.path.hasPrefix("/"), "an absolute TESSERA_CONFIG_DIR")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         self.dir = dir

@@ -1385,6 +1385,7 @@ final class TerminalScrollerTests: XCTestCase {
         }
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("tessera-scroller-theme-\(UUID().uuidString)")
+        addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let file = dir.appendingPathComponent("config.toml")
         try config("Dracula", "Solarized Light").write(to: file, atomically: true, encoding: .utf8)

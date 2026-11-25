@@ -89,13 +89,15 @@ fn exit_code_is_reported() {
 fn login_shell_runs_exit_and_reports_code() {
     // Point zsh at an empty ZDOTDIR so the developer's rc files cannot
     // interfere; other shells read nothing from it.
-    let dir = std::env::temp_dir().join(format!("tessera-pty-login-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let options = SpawnOptions::login_shell("login-session").env("ZDOTDIR", &dir);
+    // It is removed when the test ends, passing or failing.
+    let dir = tempfile::Builder::new()
+        .prefix("tessera-pty-login-")
+        .tempdir()
+        .unwrap();
+    let options = SpawnOptions::login_shell("login-session").env("ZDOTDIR", dir.path());
     let (mut pty, events) = NativePty::spawn(&options).unwrap();
     pty.write(b"exit 5\n").unwrap();
     let collected = collect_all(&events);
-    let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(
         collected.exit,
         Some(ExitStatus::Exited(5)),
@@ -206,9 +208,12 @@ fn closing_the_session_injects_no_input() {
     // (non-canonical, so no line editing hides stray bytes) input to a file
     // and is killed by a helper subshell a second later, which is the only
     // way the session ends. The file must contain exactly what we wrote.
-    let dir = std::env::temp_dir().join(format!("tessera-pty-noinject-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let file = dir.join("input");
+    // Removed when the test ends, passing or failing.
+    let dir = tempfile::Builder::new()
+        .prefix("tessera-pty-noinject-")
+        .tempdir()
+        .unwrap();
+    let file = dir.path().join("input");
     let script = format!(
         "stty -icanon -echo; trap '' HUP; echo READY; \
          (sleep 1; kill -TERM $$) & exec cat > '{}'",
@@ -224,7 +229,6 @@ fn closing_the_session_injects_no_input() {
 
     let collected = collect_all(&events);
     let contents = std::fs::read(&file).unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(collected.exit, Some(ExitStatus::Signaled(SIGTERM)));
     assert_eq!(
         contents,
@@ -560,30 +564,31 @@ fn the_child_leads_its_own_session_on_the_pty_as_controlling_terminal() {
     );
 }
 
-/// A temporary directory removed on drop.
-struct TempDir(std::path::PathBuf);
+/// A temporary directory (`tessera-pty-<tag>-*`) removed on drop.
+struct TempDir(tempfile::TempDir);
 
 impl TempDir {
     fn new(tag: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!("tessera-pty-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        Self(dir)
+        Self(
+            tempfile::Builder::new()
+                .prefix(&format!("tessera-pty-{tag}-"))
+                .tempdir()
+                .unwrap(),
+        )
+    }
+
+    /// The directory's path.
+    fn path(&self) -> &std::path::Path {
+        self.0.path()
     }
 
     /// Writes `bytes` to `name` with `mode` and returns its path.
     fn file(&self, name: &str, bytes: &[u8], mode: u32) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt;
-        let path = self.0.join(name);
+        let path = self.0.path().join(name);
         std::fs::write(&path, bytes).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
         path
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -714,7 +719,7 @@ fn the_interpreter_check_follows_the_programs_path_lookup() {
     // the working directory; a `./` name is joined to the working
     // directory alone. The check inspects that same file.
     let dir = TempDir::new("exec-path");
-    let bin = dir.0.join("bin");
+    let bin = dir.path().join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     std::fs::create_dir_all(bin.join("tessera-bad-tool")).unwrap();
     let decoy = TempDir::new("exec-path-decoy");
@@ -724,15 +729,15 @@ fn the_interpreter_check_follows_the_programs_path_lookup() {
     real.file("tessera-bad-tool", b"#!/nonexistent/x\n", 0o755);
     // A directory and a file without x permission come first in `PATH`;
     // both are skipped, as portable-pty skips them.
-    let path = std::env::join_paths([&bin, &decoy.0, &real.0]).unwrap();
+    let path = std::env::join_paths([bin.as_path(), decoy.path(), real.path()]).unwrap();
     let options = SpawnOptions::command("tessera-bad-tool", "s").env("PATH", &path);
     assert!(refused_reason(&options).contains("/nonexistent/x"));
 
     // A relative `PATH` entry is joined to the working directory.
     let options = SpawnOptions::command("tessera-bad-tool", "s")
         .env("PATH", "exec-path-sub")
-        .cwd(&dir.0);
-    std::fs::create_dir_all(dir.0.join("exec-path-sub")).unwrap();
+        .cwd(dir.path());
+    std::fs::create_dir_all(dir.path().join("exec-path-sub")).unwrap();
     dir.file(
         "exec-path-sub/tessera-bad-tool",
         b"#!/nonexistent/y\n",
@@ -741,12 +746,12 @@ fn the_interpreter_check_follows_the_programs_path_lookup() {
     assert!(refused_reason(&options).contains("/nonexistent/y"));
 
     dir.file("local", b"#!/nonexistent/z\n", 0o755);
-    let options = SpawnOptions::command("./local", "s").cwd(&dir.0);
+    let options = SpawnOptions::command("./local", "s").cwd(dir.path());
     assert!(refused_reason(&options).contains("/nonexistent/z"));
 
     // The same names resolving to a good script spawn.
     dir.file("good", b"#!/bin/sh\necho good\n", 0o755);
-    let options = SpawnOptions::command("./good", "s").cwd(&dir.0);
+    let options = SpawnOptions::command("./good", "s").cwd(dir.path());
     assert_eq!(
         collect_all(&NativePty::spawn(&options).unwrap().1).text,
         "good\n"
@@ -764,7 +769,7 @@ fn a_login_shell_that_is_a_broken_script_is_refused() {
 #[test]
 fn a_directory_and_a_file_without_x_permission_are_refused_before_forking() {
     let dir = TempDir::new("exec-kinds");
-    let sub = dir.0.join("dir");
+    let sub = dir.path().join("dir");
     std::fs::create_dir_all(&sub).unwrap();
     assert!(refused_reason(&SpawnOptions::command(&sub, "s")).contains("directory"));
     let nox = dir.file("nox", b"#!/bin/sh\necho x\n", 0o644);
@@ -843,7 +848,7 @@ fn exec_rows(dir: &std::path::Path) -> Vec<ExecRow> {
 /// Creates `row`'s file in `dir`.
 fn create(row: &ExecRow, dir: &TempDir) {
     use std::os::unix::fs::PermissionsExt;
-    let path = dir.0.join(&row.id);
+    let path = dir.path().join(&row.id);
     match row.kind.as_str() {
         "file" => {
             dir.file(&row.id, &row.content, 0o755);
@@ -906,13 +911,13 @@ fn exec_outcome(path: &std::path::Path) -> String {
 #[test]
 fn exec_spec_fixture() {
     let dir = TempDir::new("exec-spec");
-    let rows = exec_rows(&dir.0);
+    let rows = exec_rows(dir.path());
     for row in &rows {
         create(row, &dir);
     }
     let mut checked = 0;
     for row in rows.iter().filter(|row| row.tessera != "doc") {
-        let path = dir.0.join(&row.id);
+        let path = dir.path().join(&row.id);
         let exec = exec_outcome(&path);
         let expected_exec = if row.execvp == "sh" {
             "ok"
@@ -921,7 +926,7 @@ fn exec_spec_fixture() {
         };
         assert_eq!(exec, expected_exec, "row {}: exec outcome", row.id);
 
-        let options = SpawnOptions::command(&path, "exec-spec").cwd(&dir.0);
+        let options = SpawnOptions::command(&path, "exec-spec").cwd(dir.path());
         let (verdict, detail) = row.tessera.split_once(' ').unwrap_or((&row.tessera, ""));
         match verdict {
             "runs" => {

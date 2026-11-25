@@ -142,6 +142,7 @@ final class CommandNotifierTests: XCTestCase {
     /// Gives the app a core of its own on `config`.
     private func startCore(config: String) throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("tessera-notify-\(UUID().uuidString)")
+        addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         self.dir = dir
         try config.write(to: dir.appendingPathComponent("config.toml"), atomically: true, encoding: .utf8)

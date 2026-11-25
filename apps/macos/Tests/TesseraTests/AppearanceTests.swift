@@ -85,6 +85,7 @@ final class AppearanceTests: XCTestCase {
     func testTheSettingsWindowIsDark() throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(
             "tessera-appearance-\(UUID().uuidString)")
+        addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         self.dir = dir
         try "".write(to: dir.appendingPathComponent("config.toml"), atomically: true, encoding: .utf8)

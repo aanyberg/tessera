@@ -138,6 +138,7 @@ final class TesseraKitTests: XCTestCase {
         // A directory of this test's own: the scheme's scratch directory must
         // stay absent, so the other tests run without the configuration watch.
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("tessera-config-\(UUID().uuidString)")
+        addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
         let previous = ProcessInfo.processInfo.environment["TESSERA_CONFIG_DIR"]
         setenv("TESSERA_CONFIG_DIR", dir.path, 1)
         defer {

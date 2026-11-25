@@ -798,6 +798,7 @@ final class QuitAndCloseAllTests: XCTestCase {
     /// `config.toml`, shut down in `tearDown`.
     private func startCore(config: String) throws -> TesseraApp {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("tessera-464-keys-\(UUID().uuidString)")
+        addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         configDirs.append(dir)
         try config.write(to: dir.appendingPathComponent("config.toml"), atomically: true, encoding: .utf8)

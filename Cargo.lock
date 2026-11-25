@@ -2440,6 +2440,7 @@ name = "tessera-devwin"
 version = "0.2.1"
 dependencies = [
  "serde_json",
+ "tempfile",
  "tessera-app-core",
  "tessera-term",
  "winit",
@@ -2500,6 +2501,7 @@ dependencies = [
  "libc",
  "nix",
  "portable-pty",
+ "tempfile",
  "thiserror 2.0.21",
  "tracing",
 ]
@@ -2515,6 +2517,7 @@ dependencies = [
  "pollster",
  "raw-window-handle",
  "swash",
+ "tempfile",
  "tessera-grid",
  "tessera-render",
  "thiserror 2.0.21",
@@ -3471,6 +3474,7 @@ dependencies = [
  "schemars",
  "serde_json",
  "similar",
+ "tempfile",
  "tessera-config",
  "thiserror 2.0.21",
  "toml",

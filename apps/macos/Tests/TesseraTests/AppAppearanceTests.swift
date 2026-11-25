@@ -33,6 +33,8 @@ final class AppAppearanceTests: XCTestCase {
     }
 
     override func tearDown() async throws {
+        // Removed even when a step below throws (`replaceCore`).
+        defer { if let dir { try? FileManager.default.removeItem(at: dir) } }
         for controller in appDelegate.windowControllers {
             if let window = controller.window, let sheet = window.attachedSheet {
                 window.endSheet(sheet, returnCode: .alertSecondButtonReturn)
@@ -49,7 +51,6 @@ final class AppAppearanceTests: XCTestCase {
         } else {
             unsetenv("TESSERA_CONFIG_DIR")
         }
-        try? FileManager.default.removeItem(at: dir)
         appDelegate.spawnOptions = .init()
         appDelegate = nil
     }

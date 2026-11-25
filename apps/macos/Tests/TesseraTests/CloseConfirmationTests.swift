@@ -1347,6 +1347,7 @@ final class TerminationSignalTests: XCTestCase {
         followedBy followUp: Int32?, quitKeepsWindows: Bool?, crashesAtLaunch: Bool
     ) async throws -> Result {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("tessera-441-\(UUID().uuidString)")
+        addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         // A suite at a path in `dir`, not in ~/Library/Preferences:
         // cfprefsd writes what the child saved to its file seconds after

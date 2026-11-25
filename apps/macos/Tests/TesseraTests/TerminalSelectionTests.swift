@@ -156,9 +156,14 @@ final class TerminalSelectionTests: XCTestCase {
 
         init(app: TesseraApp, delegate: TitleRecorder, row: Row) async throws {
             self.delegate = delegate
-            directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
                 "tessera-selection-\(UUID().uuidString)")
+            self.directory = directory
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            // An init that throws (a spawn that fails, a child that never
+            // prints) returns no rig to close: the directory goes here.
+            var started = false
+            defer { if !started { try? FileManager.default.removeItem(at: directory) } }
             let stage1 = directory.appendingPathComponent("stage1")
             try Data(row.initialFeed).write(to: stage1)
             session = try app.spawn(
@@ -186,6 +191,7 @@ final class TerminalSelectionTests: XCTestCase {
             view.pasteboard = pasteboard
             sentinel = (pasteboard.changeCount, "sentinel")
             try await waitForTitle("sync-1", "the child printed the row's text")
+            started = true
         }
 
         func close() {

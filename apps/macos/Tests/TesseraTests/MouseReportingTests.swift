@@ -63,6 +63,7 @@ final class MouseReportingTests: XCTestCase {
     private func spawnRecorder(modes: String) -> URL {
         let file = FileManager.default.temporaryDirectory.appendingPathComponent(
             "tessera-mouse-\(UUID().uuidString).bin")
+        addTeardownBlock { try? FileManager.default.removeItem(at: file) }
         files.append(file)
         appDelegate.spawnOptions = .init(
             program: "/bin/sh",

@@ -149,7 +149,8 @@ fn close_ten_cooked_sessions_with_pending_input() -> Duration {
 struct RawCopy {
     pid: u32,
     events: PtyEvents,
-    dir: std::path::PathBuf,
+    /// Holds `file`; removed when the watcher drops, a failed check too.
+    _dir: tempfile::TempDir,
     file: std::path::PathBuf,
 }
 
@@ -161,10 +162,11 @@ impl RawCopy {
     /// `assert_input_stopped` rejects. (Dropping chunks that are still
     /// queued is covered by the queue's unit test.)
     fn start(tag: &str) -> (NativePty, Self) {
-        let dir =
-            std::env::temp_dir().join(format!("tessera-pty-close-{tag}-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("input");
+        let dir = tempfile::Builder::new()
+            .prefix(&format!("tessera-pty-close-{tag}-"))
+            .tempdir()
+            .unwrap();
+        let file = dir.path().join("input");
         let script = format!(
             "trap '' HUP; stty raw -echo; echo READY; exec cat > '{}'",
             file.display()
@@ -184,7 +186,7 @@ impl RawCopy {
             Self {
                 pid,
                 events,
-                dir,
+                _dir: dir,
                 file,
             },
         )
@@ -201,7 +203,6 @@ impl RawCopy {
         let alive = !reaped(self.pid);
         kill(self.pid);
         let status = exit_before(&self.events, Instant::now() + TIMEOUT);
-        let _ = std::fs::remove_dir_all(&self.dir);
 
         assert!(alive, "child ignoring SIGHUP exited anyway");
         assert_eq!(status, Some(ExitStatus::Signaled(Signal::SIGKILL as i32)));
@@ -272,9 +273,12 @@ fn a_chunk_being_written_is_abandoned_at_hangup() {
     // file grows by at most `CLOSE_RESIDUE` after the hangup and then
     // stops. Growth is bounded rather than timed so a starved reader on a
     // loaded machine only delays the check.
-    let dir = std::env::temp_dir().join(format!("tessera-pty-close-slow-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let file = dir.join("input");
+    // Removed when the test ends, passing or failing.
+    let dir = tempfile::Builder::new()
+        .prefix("tessera-pty-close-slow-")
+        .tempdir()
+        .unwrap();
+    let file = dir.path().join("input");
     let script = format!(
         "trap '' HUP; stty raw -echo; echo READY; exec perl -e \
          'while (sysread STDIN, $b, 1024) {{ syswrite STDOUT, $b; select undef, undef, undef, 0.02 }}' \
@@ -312,7 +316,6 @@ fn a_chunk_being_written_is_abandoned_at_hangup() {
     let alive = pty.exit_status().is_none();
     pty.kill().unwrap();
     let status = exit_before(&events, Instant::now() + TIMEOUT);
-    let _ = std::fs::remove_dir_all(&dir);
 
     assert!(alive, "child ignoring SIGHUP exited anyway");
     assert_eq!(status, Some(ExitStatus::Signaled(Signal::SIGKILL as i32)));

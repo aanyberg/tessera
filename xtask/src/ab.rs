@@ -862,8 +862,13 @@ mod tests {
     #[test]
     fn init_builds_a_probe_against_head_and_refuses_a_used_directory() {
         let root = crate::repo_root();
-        let out = std::env::temp_dir().join(format!("xtask-ab-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&out);
+        // `out` starts missing, in a directory removed when the test ends,
+        // passing or failing.
+        let temp = tempfile::Builder::new()
+            .prefix("xtask-ab-")
+            .tempdir()
+            .unwrap();
+        let out = temp.path().join("out");
 
         let aliases = init(&root, "HEAD", &["tessera-vt".to_owned()], &out).unwrap();
         assert_eq!(aliases, ["base_vt", "head_vt"]);
@@ -908,7 +913,6 @@ mod tests {
             init(&root, "HEAD", &["no-such-crate".to_owned()], &out),
             Err(Error::UnknownCrate { .. })
         ));
-        let _ = fs::remove_dir_all(&out);
     }
 
     /// The top-level entries of `root` that a string-literal `include_str!`

@@ -14,11 +14,10 @@ mod common;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::HashSet;
 use std::ffi::{CString, c_char, c_void};
-use std::path::PathBuf;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use tessera_app_core::SessionId;
 use tessera_app_core::input::{
@@ -525,16 +524,14 @@ fn scroll_event() -> ScrollEvent {
     }
 }
 
-/// A path for a scratch file no other test uses.
-fn scratch_path(name: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
+/// A directory of its own (`tessera-ffi-input-<name>-*` in the temporary
+/// directory) for a scratch file no other test uses, removed when the guard
+/// drops: when the test passes and when it fails.
+fn scratch_dir(name: &str) -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix(&format!("tessera-ffi-input-{name}-"))
+        .tempdir()
         .unwrap()
-        .as_nanos();
-    std::env::temp_dir().join(format!(
-        "tessera-ffi-input-{name}-{}-{nanos}",
-        std::process::id()
-    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -884,7 +881,8 @@ fn composed_text_and_layout_hints_are_used() {
 fn paste_is_sanitised_before_the_child_reads_it() {
     let outputs = Outputs::default();
     let app = Handle::new(&outputs);
-    let path = scratch_path("paste");
+    let scratch = scratch_dir("paste");
+    let path = scratch.path().join("written");
     let script = format!(
         "stty raw -echo; echo ready; head -c 8 > '{}'",
         path.display()
@@ -906,7 +904,6 @@ fn paste_is_sanitised_before_the_child_reads_it() {
             }
         }
     };
-    let _ = std::fs::remove_file(&path);
     assert_eq!(written, b"a\rb[31mc");
 }
 
@@ -914,7 +911,8 @@ fn paste_is_sanitised_before_the_child_reads_it() {
 fn a_paste_cannot_end_a_bracketed_paste_or_carry_c1_controls() {
     let outputs = Outputs::default();
     let app = Handle::new(&outputs);
-    let path = scratch_path("paste-c1");
+    let scratch = scratch_dir("paste-c1");
+    let path = scratch.path().join("written");
     let script = format!(
         "stty raw -echo; echo ready; head -c 10 > '{}'",
         path.display()
@@ -940,7 +938,6 @@ fn a_paste_cannot_end_a_bracketed_paste_or_carry_c1_controls() {
             }
         }
     };
-    let _ = std::fs::remove_file(&path);
     assert_eq!(written, b"x[201~yz\rw");
 }
 
@@ -1116,7 +1113,8 @@ fn mouse_reports_reach_a_tracking_child_and_are_consumed() {
     const EXPECTED: &[u8] = b"\x1b[<0;4;5M\x1b[<0;4;5m\x1b[<64;1;1M";
     let outputs = Outputs::default();
     let app = Handle::new(&outputs);
-    let path = scratch_path("mouse");
+    let scratch = scratch_dir("mouse");
+    let path = scratch.path().join("written");
     let script = format!(
         "printf '\\033[?1002h\\033[?1006h'; stty raw -echo; echo ready; head -c {} > '{}'",
         EXPECTED.len(),
@@ -1177,7 +1175,6 @@ fn mouse_reports_reach_a_tracking_child_and_are_consumed() {
             }
         }
     };
-    let _ = std::fs::remove_file(&path);
     assert_eq!(
         String::from_utf8_lossy(&written),
         String::from_utf8_lossy(EXPECTED)

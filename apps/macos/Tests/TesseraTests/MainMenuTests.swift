@@ -498,6 +498,7 @@ final class MainMenuTests: XCTestCase {
     /// test's environment is put back at once, the core has read it.
     private func startCore(config: String) throws -> TesseraApp {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("tessera-menu-\(UUID().uuidString)")
+        addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         configDirs.append(dir)
         try config.write(to: dir.appendingPathComponent("config.toml"), atomically: true, encoding: .utf8)

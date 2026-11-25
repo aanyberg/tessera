@@ -2098,12 +2098,12 @@ mod tests {
     /// so the spawn must close the master before it reaps the child.
     #[test]
     fn a_reader_thread_that_cannot_start_after_output_fails_the_spawn() {
-        let marker = std::env::temp_dir().join(format!(
-            "tessera-pty-566-{}-{:?}",
-            std::process::id(),
-            thread::current().id()
-        ));
-        let _ = std::fs::remove_file(&marker);
+        // Removed with the directory on every way out, a failing assert too.
+        let temp = tempfile::Builder::new()
+            .prefix("tessera-pty-566-")
+            .tempdir()
+            .unwrap();
+        let marker = temp.path().join("marker");
         let alone = std::env::var_os("NEXTEST").is_some();
         let fds = open_fds();
         let script = format!("printf printed; : > '{}'; sleep 30", marker.display());
@@ -2127,7 +2127,6 @@ mod tests {
         });
         let outcome = done_rx.recv_timeout(std::time::Duration::from_secs(20));
         let printed = marker.exists();
-        let _ = std::fs::remove_file(&marker);
         let (result, pid) = outcome.expect("the spawn did not return after its reader failed");
         assert!(printed, "the child never got to print before the failure");
         match result {
@@ -2336,8 +2335,8 @@ mod tests {
 
     #[test]
     fn the_header_read_stops_at_512_bytes() {
-        let dir = std::env::temp_dir().join(format!("tessera-pty-header-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let temp = scratch_dir("header");
+        let dir = temp.path();
         let path = dir.join("big");
         let mut bytes = b"#!/bin/sh".to_vec();
         bytes.resize(4096, b'x');
@@ -2349,16 +2348,17 @@ mod tests {
         let header = read_header(&path);
         assert_eq!(&header[..5], b"#!/x\n");
         assert!(header[5..].iter().all(|&byte| byte == 0));
-        assert!(read_header(&dir).iter().all(|&byte| byte == 0));
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(read_header(dir).iter().all(|&byte| byte == 0));
     }
 
-    /// A directory of its own for one test, removed by the caller.
-    fn scratch_dir(test: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("tessera-pty-{test}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// A directory of its own for one test (`tessera-pty-<test>-*` in the
+    /// temporary directory), removed when the guard drops: when the test
+    /// passes and when it fails.
+    fn scratch_dir(test: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("tessera-pty-{test}-"))
+            .tempdir()
+            .unwrap()
     }
 
     /// The boundary in plain numbers, through the file read and the parse
@@ -2367,7 +2367,8 @@ mod tests {
     /// here (the other tests size theirs from the constant).
     #[test]
     fn a_shebang_line_must_end_within_the_first_512_bytes() {
-        let dir = scratch_dir("boundary");
+        let temp = scratch_dir("boundary");
+        let dir = temp.path();
         let path = dir.join("script");
         let parsed_with_line_end_at = |at: usize| {
             let mut bytes = b"#!/bin/sh".to_vec();
@@ -2392,7 +2393,6 @@ mod tests {
             None,
             "the 513th byte is not in the header"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// An interpreter `stat` fails on for a reason other than a missing
@@ -2400,7 +2400,8 @@ mod tests {
     /// refused with that error as the system words it.
     #[test]
     fn an_interpreter_that_cannot_be_reached_is_refused_with_its_error() {
-        let dir = scratch_dir("unreachable");
+        let temp = scratch_dir("unreachable");
+        let dir = temp.path();
         let plain = dir.join("plain");
         std::fs::write(&plain, "").unwrap();
         let looped = dir.join("loop");
@@ -2421,7 +2422,6 @@ mod tests {
                 ))
             );
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The fields of every event logged on the thread it is the default
@@ -2510,7 +2510,8 @@ mod tests {
     #[test]
     fn a_slow_header_read_does_not_hold_the_caller() {
         use std::os::unix::fs::PermissionsExt as _;
-        let dir = scratch_dir("slow-header");
+        let temp = scratch_dir("slow-header");
+        let dir = temp.path();
         let script = dir.join("script");
         std::fs::write(&script, "#!/bin/sh\nexit 7\n").unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -2596,7 +2597,6 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(5));
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Waits up to 10 s for `done` to hold.
@@ -2619,7 +2619,8 @@ mod tests {
     #[test]
     fn a_program_lookup_without_an_answer_refuses_the_spawn_by_name() {
         use std::os::unix::fs::PermissionsExt as _;
-        let dir = scratch_dir("slow-lookup");
+        let temp = scratch_dir("slow-lookup");
+        let dir = temp.path();
         let script = dir.join("script");
         std::fs::write(&script, "#!/bin/sh\nexit 7\n").unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -2652,7 +2653,6 @@ mod tests {
         wait_until("the held stat did not return on release", || {
             lookup().1 == 1
         });
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// #602: with four lookups stuck on a stalled volume, a further spawn
@@ -2740,7 +2740,8 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         let eagain = nix::errno::Errno::EAGAIN as i32;
         let expected = io::Error::from_raw_os_error(eagain).to_string();
-        let dir = scratch_dir("no-check-thread");
+        let temp = scratch_dir("no-check-thread");
+        let dir = temp.path();
         let script = dir.join("script");
         std::fs::write(&script, "#!/bin/sh\nexit 7\n").unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -2759,7 +2760,6 @@ mod tests {
             Err(PtyError::Open(reason)) => assert_eq!(reason, expected),
             other => panic!("not refused with the errno: {:?}", other.err()),
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A short-lived child that exits with `code`.
@@ -2987,7 +2987,8 @@ mod tests {
     /// `PATH` again on the caller. A program given as a path keeps it.
     #[test]
     fn a_program_found_on_path_is_handed_over_by_its_path() {
-        let dir = scratch_dir("path-lookup");
+        let temp = scratch_dir("path-lookup");
+        let dir = temp.path();
         let held = dir.join("held");
         std::fs::create_dir_all(&held).unwrap();
         let mut options = SpawnOptions::command("sh", "path");
@@ -3032,7 +3033,6 @@ mod tests {
             assert_eq!(found, Some(expected), "{given}");
             assert_eq!(command.get_argv()[0], given);
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

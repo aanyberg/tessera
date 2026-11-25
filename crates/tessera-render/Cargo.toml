@@ -41,6 +41,8 @@ wgpu = { version = "30", default-features = false, features = ["metal", "wgsl", 
 png.workspace = true
 # Enables `test-hooks` for this crate's integration tests.
 tessera-render = { path = ".", features = ["test-hooks"] }
+# Scratch directories removed when a test ends, failing or not (#698).
+tempfile = "3"
 
 [features]
 # Exposes `Gpu::lose_device_for_test` for fault-injection tests of
