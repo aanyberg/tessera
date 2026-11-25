@@ -239,7 +239,17 @@ impl Session {
     /// injection that may be empty: such a bash starts as it would without
     /// Tessera, with no `PROMPT_COMMAND` in its environment.
     fn start_with(program: &Path, route: Route, startup: &str, files: &[(&str, &str)]) -> Self {
-        let temp = tempfile::tempdir().unwrap();
+        Self::start_in(tempfile::tempdir().unwrap(), program, route, startup, files)
+    }
+
+    /// [`Session::start_with`] with the scripts and the home in `temp`.
+    fn start_in(
+        temp: tempfile::TempDir,
+        program: &Path,
+        route: Route,
+        startup: &str,
+        files: &[(&str, &str)],
+    ) -> Self {
         let root = temp.path().canonicalize().unwrap();
         let scripts =
             materialise(&root.join("Application Support/it's/shell-integration")).unwrap();
@@ -1334,15 +1344,41 @@ fn capped(path: &str, host: &str) -> String {
     }
 }
 
+/// The most directory entries the ancestors of the deep directory of
+/// [`the_directory_is_encoded_once_per_directory`] may hold between them.
+/// Past `PATH_MAX` (1024 bytes) every `cd` there finds the directory's path
+/// by reading each ancestor directory for the name of the one below it, so
+/// its cost grows with their entries (#693): in a macOS `$TMPDIR` of 147,000
+/// entries the 17 `cd`s took 2.7 s of system time with the machine idle and
+/// over 30 s at a load of 90; under `target/tmp` they take 0.05 s. The bound
+/// leaves room for a crowded checkout and still fails such a `$TMPDIR`.
+const DEEP_ANCESTOR_ENTRIES: usize = 50_000;
+
+/// The entries the ancestors of `dir` (itself included) hold between them.
+fn ancestor_entries(dir: &Path) -> usize {
+    dir.ancestors()
+        .map(|ancestor| std::fs::read_dir(ancestor).map_or(0, Iterator::count))
+        .sum()
+}
+
 /// Each M1 row's directory is reported with the row's encoding, which is
 /// Terminal.app's rule; the encoding is done once per directory (counted by
 /// `_tessera_si_encodes`), also for a 3.4 KB non-ASCII directory over 50
-/// prompts.
+/// prompts. The home is under `target/tmp`, not `$TMPDIR`: see
+/// [`DEEP_ANCESTOR_ENTRIES`].
 #[test]
 fn the_directory_is_encoded_once_per_directory() {
     for bash in bashes("the_directory_is_encoded_once_per_directory") {
         let what = bash.program.display().to_string();
-        let mut session = Session::start(&bash.program, Route::Rcfile, "");
+        let temp = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let mut session = Session::start_in(temp, &bash.program, Route::Rcfile, "", &[]);
+        assert!(session.injected, "{what}: nothing injected");
+        let entries = ancestor_entries(&session.home);
+        assert!(
+            entries <= DEEP_ANCESTOR_ENTRIES,
+            "{what}: the home's ancestors hold {entries} entries, over {DEEP_ANCESTOR_ENTRIES}: \
+             each cd past PATH_MAX would read them all"
+        );
         let home = session.home.to_str().unwrap().to_owned();
         let mut prompt = 1;
         let mut expected = vec![encode(&home)];

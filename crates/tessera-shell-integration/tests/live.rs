@@ -230,7 +230,11 @@ fn prepare(case: &Case<'_>) -> Prepared {
 /// scripts directory). `$TESSERA_TEST_SCRIPTS` is
 /// the scripts directory, for startup files that source a script.
 fn prepare_via(case: &Case<'_>, route: Route) -> Prepared {
-    let temp = tempfile::tempdir().unwrap();
+    prepare_in(tempfile::tempdir().unwrap(), case, route)
+}
+
+/// [`prepare_via`] with the scripts and the home in `temp`.
+fn prepare_in(temp: tempfile::TempDir, case: &Case<'_>, route: Route) -> Prepared {
     let root = temp.path().canonicalize().unwrap();
     // Like the real location, with a space in it.
     let scripts = materialise(&root.join("Application Support/Tessera/shell-integration")).unwrap();
@@ -402,7 +406,17 @@ fn run_steps(case: &Case<'_>, steps: &[(Wait, &str)]) -> Observed {
 
 /// [`run_steps`] on `route`.
 fn run_steps_via(case: &Case<'_>, steps: &[(Wait, &str)], route: Route) -> Observed {
-    let prepared = prepare_via(case, route);
+    run_steps_in(tempfile::tempdir().unwrap(), case, steps, route)
+}
+
+/// [`run_steps_via`] with the scripts and the home in `temp`.
+fn run_steps_in(
+    temp: tempfile::TempDir,
+    case: &Case<'_>,
+    steps: &[(Wait, &str)],
+    route: Route,
+) -> Observed {
+    let prepared = prepare_in(temp, case, route);
     assert!(
         route == Route::ByHand
             || prepared.injected
@@ -1239,12 +1253,29 @@ fn osc7_encodes_like_terminal_app() {
     }
 }
 
+/// The most directory entries the ancestors of a directory past `PATH_MAX`
+/// (1024 bytes) may hold between them in a test. Past `PATH_MAX` every `cd`
+/// finds the directory's path by reading each ancestor directory for the
+/// name of the one below it, so its cost grows with their entries (#693): a
+/// macOS `$TMPDIR` holding 147,000 made the 17 `cd`s of `bash_tools.rs`
+/// take 2.7 s idle and over 30 s at a load of 90. The bound leaves room for
+/// a crowded checkout and still fails such a `$TMPDIR`.
+const DEEP_ANCESTOR_ENTRIES: usize = 50_000;
+
+/// The entries the ancestors of `dir` (itself included) hold between them.
+fn ancestor_entries(dir: &Path) -> usize {
+    dir.ancestors()
+        .map(|ancestor| std::fs::read_dir(ancestor).map_or(0, Iterator::count))
+        .sum()
+}
+
 /// #358: a directory whose report would pass the 4096-byte payload cap
 /// (`MAX_OSC7_LEN`, which drops a longer one whole and so keeps the last
 /// report, another host's say, in effect) is reported as its deepest
 /// ancestor that fits, never as nothing. Eight levels of 120 `é` encode to
 /// about 5.8 KB. fish 4.3 and later send their own report, so only zsh and
-/// bash run.
+/// bash run. The home is under `target/tmp`, not `$TMPDIR`: see
+/// [`DEEP_ANCESTOR_ENTRIES`].
 #[test]
 fn a_directory_past_the_osc7_cap_reports_its_deepest_ancestor_that_fits() {
     let component = "\u{e9}".repeat(120);
@@ -1255,7 +1286,15 @@ fn a_directory_past_the_osc7_cap_reports_its_deepest_ancestor_that_fits() {
             .map(|bash| (Shell::Bash, bash, ".bashrc")),
     );
     for (shell, program, rc) in cases {
-        let observed = run_steps(
+        let temp = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let entries = ancestor_entries(temp.path());
+        assert!(
+            entries <= DEEP_ANCESTOR_ENTRIES,
+            "{shell:?}: the home's ancestors hold {entries} entries, over \
+             {DEEP_ANCESTOR_ENTRIES}: each cd past PATH_MAX would read them all"
+        );
+        let observed = run_steps_in(
+            temp,
             &Case {
                 shell,
                 program,
@@ -1270,6 +1309,7 @@ fn a_directory_past_the_osc7_cap_reports_its_deepest_ancestor_that_fits() {
                 ),
                 (Wait::Prompts(2), "exit\r"),
             ],
+            Route::Injected,
         );
         let host = host_name();
         let full = encode(&format!(
