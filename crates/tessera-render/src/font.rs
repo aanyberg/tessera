@@ -23,6 +23,7 @@ use swash::zeno::{Angle, Format, Transform, Vector};
 
 use crate::atlas::GlyphKey;
 use crate::boxdraw;
+use crate::cmap;
 use crate::error::RenderError;
 
 /// Family used when the configured one is not installed.
@@ -77,7 +78,11 @@ const MAX_CHAR_FACES: usize = 1 << 16;
 /// output reaching many distinct glyphs must not grow it without bound.
 const MAX_GLYPH_INK: usize = 1 << 16;
 /// One past the largest Unicode scalar value.
-const CODE_SPACE: usize = 0x11_0000;
+const CODE_SPACE_U32: u32 = 0x11_0000;
+/// [`CODE_SPACE_U32`] as an index.
+const CODE_SPACE: usize = CODE_SPACE_U32 as usize;
+/// The `cmap` table's tag.
+const CMAP_TAG: u32 = u32::from_be_bytes(*b"cmap");
 
 /// Font selection for one terminal surface.
 ///
@@ -1440,15 +1445,12 @@ impl Coverage {
         // face, so a slot takes the lowest index that covers it, not the
         // first one written: first face wins in database order.
         let mut owner = vec![u32::MAX; CODE_SPACE];
-        let mut index_face = |index: u32, font: swash::FontRef<'_>| {
-            font.charmap().enumerate(|cp, glyph| {
-                if glyph != 0
-                    && let Some(slot) = owner.get_mut(cp as usize)
-                    && index < *slot
-                {
-                    *slot = index;
-                }
-            });
+        let mut walked = cmap::Walk::default();
+        let mut index_face = |index: u32, table: &[u8]| {
+            if let Some(walk) = walk_face(&mut owner, index, table) {
+                walked.code_points += walk.code_points;
+                walked.records += walk.records;
+            }
         };
         let mut opens = 0;
         for run in members.chunk_by(|a, b| a.0 == b.0) {
@@ -1470,10 +1472,11 @@ impl Coverage {
                     // Resident data: `with_face_data` maps nothing for it.
                     let _ = db.with_face_data(load_by, |data, _| {
                         for (index, face_index) in faces_of_run {
-                            if let Some(font) =
+                            if let Some(table) =
                                 swash::FontRef::from_index(data, face_index as usize)
+                                    .and_then(|font| font.table(CMAP_TAG))
                             {
-                                index_face(index, font);
+                                index_face(index, table);
                             }
                         }
                     });
@@ -1504,6 +1507,8 @@ impl Coverage {
             faces = faces.len(),
             ranges = ranges.len(),
             opens,
+            code_points = walked.code_points,
+            records = walked.records,
             elapsed = ?started.elapsed(),
             "built the fallback coverage index"
         );
@@ -1518,6 +1523,36 @@ impl Coverage {
             .filter(|&&(first, _, _)| first <= cp)
             .map(|&(_, _, id)| id)
     }
+}
+
+/// Walks the character map `table` of the face at `index` in the
+/// coverage build into `owner`: each code point it maps to a glyph goes
+/// to `index` unless a lower index has it. The walk is bounded by the
+/// code space (#689, see [`cmap::enumerate`]); `None` when it panicked,
+/// which leaves that face out (but for what it wrote before), with one
+/// warning naming the face's index, instead of the index thread dying
+/// with the index unlanded.
+fn walk_face(owner: &mut [u32], index: u32, table: &[u8]) -> Option<cmap::Walk> {
+    let walk = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        #[cfg(test)]
+        test_read_hook::during_walk(index);
+        cmap::enumerate(table, CODE_SPACE_U32, |cp, glyph| {
+            if glyph != 0
+                && let Some(slot) = owner.get_mut(cp as usize)
+                && index < *slot
+            {
+                *slot = index;
+            }
+        })
+    }));
+    if walk.is_err() {
+        tracing::warn!(
+            target: "tessera_render",
+            face = index,
+            "a character map walk panicked; the face is left out of the fallback index"
+        );
+    }
+    walk.ok()
 }
 
 /// Largest `cmap` table the coverage index reads from a font file: 2 MiB,
@@ -1546,14 +1581,14 @@ enum CmapRead {
 
 /// The faces `faces` (index into the coverage build's face list, face
 /// index in the file) of the font file at `path`, each handed to `index`
-/// as a font holding only its `cmap`. The file is opened once and read,
+/// as its `cmap` table. The file is opened once and read,
 /// never mapped (#668); a face that cannot be read is skipped, and so is
 /// the whole path when it is no longer a regular file (#669, see
 /// [`open_regular_file`]).
 fn index_file(
     path: &std::path::Path,
     faces: impl Iterator<Item = (u32, u32)>,
-    mut index: impl FnMut(u32, swash::FontRef<'_>),
+    mut index: impl FnMut(u32, &[u8]),
 ) {
     let mut file = match open_regular_file(path) {
         Ok(file) => file,
@@ -1575,8 +1610,8 @@ fn index_file(
         test_read_hook::before_face(path);
         match read_face_cmap(&mut file, face_index, &mut cmap, &mut loaded) {
             CmapRead::Read => {
-                if let Some(font) = swash::FontRef::from_offset(&cmap, 0) {
-                    index(face, font);
+                if let Some(table) = cmap.get(CMAP_FONT_HEADER..) {
+                    index(face, table);
                 }
             }
             CmapRead::Missing => {}
@@ -1746,9 +1781,26 @@ mod test_read_hook {
     use std::path::Path;
 
     type Hook = Box<dyn FnMut(&Path)>;
+    type WalkHook = Box<dyn FnMut(u32)>;
 
     thread_local! {
         static BEFORE_FACE: RefCell<Option<Hook>> = const { RefCell::new(None) };
+        static DURING_WALK: RefCell<Option<WalkHook>> = const { RefCell::new(None) };
+    }
+
+    /// Runs `hook` with the face's index in the build at the start of each
+    /// character map walk on this thread, inside the walk's
+    /// `catch_unwind`, until the next call; `None` removes it.
+    pub(super) fn set_during_walk(hook: Option<WalkHook>) {
+        DURING_WALK.with(|slot| *slot.borrow_mut() = hook);
+    }
+
+    pub(super) fn during_walk(index: u32) {
+        DURING_WALK.with(|slot| {
+            if let Some(hook) = slot.borrow_mut().as_mut() {
+                hook(index);
+            }
+        });
     }
 
     /// Runs `hook` before each face read on this thread until the next
@@ -3322,5 +3374,152 @@ mod tests {
             };
             assert_eq!(opened.is_ok(), regular, "{}: {opened:?}", path.display());
         }
+    }
+
+    /// A `cmap` table with one Windows Unicode full-repertoire (3, 10)
+    /// subtable of `format` (12 or 13) holding `groups`, each (first code
+    /// point, last code point, glyph).
+    fn cmap_with_groups(format: u16, groups: &[(u32, u32, u32)]) -> Vec<u8> {
+        let count = u32::try_from(groups.len()).expect("a test table");
+        let mut cmap = Vec::new();
+        for field in [0_u16, 1, 3, 10] {
+            cmap.extend_from_slice(&field.to_be_bytes());
+        }
+        cmap.extend_from_slice(&12_u32.to_be_bytes());
+        cmap.extend_from_slice(&format.to_be_bytes());
+        cmap.extend_from_slice(&0_u16.to_be_bytes());
+        for field in [16 + 12 * count, 0, count] {
+            cmap.extend_from_slice(&field.to_be_bytes());
+        }
+        for &(start, end, glyph) in groups {
+            for field in [start, end, glyph] {
+                cmap.extend_from_slice(&field.to_be_bytes());
+            }
+        }
+        cmap
+    }
+
+    /// Writes Monaco to `path` with its `cmap` record pointing at `cmap`,
+    /// appended at the end of the file.
+    fn write_monaco_with_cmap(path: &std::path::Path, cmap: &[u8]) {
+        let mut font =
+            std::fs::read("/System/Library/Fonts/Monaco.ttf").expect("Monaco is installed");
+        font.resize(font.len().next_multiple_of(4), 0);
+        let offset = u32::try_from(font.len()).expect("Monaco is small");
+        let len = u32::try_from(cmap.len()).expect("a test table");
+        let tables = usize::from(u16::from_be_bytes([font[4], font[5]]));
+        for record in (0..tables).map(|t| 12 + 16 * t) {
+            if &font[record..record + 4] == b"cmap" {
+                font[record + 8..record + 12].copy_from_slice(&offset.to_be_bytes());
+                font[record + 12..record + 16].copy_from_slice(&len.to_be_bytes());
+            }
+        }
+        font.extend_from_slice(cmap);
+        std::fs::write(path, font).expect("write the font");
+    }
+
+    /// The index over one font, Monaco with `cmap` as its character map,
+    /// built on a helper thread: its ranges (first, last), and how long the
+    /// build took. Fails when the build panics or takes more than a minute.
+    fn index_monaco_with(name: &str, cmap: &[u8]) -> (Vec<(u32, u32)>, std::time::Duration) {
+        let dir = font_scratch(name);
+        let path = dir.path().join("Monaco.ttf");
+        write_monaco_with_cmap(&path, cmap);
+        let mut db = fontdb::Database::new();
+        db.load_font_file(&path).expect("the copy loads");
+        assert_eq!(db.faces().count(), 1);
+        let id = db.faces().next().map(|f| f.id);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let index = Coverage::build(&db);
+            let _ = tx.send((index, started.elapsed()));
+        });
+        let (index, elapsed) = rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the index lands within a minute, without a panic");
+        assert!(index.ranges.iter().all(|&(_, _, face)| Some(face) == id));
+        let ranges = index
+            .ranges
+            .iter()
+            .map(|&(first, last, _)| (first, last))
+            .collect();
+        (ranges, elapsed)
+    }
+
+    /// #689: a format-12 group whose glyph offset is `u32::MAX` overflowed
+    /// swash's glyph arithmetic, a panic in debug builds that killed the
+    /// index thread. The arithmetic wraps, as in release: 'A' takes glyph
+    /// 0xFFFF, 'B' glyph 0 (not covered), 'C' to 'Z' glyphs 1 to 24. Run
+    /// in debug and in release (`cargo test --release`).
+    #[test]
+    fn a_format12_glyph_offset_of_u32_max_wraps_without_a_panic() {
+        let (ranges, _) =
+            index_monaco_with("wrap", &cmap_with_groups(12, &[(0x41, 0x5A, u32::MAX)]));
+        assert_eq!(ranges, [(0x41, 0x41), (0x43, 0x5A)]);
+    }
+
+    /// #689: format-12 groups reaching `u32::MAX` walked four billion code
+    /// points each, and the 2 MiB `cmap` cap holds about 174 000 groups.
+    /// Each is cut at the code space and walked only above the code
+    /// points the groups before it reached, so the build at the cap costs
+    /// one walk of the code space: this test fails at its one-minute bound
+    /// otherwise. After the first group, the second covers the rest of the
+    /// code space but each 0x10000th code point (glyph 0); the remaining
+    /// groups add nothing.
+    #[test]
+    fn format12_groups_reaching_u32_max_cost_one_walk_of_the_code_space() {
+        let count = (MAX_INDEX_CMAP_BYTES as usize - 28) / 12;
+        let mut groups = vec![(0, u32::MAX, 0); count];
+        groups[0] = (0x41, 0x5A, 1);
+        let cmap = cmap_with_groups(12, &groups);
+        assert!(
+            cmap.len() <= MAX_INDEX_CMAP_BYTES as usize,
+            "{}",
+            cmap.len()
+        );
+        let (ranges, elapsed) = index_monaco_with("reach", &cmap);
+        let mut expected = vec![(0x41, 0xFFFF)];
+        expected.extend((1..0x11).map(|plane| ((plane << 16) | 1, (plane << 16) | 0xFFFF)));
+        assert_eq!(ranges, expected);
+        eprintln!("{count} groups indexed in {elapsed:?}");
+    }
+
+    /// #689: a panic in a face's character map walk leaves that face out
+    /// and the index still lands with the others. Menlo's faces come first
+    /// and the walk of each panics; Monaco then takes their characters.
+    #[test]
+    fn a_panic_in_a_cmap_walk_leaves_the_face_out_and_the_index_lands() {
+        const MENLO: &str = "/System/Library/Fonts/Menlo.ttc";
+        const MONACO: &str = "/System/Library/Fonts/Monaco.ttf";
+        let mut db = fontdb::Database::new();
+        db.load_font_file(MENLO).expect("Menlo is installed");
+        let menlo_faces = u32::try_from(db.faces().count()).expect("a few faces");
+        db.load_font_file(MONACO).expect("Monaco is installed");
+        let monaco = db.faces().last().map(|f| f.id);
+        let walks = Arc::new(AtomicU64::new(0));
+        let counted = Arc::clone(&walks);
+        test_read_hook::set_during_walk(Some(Box::new(move |index| {
+            counted.fetch_add(1, Ordering::Relaxed);
+            assert!(index >= menlo_faces, "a hostile walk of face {index}");
+        })));
+        let index = Coverage::build(&db);
+        test_read_hook::set_during_walk(None);
+        assert_eq!(walks.load(Ordering::Relaxed), u64::from(menlo_faces) + 1);
+        assert_eq!(index.lookup('A'), monaco, "Menlo's faces are left out");
+        assert!(
+            index.ranges.iter().all(|&(_, _, id)| Some(id) == monaco),
+            "{:?}",
+            index.ranges
+        );
+    }
+
+    /// #689: swash never reads a format-13 (many-to-one) subtable, so a
+    /// group reaching `u32::MAX` there is not walked at all.
+    #[test]
+    fn a_format13_subtable_is_not_walked() {
+        let (ranges, _) =
+            index_monaco_with("format13", &cmap_with_groups(13, &[(0, u32::MAX, 1); 4]));
+        assert_eq!(ranges, []);
     }
 }
