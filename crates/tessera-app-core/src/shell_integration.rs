@@ -7,7 +7,9 @@
 //! `tessera-shell-integration` materialises under
 //! [`ConfigPaths::shell_integration_dir`](tessera_config::ConfigPaths::shell_integration_dir).
 //! The added variables are part of `SpawnOptions::env`, so the spawn's
-//! `execve` size check counts them like any other.
+//! `execve` size check counts them like any other. A spawn they push past
+//! that limit is started once more without them, and the session's first
+//! line says so ([`too_large_notice`], #519).
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -17,19 +19,40 @@ use tessera_pty::{Program, SpawnOptions};
 use tessera_shell_integration::inject::ENABLED_VAR;
 use tessera_shell_integration::{Injection, Launch, Shell, scripts};
 
-/// `options` with the shell integration applied, or unchanged: when
-/// `setting` is off, when the child's environment already has
-/// `TESSERA_SHELL_INTEGRATION` (set by the caller or inherited, whatever its
-/// value), when the program is not a shell with scripts, when the scripts
-/// cannot be written to `dir` (logged), or when the shell must not be
-/// touched (see [`Injection::for_shell`]).
+/// A copy of `options` with the shell integration applied, or `None` to
+/// start them unchanged: when `setting` is off, when the child's
+/// environment already has `TESSERA_SHELL_INTEGRATION` (set by the caller
+/// or inherited, whatever its value), when the program is not a shell with
+/// scripts, when the scripts cannot be written to `dir` (logged), or when
+/// the shell must not be touched (see [`Injection::for_shell`]). The caller
+/// keeps `options`, to start without the injection when the injected start
+/// is refused.
 ///
 /// The shell is the program's file name, or `$SHELL` (the child's) for
 /// [`Program::LoginShell`]; a login shell whose `$SHELL` is unset is not
 /// changed (the PTY then falls back to the password database's shell, which
 /// is not looked up here).
-pub(crate) fn apply(options: SpawnOptions, setting: ShellIntegration, dir: &Path) -> SpawnOptions {
-    apply_with(options, setting, dir, |key| std::env::var_os(key))
+pub(crate) fn injected(
+    options: &SpawnOptions,
+    setting: ShellIntegration,
+    dir: &Path,
+) -> Option<SpawnOptions> {
+    injected_with(options, setting, dir, |key| std::env::var_os(key))
+}
+
+/// The line written into a session started without shell integration
+/// because the injection took the spawn over the `execve` size limit
+/// (#519, ADR 0021), ending in CR LF. `bytes` and `max` are the injected
+/// spawn's footprint and the limit, as
+/// [`PtyError::ArgumentsTooLong`](tessera_pty::PtyError::ArgumentsTooLong)
+/// gives them: sizes only, never a variable's name or value
+/// (docs/security.md S8).
+pub(crate) fn too_large_notice(bytes: usize, max: usize) -> Vec<u8> {
+    format!(
+        "[Tessera] Shell integration is off for this session: the environment is too large \
+         ({bytes} bytes with it, more than the {max} allowed).\r\n"
+    )
+    .into_bytes()
 }
 
 /// The injection for `options`, or `None` to start it unchanged.
@@ -79,19 +102,19 @@ fn injection_for(
     }
 }
 
-/// [`apply`] with `inherited` standing in for this process's environment.
-fn apply_with(
-    mut options: SpawnOptions,
+/// [`injected`] with `inherited` standing in for this process's
+/// environment.
+fn injected_with(
+    options: &SpawnOptions,
     setting: ShellIntegration,
     dir: &Path,
     inherited: impl Fn(&str) -> Option<OsString>,
-) -> SpawnOptions {
+) -> Option<SpawnOptions> {
     if setting == ShellIntegration::Off {
-        return options;
+        return None;
     }
-    let Some(injection) = injection_for(&options, dir, inherited) else {
-        return options;
-    };
+    let injection = injection_for(options, dir, inherited)?;
+    let mut options = options.clone();
     options
         .env
         .retain(|(name, _)| !injection.env.iter().any(|(key, _)| key == name));
@@ -100,7 +123,7 @@ fn apply_with(
     {
         *args = new_args;
     }
-    options
+    Some(options)
 }
 
 #[cfg(test)]
@@ -111,6 +134,16 @@ mod tests {
     use tessera_shell_integration::scripts::version_dir;
 
     use super::*;
+
+    /// [`injected_with`], or `options` when nothing is injected.
+    fn apply_with(
+        options: SpawnOptions,
+        setting: ShellIntegration,
+        dir: &Path,
+        inherited: impl Fn(&str) -> Option<OsString>,
+    ) -> SpawnOptions {
+        injected_with(&options, setting, dir, inherited).unwrap_or(options)
+    }
 
     /// A temporary scripts root and a home directory with a `.zshrc`.
     struct Dirs {
