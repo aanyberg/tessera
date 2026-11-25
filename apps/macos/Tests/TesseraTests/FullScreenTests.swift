@@ -47,6 +47,9 @@ private struct WindowLayout: Equatable, Codable, CustomStringConvertible {
     var tint: NSRect?
     var titlebarInset: CGFloat
     var contentMinSize: NSSize
+    /// The spacer over the tab bar (#621), 0 while there is none or it is
+    /// hidden.
+    var tabRowSpacer: CGFloat
 
     @MainActor
     init(_ controller: TerminalWindowController) throws {
@@ -64,6 +67,7 @@ private struct WindowLayout: Equatable, Codable, CustomStringConvertible {
         tint = content.titlebarTint?.frame
         titlebarInset = content.titlebarInset
         contentMinSize = window.contentMinSize
+        tabRowSpacer = content.tabRowSpacer.map { $0.isHidden ? 0 : $0.view.frame.height } ?? 0
     }
 
     /// The strip's height, 0 without one.
@@ -73,7 +77,57 @@ private struct WindowLayout: Equatable, Codable, CustomStringConvertible {
         "fullScreen=\(fullScreen) fullSizeContent=\(fullSizeContent) titlebarAppearsTransparent=\(titlebarTransparent) "
             + "isOpaque=\(isOpaque) frame=\(frame) contentLayoutRect=\(contentLayoutRect) panes=\(panes) "
             + "strip=\(backdrop.map { "\($0)" } ?? "none") tint=\(tint.map { "\($0)" } ?? "none") "
-            + "titlebarInset=\(titlebarInset) contentMinSize=\(contentMinSize)"
+            + "titlebarInset=\(titlebarInset) contentMinSize=\(contentMinSize) tabRowSpacer=\(tabRowSpacer)"
+    }
+}
+
+/// Where a window's tab row (AppKit's `NSTabBar`) is, in screen
+/// coordinates, against what holds it (#621): the band of title bar
+/// accessories shown over the panes (the tab bar's, and the spacer over
+/// it), cut to the top of the screen when one is given (in full screen,
+/// where AppKit shows only the part of its toolbar window the accessories
+/// ask for while the menu bar is hidden), and the top of the panes. Found
+/// by walking AppKit's views, not by the app's own reading of them.
+private struct TabRowGeometry: Codable, CustomStringConvertible {
+    var row: NSRect
+    var band: NSRect
+    var screenTop: CGFloat?
+    var panesTop: CGFloat
+    var menuBarVisible: Bool
+
+    /// The space above the tabs: to the top of the band, or of the screen
+    /// where the band runs past it.
+    var top: CGFloat { min(screenTop ?? .infinity, band.maxY) - row.maxY }
+    /// The space below the tabs, to the top of the panes.
+    var bottom: CGFloat { row.minY - panesTop }
+
+    /// `controller`'s window's tab row, `screenTop` being the top of what
+    /// can be seen of it.
+    @MainActor
+    init(_ controller: TerminalWindowController, screenTop: CGFloat?) throws {
+        let window = try XCTUnwrap(controller.window)
+        let tabBarClass: AnyClass = try XCTUnwrap(NSClassFromString("NSTabBar"))
+        func onScreen(_ view: NSView) -> NSRect? {
+            guard let host = view.window else { return nil }
+            return host.convertToScreen(view.convert(view.bounds, to: nil))
+        }
+        func tabBar(in view: NSView) -> NSView? {
+            if view.isKind(of: tabBarClass), !view.isHidden { return view }
+            return view.subviews.lazy.compactMap(tabBar(in:)).first
+        }
+        let shown = window.titlebarAccessoryViewControllers.filter { !$0.isHidden && $0.layoutAttribute == .bottom }
+        let bar = try XCTUnwrap(shown.lazy.compactMap { tabBar(in: $0.view) }.first, "no tab bar in \(window)")
+        row = try XCTUnwrap(onScreen(bar))
+        band = shown.compactMap { onScreen($0.view) }.reduce(NSRect.null) { $0.union($1) }
+        self.screenTop = screenTop
+        let panes = controller.paneContainer
+        panesTop = window.convertToScreen(panes.convert(panes.bounds, to: nil)).maxY
+        menuBarVisible = NSMenu.menuBarVisible()
+    }
+
+    var description: String {
+        "top=\(top) bottom=\(bottom) row=\(row) band=\(band) screenTop=\(screenTop.map { "\($0)" } ?? "none") "
+            + "panesTop=\(panesTop) menuBarVisible=\(menuBarVisible)"
     }
 }
 
@@ -148,37 +202,82 @@ final class FullScreenLayoutTests: XCTestCase {
         typealias Layout = TerminalWindowContentView.TitlebarLayout
         let layout = TerminalWindowContentView.titlebarLayout
         XCTAssertEqual(
-            layout(false, true, 68), Layout(titlebarTransparent: true, stripHeight: 68),
+            layout(false, true, 68, nil), Layout(titlebarTransparent: true, stripHeight: 68),
             "windowed, translucent: a transparent title bar over the measured strip")
         XCTAssertEqual(
-            layout(false, false, 68), Layout(titlebarTransparent: false, stripHeight: 0),
+            layout(false, false, 68, nil), Layout(titlebarTransparent: false, stripHeight: 0),
             "windowed, opaque: the standard title bar, no strip")
         XCTAssertEqual(
-            layout(true, true, 68), Layout(titlebarTransparent: false, stripHeight: 0),
+            layout(true, true, 68, nil), Layout(titlebarTransparent: false, stripHeight: 0),
             "full screen, translucent: an opaque title bar, no strip (D7)")
         XCTAssertEqual(
-            layout(true, false, 68), Layout(titlebarTransparent: false, stripHeight: 0),
+            layout(true, false, 68, nil), Layout(titlebarTransparent: false, stripHeight: 0),
             "full screen, opaque: the standard title bar, no strip")
         XCTAssertEqual(
-            layout(false, true, -4), Layout(titlebarTransparent: true, stripHeight: 0),
+            layout(false, true, -4, nil), Layout(titlebarTransparent: true, stripHeight: 0),
             "a content no taller than the panes has no strip")
+    }
+
+    /// The spacer over the tab bar in full screen (#621): AppKit's tab row
+    /// on macOS 27.2 has 0 pt above it and 8 pt below in its accessory
+    /// (measured in an unshown window), and the title row that is above it
+    /// in a window slides away in full screen; the spacer makes the space
+    /// above the tabs the space below them, translucent or opaque, and
+    /// there is none in a window, without a tab bar, or where there is
+    /// already as much space above.
+    func testTheDecisionPutsASpacerOverTheTabRowInFullScreen() {
+        typealias Layout = TerminalWindowContentView.TitlebarLayout
+        typealias Insets = TerminalWindowContentView.TabRowInsets
+        let layout = TerminalWindowContentView.titlebarLayout
+        let macOS27 = Insets(top: 0, bottom: 8)
+        for translucent in [true, false] {
+            let full = layout(true, translucent, 36, macOS27)
+            XCTAssertEqual(
+                full, Layout(titlebarTransparent: false, stripHeight: 0, tabRowSpacerHeight: 8),
+                "full screen, translucent \(translucent): an 8 pt spacer")
+            XCTAssertEqual(
+                macOS27.top + full.tabRowSpacerHeight, macOS27.bottom, accuracy: 1,
+                "full screen, translucent \(translucent): as much space above the tabs as below")
+            XCTAssertEqual(
+                layout(true, translucent, 36, Insets(top: 2, bottom: 9)).tabRowSpacerHeight, 7,
+                "full screen, translucent \(translucent): the difference")
+            XCTAssertEqual(
+                layout(true, translucent, 36, Insets(top: 6, bottom: 4)).tabRowSpacerHeight, 0,
+                "full screen, translucent \(translucent): more space above than below, no spacer")
+            XCTAssertEqual(
+                layout(true, translucent, 36, nil).tabRowSpacerHeight, 0,
+                "full screen, translucent \(translucent): no tab bar, no spacer")
+            XCTAssertEqual(
+                layout(false, translucent, 68, macOS27).tabRowSpacerHeight, 0,
+                "windowed, translucent \(translucent): the title row is over the tabs, no spacer")
+        }
+        XCTAssertEqual(
+            layout(false, true, 68, macOS27), Layout(titlebarTransparent: true, stripHeight: 68),
+            "windowed with a tab bar: the layout of #494")
     }
 
     /// Two tabs of `profile` in one window (so it has a tab bar), the
     /// first selected.
     private func openTabs(profile: String?) throws -> (TerminalWindowController, TerminalWindowController) {
+        let tabs = try openTabs(profile: profile, count: 2)
+        return (tabs[0], tabs[1])
+    }
+
+    /// `count` tabs of `profile` in one window, the first selected.
+    private func openTabs(profile: String?, count: Int) throws -> [TerminalWindowController] {
         let host = try host ?? TransparencyHost(core: TesseraApp())
         self.host = host
-        let first = try host.open(profile: profile)
-        let second = try host.open(profile: profile)
-        let window = try XCTUnwrap(first.window)
-        window.addTabbedWindow(try XCTUnwrap(second.window), ordered: .above)
+        let tabs = try (0..<count).map { _ in try host.open(profile: profile) }
+        let window = try XCTUnwrap(tabs[0].window)
+        for tab in tabs.dropFirst() {
+            window.addTabbedWindow(try XCTUnwrap(tab.window), ordered: .above)
+        }
         window.tabGroup?.selectedWindow = window
-        guard MTLCreateSystemDefaultDevice() != nil, (first.panes + second.panes).allSatisfy(\.view.surface.isAttached)
+        guard MTLCreateSystemDefaultDevice() != nil, tabs.flatMap(\.panes).allSatisfy(\.view.surface.isAttached)
         else {
             throw XCTSkip("the core could not attach a renderer to the views (no GPU can present, or no font)")
         }
-        return (first, second)
+        return tabs
     }
 
     /// The window's delegate as AppKit calls it at the end of a transition.
@@ -217,8 +316,13 @@ final class FullScreenLayoutTests: XCTestCase {
         XCTAssertEqual(full.stripHeight, 0, "full screen: no strip under the title bar and tab bar")
         XCTAssertEqual(full.tint?.height, 0, "full screen: no tint either")
         XCTAssertFalse(full.isOpaque, "the panes keep their opacity")
-        XCTAssertEqual(full.panes, windowed.panes, "the panes keep their frames")
-        XCTAssertEqual(full.contentMinSize, windowed.contentMinSize, "the windowed smallest size is kept")
+        XCTAssertGreaterThan(full.tabRowSpacer, 0, "full screen: a spacer over the tab bar (#621)")
+        var panes = windowed.panes
+        panes.size.height -= full.tabRowSpacer
+        XCTAssertEqual(full.panes, panes, "the panes keep their frames, less the spacer over the tab bar")
+        XCTAssertEqual(
+            full.contentMinSize.height, windowed.contentMinSize.height + full.tabRowSpacer,
+            "the windowed smallest size is kept, with the spacer")
         XCTAssertFalse(tab.titlebarAppearsTransparent, "the other tab too")
         XCTAssertEqual(try WindowLayout(second).stripHeight, 0, "the other tab has no strip either")
 
@@ -343,11 +447,109 @@ final class FullScreenLayoutTests: XCTestCase {
         for each in [window, try XCTUnwrap(second.window)] { ReportedFullScreen.set(each, true) }
         delegateDid(true, window)
         var full = try WindowLayout(first)
+        XCTAssertGreaterThan(full.tabRowSpacer, 0, "full screen: a spacer over the tab bar (#621)")
         full.fullScreen = false
+        // The spacer takes its height off the content (#621).
+        full.contentLayoutRect.size.height += full.tabRowSpacer
+        full.tabRowSpacer = 0
+        full.bounds = windowed.bounds
+        full.panes = windowed.panes
         XCTAssertEqual(full, windowed, "full screen: the same opaque window")
         for each in [window, try XCTUnwrap(second.window)] { ReportedFullScreen.set(each, false) }
+        // The exit is another transition, on a later pass of the run loop.
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.02))
         delegateDid(false, window)
         XCTAssertEqual(try WindowLayout(first), windowed)
+    }
+}
+
+extension FullScreenLayoutTests {
+    /// In full screen, three tabs (#621): the tab row has as much space
+    /// above it, in the title bar accessories over the panes, as below it,
+    /// translucent and opaque, in every tab; a window has no spacer before
+    /// or after, and its layout is the windowed one again. The real
+    /// transition is ``FullScreenToggleTests``'.
+    func testInFullScreenTheTabRowHasAsMuchSpaceAboveAsBelow() throws {
+        XCTAssertTrue(ReportedFullScreen.installed)
+        for profile in [nil, "solid"] {
+            let tabs = try openTabs(profile: profile, count: 3)
+            let windows = try tabs.map { try XCTUnwrap($0.window) }
+            let windowed = try WindowLayout(tabs[0])
+            let windowedRow = try TabRowGeometry(tabs[0], screenTop: nil)
+            print("FULLSCREEN tab row \(profile ?? "default") windowed: \(windowedRow)")
+            XCTAssertEqual(windowed.tabRowSpacer, 0, "\(profile ?? "default") windowed: no spacer")
+            XCTAssertLessThan(windowedRow.top + 1, windowedRow.bottom, "AppKit's tab row: less space above it")
+
+            // Twice: a spacer hidden on the way out is shown again.
+            for pass in ["first", "second"] {
+                let name = "\(profile ?? "default") \(pass) full screen"
+                for each in windows { ReportedFullScreen.set(each, true) }
+                delegateDid(true, windows[0])
+                windows[0].layoutIfNeeded()
+                let row = try TabRowGeometry(tabs[0], screenTop: nil)
+                print("FULLSCREEN tab row \(name): \(row)")
+                XCTAssertGreaterThan(row.bottom, 0, "\(name): space below the tabs")
+                XCTAssertEqual(row.top, row.bottom, accuracy: 1, "\(name): as much space above the tabs as below")
+                // In full screen AppKit sizes an accessory by its
+                // `fullScreenMinHeight`, not by its view.
+                let spacer = try XCTUnwrap((windows[0].contentView as? TerminalWindowContentView)?.tabRowSpacer, name)
+                XCTAssertEqual(spacer.fullScreenMinHeight, spacer.view.frame.height, "\(name): the height it keeps")
+                // AppKit raises on a tab selected in a window that only says
+                // it is in full screen: the other tabs, which do not hold the
+                // tab bar, are given the same spacer.
+                for (index, tab) in tabs.enumerated().dropFirst() {
+                    XCTAssertEqual(
+                        try WindowLayout(tab).tabRowSpacer, row.top - windowedRow.top,
+                        "\(name), tab \(index): the same spacer")
+                }
+
+                for each in windows { ReportedFullScreen.set(each, false) }
+                RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.02))
+                delegateDid(false, windows[0])
+                XCTAssertEqual(try WindowLayout(tabs[0]), windowed, "\(name): the windowed layout is back")
+                for (index, tab) in tabs.enumerated() {
+                    XCTAssertEqual(try WindowLayout(tab).tabRowSpacer, 0, "\(name), tab \(index) exited")
+                }
+                RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.02))
+            }
+            for window in windows { window.close() }
+        }
+    }
+}
+
+extension FullScreenLayoutTests {
+    /// A tab that was given the spacer in full screen, closed, frees its
+    /// controller, its window and the spacer (#621): the window holds the
+    /// spacer, and the spacer nothing of the tab. The content view is not
+    /// checked: after a faked full-screen entry it outlives the closed
+    /// window on main too, with no spacer, when another test ran first.
+    func testClosingATabWithASpacerReleasesIt() async throws {
+        XCTAssertTrue(ReportedFullScreen.installed)
+        weak var weakController: TerminalWindowController?
+        weak var weakWindow: NSWindow?
+        weak var weakSpacer: NSTitlebarAccessoryViewController?
+        try autoreleasepool {
+            let tabs = try openTabs(profile: nil, count: 2)
+            let windows = try tabs.map { try XCTUnwrap($0.window) }
+            for each in windows { ReportedFullScreen.set(each, true) }
+            delegateDid(true, windows[0])
+            weakController = tabs[1]
+            weakWindow = windows[1]
+            weakSpacer = (windows[1].contentView as? TerminalWindowContentView)?.tabRowSpacer
+            // AppKit's full-screen paths are not taken for a window that
+            // only says it is in full screen.
+            for each in windows { ReportedFullScreen.set(each, false) }
+            for pane in tabs[1].panes { pane.view.inputContext?.deactivate() }
+        }
+        XCTAssertNotNil(weakSpacer, "the tab had a spacer")
+        autoreleasepool { weakController?.window?.close() }
+        let deadline = ContinuousClock.now + .seconds(10)
+        while weakController != nil || weakWindow != nil || weakSpacer != nil, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertNil(weakController, "the closed tab's controller is freed")
+        XCTAssertNil(weakWindow, "its window is freed")
+        XCTAssertNil(weakSpacer, "its spacer is freed")
     }
 }
 
@@ -358,6 +560,11 @@ private struct ToggleLayouts: Codable {
     var full: WindowLayout
     var tab: WindowLayout
     var exited: WindowLayout
+    /// The tab row of every tab in full screen, each selected in turn
+    /// (#621), the screen's top cutting what can be seen of it.
+    var fullRows: [TabRowGeometry] = []
+    /// Every tab after the transition out, each selected in turn.
+    var exitedTabs: [WindowLayout] = []
 }
 
 /// Native full screen for real (#494, ADR 0043 D7): a window and a tab
@@ -420,11 +627,11 @@ final class FullScreenToggleTests: XCTestCase {
     /// One transition of `profile` in a child test host; its layouts,
     /// printed. A child that never starts its work fails the test (XCTest
     /// was not injected into it): only a started child's end is the host's.
-    private func enterAndExit(profile: String?, _ what: String) async throws -> ToggleLayouts {
+    private func enterAndExit(profile: String?, tabs: Int = 2, _ what: String) async throws -> ToggleLayouts {
         try requireTransitions()
         let suite = "com.aanyberg.tessera.tests.\(UUID().uuidString)"
         defer { UserDefaults.standard.removePersistentDomain(forName: suite) }
-        let request = FullScreenToggleChild.Request(profile: profile, configDir: dir.path, suite: suite)
+        let request = FullScreenToggleChild.Request(profile: profile, configDir: dir.path, suite: suite, tabs: tabs)
         try JSONEncoder().encode(request).write(to: dir.appendingPathComponent(FullScreenToggleChild.requestFile))
         let child = try TerminationSignalChild.launch(in: dir)
         defer {
@@ -467,7 +674,32 @@ final class FullScreenToggleTests: XCTestCase {
         print("FULLSCREEN \(what) full screen: \(layouts.full)")
         print("FULLSCREEN \(what) full screen, other tab: \(layouts.tab)")
         print("FULLSCREEN \(what) exited: \(layouts.exited)")
+        for (index, row) in layouts.fullRows.enumerated() {
+            print("FULLSCREEN \(what) tab row of tab \(index) in full screen: \(row)")
+        }
         return layouts
+    }
+
+    /// Three tabs in full screen (#621): in each, selected, the tabs have
+    /// as much space above them as below, to the top of the screen or of
+    /// the accessories over the panes and to the top of the panes, and
+    /// leaving full screen leaves no spacer in any tab.
+    private func assertTabRows(_ layouts: ToggleLayouts, _ what: String, file: StaticString = #filePath, line: UInt = #line) {
+        XCTAssertEqual(layouts.fullRows.count, 3, "\(what): a tab row for every tab", file: file, line: line)
+        for (index, row) in layouts.fullRows.enumerated() {
+            XCTAssertGreaterThan(row.bottom, 0, "\(what) tab \(index): space below the tabs", file: file, line: line)
+            XCTAssertEqual(
+                row.top, row.bottom, accuracy: 1,
+                "\(what) tab \(index) in full screen (menu bar shown: \(row.menuBarVisible)): as much space above "
+                    + "the tabs as below: \(row)", file: file, line: line)
+        }
+        XCTAssertEqual(layouts.exitedTabs.count, 3, "\(what): every tab after the transition", file: file, line: line)
+        for (index, tab) in layouts.exitedTabs.enumerated() {
+            XCTAssertEqual(tab.tabRowSpacer, 0, "\(what) tab \(index) exited: no spacer", file: file, line: line)
+            XCTAssertEqual(
+                tab.contentLayoutRect, layouts.windowed.contentLayoutRect,
+                "\(what) tab \(index) exited: the windowed layout rect", file: file, line: line)
+        }
     }
 
     private func assertFullScreen(
@@ -518,6 +750,20 @@ final class FullScreenToggleTests: XCTestCase {
         let layouts = try await enterAndExit(profile: "solidblur", "opacity 1.0, blur on")
         assertFullScreen(layouts, translucent: false, "opacity 1.0, blur on")
     }
+
+    /// The case #621 names: three tabs of a translucent window, entered
+    /// as the View menu does.
+    func testATranslucentWindowsTabRowHasAsMuchSpaceAboveAsBelowInFullScreen() async throws {
+        let layouts = try await enterAndExit(profile: nil, tabs: 3, "three tabs, opacity 0.8")
+        assertFullScreen(layouts, translucent: true, "three tabs, opacity 0.8")
+        assertTabRows(layouts, "three tabs, opacity 0.8")
+    }
+
+    func testAnOpaqueWindowsTabRowHasAsMuchSpaceAboveAsBelowInFullScreen() async throws {
+        let layouts = try await enterAndExit(profile: "solid", tabs: 3, "three tabs, opacity 1.0")
+        assertFullScreen(layouts, translucent: false, "three tabs, opacity 1.0")
+        assertTabRows(layouts, "three tabs, opacity 1.0")
+    }
 }
 
 /// Set by a notification observer on the main queue, read by the child.
@@ -549,6 +795,9 @@ enum FullScreenToggleChild {
         let configDir: String
         /// The defaults suite the window state is saved to.
         let suite: String
+        /// How many tabs the window has: a window and the rest as ⌘T opens
+        /// them.
+        let tabs: Int
     }
 
     fileprivate struct Outcome: Codable {
@@ -609,10 +858,14 @@ enum FullScreenToggleChild {
         NSApp.activate()
         let first = try appDelegate.newWindow(profile: request.profile)
         guard let window = first.window else { throw TerminationSignalChild.Failure(description: "no window") }
-        let second = try appDelegate.newTab(in: window, profile: request.profile)
+        let others = try (1..<max(2, request.tabs)).map { _ in
+            try appDelegate.newTab(in: window, profile: request.profile)
+        }
+        let second = others[0]
+        let tabs = [first] + others
         window.tabGroup?.selectedWindow = window
         window.makeKeyAndOrderFront(nil)
-        guard MTLCreateSystemDefaultDevice() != nil, (first.panes + second.panes).allSatisfy(\.view.surface.isAttached)
+        guard MTLCreateSystemDefaultDevice() != nil, tabs.flatMap(\.panes).allSatisfy(\.view.surface.isAttached)
         else {
             throw Skip(reason: "the core could not attach a renderer to the views (no GPU can present, or no font)")
         }
@@ -623,10 +876,34 @@ enum FullScreenToggleChild {
         TerminationSignalChild.mark("in full screen")
         let full = try WindowLayout(first)
         let tab = try layout(of: second, selectedIn: window)
+        var fullRows: [TabRowGeometry] = []
+        if request.tabs > 2 {
+            fullRows = try tabs.map { controller in
+                let tab = try tabWindow(of: controller)
+                select(tab, in: window, frame: window.frame)
+                return try TabRowGeometry(controller, screenTop: tab.screen?.frame.maxY)
+            }
+            select(window, in: window, frame: window.frame)
+        }
         try toggle(window, entering: false)
         spin(for: .milliseconds(200))
         TerminationSignalChild.mark("out of full screen")
-        return ToggleLayouts(windowed: windowed, full: full, tab: tab, exited: try WindowLayout(first))
+        let exited = try WindowLayout(first)
+        var exitedTabs: [WindowLayout] = []
+        if request.tabs > 2 {
+            exitedTabs = try tabs.map { controller in
+                select(try tabWindow(of: controller), in: window, frame: window.frame, fullScreen: false)
+                return try WindowLayout(controller)
+            }
+            select(window, in: window, frame: window.frame, fullScreen: false)
+        }
+        return ToggleLayouts(
+            windowed: windowed, full: full, tab: tab, exited: exited, fullRows: fullRows, exitedTabs: exitedTabs)
+    }
+
+    private static func tabWindow(of controller: TerminalWindowController) throws -> NSWindow {
+        guard let tab = controller.window else { throw TerminationSignalChild.Failure(description: "no tab window") }
+        return tab
     }
 
     /// `toggleFullScreen(_:)` on `window`, as the View menu sends it, then
@@ -669,11 +946,13 @@ enum FullScreenToggleChild {
     }
 
     /// Selects `tab` of `window`'s group and runs the app until it is in
-    /// full screen at `frame` (at most 5 s), and a moment more.
-    private static func select(_ tab: NSWindow, in window: NSWindow, frame: NSRect) {
+    /// full screen (or, for `fullScreen` false, out of it) at `frame` (at
+    /// most 5 s), and a moment more.
+    private static func select(_ tab: NSWindow, in window: NSWindow, frame: NSRect, fullScreen: Bool = true) {
         window.tabGroup?.selectedWindow = tab
         let deadline = ContinuousClock.now + .seconds(5)
-        while !(tab.styleMask.contains(.fullScreen) && tab.frame == frame), ContinuousClock.now < deadline {
+        while !(tab.styleMask.contains(.fullScreen) == fullScreen && tab.frame == frame), ContinuousClock.now < deadline
+        {
             spin(for: .milliseconds(20))
         }
         spin(for: .milliseconds(200))
