@@ -138,7 +138,7 @@ final class CloseConfirmationTests: XCTestCase {
         // The shell cannot be sent the name as typed input (the line editor
         // would take the escape as a key), so a script `exec`s it.
         let controller = try appDelegate.newWindow()
-        let job = try await runSleeper(in: dir, session: controller.focusedPane.session, "the copied sleep runs")
+        let job = try await runSleeper(in: dir, pane: controller.focusedPane, "the copied sleep runs")
         XCTAssertTrue(job.name.unicodeScalars.contains { $0.properties.generalCategory == .control }, job.name)
 
         controller.window?.performClose(nil)
@@ -450,6 +450,88 @@ final class CloseConfirmationTests: XCTestCase {
         XCTAssertTrue(presenter.modals.isEmpty)
     }
 
+    // MARK: Start waits (#614, #620)
+
+    func testTheStartBudgetScalesWithTheLoadPerCoreUpToItsCap() {
+        XCTAssertEqual(ChildStartBudget.budget(atLoadPerCore: 0.2), .seconds(30), "an idle machine: the base")
+        XCTAssertEqual(ChildStartBudget.budget(atLoadPerCore: 1), .seconds(30))
+        XCTAssertEqual(ChildStartBudget.budget(atLoadPerCore: 2), .seconds(60), "2x ncpu: twice the base")
+        XCTAssertEqual(ChildStartBudget.budget(atLoadPerCore: 2.5), .seconds(75))
+        XCTAssertEqual(ChildStartBudget.budget(atLoadPerCore: 10), .seconds(90), "the cap")
+    }
+
+    func testAJobStartFailsAtOnceWhenTheShellEnds() async throws {
+        // The shell reads the typed line and exits: the wait sees it end.
+        // Then one that has already ended when the line is typed: the
+        // write fails, and the start fails the same way.
+        for (script, path) in [("read x; exit 4", "the wait"), ("exit 4", "the typing")] {
+            appDelegate.spawnOptions = .init(program: "/bin/sh", arguments: ["-c", script])
+            let pane = try appDelegate.newWindow().focusedPane
+            if path == "the typing" {
+                try await waitUntil("the shell ended", timeout: ChildStartBudget.cap) { pane.view.status != nil }
+            }
+            let started = ContinuousClock.now
+            do {
+                _ = try await startForegroundJob("sleep 100", in: pane)
+                XCTFail("\(path): a job started in a shell that exited")
+            } catch let failure as PollTimedOut {
+                XCTAssertTrue(
+                    failure.description.hasPrefix("the shell ended (shell exited with code 4)"),
+                    "\(path): \(failure.description)")
+                XCTAssertTrue(
+                    failure.description.contains("sleep runs in the foreground; stage: "),
+                    "\(path): \(failure.description)")
+                XCTAssertEqual(
+                    failure.description.contains("stage: the line not typed"), path == "the typing",
+                    "\(path): \(failure.description)")
+            }
+            XCTAssertLessThan(ContinuousClock.now - started, ChildStartBudget.base, "\(path): not after the budget")
+        }
+    }
+
+    func testAJobStartThatTimesOutNamesTheStageItReached() async throws {
+        let short = { ChildStartBudget(base: .milliseconds(500), cap: .milliseconds(500)) }
+        func failure(_ start: () async throws -> Void) async -> String {
+            do {
+                try await start()
+                return "no failure"
+            } catch {
+                return "\(error)"
+            }
+        }
+        // A job runs, but not the one waited for.
+        let busy = try appDelegate.newWindow().focusedPane
+        _ = try await startForegroundJob("sleep 100", in: busy)
+        let other = await failure {
+            _ = try await waitForForegroundJob(in: busy, typed: "sleep 100", "vim runs", budget: short()) {
+                $0.name == "vim"
+            }
+        }
+        XCTAssertTrue(other.hasPrefix("timed out after "), other)
+        XCTAssertTrue(other.contains(#"vim runs; stage: a job runs in the foreground, "sleep" (pid "#), other)
+
+        // At the prompt, the typed line run by the shell itself.
+        let idle = try appDelegate.newWindow().focusedPane
+        try idle.session.write(Array("read x\n".utf8))
+        let builtin = await failure {
+            _ = try await waitForForegroundJob(in: idle, typed: "read x", "read runs", budget: short()) { _ in true }
+        }
+        XCTAssertTrue(
+            builtin.contains("stage: no job in the foreground; the screen shows a prompt and the typed line"), builtin)
+
+        // Nothing on the screen: no prompt, no echo.
+        appDelegate.spawnOptions = .init(program: "/bin/sh", arguments: ["-c", "stty -echo; exec sleep 100"])
+        let silent = try appDelegate.newWindow().focusedPane
+        try await Task.sleep(for: .milliseconds(500))
+        try silent.session.write(Array("sleep 100\n".utf8))
+        let nothing = await failure {
+            _ = try await waitForForegroundJob(in: silent, typed: "sleep 100", "sleep runs", budget: short()) {
+                _ in true
+            }
+        }
+        XCTAssertTrue(nothing.contains("stage: nothing on the screen yet"), nothing)
+    }
+
     // MARK: Text
 
     func testDisplayNameFiltersWhatAProcessCallsItself() {
@@ -503,13 +585,9 @@ final class CloseConfirmationTests: XCTestCase {
     }
 
     /// Types `command` into the tab's shell and waits until it runs in the
-    /// foreground.
+    /// foreground (``startForegroundJob(_:in:)``).
     private func start(_ command: String, in controller: TerminalWindowController) async throws {
-        let name = String(command.prefix { $0 != " " })
-        try controller.focusedPane.session.write(Array("\(command)\n".utf8))
-        _ = try await poll("\(name) runs in the foreground") {
-            try controller.focusedPane.session.foregroundProcess().flatMap { $0.name == name ? $0 : nil }
-        }
+        _ = try await startForegroundJob(command, in: controller.focusedPane)
     }
 
     private func poll<T>(
@@ -555,19 +633,164 @@ struct PollTimedOut: Error, CustomStringConvertible {
     let description: String
 }
 
+// MARK: - Waiting for a child to start (#620, #614)
+
+/// How long a test waits for a child it started (a shell, its job, a
+/// recorder) to get ready: ``base`` while the machine's one-minute load is
+/// at most one per core, that many times the load per core above it, and
+/// at most ``cap`` (#620, #614). Such a wait ends as soon as the child is
+/// ready, or gone, so a long budget costs a passing test nothing; the cap
+/// keeps a failed start within xcodebuild's 120 s allowance per test. The
+/// budget follows the load up while the wait lasts, never down.
+struct ChildStartBudget {
+    static let base: Duration = .seconds(30)
+    static let cap: Duration = .seconds(90)
+
+    /// The budget at `loadPerCore`, the one-minute load average over the
+    /// active cores.
+    static func budget(atLoadPerCore loadPerCore: Double, base: Duration = base, cap: Duration = cap) -> Duration {
+        min(cap, base * max(1, loadPerCore))
+    }
+
+    /// The one-minute load average per active core now.
+    static func loadPerCore() -> Double {
+        var load = 0.0
+        guard getloadavg(&load, 1) == 1 else { return 1 }
+        return load / Double(max(1, ProcessInfo.processInfo.activeProcessorCount))
+    }
+
+    let started = ContinuousClock.now
+    /// ``base`` and ``cap`` unless a test of the waits asks for less.
+    let base: Duration
+    let cap: Duration
+    private(set) var peakLoadPerCore: Double
+    private(set) var budget: Duration
+
+    init(base: Duration = Self.base, cap: Duration = Self.cap) {
+        self.base = base
+        self.cap = cap
+        peakLoadPerCore = Self.loadPerCore()
+        budget = Self.budget(atLoadPerCore: peakLoadPerCore, base: base, cap: cap)
+    }
+
+    var elapsed: Duration { ContinuousClock.now - started }
+
+    /// Whether the budget has run out, at the highest load seen since the
+    /// wait began (read again only once the budget seems spent).
+    mutating func isSpent() -> Bool {
+        guard elapsed >= budget else { return false }
+        peakLoadPerCore = max(peakLoadPerCore, Self.loadPerCore())
+        budget = Self.budget(atLoadPerCore: peakLoadPerCore, base: base, cap: cap)
+        return elapsed >= budget
+    }
+
+    /// "after 31.2 s (budget 30.0 s at load 0.8 per core on 10 cores)".
+    var summary: String {
+        func seconds(_ duration: Duration) -> String {
+            let (whole, fraction) = duration.components
+            return String(format: "%.1f s", Double(whole) + Double(fraction) / 1e18)
+        }
+        return "after \(seconds(elapsed)) (budget \(seconds(budget)) at load "
+            + String(format: "%.1f", peakLoadPerCore)
+            + " per core on \(ProcessInfo.processInfo.activeProcessorCount) cores)"
+    }
+}
+
+/// What `pane`'s shell got to while a job typed as `line` was expected in
+/// the foreground: the job it runs, or else whether its screen shows a
+/// prompt and the typed line, and the screen's last 200 characters.
+@MainActor
+func shellStage(of pane: Pane, typed line: String, job: TesseraSession.ForegroundProcess?) -> String {
+    if let job {
+        return "stage: a job runs in the foreground, "
+            + "\(CloseConfirmation.displayName(job.name).debugDescription) (pid \(job.pid))"
+    }
+    let screen = ((try? pane.session.accessibleText().string) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !screen.isEmpty else {
+        return "stage: nothing on the screen yet (no prompt, the typed line not echoed)"
+    }
+    // A long line wraps; compare without the breaks.
+    let joined = { (text: String) in text.filter { !$0.isWhitespace } }
+    let echoed = joined(screen).contains(joined(line))
+    return "stage: no job in the foreground; the screen shows "
+        + (screen.contains("$") ? "a prompt" : "no prompt") + " and "
+        + (echoed ? "the typed line" : "not the typed line")
+        + ", ending \(String(screen.suffix(200)).debugDescription)"
+}
+
+/// Waits until `pane`'s foreground job satisfies `isReady` and returns it,
+/// for at most a ``ChildStartBudget`` (#614). It fails at once when the
+/// shell exits or `failure` gives a reason, and a timeout names the stage
+/// the shell reached (``shellStage(of:typed:job:)``, then `stage`'s note).
+@MainActor
+func waitForForegroundJob(
+    in pane: Pane, typed line: String, _ description: String, budget: ChildStartBudget = ChildStartBudget(),
+    stage: () -> String? = { nil }, failure: () -> String? = { nil },
+    isReady: (TesseraSession.ForegroundProcess) -> Bool
+) async throws -> TesseraSession.ForegroundProcess {
+    var budget = budget
+    while true {
+        let job = try pane.session.foregroundProcess()
+        if let job, isReady(job) { return job }
+        func stages() -> String {
+            ([shellStage(of: pane, typed: line, job: job)] + [stage()].compactMap(\.self)).joined(separator: "; ")
+        }
+        if let status = pane.view.status {
+            throw PollTimedOut(description: "the shell ended (\(status)) \(budget.summary): \(description); \(stages())")
+        }
+        if let reason = failure() {
+            throw PollTimedOut(description: "\(reason) \(budget.summary): \(description); \(stages())")
+        }
+        if budget.isSpent() {
+            throw PollTimedOut(description: "timed out \(budget.summary): \(description); \(stages())")
+        }
+        try await Task.sleep(for: .milliseconds(20))
+    }
+}
+
+/// Types `command` into `pane`'s shell (an interactive `/bin/sh`) and
+/// returns the job once it runs in the foreground under the name that
+/// `command` starts with (``waitForForegroundJob(in:typed:_:budget:stage:failure:isReady:)``).
+@MainActor
+func startForegroundJob(_ command: String, in pane: Pane) async throws -> TesseraSession.ForegroundProcess {
+    let name = String(command.prefix { $0 != " " })
+    let description = "\(name) runs in the foreground"
+    let budget = ChildStartBudget()
+    try await type(command, into: pane, description, budget: budget)
+    return try await waitForForegroundJob(in: pane, typed: command, description, budget: budget) {
+        $0.name == name
+    }
+}
+
+/// Types `line` and a return into `pane`'s shell. A shell that has already
+/// exited (the write fails) fails the start once, the way
+/// ``waitForForegroundJob(in:typed:_:budget:stage:failure:isReady:)`` does,
+/// with how it ended once the view knows.
+@MainActor
+func type(_ line: String, into pane: Pane, _ description: String, budget: ChildStartBudget) async throws {
+    do {
+        try pane.session.write(Array("\(line)\n".utf8))
+    } catch {
+        var budget = budget
+        while pane.view.status == nil, !budget.isSpent() { try await Task.sleep(for: .milliseconds(20)) }
+        let ended = pane.view.status.map { "the shell ended (\($0))" } ?? "the line could not be typed"
+        throw PollTimedOut(
+            description: "\(ended) \(budget.summary): \(description); stage: the line not typed (\(error))")
+    }
+}
+
 /// Runs the sleeper ``compileSleeper(to:)`` built in `dir` (its name, which
-/// may hold anything, starts with "z" and ends with "q") in `session`, the
-/// way a user would, through a script that `exec`s it, and returns it once
-/// it is the session's foreground job.
+/// may hold anything, starts with "z" and ends with "q") in `pane`'s shell,
+/// the way a user would, through a script that `exec`s it, and returns it
+/// once it is the session's foreground job.
 ///
 /// The shell, the script and the exec take seconds on a loaded CI runner
-/// under TSan (#599), so it waits up to `timeout`; but it fails as soon as
-/// the script's shell (which wrote its pid before the exec) is gone without
-/// having become the sleeper.
+/// under TSan (#599), so it waits up to a ``ChildStartBudget``; but it fails
+/// as soon as the script's shell (which wrote its pid before the exec) is
+/// gone without having become the sleeper, and a timeout says whether the
+/// typed line, the script and its exec got that far.
 @MainActor
-func runSleeper(
-    in dir: URL, session: TesseraSession, _ description: String, timeout: Duration = .seconds(30)
-) async throws -> TesseraSession.ForegroundProcess {
+func runSleeper(in dir: URL, pane: Pane, _ description: String) async throws -> TesseraSession.ForegroundProcess {
     let script = dir.appendingPathComponent("run.sh")
     let pidFile = dir.appendingPathComponent("pid")
     try #"""
@@ -576,20 +799,25 @@ func runSleeper(
         exec "$d"/z*q
 
         """#.write(to: script, atomically: true, encoding: .utf8)
-    try session.write(Array("sh \(script.path)\n".utf8))
-    let deadline = ContinuousClock.now + timeout
-    while true {
-        if let job = try session.foregroundProcess(), job.name.hasPrefix("z") { return job }
-        if let text = try? String(contentsOf: pidFile, encoding: .utf8),
-            let pid = Int32(text.trimmingCharacters(in: .whitespacesAndNewlines)), kill(pid, 0) != 0, errno == ESRCH
-        {
-            throw PollTimedOut(description: "the script's shell (\(pid)) exited before it ran: \(description)")
-        }
-        guard ContinuousClock.now < deadline else {
-            throw PollTimedOut(description: "timed out after \(timeout): \(description)")
-        }
-        try await Task.sleep(for: .milliseconds(20))
+    let line = "sh \(script.path)"
+    let budget = ChildStartBudget()
+    try await type(line, into: pane, description, budget: budget)
+    func scriptPid() -> Int32? {
+        (try? String(contentsOf: pidFile, encoding: .utf8))
+            .flatMap { Int32($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
     }
+    return try await waitForForegroundJob(
+        in: pane, typed: line, description, budget: budget,
+        stage: {
+            scriptPid().map { "the script's shell (\($0)) wrote its pid and has not exec'd the sleeper" }
+                ?? "the script has not written its pid"
+        },
+        failure: {
+            scriptPid().flatMap { pid in
+                kill(pid, 0) != 0 && errno == ESRCH ? "the script's shell (\(pid)) exited before it ran" : nil
+            }
+        },
+        isReady: { $0.name.hasPrefix("z") })
 }
 
 // MARK: - Termination signals with a confirmation up (#441)
@@ -612,6 +840,101 @@ final class TerminationSignalTests: XCTestCase {
     /// #525: only a thread that spent the whole sample in TSan's fork
     /// interceptor at an atfork handler counts as the #278 hang (stacks as
     /// `sample` prints them, from the CI hang of run 44504840654).
+    /// #625: a child that dies of a signal before its first stage (here
+    /// on purpose, as Thread Sanitizer's runtime did under load) is
+    /// started once more, and the test runs on the second one.
+    func testAChildThatDiesBeforeItsFirstStageIsRelaunchedOnce() async throws {
+        let result = try await run(.sheet, command: "sleep 100", trigger: .signal(SIGTERM), crashingLaunches: 1)
+        if let report = result.relaunchedAfter?.crashReport { try? FileManager.default.removeItem(at: report) }
+        let first = try XCTUnwrap(result.relaunchedAfter, "the first launch died, and a second ran")
+        XCTAssertEqual(first.kind, .diedBeforeItsFirstStage)
+        assertQuit(result, within: Self.exitDeadline, "SIGTERM to the relaunched child")
+    }
+
+    /// #625: a second such death fails the test, naming the signal and
+    /// with what Thread Sanitizer and ReportCrash said about the crash.
+    func testAChildThatDiesBeforeItsFirstStageTwiceFailsWithTheSignalAndTheCrashReport() async throws {
+        do {
+            _ = try await run(.sheet, command: "sleep 100", trigger: .signal(SIGTERM), crashingLaunches: 2)
+            XCTFail("a child that died at both launches got ready")
+        } catch let failure as ChildFailedTwice {
+            for report in failure.crashReports { try? FileManager.default.removeItem(at: report) }
+            let text = failure.description
+            XCTAssertTrue(text.hasPrefix("the relaunched child failed too: the child died before its first stage"), text)
+            // Thread Sanitizer's handler turns the fault into an abort.
+            let tsan = Self.threadSanitizerIsLoaded
+            let signal = tsan ? SIGABRT : SIGSEGV
+            let named = "the child died of signal \(signal) (\(String(cString: strsignal(signal))))"
+            XCTAssertEqual(text.components(separatedBy: named).count, 3, "both tries name the signal: \(text)")
+            XCTAssertTrue(text.contains("stages:\n(none)"), text)
+            if tsan {
+                // From its `log_path` file (`tsan.<pid>`, which starts
+                // `==<pid>==ERROR:`), not the child's output, whose
+                // `ThreadSanitizer:DEADLYSIGNAL` the diagnosis also shows.
+                let logged = try NSRegularExpression(
+                    pattern: #"Thread Sanitizer reports:\n\#(TerminationSignalChild.tsanLogPrefix)\.(\d+):\n==\1==ERROR: ThreadSanitizer: SEGV"#)
+                let pids = Set(logged.matches(in: text, range: NSRange(text.startIndex..., in: text)).compactMap {
+                    Range($0.range(at: 1), in: text).map { text[$0] }
+                })
+                XCTAssertEqual(pids.count, 2, "the TSan report of both tries, from its log: \(text)")
+            }
+            // Where ReportCrash writes reports (not every runner might),
+            // its report for the child's pid, with the faulting thread.
+            let reports = text.components(separatedBy: "\ncrash report ").count - 1
+            let missing = text.components(separatedBy: "\nno crash report for pid ").count - 1
+            XCTAssertEqual(reports + missing, 2, "a crash report, or its absence, for both tries: \(text)")
+            XCTAssertEqual(failure.crashReports.count, reports)
+            if reports > 0 {
+                XCTAssertTrue(text.contains("crashed thread "), text)
+                XCTAssertTrue(text.contains("TerminationSignalChild.mark"), "the frame that crashed: \(text)")
+            }
+            print("crash reports found: \(reports) of 2")
+        }
+    }
+
+    /// The summary of a crash report, whether or not this machine still
+    /// writes them (OSAnalytics stops at 25 a process): the exception, the
+    /// abort reason and the crashed thread's frames with their images, from
+    /// the JSON body after the report's header line; a body that does not
+    /// parse comes back as it is.
+    func testACrashReportIsSummarisedByItsExceptionAndCrashedThread() throws {
+        let header = #"{"app_name":"Tessera","name":"Tessera","bug_type":"309"}"#
+        let body: [String: Any] = [
+            "pid": 4242,
+            "exception": ["type": "EXC_CRASH", "signal": "SIGABRT"],
+            "termination": ["indicator": "Abort trap: 6"],
+            "asi": ["libsystem_c.dylib": ["abort() called"]],
+            "faultingThread": 1,
+            "usedImages": [["name": "libsystem_kernel.dylib"], ["name": "libclang_rt.tsan_osx_dynamic.dylib"]],
+            "threads": [
+                ["frames": [["imageIndex": 0, "symbol": "mach_msg2_trap"]]],
+                ["frames": [
+                    ["imageIndex": 0, "symbol": "__pthread_kill"],
+                    ["imageIndex": 1, "symbol": "__tsan::MetaMap::AllocBlock"],
+                    ["imageIndex": 7, "symbol": "beyond the images"],
+                ]],
+            ],
+        ]
+        let json = String(decoding: try JSONSerialization.data(withJSONObject: body), as: UTF8.self)
+        let summary = TerminationSignalChild.summarizeCrashReport("\(header)\n\(json)")
+        XCTAssertEqual(
+            summary,
+            """
+            exception: EXC_CRASH, SIGABRT
+            termination: Abort trap: 6
+            abort reason (libsystem_c.dylib): abort() called
+            crashed thread 1:
+              libsystem_kernel.dylib: __pthread_kill
+              libclang_rt.tsan_osx_dynamic.dylib: __tsan::MetaMap::AllocBlock
+              ?: beyond the images
+            """)
+        XCTAssertEqual(TerminationSignalChild.summarizeCrashReport("\(header)\nnot json"), "\(header)\nnot json")
+    }
+
+    private static let threadSanitizerIsLoaded = (0..<_dyld_image_count()).contains { index in
+        _dyld_get_image_name(index).map { String(cString: $0).contains("libclang_rt.tsan") } ?? false
+    }
+
     func testOnlyAWholeSampleInTheForkInterceptorIsTheForkHang() {
         let hung = [
             "Call graph:",
@@ -872,6 +1195,9 @@ final class TerminationSignalTests: XCTestCase {
         /// answered.
         let confirmations: [String]
         let output: String
+        /// Why the first launch was not used, when the child was started
+        /// once more (``RelaunchedChild``).
+        var relaunchedAfter: RelaunchedChild? = nil
     }
 
     /// Sends `pid` a quit Apple event naming `reason` (as a parameter or
@@ -945,24 +1271,43 @@ final class TerminationSignalTests: XCTestCase {
     /// The hang is found by sampling a child still not ready after
     /// ``forkHangProbe`` (that deadlock never resolves), so a retry costs
     /// about 25 s and a test with one stays well within the default 120 s
-    /// allowance and the watchdog's 150 s. A second hang fails.
+    /// allowance and the watchdog's 150 s. So is a child that dies of a
+    /// signal before its first stage (#625: Thread Sanitizer's runtime
+    /// faulted in its own allocator inside `NSApplication.shared` under
+    /// load); the output says so, with the signal and the crash report.
+    /// Each kind is relaunched once (the two are unrelated, and the second
+    /// can strike the relaunch of the first under load); a second failure
+    /// of the same kind fails the test, with every try's diagnosis.
+    ///
+    /// The first `crashingLaunches` launches crash on purpose before their
+    /// first stage (``TerminationSignalChild/crashVariable``), for the
+    /// tests of that relaunch.
     private func run(
         _ mode: TerminationSignalChild.Mode, command: String, trigger: Trigger?, thenExpect expected: String? = nil,
-        followedBy followUp: Int32? = nil, quitKeepsWindows: Bool? = nil
+        followedBy followUp: Int32? = nil, quitKeepsWindows: Bool? = nil, crashingLaunches: Int = 0
     ) async throws -> Result {
+        var launches = 0
         func attempt() async throws -> Result {
-            try await runOnce(
+            launches += 1
+            return try await runOnce(
                 mode, command: command, trigger: trigger, thenExpect: expected, followedBy: followUp,
-                quitKeepsWindows: quitKeepsWindows)
+                quitKeepsWindows: quitKeepsWindows, crashesAtLaunch: launches <= crashingLaunches)
         }
-        do {
-            return try await attempt()
-        } catch let hang as ChildForkHang {
-            print("TSan fork hang in the child (#278), retried once; the first try:\n\(hang)")
+        var relaunched: [RelaunchedChild] = []
+        while true {
             do {
-                return try await attempt()
-            } catch let again as ChildForkHang {
-                throw PollTimedOut(description: "the second try hung in TSan's fork hook too (#278): \(again)")
+                var result = try await attempt()
+                result.relaunchedAfter = relaunched.first
+                return result
+            } catch let failure as RelaunchedChild {
+                guard !relaunched.contains(where: { $0.kind == failure.kind }) else {
+                    throw ChildFailedTwice(
+                        description: "the relaunched child failed too: \(failure.what): \(failure)\n"
+                            + relaunched.map { "an earlier try: \($0.what): \($0)" }.joined(separator: "\n"),
+                        crashReports: (relaunched + [failure]).compactMap(\.crashReport))
+                }
+                print("\(failure.what), relaunched once; that try:\n\(failure)")
+                relaunched.append(failure)
             }
         }
     }
@@ -972,15 +1317,34 @@ final class TerminationSignalTests: XCTestCase {
     /// (a child gets ready in 11-16 s on CI).
     private static let forkHangProbe: Duration = .seconds(20)
 
-    /// A child that never got ready because its main thread is stuck in
-    /// Thread Sanitizer's fork hook (#278).
-    private struct ChildForkHang: Error, CustomStringConvertible {
+    /// A child that never got ready for a reason of the machine's rather
+    /// than the app's, so it is started once more: its main thread was
+    /// stuck in Thread Sanitizer's fork hook (#278), or it died of a signal
+    /// before its first stage (#625).
+    struct RelaunchedChild: Error, CustomStringConvertible {
+        enum Kind { case forkHang, diedBeforeItsFirstStage }
+        let kind: Kind
         let description: String
+        /// The crash report ReportCrash wrote for it, if one was found.
+        var crashReport: URL?
+
+        var what: String {
+            switch kind {
+            case .forkHang: "TSan fork hang in the child (#278)"
+            case .diedBeforeItsFirstStage: "the child died before its first stage (#625)"
+            }
+        }
+    }
+
+    /// A relaunched child failed as the first one did.
+    struct ChildFailedTwice: Error, CustomStringConvertible {
+        let description: String
+        let crashReports: [URL]
     }
 
     private func runOnce(
         _ mode: TerminationSignalChild.Mode, command: String, trigger: Trigger?, thenExpect expected: String?,
-        followedBy followUp: Int32?, quitKeepsWindows: Bool?
+        followedBy followUp: Int32?, quitKeepsWindows: Bool?, crashesAtLaunch: Bool
     ) async throws -> Result {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("tessera-441-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -1001,7 +1365,8 @@ final class TerminationSignalTests: XCTestCase {
             try? FileManager.default.removeItem(at: dir)
         }
 
-        let child = try TerminationSignalChild.launch(in: dir)
+        let launchedAt = Date()
+        let child = try TerminationSignalChild.launch(in: dir, crashing: crashesAtLaunch)
         let ready = dir.appendingPathComponent(TerminationSignalChild.readyFile)
         let failure = dir.appendingPathComponent(TerminationSignalChild.errorFile)
         let stages = dir.appendingPathComponent(TerminationSignalChild.stagesFile)
@@ -1026,6 +1391,17 @@ final class TerminationSignalTests: XCTestCase {
                 graph = TerminationSignalChild.callGraph(of: child, in: dir)
             }
             let forkHang = loaded && child.isRunning && inFork(graph)
+            if !child.isRunning, !loaded, child.terminationReason == .uncaughtSignal {
+                let (reason, crashReport) = await TerminationSignalChild.crashReason(
+                    of: child, in: dir, launchedAt: launchedAt)
+                let signal = child.terminationStatus
+                throw RelaunchedChild(
+                    kind: .diedBeforeItsFirstStage,
+                    description: "the child died of signal \(signal) (\(String(cString: strsignal(signal)))) "
+                        + "\(waited) after launch, before its first stage\n"
+                        + "\(TerminationSignalChild.diagnose(child, in: dir))\n\(reason)",
+                    crashReport: crashReport)
+            }
             if timedOut || forkHang {
                 let what: String
                 if forkHang {
@@ -1041,7 +1417,7 @@ final class TerminationSignalTests: XCTestCase {
                 if child.isRunning { kill(child.processIdentifier, SIGKILL) }
                 child.waitUntilExit()
                 let description = "the child \(what) after \(waited)\n\(diagnosis)"
-                if hung { throw ChildForkHang(description: description) }
+                if hung { throw RelaunchedChild(kind: .forkHang, description: description) }
                 throw PollTimedOut(description: description)
             }
             try await Task.sleep(for: .milliseconds(20))
@@ -1120,6 +1496,12 @@ enum TerminationSignalChild {
     nonisolated static let stagesFile = "stages.log"
     /// How the parent launched the child, for a failure's diagnosis.
     static let launchFile = "launch.txt"
+    /// Thread Sanitizer's `log_path` in the child's directory: it writes
+    /// each report to this name plus `.<pid>`.
+    static let tsanLogPrefix = "tsan"
+    /// Set to 1, the child crashes before its first stage (the tests of
+    /// #625's relaunch).
+    nonisolated static let crashVariable = "TESSERA_TESTS_SIGNAL_CHILD_CRASH"
     /// Written when `NSApplication.willTerminateNotification` is posted.
     static let willTerminateFile = "will-terminate"
     /// The child's sheets and modal alert once its sheet or alert is up,
@@ -1211,7 +1593,7 @@ enum TerminationSignalChild {
     /// (``requestFile`` there says what), its output in `output.log`.
     /// XCTest in the copy reads a copy of this run's configuration that
     /// reports to no IDE, from a file.
-    static func launch(in dir: URL) throws -> Process {
+    static func launch(in dir: URL, crashing: Bool = false) throws -> Process {
         guard let configurationClass = NSClassFromString("XCTestConfiguration") as? NSObject.Type,
             let active = configurationClass.perform(NSSelectorFromString("activeTestConfiguration"))?
                 .takeUnretainedValue() as? NSObject
@@ -1249,8 +1631,14 @@ enum TerminationSignalChild {
         environment[directoryVariable] = dir.path
         // Thread Sanitizer sleeps 1 s at exit by default (2 s measured); the
         // exit deadline measures the app, not that.
-        environment["TSAN_OPTIONS"] = [environment["TSAN_OPTIONS"], "atexit_sleep_ms=0"]
-            .compactMap(\.self).filter { !$0.isEmpty }.joined(separator: ":")
+        // Its reports go to `tsan.<pid>` in `dir` (``tsanLogPrefix``), for
+        // a failure's diagnosis.
+        environment["TSAN_OPTIONS"] = [
+            environment["TSAN_OPTIONS"], "atexit_sleep_ms=0",
+            "log_path=\(dir.appendingPathComponent(tsanLogPrefix).path)",
+        ]
+        .compactMap(\.self).filter { !$0.isEmpty }.joined(separator: ":")
+        environment[crashVariable] = crashing ? "1" : nil
 
         let output = dir.appendingPathComponent("output.log")
         FileManager.default.createFile(atPath: output.path, contents: Data())
@@ -1280,6 +1668,12 @@ enum TerminationSignalChild {
     /// a process that is no child.
     nonisolated static func mark(_ stage: String) {
         guard let path = ProcessInfo.processInfo.environment[directoryVariable] else { return }
+        if ProcessInfo.processInfo.environment[crashVariable] == "1" {
+            // Before the first stage is written: a fault Thread Sanitizer's
+            // handler reports and aborts on, as in #625's launches (without
+            // TSan, death by SIGSEGV).
+            raise(SIGSEGV)
+        }
         let file = URL(fileURLWithPath: path).appendingPathComponent(stagesFile)
         if !FileManager.default.fileExists(atPath: file.path) {
             FileManager.default.createFile(atPath: file.path, contents: Data())
@@ -1306,6 +1700,7 @@ enum TerminationSignalChild {
             "stages:\n\(read(stagesFile))",
             read(launchFile),
             "output (tail):\n\(read("output.log").suffix(2000))",
+            "Thread Sanitizer reports:\n\(tsanReports(in: dir) ?? "(none)")",
         ]
         if let graph = graph ?? (child.isRunning ? callGraph(of: child, in: dir) : nil) {
             let text = read(sampleFile).split(separator: "\n", omittingEmptySubsequences: false)
@@ -1318,6 +1713,90 @@ enum TerminationSignalChild {
     }
 
     private static let sampleFile = "sample.txt"
+
+    /// What Thread Sanitizer wrote to its logs in `dir` (``tsanLogPrefix``),
+    /// the last 4000 characters of each, or `nil` without any.
+    static func tsanReports(in dir: URL) -> String? {
+        let logs = ((try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? [])
+            .filter { $0.hasPrefix("\(tsanLogPrefix).") }.sorted()
+        guard !logs.isEmpty else { return nil }
+        return logs.map { name in
+            let text = (try? String(contentsOf: dir.appendingPathComponent(name), encoding: .utf8)) ?? ""
+            return "\(name):\n\(text.suffix(4000))"
+        }.joined(separator: "\n")
+    }
+
+    /// Where ReportCrash writes the current user's crash reports.
+    static let crashReportsDirectory = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Logs/DiagnosticReports")
+
+    /// Why `child`, which died of a signal, crashed: the crash report
+    /// ReportCrash wrote for its pid (summarised by ``summarizeCrashReport(_:)``,
+    /// waiting up to `wait` for it to appear), and its URL. Best effort:
+    /// OSAnalytics keeps at most 25 reports of a process name, then saves
+    /// none ("the limit of 25 logs has been reached"), so the Thread
+    /// Sanitizer report (``tsanReports(in:)``) is the one to rely on.
+    static func crashReason(
+        of child: Process, in dir: URL, launchedAt: Date, wait: Duration = .seconds(10)
+    ) async -> (String, URL?) {
+        let pid = child.processIdentifier
+        let name = Bundle.main.executableURL?.lastPathComponent ?? "Tessera"
+        let deadline = ContinuousClock.now + wait
+        let keys: [URLResourceKey] = [.contentModificationDateKey]
+        while true {
+            let reports = ((try? FileManager.default.contentsOfDirectory(
+                at: crashReportsDirectory, includingPropertiesForKeys: keys)) ?? [])
+                .filter { $0.lastPathComponent.hasPrefix("\(name)-") && $0.pathExtension == "ips" }
+                .compactMap { url -> (URL, Date)? in
+                    guard let date = try? url.resourceValues(forKeys: Set(keys)).contentModificationDate,
+                        date >= launchedAt.addingTimeInterval(-1)
+                    else { return nil }
+                    return (url, date)
+                }
+                .sorted { $0.1 > $1.1 }
+            for (url, _) in reports {
+                guard let text = try? String(contentsOf: url, encoding: .utf8),
+                    text.contains("\"pid\" : \(pid),")
+                else { continue }
+                return ("crash report \(url.path):\n\(summarizeCrashReport(text))", url)
+            }
+            guard ContinuousClock.now < deadline else {
+                return ("no crash report for pid \(pid) in \(crashReportsDirectory.path) within \(wait)", nil)
+            }
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+    }
+
+    /// The exception, the abort reason and the crashed thread's top 40
+    /// frames of a crash report (`.ips`: a header line, then a JSON body),
+    /// or its first 3000 characters if the body does not parse.
+    static func summarizeCrashReport(_ text: String) -> String {
+        let body = text.split(separator: "\n", maxSplits: 1).last.map(String.init) ?? ""
+        guard let json = try? JSONSerialization.jsonObject(with: Data(body.utf8)) as? [String: Any] else {
+            return String(text.prefix(3000))
+        }
+        var lines: [String] = []
+        if let exception = json["exception"] as? [String: Any] {
+            lines.append("exception: \(["type", "signal", "subtype"].compactMap { exception[$0] as? String }.joined(separator: ", "))")
+        }
+        if let termination = json["termination"] as? [String: Any], let indicator = termination["indicator"] {
+            lines.append("termination: \(indicator)")
+        }
+        for (image, reasons) in ((json["asi"] as? [String: Any]) ?? [:]).sorted(by: { $0.key < $1.key }) {
+            lines.append("abort reason (\(image)): \(((reasons as? [String]) ?? []).joined(separator: "; "))")
+        }
+        let images = (json["usedImages"] as? [[String: Any]]) ?? []
+        if let threads = json["threads"] as? [[String: Any]], let index = json["faultingThread"] as? Int,
+            threads.indices.contains(index)
+        {
+            lines.append("crashed thread \(index):")
+            for frame in ((threads[index]["frames"] as? [[String: Any]]) ?? []).prefix(40) {
+                let image = (frame["imageIndex"] as? Int).flatMap { images.indices.contains($0) ? images[$0] : nil }
+                lines.append("  \(image?["name"] as? String ?? "?"): \(frame["symbol"] as? String ?? "?")")
+            }
+        }
+        return lines.joined(separator: "\n")
+    }
 
     /// How many lines of the call graph a ``diagnose(_:in:graph:)`` keeps
     /// (#526: a 40-line cut hid a stalled launch). At least 200, the number

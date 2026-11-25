@@ -65,13 +65,9 @@ final class TerminalSurfaceViewTests: XCTestCase {
         view.scroller.preferredStyleOverride = .overlay
         // Never the user's clipboard.
         view.pasteboard = NSPasteboard(name: NSPasteboard.Name("com.aanyberg.tessera.tests.\(UUID().uuidString)"))
-        // The recorder prints R once raw mode is set.
-        try await waitUntil("the recorder is in raw mode") { FileManager.default.fileExists(atPath: self.file.path) }
-        if !FileManager.default.fileExists(atPath: file.path) {
-            // What the child did: the wait alone cannot tell slow from dead.
-            let screen = (try? view.session.accessibleText().string) ?? ""
-            XCTFail("the recorder did not start: \(view.status ?? "still running"), screen \(screen.debugDescription)")
-        }
+        // The recorder prints R once raw mode is set. A recorder that did
+        // not start fails the test here, once (the error skips its body).
+        try await waitForRecorder(of: view, recordingTo: file)
         try await Task.sleep(for: .milliseconds(100))
     }
 
@@ -89,6 +85,47 @@ final class TerminalSurfaceViewTests: XCTestCase {
         appDelegate = nil
         view = nil
         window = nil
+    }
+
+    // MARK: The recorder's start (#620)
+
+    /// A recorder that exits before raw mode fails its wait at once, with
+    /// how it ended and the stage it reached.
+    func testARecorderThatExitsFailsItsWaitAtOnceWithItsStage() async throws {
+        let other = FileManager.default.temporaryDirectory.appendingPathComponent("tessera-view-\(UUID()).bin")
+        appDelegate.spawnOptions = .init(program: "/bin/sh", arguments: ["-c", "exit 5"])
+        let pane = try appDelegate.newWindow().focusedPane
+        let started = ContinuousClock.now
+        do {
+            try await waitForRecorder(of: pane.view, recordingTo: other)
+            XCTFail("a recorder that exited got ready")
+        } catch let failure as PollTimedOut {
+            let text = failure.description
+            XCTAssertTrue(text.hasPrefix("the recorder did not start: it exited (shell exited with code 5) "), text)
+            XCTAssertTrue(text.contains("stage: it has not printed R: raw mode is not set yet"), text)
+        }
+        XCTAssertLessThan(ContinuousClock.now - started, ChildStartBudget.base, "not after the whole budget")
+    }
+
+    /// A recorder in raw mode whose `cat` never opens its file times out
+    /// at its budget, naming that stage.
+    func testARecorderThatNeverRecordsTimesOutNamingRawMode() async throws {
+        let other = FileManager.default.temporaryDirectory.appendingPathComponent("tessera-view-\(UUID()).bin")
+        appDelegate.spawnOptions = .init(
+            program: "/bin/sh", arguments: ["-c", #"stty raw -echo; printf R; exec sleep 100"#])
+        let pane = try appDelegate.newWindow().focusedPane
+        do {
+            try await waitForRecorder(
+                of: pane.view, recordingTo: other, budget: ChildStartBudget(base: .seconds(3), cap: .seconds(3)))
+            XCTFail("a recorder that never opened its file got ready")
+        } catch let failure as PollTimedOut {
+            let text = failure.description
+            XCTAssertTrue(text.hasPrefix("the recorder did not start: timed out after "), text)
+            XCTAssertTrue(text.contains("(budget 3.0 s at load "), text)
+            XCTAssertTrue(
+                text.contains("stage: it printed R (raw mode is set), but its cat has not opened \(other.lastPathComponent)"),
+                text)
+        }
     }
 
     // MARK: Section A: Option dead keys and composition (US/ABC)
@@ -1788,6 +1825,41 @@ final class TerminalSurfaceViewTests: XCTestCase {
             }
             try await Task.sleep(for: .milliseconds(10))
         }
+    }
+}
+
+/// Waits until the recorder that `view`'s session runs is ready to record,
+/// for at most a ``ChildStartBudget`` (#620): its script (`stty raw -echo;
+/// printf R; exec cat >> file`, after any output of its own) printed R, its
+/// readiness signal, as its screen's last line once raw mode was set, and
+/// its `cat` opened `file`. It throws, so that a test whose recorder never
+/// started fails once, at once if the child exited, and with the stage the
+/// child reached, rather than again in every check after it.
+@MainActor
+func waitForRecorder(
+    of view: TerminalSurfaceView, recordingTo file: URL, budget: ChildStartBudget = ChildStartBudget()
+) async throws {
+    var budget = budget
+    func screen() -> String { (try? view.session.accessibleText().string) ?? "" }
+    func printedR() -> Bool {
+        screen().split(whereSeparator: \.isNewline).last { !$0.allSatisfy(\.isWhitespace) }?
+            .trimmingCharacters(in: .whitespaces) == "R"
+    }
+    func opened() -> Bool { FileManager.default.fileExists(atPath: file.path) }
+    while !(printedR() && opened()) {
+        let exited = view.status
+        guard exited == nil, !budget.isSpent() else {
+            let stage =
+                printedR()
+                ? "it printed R (raw mode is set), but its cat has not opened \(file.lastPathComponent)"
+                : "it has not printed R: raw mode is not set yet"
+            let text = String(screen().trimmingCharacters(in: .whitespacesAndNewlines).suffix(200))
+            throw PollTimedOut(
+                description: "the recorder did not start: "
+                    + (exited.map { "it exited (\($0))" } ?? "timed out") + " \(budget.summary); stage: \(stage); "
+                    + "screen ending \(text.debugDescription)")
+        }
+        try await Task.sleep(for: .milliseconds(10))
     }
 }
 

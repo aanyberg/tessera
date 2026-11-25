@@ -511,12 +511,21 @@ proptest::proptest! {
     }
 }
 
-/// Seconds to parse `bytes` in one [`Terminal::advance`] call.
+/// The CPU time, in seconds, a small read in
+/// [`c1_aware_parsing_is_linear_in_the_read`] takes at least about at
+/// calibration (the timed runs may read a little faster): long enough that
+/// clock resolution and per-call noise are small against it.
+const MIN_SAMPLE: f64 = 5e-3;
+
+/// Seconds of the thread's CPU time ([`common::thread_cpu_time`]) to parse
+/// `bytes` in one [`Terminal::advance`] call.
 fn parse_seconds(bytes: &[u8]) -> f64 {
     let mut term = Terminal::new(24, 80);
-    let start = std::time::Instant::now();
+    let start = common::thread_cpu_time();
     term.advance(bytes);
-    let seconds = start.elapsed().as_secs_f64();
+    let seconds = common::thread_cpu_time()
+        .saturating_sub(start)
+        .as_secs_f64();
     drop(term.take_requests());
     seconds
 }
@@ -532,16 +541,35 @@ fn flood(prefix: &[u8], unit: &[u8], tail: &[u8], len: usize) -> Vec<u8> {
     bytes
 }
 
+/// The smallest of `runs` [`parse_seconds`] samples of `bytes`.
+fn best_seconds(bytes: &[u8], runs: usize) -> f64 {
+    (0..runs)
+        .map(|_| parse_seconds(bytes))
+        .fold(f64::INFINITY, f64::min)
+}
+
 /// Parsing stays linear in the size of a read whatever it holds: a read
 /// with one byte in `0x80..=0x9F` takes the C1-aware path, and every DCS
 /// start and end and every sequence that can switch 8-bit mode must not
 /// make it look at the rest of the read again (#96 review B1). Sixteen
 /// times the input must take about sixteen times as long, not 256: best of
 /// three interleaved runs, up to five attempts, bar 64 (the geometric
-/// midpoint, so load noise has a factor of four either way).
+/// midpoint, so noise has a factor of four either way). An attempt at 128
+/// or more fails at once: a linear parse would need eightfold noise to read
+/// that high, and a quadratic one then fails in seconds, not minutes.
+///
+/// The small read is doubled from 4 KiB (up to 1 MiB) until it takes at
+/// least about [`MIN_SAMPLE`] seconds at calibration on this machine, and
+/// time is the thread's CPU time, so time spent preempted does not count
+/// (#652): at a fixed 4 KiB on the wall clock the small read took a third
+/// of a millisecond, and on CI a linear parse read 67-82x. Measured (debug,
+/// Apple M-series): 64-128 KiB small reads of 5-7 ms read 16-19x; a
+/// forward scan cursor that rescans to the end at every DCS start and end
+/// reads 239-260x in both DCS cases.
 #[test]
 fn c1_aware_parsing_is_linear_in_the_read() {
-    const N: usize = 4 << 10;
+    const START: usize = 4 << 10;
+    const MAX_LEN: usize = 1 << 20;
     const SCALE: usize = 16;
     const BAR: f64 = 64.0;
     let cases: [Flood; 4] = [
@@ -552,9 +580,18 @@ fn c1_aware_parsing_is_linear_in_the_read() {
     ];
     let mut slow = Vec::new();
     for (name, prefix, unit, tail) in cases {
-        let small = flood(prefix, unit, tail, N);
-        let large = flood(prefix, unit, tail, SCALE * N);
+        let mut len = START;
+        let small = loop {
+            let small = flood(prefix, unit, tail, len);
+            let seconds = best_seconds(&small, 3);
+            if seconds >= MIN_SAMPLE || len >= MAX_LEN {
+                break small;
+            }
+            len = MAX_LEN.min(2 * len);
+        };
+        let large = flood(prefix, unit, tail, SCALE * len);
         let mut ratio = f64::INFINITY;
+        let mut times = (0.0, 0.0);
         for _ in 0..5 {
             let (mut s, mut l) = (f64::INFINITY, f64::INFINITY);
             for _ in 0..3 {
@@ -562,13 +599,20 @@ fn c1_aware_parsing_is_linear_in_the_read() {
                 l = l.min(parse_seconds(&large));
             }
             ratio = l / s;
-            if ratio < BAR {
+            times = (s, l);
+            // Linear: done. Far over the bar: no noise explains it.
+            if ratio < BAR || ratio >= 2.0 * BAR {
                 break;
             }
         }
         if ratio >= BAR {
             slow.push(format!(
-                "{name}: {SCALE}x the input took {ratio:.1}x as long"
+                "{name}: {SCALE}x the input took {ratio:.1}x as long \
+                 ({} bytes in {:.1} ms, {} bytes in {:.1} ms)",
+                small.len(),
+                times.0 * 1e3,
+                large.len(),
+                times.1 * 1e3,
             ));
         }
     }
