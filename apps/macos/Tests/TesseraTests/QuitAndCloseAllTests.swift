@@ -724,7 +724,7 @@ final class QuitAndCloseAllTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: dir) }
         try compileSleeper(to: dir.appendingPathComponent("z\u{202E}x\nq"))
         let controller = try appDelegate.newWindow()
-        let job = try await runSleeper(in: dir, session: controller.focusedPane.session, "the hostile sleeper runs")
+        let job = try await runSleeper(in: dir, pane: controller.focusedPane, "the hostile sleeper runs")
         XCTAssertTrue(job.name.contains("\u{202E}") || job.name.contains("\n"), "the name is hostile: \(job.name)")
         presenter.modalAnswer = false
 
@@ -823,13 +823,9 @@ final class QuitAndCloseAllTests: XCTestCase {
     }
 
     /// Types `command` into the tab's shell and waits until it runs in the
-    /// foreground.
+    /// foreground (``startForegroundJob(_:in:)``).
     private func start(_ command: String, in controller: TerminalWindowController) async throws {
-        let name = String(command.prefix { $0 != " " })
-        try controller.focusedPane.session.write(Array("\(command)\n".utf8))
-        _ = try await poll("\(name) runs in the foreground") {
-            try controller.focusedPane.session.foregroundProcess().flatMap { $0.name == name ? $0 : nil }
-        }
+        _ = try await startForegroundJob(command, in: controller.focusedPane)
     }
 
     private func poll<T>(
