@@ -836,3 +836,41 @@ fn a_double_click_with_64_rules_on_2048_columns_takes_under_5_ms() {
         app.close_session(id).unwrap();
     }
 }
+
+/// #590 m1 (#518): a live change of `selection.smart_rules`, applied as a
+/// configuration reload applies it, rebuilds the engines for the next
+/// double-click: a changed pattern (same count and precision), an added
+/// rule and a removed one each select by the new set. Engines kept from
+/// the set before would select by its patterns, or nothing for the added
+/// rule.
+#[test]
+fn a_live_smart_rules_change_rebuilds_the_engines() {
+    let theme = tessera_config::Theme::default();
+    let rule = |pattern: &str| SmartRule::new(pattern, Precision::High);
+    let text = b"ab-cd-ef gh=ij";
+    let app = app_with(Some(vec![rule("ab-cd")]), true);
+    let apply = |rules: Vec<SmartRule>| {
+        let mut config = Config::clone(&app.config());
+        config.selection.smart_rules = Some(rules);
+        app.apply_config(&config, &theme);
+    };
+    let id = session(&app, 2, 40, text);
+    let click = |col| word_click(&app, id, 0, col).1;
+    // The word selections the rules must beat.
+    let plain = app_with(Some(Vec::new()), true);
+    let plain_id = session(&plain, 2, 40, text);
+    let word = |col| word_click(&plain, plain_id, 0, col).1;
+    assert_ne!(word(4).as_deref(), Some("ab-cd"));
+    assert_ne!(word(4).as_deref(), Some("cd-ef"));
+    assert_ne!(word(10).as_deref(), Some("gh=ij"));
+
+    assert_eq!(click(4).as_deref(), Some("ab-cd"), "the loaded rule");
+    apply(vec![rule("cd-ef")]);
+    assert_eq!(click(4).as_deref(), Some("cd-ef"), "a changed pattern");
+    apply(vec![rule("cd-ef"), rule("gh=ij")]);
+    assert_eq!(click(4).as_deref(), Some("cd-ef"), "the kept rule");
+    assert_eq!(click(10).as_deref(), Some("gh=ij"), "an added rule");
+    apply(vec![rule("gh=ij")]);
+    assert_eq!(click(4), word(4), "a removed rule");
+    assert_eq!(click(10).as_deref(), Some("gh=ij"));
+}
