@@ -60,8 +60,9 @@ extension SettingsModel {
             ? "Waiting for config.toml to be applied; plugins can be turned on or off once it is." : nil
     }
 
-    /// The host's warning while `[plugins] enabled` lists more ids than it
-    /// reads, with how many it ignores; `nil` otherwise.
+    /// The pane's warning while `[plugins] enabled` lists more ids than the
+    /// host reads, with how many it ignores; `nil` otherwise (the core's
+    /// configuration loader logs its own, which names only the cap).
     var pluginsSkipWarning: String? {
         let count = listedPluginIDs.count
         guard count > TesseraPlugin.maxEnabled else { return nil }

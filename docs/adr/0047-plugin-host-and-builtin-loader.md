@@ -118,3 +118,13 @@ once per load of a `[plugins] enabled` past the cap, naming the cap only
 (S8), and keeps the list whole; the host still reads the first 64 ids
 and no longer warns of the rest. Its warnings for an id past 128 bytes
 or an unknown id stay as they were.
+
+## Amendment: the cap warning is logged once (#590, 2026-11-25)
+
+This corrects "warns once per load" in the #560 amendment. The config
+loader returns one warning (an `OutOfRange` of `plugins.enabled`, naming
+the cap only, S8) on every load of a `[plugins] enabled` past 64 ids, and
+keeps the list whole. The configuration store logs a load's warnings that
+the previous load did not have, so the cap warning is logged once, when it
+first appears, and not again while the list stays past the cap; it is
+logged again only after a load without it.

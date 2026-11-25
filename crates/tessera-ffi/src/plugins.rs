@@ -8,11 +8,21 @@ use crate::panic::ffi_guard;
 use crate::selection::copy_out;
 
 /// Most ids of `[plugins] enabled` the plugin host reads; it ignores the
-/// rest, and the configuration loader warns of them once per load. A
-/// frontend's Plugins pane refuses to list another id at it. Equal to
-/// `tessera_app_core::plugins::MAX_ENABLED_PLUGINS` (a literal here, so
-/// that cbindgen can export it; a test ties the two).
+/// rest. The configuration loader returns a warning of them on every load
+/// of such a list, and the configuration store logs it once, when it first
+/// appears (not again while the list stays past the cap). A frontend's
+/// Plugins pane refuses to list another id at it. Equal to
+/// `tessera_app_core::plugins::MAX_ENABLED_PLUGINS`, tessera-config's cap
+/// re-exported (a literal here, so that cbindgen can export it; a
+/// compile-time assertion in tessera-ffi ties the two).
 pub const MAX_ENABLED_PLUGINS: usize = 64;
+
+// #590 (#560 M4): a cap that drifts from the host's (tessera-config's,
+// which the host re-exports) fails the build, not only a test.
+const _: () = assert!(
+    MAX_ENABLED_PLUGINS == tessera_app_core::plugins::MAX_ENABLED_PLUGINS,
+    "TESSERA_MAX_ENABLED_PLUGINS must equal the plugin host's cap"
+);
 
 /// One status item as JSON.
 fn item_json(item: &StatusItem) -> serde_json::Value {
