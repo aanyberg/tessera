@@ -186,3 +186,40 @@ rcfile | R8 | POSIXLY_CORRECT=1 | --noprofile
 rcfile | R9 | POSIXLY_CORRECT=1 | -norc
 rcfile | R10 | POSIXLY_CORRECT=1 | -l
 rcfile | R11 | SHELLOPTS=braceexpand:posix | -i
+#
+# The --rcfile route's end of the startup file (#659): a `.bashrc` that
+# runs `set -e` and ends in a failing `&&` list or in `return N` keeps the
+# shell, as without Tessera (the status `source` returns for it no longer
+# trips `set -e`), while `set -e` still stops the file, and the shell, at
+# a failing command inside it. The first prompt's PROMPT_COMMAND entry
+# (`pc=`) and the first command (`st=`) see bash's own status of the file
+# (`return N` leaves the status before it). The `.bashrc` is the field
+# exactly (one line per `\n`; the prompt comes from the environment), so
+# it ends with the field's last line. On the --rcfile route only.
+# `lines: a / b`: the injected shell prints exactly a, b, and so does the
+# same bash without the injection; `lines: -`: neither prints anything
+# (both exit before their first prompt). E1 also checks that neither our
+# RETURN trap nor a `_tessera_si_rc_` variable is left after startup.
+# E10 is an ACCEPTED LIMIT: the
+# startup file's own RETURN trap replaces ours (`limit:` as above).
+# rcexit | id | bashes | .bashrc | commands | expected
+rcexit | E1 | 3.2 5.1 5.3 | PROMPT_COMMAND='echo "pc=$?"'\nset -e\nfalse && true | echo "st=$? e=${-//[^e]/}"\necho "rt=[$(trap -p RETURN)] v=[$(compgen -v _tessera_si_rc_)]" | lines: pc=1 / st=1 e=e / pc=0 / rt=[] v=[] / pc=0
+rcexit | E2 | 3.2 5.1 5.3 | PROMPT_COMMAND='echo "pc=$?"'\nset -e\nfalse\necho after | echo "st=$? e=${-//[^e]/}" | lines: -
+rcexit | E3 | 3.2 5.1 5.3 | PROMPT_COMMAND='echo "pc=$?"'\nset -e\nf() { false; echo in-f; }\nf\necho after | echo "st=$? e=${-//[^e]/}" | lines: -
+rcexit | E4 | 3.2 5.1 5.3 | PROMPT_COMMAND='echo "pc=$?"'\nset -e\ntrue\nreturn 3 | echo "st=$? e=${-//[^e]/}" | lines: pc=0 / st=0 e=e / pc=0
+rcexit | E5 | 3.2 5.1 5.3 | PROMPT_COMMAND='echo "pc=$?"'\nset -e\nfalse && true\nreturn 3 | echo "st=$? e=${-//[^e]/}" | lines: pc=1 / st=1 e=e / pc=0
+rcexit | E6 | 3.2 5.1 5.3 | PROMPT_COMMAND='echo "pc=$?"'\nfalse && true | echo "st=$? e=${-//[^e]/}" | lines: pc=1 / st=1 e= / pc=0
+rcexit | E7 | 3.2 5.1 5.3 | PROMPT_COMMAND='echo "pc=$?"'\nfalse | echo "st=$? e=${-//[^e]/}" | lines: pc=1 / st=1 e= / pc=0
+rcexit | E8 | 3.2 5.1 5.3 | PROMPT_COMMAND='echo "pc=$?"'\nfalse\nreturn 3 | echo "st=$? e=${-//[^e]/}" | lines: pc=1 / st=1 e= / pc=0
+rcexit | E9 | 5.1 5.3 | PROMPT_COMMAND=('echo "pc=$?"')\nset -e\nfalse && true | echo "st=$? e=${-//[^e]/}" | lines: pc=1 / st=1 e=e / pc=0
+rcexit | E10 | 3.2 5.1 5.3 | PROMPT_COMMAND='echo "pc=$?"'\nset -e\ntrap 'echo R' RETURN\nfalse && true | echo "st=$? e=${-//[^e]/}" | limit: R
+rcexit | E11 | 3.2 5.1 5.3 | PROMPT_COMMAND='echo "pc=$?"'\nset -e\n. /dev/null\nset -T\ng() { :; }\ng\nfalse && true | echo "st=$? e=${-//[^e]/}" | lines: pc=1 / st=1 e=e / pc=0
+# A syntax error ends the file with source's status, bash's own on 5.x;
+# on 3.2 bash alone has 258 (ACCEPTED LIMIT, as before #659). Standard
+# error, where bash reports it with the file's path, goes to /dev/null
+# until the first prompt's entry puts it back.
+rcexit | E12 | 5.1 5.3 | PROMPT_COMMAND='s=$?; exec 2>&1; echo "pc=$s"'\nexec 2>/dev/null\nfi | echo "st=$? e=${-//[^e]/}" | lines: pc=2 / st=2 e= / pc=0
+rcexit | E13 | 3.2 | PROMPT_COMMAND='s=$?; exec 2>&1; echo "pc=$s"'\nexec 2>/dev/null\nfi | echo "st=$? e=${-//[^e]/}" | limit: pc=1 / st=1 e= / pc=0
+# `set -E` under `shopt -s nocasematch` is not `set -e` (#659 B1): the
+# trap tests the option, not `$-`.
+rcexit | E14 | 3.2 5.1 5.3 | PROMPT_COMMAND='echo "pc=$?"'\nshopt -s nocasematch\nset -E | false\necho alive | lines: pc=0 / pc=1 / alive / pc=0
