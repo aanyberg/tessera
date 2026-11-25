@@ -217,3 +217,47 @@ same date.
   registration and stays on `poll_interval`, as intended: the walk still
   works, so the poll is what applies a retarget of that link, as promptly
   as the polling backend does.
+
+## Amendment: fallback on program lookups without an answer (#602, 2026-11-25)
+
+- **Fallback list, appended.** Since #554 a profile `command` is looked up
+  (its path, each `PATH` candidate) on a helper thread that the spawn waits
+  for at most 5 s. Two more refusals of that lookup fall back like a spawn
+  error, the built-in start running once more:
+  - `PtyError::ProgramTimedOut`: the file system gave no answer within
+    the 5 s, as for a command on a stalled network volume. The notice reads
+    `could not start (Operation timed out)`, `ETIMEDOUT` the logged errno,
+    as for the pty open that gave no answer in time (#568). Before this
+    the tab failed after 5 s (and before #554 the caller hung until the
+    volume answered, then fell back).
+  - `PtyError::ProgramLookupBusy`: the lookup was not made because four
+    earlier lookups or `#!` checks are still waiting for the file system
+    (the helper cap, docs/security.md S5), or every helper stayed busy with
+    earlier ones for the whole 5 s. Its message says so (`too many earlier
+    program checks are still waiting`) rather than that the file system
+    gave no answer, since nothing was asked. The notice reads `could not
+    start (Resource temporarily unavailable)`, `EAGAIN` the logged errno.
+
+  A lookup or `#!` check whose helper thread cannot be started (the
+  process out of threads) refuses the spawn as a `PtyError::Spawn` whose
+  reason keeps the thread start's `(os error N)` (`EAGAIN`), so the
+  fallback's notice names that errno, as for any other spawn error; a pty
+  open whose helper cannot be started is a `PtyError::Open` with that
+  reason, which does not fall back. The notice and the warning still carry
+  only the sanitised profile name, its index and the errno: never the
+  command's path (S3, S8).
+- **Known limit: the fallback at the helper cap.** The built-in start
+  looks its program up (the login shell) through the same capped helpers.
+  While four earlier lookups are stuck, its lookup is refused too, so no
+  default shell starts: the tab fails with the profile's
+  `ProgramLookupBusy` error ("too many earlier program checks are still
+  waiting"). The fallback on `ProgramLookupBusy` stays, since it works as
+  soon as one stuck lookup ends. Keeping a helper free for the built-in
+  start (or exempting its lookup) is #661.
+- **Known limit: `$HOME` on a stalled volume.** A session that starts in
+  `$HOME` (no working directory given, or one that is not a directory)
+  whose home is on a volume that gives no answer still holds the caller,
+  the app's main thread, until the volume answers: the forked child's
+  `chdir(2)` into `$HOME` blocks before its `exec`, and the spawn waits for
+  the `exec`. This predates #554 and is not bounded; neither the lookup's
+  5 s nor the fallback applies to it.

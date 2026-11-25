@@ -25,5 +25,11 @@ libc.workspace = true
 # `waitpid` proves a refused spawn left no child behind.
 nix = { workspace = true, features = ["feature", "hostname", "process", "signal"] }
 
+[features]
+# Exposes `test_hooks` (a program lookup held as on a stalled volume, a
+# helper thread that cannot start) for other crates' tests (#602). Off in
+# every release build.
+test-hooks = []
+
 [lints]
 workspace = true

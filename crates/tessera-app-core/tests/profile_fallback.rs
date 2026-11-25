@@ -17,11 +17,12 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tessera_app_core::{
     App, Config, ConfigPaths, Error, PtyError, PtySize, SessionId, SpawnOptions,
 };
+use tessera_pty::test_hooks;
 
 /// Pause between two polls.
 const POLL: Duration = Duration::from_millis(10);
@@ -68,6 +69,33 @@ impl Locked {
 impl Drop for Locked {
     fn drop(&mut self) {
         let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+    }
+}
+
+/// An executable script in `dir` (it would print `ran` and exit), for a
+/// profile `command` that exists and could run.
+fn script(dir: &Path) -> PathBuf {
+    let path = dir.join("stalled-tool");
+    std::fs::write(&path, "#!/bin/sh\necho ran\n").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+/// Releases a program lookup held with
+/// [`test_hooks::hold_program_lookup`] when dropped, so a failed assert
+/// does not leave its helper blocked.
+struct HeldLookup(PathBuf);
+
+impl HeldLookup {
+    fn new(path: &Path) -> Self {
+        test_hooks::hold_program_lookup(path);
+        Self(path.to_path_buf())
+    }
+}
+
+impl Drop for HeldLookup {
+    fn drop(&mut self) {
+        test_hooks::release_program_lookup(&self.0);
     }
 }
 
@@ -406,4 +434,106 @@ fn a_failure_of_the_callers_own_options_is_not_retried() {
         "{logged:?}"
     );
     assert_eq!(app.session_ids(), Vec::new());
+}
+
+/// #602: a profile whose `command` lives on a stalled volume (its lookup
+/// never answers) starts the default shell in `$HOME` once the lookup's
+/// time is up, with an `ETIMEDOUT` notice, instead of failing the tab;
+/// the warning names no path.
+#[test]
+fn a_command_whose_lookup_never_answers_starts_the_default_shell_at_home() {
+    let root = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let tool = script(root.path());
+    let app = app(
+        &root,
+        config(
+            &[("stalled", Some(tool.to_str().unwrap()), None)],
+            "Default",
+        ),
+    );
+    let held = HeldLookup::new(&tool);
+    let started = Instant::now();
+    let (id, logged) = warnings(|| {
+        app.spawn_session_with_profile(options(home.path()), Some("stalled"))
+            .expect("the fallback starts")
+    });
+    let waited = started.elapsed();
+    let (callers, finished) = test_hooks::program_lookup_calls(&tool);
+    assert_eq!(callers, ["pty-spawn-program"], "the lookup was not held");
+    assert_eq!(finished, 0, "the held lookup returned before the fallback");
+    assert!(
+        waited >= test_hooks::PROGRAM_LOOKUP_TIMEOUT,
+        "fell back after {waited:?}, before the lookup's time was up"
+    );
+    assert!(
+        waited < test_hooks::PROGRAM_LOOKUP_TIMEOUT + Duration::from_secs(2),
+        "fell back after {waited:?}"
+    );
+    let reason = std::io::Error::from_raw_os_error(nix::errno::Errno::ETIMEDOUT as i32).to_string();
+    let reason = reason.split(" (os error").next().unwrap();
+    let rows = wait_for_row(&app, id, &notice("stalled", reason));
+    assert_eq!(rows[0], notice("stalled", reason), "{rows:?}");
+    assert!(!rows.iter().any(|row| row == "ran"), "{rows:?}");
+    assert_a_shell_in(&app, id, home.path());
+    app.close_session(id).unwrap();
+    let fallback: Vec<_> = logged
+        .iter()
+        .filter(|line| line.contains("could not start"))
+        .collect();
+    assert_eq!(fallback.len(), 1, "{logged:?}");
+    assert!(
+        fallback[0].contains(&format!(
+            "errno=Some({})",
+            nix::errno::Errno::ETIMEDOUT as i32
+        )),
+        "{logged:?}"
+    );
+    for line in &logged {
+        assert!(!line.contains("stalled-tool"), "{logged:?}");
+    }
+    drop(held);
+    for _ in 0..OUTPUT_ATTEMPTS {
+        if test_hooks::program_lookup_calls(&tool).1 == 1 {
+            return;
+        }
+        thread::sleep(POLL);
+    }
+    panic!("the held lookup did not return on release");
+}
+
+/// #602: a profile whose program lookup could not start its helper thread
+/// (the process out of threads) starts the default shell with the
+/// thread start's `EAGAIN` in the notice, not a timeout.
+#[test]
+fn a_command_whose_lookup_thread_cannot_start_starts_the_default_shell() {
+    let root = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let tool = script(root.path());
+    let app = app(
+        &root,
+        config(
+            &[("threads", Some(tool.to_str().unwrap()), None)],
+            "Default",
+        ),
+    );
+    let eagain = nix::errno::Errno::EAGAIN as i32;
+    // The first helper the spawn starts on this thread is its lookup.
+    test_hooks::fail_next_helper_start(eagain);
+    let (id, logged) = warnings(|| {
+        app.spawn_session_with_profile(options(home.path()), Some("threads"))
+            .expect("the fallback starts")
+    });
+    let reason = std::io::Error::from_raw_os_error(eagain).to_string();
+    let reason = reason.split(" (os error").next().unwrap();
+    let rows = wait_for_row(&app, id, &notice("threads", reason));
+    assert_eq!(rows[0], notice("threads", reason), "{rows:?}");
+    assert!(!rows.iter().any(|row| row == "ran"), "{rows:?}");
+    assert_a_shell_in(&app, id, home.path());
+    app.close_session(id).unwrap();
+    assert!(
+        logged.iter().any(|line| line.contains("could not start")
+            && line.contains(&format!("errno=Some({eagain})"))),
+        "{logged:?}"
+    );
 }
