@@ -26,7 +26,7 @@ use tessera_shell_integration::{Injection, Launch, Shell};
 const SPEC: &str = include_str!("fixtures/bash_spec.txt");
 
 /// The stand-ins, by file name.
-const TOOLS: [(&str, &str); 8] = [
+const TOOLS: [(&str, &str); 9] = [
     (
         "starship-init-1.27.bash",
         include_str!("fixtures/bash-tools/starship-init-1.27.bash"),
@@ -54,6 +54,12 @@ const TOOLS: [(&str, &str); 8] = [
     (
         "bash-preexec-0.5.sh",
         include_str!("fixtures/bash-tools/bash-preexec-0.5.sh"),
+    ),
+    // The real bash-preexec 0.7.0, vendored (#613): see
+    // vendored_bash_preexec_0_7_is_the_upstream_file.
+    (
+        "bash-preexec-0.7.sh",
+        include_str!("fixtures/bash-tools/bash-preexec-0.7.sh"),
     ),
     (
         "oh-my-bash-prompt.sh",
@@ -91,6 +97,31 @@ const BASH: &str = "/bin/bash";
 /// Where a bash 4 or later is looked for besides `PATH`.
 const NEWER_BASH: [&str; 2] = ["/opt/homebrew/bin/bash", "/usr/local/bin/bash"];
 
+/// The environment variable naming a bash 5.1 to run the bash 5.1+ rows on
+/// as well (#613: 5.1 and 5.2 run array elements as 5.3 does, but only a
+/// real 5.1 shows it; Homebrew ships the newest bash only).
+const BASH51_VAR: &str = "TESSERA_TEST_BASH51";
+
+/// The bash 5.1 that [`BASH51_VAR`] names, or `None` (with one skip line
+/// naming the variable for `test`) when it is unset.
+fn bash51(test: &str) -> Option<PathBuf> {
+    match std::env::var_os(BASH51_VAR) {
+        Some(program) if !program.is_empty() => {
+            let program = PathBuf::from(program);
+            assert!(
+                version(&program).is_some_and(|v| v >= (5, 1)),
+                "{test}: {BASH51_VAR}={} is not a bash 5.1 or later",
+                program.display()
+            );
+            Some(program)
+        }
+        _ => {
+            eprintln!("{test}: bash 5.1 part skipped: {BASH51_VAR} is unset");
+            None
+        }
+    }
+}
+
 /// Which first-prompt columns of the table a bash is held to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Columns {
@@ -109,8 +140,8 @@ struct Bash {
 }
 
 /// `/bin/bash`, and a bash 4 or later when one is installed (the first of
-/// `PATH` and [`NEWER_BASH`] whose `BASH_VERSINFO` says so); prints a skip
-/// line when there is none.
+/// `PATH` and [`NEWER_BASH`] whose `BASH_VERSINFO` says so), and the bash
+/// 5.1 of [`BASH51_VAR`]; prints a skip line for each one missing.
 fn bashes(test: &str) -> Vec<Bash> {
     let mut found = vec![Bash {
         program: BASH.into(),
@@ -137,6 +168,12 @@ fn bashes(test: &str) -> Vec<Bash> {
         None => eprintln!(
             "{test}: bash >= 4 part skipped: no bash 4 or later on PATH or in {NEWER_BASH:?}"
         ),
+    }
+    if let Some(program) = bash51(test) {
+        found.push(Bash {
+            program,
+            columns: Columns::Arrays,
+        });
     }
     found
 }
@@ -510,26 +547,6 @@ fn assert_mark_rules(what: &str, payloads: &[String]) {
 /// What readline prints at every prompt on bash 5.1 and later.
 const BRACKETED_PASTE_ON: &str = "\u{1b}[?2004h";
 
-/// Asserts a [`run_prompts`] shell ran as without Tessera: no OSC 133, at
-/// most the handshake and one OSC 7 (bash-preexec 0.6 makes the array at
-/// its first prompt, after the script loaded), and every `echo hi` printed.
-fn assert_left_alone(what: &str, output: &[u8]) {
-    let payloads = osc_payloads(output);
-    let count = |prefix: &str| payloads.iter().filter(|p| p.starts_with(prefix)).count();
-    assert!(
-        count("133;") == 0 && count("1337;") <= 1 && count("7;") <= 1,
-        "{what}: not integrated, yet {payloads:?}"
-    );
-    let echoes = (1..PROMPTS)
-        .filter(|prompt| COMMANDS[(prompt - 1) % COMMANDS.len()].0 == "echo hi")
-        .count();
-    assert_eq!(
-        String::from_utf8_lossy(output).matches("\rhi\r\n").count(),
-        echoes,
-        "{what}: every command ran"
-    );
-}
-
 /// Runs [`PROMPTS`] prompts: [`COMMANDS`] in turn, then `exit` at the last.
 /// Returns the output. A bash 5.1+ (`columns`) is waited for by readline's
 /// prompts, not by OSC 7 (it may leave the integration).
@@ -567,6 +584,7 @@ fn expected_marks(first_prompt: &[String], first_command: &[String]) -> Vec<Stri
 
 #[test]
 fn prompt_tools_keep_every_mark_from_the_second_prompt() {
+    let mut failures = Vec::new();
     for bash in bashes("prompt_tools_keep_every_mark_from_the_second_prompt") {
         for row in rows("mark") {
             let [
@@ -593,11 +611,6 @@ fn prompt_tools_keep_every_mark_from_the_second_prompt() {
             let what = format!("{id} on {}", bash.program.display());
             let output = run_prompts(&bash.program, bash.columns, route, &startup_sourcing(tools));
             assert_no_errors(&what, &output);
-            if bash.columns == Columns::Arrays && arrays_prompt == "off" {
-                assert_eq!(arrays_command, "off", "{what}: both fields are off");
-                assert_left_alone(&what, &output);
-                continue;
-            }
             let payloads = osc_payloads(&output);
             assert_mark_rules(&what, &payloads);
             assert_eq!(
@@ -619,11 +632,12 @@ fn prompt_tools_keep_every_mark_from_the_second_prompt() {
                     got.len() >= tail && got[got.len() - tail..] == want[want.len() - tail..],
                     "{what} (from the second prompt; first D at {first_d}): {got:?}"
                 );
-            } else {
-                assert_eq!(got, want, "{what}");
+            } else if got != want {
+                failures.push(format!("{what}:\n got  {got:?}\n want {want:?}"));
             }
         }
     }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 /// Files for [`Session::start_with`]: name under the home, contents.
@@ -935,69 +949,172 @@ fn bash_preexec_sourced_at_a_prompt_runs_preexec_functions() {
     }
 }
 
-/// bash-preexec under `set -u` on bash 5.1+: the array it makes (0.6, at
-/// its first prompt) or one the user makes (after 0.5) leaves the shell
-/// alone with no error, the user's preexec functions run from the first
-/// command, and nothing is marked after the opt-out (#158 r5 B1: the
-/// opt-out read variables bash-preexec's install never set).
+/// Prints, on one line after `PL=`: `M=<i>` for each element with our marks entry,
+/// `L=<i>` for the element bash-preexec closes the array with, `K=` the
+/// element count and `X=` the highest index.
+const PLACES: &str = "printf 'P%s ' L=; for i in \"${!PROMPT_COMMAND[@]}\"; do case ${PROMPT_COMMAND[i]} in *_tessera_si_prompt*) printf 'M=%s ' \"$i\";; esac; case ${PROMPT_COMMAND[i]} in *__bp_interactive_mode) printf 'L=%s ' \"$i\";; esac; x=$i; done; printf 'K=%s X=%s\\n' \"${#PROMPT_COMMAND[@]}\" \"${x-}\"";
+
+/// The values of a [`PLACES`] line: `M` and `L` indices, `K`, `X`.
+fn places(line: &str) -> (Vec<u32>, Vec<u32>, String) {
+    let mut ours = Vec::new();
+    let mut last = Vec::new();
+    let mut size = String::new();
+    for word in line.split(' ') {
+        if let Some(i) = word.strip_prefix("M=") {
+            ours.push(i.parse().unwrap());
+        } else if let Some(i) = word.strip_prefix("L=") {
+            last.push(i.parse().unwrap());
+        } else {
+            size.push_str(word);
+            size.push(' ');
+        }
+    }
+    (ours, last, size)
+}
+
+/// bash-preexec 0.5 and 0.6 (stand-ins) and 0.7 (the real one, vendored)
+/// with an array `PROMPT_COMMAND` on bash 5.1+ (#613 item 5): sourced from
+/// `.bashrc` (before the script) and typed at a prompt (after it), with
+/// `PROMPT_COMMAND` unset, a string, an array and an array under `set -u`.
+/// Its preexec and precmd functions run as often as in the same shell
+/// without Tessera; our marks entry is in an element before bash-preexec's
+/// closing `__bp_interactive_mode` (or in that element, before it), and
+/// stays there; with 0.7 the array does not grow over five prompts; no
+/// trap of ours is left (`trap -p DEBUG`) or saved as the user's
+/// (`__bp_trap_string`); on 5.3 0.7 uses PS0, not a DEBUG trap; and the
+/// shell stays integrated (a C and `D;<status>` for the last commands;
+/// bash-preexec 0.5 with a user array: bare marks only, its B10 limit).
 #[test]
-fn bash_preexec_under_set_u_leaves_an_array_alone_without_errors() {
-    let pe = "pe() { printf 'PE[%s]\\n' \"$1\"; }\npreexec_functions+=(pe)\n";
-    for bash in bashes("bash_preexec_under_set_u_leaves_an_array_alone_without_errors") {
+#[expect(clippy::too_many_lines, reason = "one matrix, one report")]
+fn bash_preexec_with_an_array_keeps_its_counts_and_our_entry_before_its_last() {
+    let count = "npre=0 npc=0\npre() { npre=$((npre + 1)); }\npc() { npc=$((npc + 1)); }\n";
+    let register = "preexec_functions+=(pre); precmd_functions+=(pc)";
+    let report = "printf 'N%s[%s %s] TS%s[%s]\\n' = \"$npre\" \"$npc\" = \"${__bp_trap_string-}\"";
+    let ps0 = "printf 'P0%s[%s]\\n' = \"${PS0-}\"";
+    let variants = [
+        ("unset", "unset PROMPT_COMMAND\n"),
+        ("string", "u1() { :; }\nPROMPT_COMMAND=u1\n"),
+        (
+            "array",
+            "u1() { :; }\nu2() { :; }\nPROMPT_COMMAND=(u1 u2)\n",
+        ),
+        (
+            "array set -u",
+            "set -u\nu1() { :; }\nu2() { :; }\nPROMPT_COMMAND=(u1 u2)\n",
+        ),
+    ];
+    let mut failures = Vec::new();
+    for bash in bashes("bash_preexec_with_an_array_keeps_its_counts_and_our_entry_before_its_last")
+    {
         if bash.columns != Columns::Arrays {
             continue;
         }
-        for (tool, lines) in [
-            ("bash-preexec-0.6.sh", &["true", "echo hi", "exit"][..]),
-            (
-                "bash-preexec-0.5.sh",
-                &["PROMPT_COMMAND+=(f1)", "true", "echo hi", "exit"][..],
-            ),
+        let v53 = version(&bash.program).is_some_and(|v| v >= (5, 3));
+        for tool in [
+            "bash-preexec-0.5.sh",
+            "bash-preexec-0.6.sh",
+            "bash-preexec-0.7.sh",
         ] {
-            for route in [Route::Rcfile, Route::Login] {
-                let what = format!("{} {tool} {route:?}", bash.program.display());
-                let startup = format!("set -u\nf1() {{ :; }}\n. ~/tools/{tool}\n{pe}");
-                let mut session = Session::start(&bash.program, route, &startup);
-                for (prompt, line) in (1..).zip(lines) {
-                    session.at_readline(prompt, line);
+            for typed in [false, true] {
+                for (name, pc) in variants {
+                    let source = format!(". ~/tools/{tool}");
+                    let startup = if typed {
+                        format!("{count}{pc}")
+                    } else {
+                        format!("{count}{pc}{source}\n{register}\n")
+                    };
+                    let mut lines: Vec<&str> = Vec::new();
+                    let both = format!("{source}; {register}");
+                    if typed {
+                        lines.push(&both);
+                    }
+                    lines.extend(["true", "false", PLACES, "echo hi", "true", "false"]);
+                    lines.extend([":", "true", PLACES, report, ps0]);
+                    lines.extend(["trap -p DEBUG", "true", "exit"]);
+                    let what = format!("{} {tool} typed={typed} {name}", bash.program.display());
+                    let run = |route| {
+                        let mut session = Session::start(&bash.program, route, &startup);
+                        for (prompt, line) in (1..).zip(&lines) {
+                            session.at_readline(prompt, line);
+                        }
+                        session.finish()
+                    };
+                    let output = run(Route::Rcfile);
+                    let base = run(Route::Sourced);
+                    assert_no_errors(&what, &output);
+                    assert_no_errors(&what, &base);
+                    let payloads = osc_payloads(&output);
+                    assert_mark_rules(&what, &payloads);
+                    let text = String::from_utf8_lossy(&output);
+                    let base_text = String::from_utf8_lossy(&base);
+                    let line_of = |text: &str, prefix: &str, nth: usize| {
+                        text.split("\r\n")
+                            .filter_map(|line| line.find(prefix).map(|at| &line[at..]))
+                            .nth(nth)
+                            .unwrap_or_default()
+                            .to_owned()
+                    };
+                    let counts = line_of(&text, "N=[", 0);
+                    let base_counts = line_of(&base_text, "N=[", 0);
+                    let (ours_a, last_a, size_a) = places(&line_of(&text, "PL= ", 0));
+                    let (ours_b, last_b, size_b) = places(&line_of(&text, "PL= ", 1));
+                    let before = |ours: &[u32], last: &[u32]| {
+                        ours.len() == 1 && last.len() == 1 && ours[0] <= last[0]
+                    };
+                    let got = marks(&payloads);
+                    // From `echo hi` on: C, then `D;0`, `D;0`, `D;1`, ...
+                    let tail: Vec<&str> = got.iter().rev().take(4).map(String::as_str).collect();
+                    let trap = text
+                        .split("trap -p DEBUG\r\n")
+                        .nth(1)
+                        .and_then(|rest| rest.split('\x1b').next())
+                        .unwrap_or_default();
+                    let mut wrong = Vec::new();
+                    if counts.is_empty()
+                        || counts.split(" TS").next() != base_counts.split(" TS").next()
+                    {
+                        wrong.push(format!(
+                            "counts {counts:?}, without Tessera {base_counts:?}"
+                        ));
+                    }
+                    if counts.contains("_tessera_si") || trap.contains("_tessera_si") {
+                        wrong.push(format!("our trap kept: {counts:?} {trap:?}"));
+                    }
+                    // Our PS0 piece leaves PS0 with the trap.
+                    let ps0_now = line_of(&text, "P0=[", 0);
+                    if ps0_now.is_empty() || ps0_now.contains("_tessera_si") {
+                        wrong.push(format!("PS0 {ps0_now:?}"));
+                    }
+                    if !before(&ours_a, &last_a) || ours_a != ours_b || last_a != last_b {
+                        wrong.push(format!(
+                            "places {ours_a:?} {last_a:?} then {ours_b:?} {last_b:?}"
+                        ));
+                    }
+                    if tool.ends_with("0.7.sh") && size_a != size_b {
+                        wrong.push(format!("0.7 grew: {size_a:?} then {size_b:?}"));
+                    }
+                    if v53 && tool.ends_with("0.7.sh") && !trap.trim().is_empty() {
+                        wrong.push(format!("0.7 on 5.3 has a DEBUG trap: {trap:?}"));
+                    }
+                    // bp 0.5 fuses its epilogue into the last element, so
+                    // with a user array its preexec runs for the user's
+                    // element (bp's own B10 limit) and eats our arming: the
+                    // marks stay bare A, B, D, never a wrong status.
+                    if tool.ends_with("0.5.sh") && what.contains(" array") {
+                        if got.iter().skip(4).any(|m| m == "C" || m.starts_with("D;")) {
+                            wrong.push(format!("0.5 with an array: {got:?}"));
+                        }
+                    } else if tail != ["C", "B", "A", "D;0"] {
+                        wrong.push(format!("not integrated at the end: {got:?}"));
+                    }
+                    if !wrong.is_empty() {
+                        failures.push(format!("{what}: {}", wrong.join("; ")));
+                    }
                 }
-                let output = session.finish();
-                assert_no_errors(&what, &output);
-                let text = String::from_utf8_lossy(&output);
-                let seen: Vec<&str> = text
-                    .split("PE[")
-                    .skip(1)
-                    .filter_map(|piece| piece.split_once(']').map(|(command, _)| command))
-                    .collect();
-                // After 0.5 the user's array element runs after
-                // bash-preexec's last entry, which then takes it for the
-                // command: no later preexec, as without Tessera.
-                let preexec = if tool.ends_with("0.6.sh") {
-                    lines
-                } else {
-                    &lines[..1]
-                };
-                for command in preexec {
-                    assert!(
-                        seen.iter().any(|got| got.trim_start().ends_with(command)),
-                        "{what}: no preexec for {command:?}: {text:?}"
-                    );
-                }
-                // The array is there from the first prompt (0.6) or from
-                // the second (the user's): no mark after that prompt's D.
-                let got = marks(&osc_payloads(&output));
-                let after = got
-                    .iter()
-                    .position(|m| m.starts_with('D'))
-                    .map_or(0, |d| d + 1);
-                let allowed = if tool.ends_with("0.6.sh") { 0 } else { after };
-                assert!(
-                    got.len() <= allowed,
-                    "{what}: marks after the opt-out: {got:?}"
-                );
             }
         }
     }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 /// An entry put before bash-preexec's prologue (`PROMPT_COMMAND="cmd;
@@ -1166,6 +1283,8 @@ printf '[%s]\n' "${_tessera_si_loader-}""#;
                 .env("PROMPT_COMMAND", prompt_command)
                 .env("LOADER", prompt_command)
                 .env_remove("TESSERA_SHELL_INTEGRATION")
+                // (The count below is of the environment: not the tests'.)
+                .env_remove(BASH51_VAR)
                 .output()
                 .unwrap();
             let what = format!("{} {mode:?}", bash.program.display());
@@ -1287,4 +1406,37 @@ fn the_directory_is_encoded_once_per_directory() {
             "{what}: {text:?}"
         );
     }
+}
+
+/// The vendored bash-preexec 0.7.0 (#613) is the upstream file under our
+/// header: the bytes after the header's end line hash to the sha256 the
+/// header gives (that of `bash-preexec.sh` at tag 0.7.0).
+#[test]
+fn vendored_bash_preexec_0_7_is_the_upstream_file() {
+    const UPSTREAM: &str = "33de4e70ee84981d46e7d8a0e3105f1dd9affc9c4178594446cd96e7ef3b2752";
+    const END: &str = "# --- end of the Tessera header ---\n";
+    let (_, text) = TOOLS
+        .iter()
+        .find(|(name, _)| *name == "bash-preexec-0.7.sh")
+        .expect("vendored");
+    let (header, body) = text.split_once(END).expect("header end line");
+    assert!(
+        header.contains(UPSTREAM)
+            && header.contains(
+                "https://raw.githubusercontent.com/rcaloras/bash-preexec/0.7.0/bash-preexec.sh"
+            )
+            && header.contains("Copyright (c) 2017 Ryan Caloras and contributors"),
+        "{header}"
+    );
+    let mut shasum = std::process::Command::new("/usr/bin/shasum")
+        .args(["-a", "256"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("shasum");
+    std::io::Write::write_all(&mut shasum.stdin.take().expect("stdin"), body.as_bytes())
+        .expect("write");
+    let output = shasum.wait_with_output().expect("shasum output");
+    let digest = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(digest.split(' ').next(), Some(UPSTREAM), "{digest}");
 }

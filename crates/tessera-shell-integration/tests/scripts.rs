@@ -13,7 +13,7 @@ use tessera_shell_integration::scripts::{
 
 /// The version and digest of the scripts as last released. A script change
 /// must bump `SCRIPTS_VERSION` and record the new digest here.
-const RECORDED: (u32, u64) = (12, 0x292a_1b2d_0972_90d7);
+const RECORDED: (u32, u64) = (13, 0x2130_1a76_4725_ad3e);
 
 #[test]
 fn scripts_version_matches_the_scripts() {
