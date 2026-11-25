@@ -535,14 +535,16 @@ mod tests {
     }
 
     /// A caller waiting for a free helper returns at once when the busy
-    /// one times out and so fills the cap with stuck helpers.
+    /// one times out and so fills the cap with stuck helpers. The busy
+    /// call's 1 s leaves a loaded machine time to have the caller waiting
+    /// before then, so the wake-up on the cap filling is what returns it.
     #[test]
     fn a_waiting_caller_returns_once_the_cap_fills_with_stuck_helpers() {
         static POOL: Pool = Pool::new(1);
         let (release, released) = mpsc::channel::<()>();
         let (entered, has_entered) = mpsc::channel::<()>();
         let busy = thread::spawn(move || {
-            POOL.run("bounded-test", Duration::from_millis(200), move || {
+            POOL.run("bounded-test", Duration::from_secs(1), move || {
                 entered.send(()).unwrap();
                 released.recv_timeout(SLACK * 4).ok();
             })
@@ -558,6 +560,32 @@ mod tests {
         assert_eq!(started(&POOL), 1, "a second helper started");
         release.send(()).unwrap();
         wait_idle(&POOL);
+    }
+
+    /// #554 M3: every helper first runs the crate's thread start hook
+    /// (ADR 0018), on the process's own helpers too. The hook is
+    /// process-wide: no other test in this crate's unit tests installs
+    /// one, and it only records the threads it ran on, so tests beside it
+    /// (`cargo test`) are unaffected.
+    #[test]
+    fn a_helper_runs_the_thread_start_hook_first() {
+        static HOOKED: Mutex<Vec<thread::ThreadId>> = Mutex::new(Vec::new());
+        fn record() {
+            lock(&HOOKED).push(thread::current().id());
+        }
+        assert!(
+            crate::set_thread_start_hook(record),
+            "another hook was installed"
+        );
+        for name in ["pty-spawn-check", "pty-spawn-program"] {
+            let helper = run_bounded(name, SLACK, || {
+                let me = thread::current().id();
+                (me, lock(&HOOKED).contains(&me))
+            });
+            let (helper, hooked_first) = helper.expect("the helper answered");
+            assert_ne!(helper, thread::current().id(), "{name} ran on the caller");
+            assert!(hooked_first, "{name} ran before the hook");
+        }
     }
 
     #[test]
