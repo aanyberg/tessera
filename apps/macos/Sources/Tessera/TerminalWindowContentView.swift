@@ -29,7 +29,11 @@ import TesseraKit
 /// AppKit's full-screen toolbar window, where there is no desktop behind
 /// them: they draw opaque there (the title bar is not transparent) and the
 /// content has no strip under them, whatever the window's opacity and blur;
-/// the panes keep theirs. Leaving full screen brings the windowed look back.
+/// the panes keep theirs. There the title row slides away with the menu bar,
+/// and the tab bar, which keeps its windowed space below the tabs and none
+/// above (the title row is above it when windowed), would sit at the top
+/// edge of the screen: a spacer over it gives the tabs the same space above
+/// as below (#621). Leaving full screen brings the windowed look back.
 @MainActor
 final class TerminalWindowContentView: NSView {
     let paneContainer: PaneContainerView
@@ -41,6 +45,12 @@ final class TerminalWindowContentView: NSView {
     /// The theme's tint over ``titlebarBackdrop``, the same size; `nil`
     /// while opaque.
     private(set) var titlebarTint: StripTintView?
+
+    /// The empty title bar accessory over the tab bar in native full
+    /// screen (``TitlebarLayout/tabRowSpacerHeight``), added the first
+    /// time one is needed and hidden (taking no height) while none is;
+    /// `nil` before.
+    private(set) var tabRowSpacer: NSTitlebarAccessoryViewController?
 
     /// The window's `contentLayoutRect`, which a tab bar coming or going
     /// changes without resizing a full-size content view.
@@ -94,17 +104,65 @@ final class TerminalWindowContentView: NSView {
         /// The height of the blurred, tinted strip under the title bar and
         /// tab bar; 0 for none.
         var stripHeight: CGFloat
+        /// The height of the spacer over the tab bar (``tabRowSpacer``);
+        /// 0 for none.
+        var tabRowSpacerHeight: CGFloat = 0
+    }
+
+    /// The space above and below the tab row (AppKit's tab bar) in the
+    /// title bar accessory that holds it, as AppKit lays it out: on macOS
+    /// 27, none above and 8 pt below, the title row being above it in a
+    /// window.
+    struct TabRowInsets: Equatable {
+        var top: CGFloat
+        var bottom: CGFloat
     }
 
     /// The title bar and strip of a window in native full screen or not,
     /// translucent or opaque, whose content runs `measuredStrip` above the
-    /// panes (under the title bar and tab bar): windowed and translucent,
+    /// panes (under the title bar and tab bar) and whose tab row has
+    /// `tabRow` round it (`nil`: no tab bar): windowed and translucent,
     /// a transparent title bar over a strip of that height; otherwise
     /// (opaque, or in full screen, which has no desktop behind the bars)
-    /// a title bar that draws its own material and no strip.
-    static func titlebarLayout(fullScreen: Bool, translucent: Bool, measuredStrip: CGFloat) -> TitlebarLayout {
-        guard translucent, !fullScreen else { return TitlebarLayout(titlebarTransparent: false, stripHeight: 0) }
+    /// a title bar that draws its own material and no strip. In full
+    /// screen, where the title row is hidden with the menu bar and the tab
+    /// bar is the top of the screen, a spacer over the tab bar makes the
+    /// space above the tabs what AppKit leaves below them (#621); windowed,
+    /// none, and none where there is more space above than below.
+    static func titlebarLayout(
+        fullScreen: Bool, translucent: Bool, measuredStrip: CGFloat, tabRow: TabRowInsets?
+    ) -> TitlebarLayout {
+        guard translucent, !fullScreen else {
+            let spacer = fullScreen ? max(0, (tabRow?.bottom ?? 0) - (tabRow?.top ?? 0)) : 0
+            return TitlebarLayout(titlebarTransparent: false, stripHeight: 0, tabRowSpacerHeight: spacer)
+        }
         return TitlebarLayout(titlebarTransparent: true, stripHeight: max(0, measuredStrip))
+    }
+
+    /// The insets of the tab row of `window`'s tab group
+    /// (``TabRowInsets``): read from the accessory of whichever of its
+    /// windows holds the tab bar now (the selected one, which a tab
+    /// selection may not have moved it to yet); `nil` while the group shows
+    /// no tab bar, or where AppKit has no `NSTabBar` to read.
+    static func tabRowInsets(of window: NSWindow) -> TabRowInsets? {
+        guard let tabBarClass = NSClassFromString("NSTabBar") else { return nil }
+        func insets(in window: NSWindow) -> TabRowInsets? {
+            for accessory in window.titlebarAccessoryViewControllers
+            where !(accessory is TabRowSpacerController) && !accessory.isHidden {
+                let bar = accessory.view
+                guard let row = bar.subviews.first(where: { $0.isKind(of: tabBarClass) && !$0.isHidden }) else {
+                    continue
+                }
+                let frame = row.frame
+                let bounds = bar.bounds
+                return bar.isFlipped
+                    ? TabRowInsets(top: frame.minY - bounds.minY, bottom: bounds.maxY - frame.maxY)
+                    : TabRowInsets(top: bounds.maxY - frame.maxY, bottom: frame.minY - bounds.minY)
+            }
+            return nil
+        }
+        if let own = insets(in: window) { return own }
+        return (window.tabGroup?.windows ?? []).lazy.filter { $0 !== window }.compactMap(insets(in:)).first
     }
 
     /// A view for `paneContainer`, which ``install(in:)`` puts in it.
@@ -145,7 +203,7 @@ final class TerminalWindowContentView: NSView {
     /// blurs under it while `translucent`, whatever the panes' blur; in
     /// native full screen the title bar draws its own material over the
     /// full-size content and nothing is under it
-    /// (``titlebarLayout(fullScreen:translucent:measuredStrip:)``).
+    /// (``titlebarLayout(fullScreen:translucent:measuredStrip:tabRow:)``).
     func updateTitlebar(translucent: Bool) {
         guard let window else { return }
         if window.styleMask.contains(.fullSizeContentView) != translucent {
@@ -309,6 +367,12 @@ final class TerminalWindowContentView: NSView {
         super.viewWillMove(toWindow: newWindow)
         layoutRectObservation = nil
         tabSelectionObservation = nil
+        if let window, let tabRowSpacer {
+            if let index = window.titlebarAccessoryViewControllers.firstIndex(of: tabRowSpacer) {
+                window.removeTitlebarAccessoryViewController(at: index)
+            }
+            self.tabRowSpacer = nil
+        }
         if let window {
             NotificationCenter.default.removeObserver(
                 self, name: NSWindow.didChangeOcclusionStateNotification, object: window)
@@ -346,20 +410,29 @@ final class TerminalWindowContentView: NSView {
 
     /// Lays the panes out in ``paneArea`` and the blur above them, and
     /// makes the title bar transparent or not, as
-    /// ``titlebarLayout(fullScreen:translucent:measuredStrip:)`` has it for
+    /// ``titlebarLayout(fullScreen:translucent:measuredStrip:tabRow:)`` has it for
     /// the window now (in or out of native full screen, whose transition
     /// changes the layout rect); the window's smallest size follows a
-    /// change of the title bar's height.
+    /// change of the title bar's height. The spacer over the tab bar comes
+    /// first, as it moves the layout rect.
     private func placeSubviews() {
         guard !holdsPanes else { return }
+        let style = window?.styleMask ?? []
+        let fullScreen = style.contains(.fullScreen)
+        let translucent = style.contains(.fullSizeContentView)
+        // Read in full screen only: a window has no spacer, and reading
+        // its tab group the first time creates it (#608), here while
+        // AppKit still places a new window.
+        let tabRow = fullScreen ? window.flatMap(Self.tabRowInsets(of:)) : nil
+        placeTabRowSpacer(
+            Self.titlebarLayout(fullScreen: fullScreen, translucent: translucent, measuredStrip: 0, tabRow: tabRow)
+                .tabRowSpacerHeight)
         let area = paneArea
         if paneContainer.frame != area {
             paneContainer.frame = area
         }
-        let style = window?.styleMask ?? []
         let layout = Self.titlebarLayout(
-            fullScreen: style.contains(.fullScreen), translucent: style.contains(.fullSizeContentView),
-            measuredStrip: bounds.maxY - area.maxY)
+            fullScreen: fullScreen, translucent: translucent, measuredStrip: bounds.maxY - area.maxY, tabRow: tabRow)
         if let window, window.titlebarAppearsTransparent != layout.titlebarTransparent {
             window.titlebarAppearsTransparent = layout.titlebarTransparent
         }
@@ -389,6 +462,35 @@ final class TerminalWindowContentView: NSView {
         }
     }
 
+    /// Shows ``tabRowSpacer`` `height` high over the tab bar, in full
+    /// screen too (`fullScreenMinHeight`), adding it the first time; hides
+    /// it for 0. AppKit sizes an accessory's view as it adds it, so the
+    /// height is set after.
+    private func placeTabRowSpacer(_ height: CGFloat) {
+        guard let window else { return }
+        guard height > 0 else {
+            if let tabRowSpacer, !tabRowSpacer.isHidden { tabRowSpacer.isHidden = true }
+            return
+        }
+        let spacer: NSTitlebarAccessoryViewController
+        if let tabRowSpacer {
+            spacer = tabRowSpacer
+        } else {
+            spacer = TabRowSpacerController()
+            spacer.view = NSView(frame: NSRect(x: 0, y: 0, width: bounds.width, height: height))
+            spacer.layoutAttribute = .bottom
+            // Kept before it is added: adding it moves the layout rect,
+            // whose observer lays out again from inside the call.
+            tabRowSpacer = spacer
+            window.addTitlebarAccessoryViewController(spacer)
+        }
+        if spacer.view.frame.height != height {
+            spacer.view.setFrameSize(NSSize(width: spacer.view.frame.width, height: height))
+        }
+        if spacer.fullScreenMinHeight != height { spacer.fullScreenMinHeight = height }
+        if spacer.isHidden { spacer.isHidden = false }
+    }
+
     /// The height of `window`'s title bar alone, without a tab bar: the
     /// frame a standard (not full-size) window of its style puts round an
     /// empty content rect.
@@ -396,6 +498,11 @@ final class TerminalWindowContentView: NSView {
         NSWindow.frameRect(forContentRect: .zero, styleMask: window.styleMask.subtracting(.fullSizeContentView)).height
     }
 }
+
+/// ``TerminalWindowContentView/tabRowSpacer``'s controller: set apart from
+/// AppKit's tab bar accessory, which ``TerminalWindowContentView/tabRowInsets(of:)``
+/// reads, in every tab of a group.
+final class TabRowSpacerController: NSTitlebarAccessoryViewController {}
 
 /// The theme's colour over the strip's blur in a translucent window (#388,
 /// ADR 0043 strip tint): one segment per pane at the top of the panes, each

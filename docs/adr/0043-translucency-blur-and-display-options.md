@@ -181,7 +181,10 @@ whatever the window's opacity and blur. The terminal content keeps its
 opacity setting: the window stays transparent and each pane draws its
 background at its opacity, with its own blur. Leaving full screen brings the
 windowed look back (transparent title bar over the blurred, tinted strip). An
-opaque window is the same in and out of full screen.
+opaque window looks the same in and out of full screen. In both, while the tab
+bar shows, the panes lose 8 pt of height in full screen to the tab-row spacer:
+a title bar accessory over the tab bar that gives the tabs as much space above
+them as below (#621).
 
 **Why.** In full screen AppKit moves the title bar and tab bar into its
 separate full-screen toolbar window, which slides in over the content. There
@@ -189,9 +192,11 @@ is no desktop behind them there, so a transparent bar showed the content or
 the space's backdrop through it, over a strip sized for the windowed title
 bar (#494, found in the 0.2.0 manual pass).
 
-**How.** One pure function, `TerminalWindowContentView.titlebarLayout(fullScreen:translucent:measuredStrip:)`,
-returns `(titlebarTransparent, stripHeight)`: a transparent bar over the
-measured strip only for a translucent window out of full screen. The content
+**How.** One pure function, `TerminalWindowContentView.titlebarLayout(fullScreen:translucent:measuredStrip:tabRow:)`,
+returns `(titlebarTransparent, stripHeight, tabRowSpacerHeight)`: a
+transparent bar over the measured strip only for a translucent window out of
+full screen, and in full screen a spacer as high as the tab row's space below
+it minus its space above (8 pt on macOS 27, zero without a tab bar). The content
 view applies it on every layout pass, reading
 `window.styleMask.contains(.fullScreen)` (the transition resizes the window
 and moves its `contentLayoutRect`, and a tab selected in full screen lays out
