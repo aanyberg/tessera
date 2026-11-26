@@ -114,6 +114,12 @@ final class TerminalSurfaceViewTests: XCTestCase {
         let other = FileManager.default.temporaryDirectory.appendingPathComponent("tessera-view-\(UUID()).bin")
         appDelegate.spawnOptions = .init(program: "/bin/sh", arguments: ["-c", "sleep 100; true"])
         let pane = try appDelegate.newWindow().focusedPane
+        // The shell forks its sleep on its own time: wait for it, so the
+        // 3 s below times the recorder wait, not the fork (#664).
+        let shellAndSleep = #"pid \d+ (sh|bash|dash|zsh) > pid \d+ sleep( |$)"#
+        try await waitForChildProcesses("the shell and its sleep") {
+            $0.range(of: shellAndSleep, options: .regularExpression) != nil
+        }
         do {
             try await waitForRecorder(
                 of: pane.view, recordingTo: other, budget: ChildStartBudget(base: .seconds(3), cap: .seconds(3)))
@@ -134,11 +140,30 @@ final class TerminalSurfaceViewTests: XCTestCase {
     /// unreaped one's state, one `>` per level (#664).
     func testARecorderStuckBeforeRawModeNamesStoppedAndUnreapedChildren() async throws {
         let other = FileManager.default.temporaryDirectory.appendingPathComponent("tessera-view-\(UUID()).bin")
-        // `sleep 0` exits and `sleep 100` stops (perhaps still the forked
-        // shell, before its exec); the exec'd sleep never reaps either.
+        // The test ends one of the shell's two sleeps and stops the other,
+        // once the shell has exec'd its own sleep, which never reaps or
+        // waits on them. Not the script (#664): its `kill -STOP $!` raced
+        // the child's exec, and the shell continued a child it saw stop
+        // (a running sleep then), and its `sleep 0` exited early enough
+        // for the shell to reap it before its exec.
         appDelegate.spawnOptions = .init(
-            program: "/bin/sh", arguments: ["-c", "sleep 0 & sleep 100 & kill -STOP $!; exec sleep 100"])
+            program: "/bin/sh", arguments: ["-c", "sleep 100 & sleep 100 & exec sleep 100"])
         let pane = try appDelegate.newWindow().focusedPane
+        let sleeps = /pid \d+ sleep > pid (\d+) sleep > pid (\d+) sleep/
+        var pids: (stopped: pid_t, ended: pid_t)?
+        try await waitForChildProcesses("the shell's sleep and its two") { tree in
+            guard let match = tree.firstMatch(of: sleeps), let stopped = pid_t(match.1), let ended = pid_t(match.2)
+            else { return false }
+            pids = (stopped, ended)
+            return true
+        }
+        let (stopped, ended) = try XCTUnwrap(pids)
+        defer { kill(stopped, SIGKILL) }
+        kill(ended, SIGKILL)
+        kill(stopped, SIGSTOP)
+        try await waitForChildProcesses("one sleep stopped, one exited") { tree in
+            tree.contains("pid \(stopped) sleep (stopped)") && tree.contains("pid \(ended) sleep (exited, not reaped)")
+        }
         var text = ""
         do {
             try await waitForRecorder(
@@ -148,15 +173,9 @@ final class TerminalSurfaceViewTests: XCTestCase {
             text = failure.description
         }
         XCTAssertNotNil(
-            text.range(of: #"pid \d+ sleep > pid \d+ (sleep|sh|bash|dash|zsh) \(stopped\)"#, options: .regularExpression),
-            text)
+            text.range(of: #"pid \d+ sleep > pid \#(stopped) sleep \(stopped\)"#, options: .regularExpression), text)
         XCTAssertNotNil(
-            text.range(of: #" > pid \d+ sleep \(exited, not reaped\)"#, options: .regularExpression), text)
-        // The stopped child (stopped before or after its exec of sleep)
-        // outlives a hang-up; end it here.
-        if let match = text.firstMatch(of: /pid (\d+) \w+ \(stopped\)/), let pid = pid_t(match.1) {
-            kill(pid, SIGKILL)
-        }
+            text.range(of: #" > pid \#(ended) sleep \(exited, not reaped\)"#, options: .regularExpression), text)
     }
 
     /// The list puts one `>` per level and stops at its limit with how many
@@ -2119,6 +2138,23 @@ func waitForRecorder(
                     + "screen ending \(text.debugDescription)")
         }
         try await Task.sleep(for: .milliseconds(10))
+    }
+}
+
+/// Waits until ``childProcesses(limit:)`` satisfies `condition`, for at
+/// most a ``ChildStartBudget``: a test of how a stuck recorder's timeout
+/// names its processes sets them up first, so that timeout does not race
+/// the forks, exits and stops it lists (#664).
+@MainActor
+func waitForChildProcesses(_ description: String, _ condition: (String) -> Bool) async throws {
+    var budget = ChildStartBudget()
+    var tree = childProcesses(limit: 100)
+    while !condition(tree) {
+        guard !budget.isSpent() else {
+            throw PollTimedOut(description: "the host's children never showed \(description) \(budget.summary): \(tree)")
+        }
+        try await Task.sleep(for: .milliseconds(10))
+        tree = childProcesses(limit: 100)
     }
 }
 

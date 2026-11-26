@@ -675,13 +675,21 @@ struct ChildStartBudget {
 
     var elapsed: Duration { ContinuousClock.now - started }
 
+    /// When the load was last read.
+    private var sampled = ContinuousClock.now
+
     /// Whether the budget has run out, at the highest load seen since the
-    /// wait began (read again only once the budget seems spent).
+    /// wait began: read again every second of the wait and once the budget
+    /// seems spent. Read only at the start and the end, a spike in between
+    /// that had passed by the end set no budget at all (#664).
     mutating func isSpent() -> Bool {
-        guard elapsed >= budget else { return false }
+        let now = ContinuousClock.now
+        let spent = now - started >= budget
+        guard spent || now - sampled >= .seconds(1) else { return false }
+        sampled = now
         peakLoadPerCore = max(peakLoadPerCore, Self.loadPerCore())
         budget = Self.budget(atLoadPerCore: peakLoadPerCore, base: base, cap: cap)
-        return elapsed >= budget
+        return now - started >= budget
     }
 
     /// "after 31.2 s (budget 30.0 s at load 0.8 per core on 10 cores)".
