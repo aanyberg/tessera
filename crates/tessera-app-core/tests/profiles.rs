@@ -106,7 +106,7 @@ fn a_profile_runs_its_command_in_its_working_directory() {
 }
 
 /// Done-when 2: `~` is the home directory, and a directory that does not
-/// exist falls back to it (with a warning, `profile` unit tests).
+/// exist falls back to it (with a warning, `tessera-pty` unit tests).
 #[test]
 fn a_tilde_and_a_missing_directory_both_start_at_home() {
     let root = tempfile::tempdir().unwrap();
