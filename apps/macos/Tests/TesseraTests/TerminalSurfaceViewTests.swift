@@ -1,10 +1,10 @@
 import AppKit
 import Carbon
 import Metal
-import TesseraKit
 import XCTest
 
 @testable import Tessera
+@testable import TesseraKit
 
 /// `TerminalSurfaceView` in a real window of the running app: keyboard and
 /// input-method handling against the bytes that reach the PTY, resize
@@ -899,6 +899,107 @@ final class TerminalSurfaceViewTests: XCTestCase {
             XCTAssertTrue(view.isDisplayLinkPaused, "\(label): the link idles again")
             view.displayLinkDidFire()
             XCTAssertEqual(view.renderCount, before + 1, "\(label): no second frame")
+        }
+    }
+
+    /// #650: the landing as the core reports it, with nothing in the test
+    /// calling ``TerminalSurfaceView/fontIndexDidLand()``: the core's test
+    /// hook holds the font index of a window opened the app's way while it
+    /// draws a character that waits for the index (U+1F210 in text
+    /// presentation, which only the emoji family covers), then releases it.
+    /// The core calls `on_font_index_ready`, and the bridge and the router
+    /// hand it to every view: an idle one wakes its link and draws one frame.
+    ///
+    /// The view that shows the landing is the test's recorder, an idle pane
+    /// whose child prints nothing more (its R arrived in set-up): nothing
+    /// else asks it for a frame. The new window's pane is asked too, but its
+    /// own output may still be on its way to it. Where its frames get a
+    /// drawable (a visible window), the one after the landing also replaces
+    /// the provisional face; the hosted test windows usually get none, and
+    /// the core's own test covers the drawing (#594).
+    func testTheCoresFontIndexLandingRedrawsAnIdlePane() async throws {
+        try requireSurface()
+        try requireCoreTestHooks()
+        let app = try XCTUnwrap(view.session.core.pointer)
+        XCTAssertEqual(tessera_test_hold_font_index(app, true), 0, "held")
+        var held = true
+        defer {
+            if held { _ = tessera_test_hold_font_index(app, false) }
+        }
+        appDelegate.spawnOptions = .init(
+            program: "/bin/sh", arguments: ["-c", #"printf '\360\237\210\220\357\270\216 ready'; exec cat"#])
+        // Its surface attaches with the fonts loaded after the hold.
+        let pane = try appDelegate.newWindow().focusedPane
+        let provisional = pane.view
+        let other = KeyControlledWindow(contentRect: provisional.frame)
+        extraWindows.append(other)
+        other.contentView = provisional
+        provisional.occlusionOverride = false
+        provisional.frameStatusOverride = .presented
+        provisional.scroller.preferredStyleOverride = .overlay
+        guard provisional.surface.isAttached else {
+            throw XCTSkip("the core could not attach a renderer to the new window's view (no GPU can present)")
+        }
+        var budget = ChildStartBudget()
+        while !((try? pane.session.accessibleText().string) ?? "").contains("ready") {
+            guard provisional.status == nil, !budget.isSpent() else {
+                throw PollTimedOut(description: "the child's text never showed \(budget.summary)")
+            }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        // A frame with a drawable shapes the character with a provisional
+        // face.
+        let presentedBefore = provisional.presentedFrameCount
+        provisional.displayLinkDidFire()
+        let drew = provisional.presentedFrameCount > presentedBefore
+        if drew {
+            XCTAssertEqual(try provisionalFaces(app, pane.session), true, "drawn with a provisional face")
+        }
+        view.occlusionOverride = false
+        view.displayLinkDidFire()
+        XCTAssertFalse(view.isRenderPending, "idle before the landing")
+        XCTAssertTrue(view.isDisplayLinkPaused, "idle before the landing")
+
+        let before = view.renderCount
+        XCTAssertEqual(tessera_test_hold_font_index(app, false), 0, "released")
+        held = false
+        budget = ChildStartBudget()
+        while !view.isRenderPending {
+            guard !budget.isSpent() else {
+                throw PollTimedOut(description: "the landing never asked the idle view for a frame \(budget.summary)")
+            }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertFalse(view.isDisplayLinkPaused, "the landing wakes the link")
+        XCTAssertEqual(view.renderCount, before, "nothing drew it yet")
+        view.displayLinkDidFire()
+        XCTAssertEqual(view.renderCount, before + 1, "one frame")
+        XCTAssertFalse(view.isRenderPending, "nothing pending after it")
+        XCTAssertTrue(view.isDisplayLinkPaused, "the link idles again")
+
+        XCTAssertTrue(provisional.isRenderPending, "the pane that drew the character is asked too")
+        let presentedAtLanding = provisional.presentedFrameCount
+        provisional.displayLinkDidFire()
+        if drew, provisional.presentedFrameCount > presentedAtLanding {
+            XCTAssertEqual(try provisionalFaces(app, pane.session), false, "redrawn with the face the index found")
+        } else {
+            print("testTheCoresFontIndexLandingRedrawsAnIdlePane: no drawable, so the redrawn face is not checked")
+        }
+    }
+
+    /// What the core's test hook says about `session`'s surface.
+    private func provisionalFaces(_ app: OpaquePointer, _ session: TesseraSession) throws -> Bool {
+        var shows = false
+        XCTAssertEqual(tessera_test_surface_shows_provisional_faces(app, session.id, &shows), 0, "read")
+        return shows
+    }
+
+    /// Fails unless the host exports the core's test hooks
+    /// (CoreTestHooks.h): `just app-test` builds the core with them, and
+    /// the Tessera target's Debug link keeps them.
+    private func requireCoreTestHooks() throws {
+        guard TesseraTestsCoreTestHooksLinked() else {
+            throw MissingCoreTestHooks()
         }
     }
 
@@ -1968,6 +2069,15 @@ final class TerminalSurfaceViewTests: XCTestCase {
             }
             try await Task.sleep(for: .milliseconds(10))
         }
+    }
+}
+
+/// The host does not export the core's test hooks (CoreTestHooks.h).
+private struct MissingCoreTestHooks: Error, CustomStringConvertible {
+    var description: String {
+        "the test host does not export tessera_test_hold_font_index and "
+            + "tessera_test_surface_shows_provisional_faces: its core was built without tessera-ffi's test-hooks "
+            + "(run the tests through just app-test or just app-test-only), or its link dead-stripped them"
     }
 }
 

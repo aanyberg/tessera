@@ -2,6 +2,8 @@
 
 #import <Foundation/Foundation.h>
 
+#import "CoreTestHooks.h"
+
 NS_ASSUME_NONNULL_BEGIN
 
 /// Runs `block` and returns the Objective-C exception that ended it, or
