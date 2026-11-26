@@ -45,6 +45,7 @@ pub use wgpu;
 
 mod atlas;
 mod boxdraw;
+mod cmap;
 mod damage;
 mod error;
 mod font;

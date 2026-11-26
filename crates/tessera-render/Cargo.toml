@@ -39,6 +39,8 @@ wgpu = { version = "30", default-features = false, features = ["metal", "wgsl", 
 [dev-dependencies]
 # Golden images in tests/golden (ADR 0010).
 png.workspace = true
+# Property tests of the character map walk against swash's (#689).
+proptest.workspace = true
 # Enables `test-hooks` for this crate's integration tests.
 tessera-render = { path = ".", features = ["test-hooks"] }
 # Scratch directories removed when a test ends, failing or not (#698).

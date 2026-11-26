@@ -411,3 +411,28 @@ to the ordinary resolution, in-family step included. #119 said emoji
 presentation must not change; this is an accepted deviation from the issue:
 which family is tried first is unchanged for both selectors, and a selector
 should not bring back the wrong-family result the step exists to avoid.
+
+## Amendment: a bounded character map walk (#689, 2026-11-25)
+
+The coverage index no longer walks a face's character map with swash's
+`Charmap::enumerate`. That walk took each format-12 group from its start
+to its end as the font states them: a group ending at `u32::MAX` cost
+four billion steps (1.66 s in release), the 2 MiB `cmap` cap holds about
+174 000 such groups, and a glyph offset near `u32::MAX` overflowed the
+glyph arithmetic, a panic in debug builds that killed the index thread
+so the index never landed. The index now reads the subtable swash's
+character map picks (`cmap::enumerate` in tessera-render: a symbol
+subtable, else a Unicode format-12 one, else the first Unicode format-4
+one; never format 13, which swash does not read either) with its own
+walk, which stops at the code space (U+10FFFF), starts each group or
+segment above the highest code point an earlier one reached (a valid
+font's groups are sorted and do not overlap, so nothing changes for
+one), and wraps glyph arithmetic as swash does in release. A face costs
+at most 0x110000 code points plus one step per group or segment: 1.3 ms
+in release (41 ms in debug) for a 2 MiB `cmap` of 174 760 overlapping
+groups reaching `u32::MAX`, which took hours before. For a
+well-formed table it yields swash's pairs (a property test and the
+installed-font build compare the two). A panic in a face's walk is
+caught: the face is left out, with one warning naming its index, and the index lands from the others. The lookups after the index still
+use swash's `Charmap::map`, whose format-12 arithmetic can overflow in a
+debug build for such a font (release wraps).
