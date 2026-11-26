@@ -84,6 +84,15 @@ const CODE_SPACE: usize = CODE_SPACE_U32 as usize;
 /// The `cmap` table's tag.
 const CMAP_TAG: u32 = u32::from_be_bytes(*b"cmap");
 
+/// `font`'s `cmap` table, `None` when it has none or its record puts it
+/// at offset 0, which swash's character map and the index's read
+/// ([`read_face_cmap`]) take for no table (`FontRef::table` gives the
+/// bytes from the file's start).
+fn cmap_table<'a>(font: &swash::FontRef<'a>) -> Option<&'a [u8]> {
+    font.table(CMAP_TAG)
+        .filter(|table| !std::ptr::eq(table.as_ptr(), font.data.as_ptr()))
+}
+
 /// Font selection for one terminal surface.
 ///
 /// `size_pt` is in typographic points, which on macOS are logical pixels;
@@ -1075,8 +1084,7 @@ impl Inner {
     }
 
     fn covers(&mut self, face: FaceId, ch: char) -> bool {
-        self.load(face)
-            .is_some_and(|font| font.as_swash().charmap().map(ch) != 0)
+        self.nominal_glyph(face, ch) != 0
     }
 
     pub(crate) fn is_color(&mut self, face: FaceId) -> bool {
@@ -1098,10 +1106,10 @@ impl Inner {
         let font = font.as_swash();
         let metrics = font.metrics(&[]).scale(size_px);
         let glyphs = font.glyph_metrics(&[]).scale(size_px);
-        let charmap = font.charmap();
+        let cmap = cmap_table(&font).unwrap_or_default();
         let cell_advance = ['0', 'M']
             .into_iter()
-            .map(|c| charmap.map(c))
+            .map(|c| cmap::map(cmap, u32::from(c)))
             .find(|&g| g != 0)
             .map_or(size_px * 0.6, |g| glyphs.advance_width(g));
         Some(FaceMetrics {
@@ -1148,10 +1156,14 @@ impl Inner {
     }
 
     /// The glyph `face`'s character map gives `ch`, before any shaping
-    /// substitution (0 when the face does not cover it).
+    /// substitution (0 when the face does not cover it): swash's
+    /// `Charmap::map`, through Tessera's own reader of the same subtable
+    /// ([`cmap::map`]), whose glyph arithmetic wraps where swash's
+    /// overflowed in debug builds (#716).
     pub(crate) fn nominal_glyph(&mut self, face: FaceId, ch: char) -> u16 {
-        self.load(face)
-            .map_or(0, |font| font.as_swash().charmap().map(ch))
+        self.load(face).map_or(0, |font| {
+            cmap_table(&font.as_swash()).map_or(0, |table| cmap::map(table, u32::from(ch)))
+        })
     }
 
     /// `None` when the glyph draws nothing; otherwise the horizontal extent
@@ -1386,10 +1398,10 @@ impl Coverage {
     /// the first face in database order that has a glyph for it (what a
     /// per-character linear search would find).
     fn build(db: &fontdb::Database) -> Self {
-        Self::build_counting_opens(db).0
+        Self::build_with_stats(db).0
     }
 
-    /// [`Self::build`], also returning how many font files it opened.
+    /// [`Self::build`], also returning what it cost.
     ///
     /// A font file is read with `read(2)`, never memory mapped: another
     /// process may truncate or rewrite an installed font in place while
@@ -1407,7 +1419,16 @@ impl Coverage {
     /// being read, reused by the next face when the faces share it, and
     /// is dropped before the next file opens; files are read one at a
     /// time. In-memory fonts (`Source::Binary`) are read where they are.
-    fn build_counting_opens(db: &fontdb::Database) -> (Self, usize) {
+    ///
+    /// A face whose `cmap` is the one the face before it in the same file
+    /// read (same offset and length) is not walked again (#716): it comes
+    /// later in database order, so it can win no code point the earlier
+    /// face did not already take. The whole build walks at most
+    /// [`MAX_INDEX_STEPS`] and reads at most [`MAX_INDEX_CMAP_READ`] of
+    /// `cmap` tables (a collection's face count is unbounded): the face
+    /// that runs out of either is cut there and every later face is left
+    /// out, with one warning.
+    fn build_with_stats(db: &fontdb::Database) -> (Self, BuildStats) {
         let started = std::time::Instant::now();
         let mut faces: Vec<fontdb::ID> = Vec::new();
         // One entry per face: (its source, index into `faces`, face index
@@ -1444,16 +1465,11 @@ impl Coverage {
         // source can hold a face that comes after a later source's first
         // face, so a slot takes the lowest index that covers it, not the
         // first one written: first face wins in database order.
-        let mut owner = vec![u32::MAX; CODE_SPACE];
-        let mut walked = cmap::Walk::default();
-        let mut index_face = |index: u32, table: &[u8]| {
-            if let Some(walk) = walk_face(&mut owner, index, table) {
-                walked.code_points += walk.code_points;
-                walked.records += walk.records;
-            }
-        };
-        let mut opens = 0;
+        let mut build = Build::new();
         for run in members.chunk_by(|a, b| a.0 == b.0) {
+            if build.stopped {
+                break;
+            }
             let Some(&load_by) = run
                 .first()
                 .and_then(|&(source, _, _)| faces.get(source as usize))
@@ -1465,8 +1481,8 @@ impl Coverage {
                 .map(|&(_, index, face_index)| (index, face_index));
             match db.face(load_by).map(|f| &f.source) {
                 Some(fontdb::Source::File(path) | fontdb::Source::SharedFile(path, _)) => {
-                    opens += 1;
-                    index_file(path, faces_of_run, &mut index_face);
+                    build.stats.opens += 1;
+                    index_file(path, faces_of_run, &mut build);
                 }
                 Some(fontdb::Source::Binary(_)) => {
                     // Resident data: `with_face_data` maps nothing for it.
@@ -1474,9 +1490,9 @@ impl Coverage {
                         for (index, face_index) in faces_of_run {
                             if let Some(table) =
                                 swash::FontRef::from_index(data, face_index as usize)
-                                    .and_then(|font| font.table(CMAP_TAG))
+                                    .and_then(|font| cmap_table(&font))
                             {
-                                index_face(index, table);
+                                build.walk_face(index, table);
                             }
                         }
                     });
@@ -1485,6 +1501,7 @@ impl Coverage {
             }
         }
         drop(members);
+        let Build { owner, stats, .. } = build;
         let mut ranges = Vec::new();
         let mut cp = 0;
         while cp < owner.len() {
@@ -1506,13 +1523,15 @@ impl Coverage {
             target: "tessera_render",
             faces = faces.len(),
             ranges = ranges.len(),
-            opens,
-            code_points = walked.code_points,
-            records = walked.records,
+            opens = stats.opens,
+            code_points = stats.walked.code_points,
+            records = stats.walked.records,
+            cmap_bytes = stats.cmap_bytes,
+            reused = stats.reused,
             elapsed = ?started.elapsed(),
             "built the fallback coverage index"
         );
-        (Self { ranges }, opens)
+        (Self { ranges }, stats)
     }
 
     fn lookup(&self, ch: char) -> Option<fontdb::ID> {
@@ -1525,34 +1544,120 @@ impl Coverage {
     }
 }
 
-/// Walks the character map `table` of the face at `index` in the
-/// coverage build into `owner`: each code point it maps to a glyph goes
-/// to `index` unless a lower index has it. The walk is bounded by the
-/// code space (#689, see [`cmap::enumerate`]); `None` when it panicked,
-/// which leaves that face out (but for what it wrote before), with one
-/// warning naming the face's index, instead of the index thread dying
-/// with the index unlanded.
-fn walk_face(owner: &mut [u32], index: u32, table: &[u8]) -> Option<cmap::Walk> {
-    let walk = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        #[cfg(test)]
-        test_read_hook::during_walk(index);
-        cmap::enumerate(table, CODE_SPACE_U32, |cp, glyph| {
-            if glyph != 0
-                && let Some(slot) = owner.get_mut(cp as usize)
-                && index < *slot
-            {
-                *slot = index;
-            }
-        })
-    }));
-    if walk.is_err() {
-        tracing::warn!(
-            target: "tessera_render",
-            face = index,
-            "a character map walk panicked; the face is left out of the fallback index"
-        );
+/// Most steps the whole coverage build walks over all faces' character
+/// maps (#716): a code point visited or a group or segment read is one
+/// step ([`cmap::Walk::steps`]). 64 walks of the code space; the
+/// installed fonts on macOS 26 (1 016 faces) take about 2.8 million, 4 %
+/// of it. A face costs at most one walk of the code space plus one step
+/// per record (#689), but a collection may hold any number of faces.
+const MAX_INDEX_STEPS: u64 = 64 * CODE_SPACE_U32 as u64;
+
+/// Most bytes of `cmap` tables the whole coverage build reads (#716): 64
+/// tables at [`MAX_INDEX_CMAP_BYTES`], 128 MiB. A `cmap` shared with the
+/// face before it is read once. The installed fonts on macOS 26 read
+/// about 13 MiB.
+const MAX_INDEX_CMAP_READ: u64 = 64 * MAX_INDEX_CMAP_BYTES as u64;
+
+/// What one coverage build cost.
+#[derive(Debug, Default)]
+struct BuildStats {
+    /// Font files opened.
+    opens: usize,
+    /// Steps of every face's walk, `cut` when the step budget ran out.
+    walked: cmap::Walk,
+    /// Bytes of `cmap` tables read from font files.
+    cmap_bytes: u64,
+    /// Faces whose walk was skipped: their `cmap` is the one the face
+    /// before them in the same file read.
+    reused: u64,
+}
+
+/// The state of one coverage build.
+struct Build {
+    /// Index into the build's face list per code point; `u32::MAX` =
+    /// uncovered. A source can hold a face that comes after a later
+    /// source's first face, so a slot takes the lowest index that covers
+    /// it, not the first one written: first face wins in database order.
+    owner: Vec<u32>,
+    stats: BuildStats,
+    /// `true` once either budget ran out: no further face is read or
+    /// walked.
+    stopped: bool,
+}
+
+impl Build {
+    fn new() -> Self {
+        Self {
+            owner: vec![u32::MAX; CODE_SPACE],
+            stats: BuildStats::default(),
+            stopped: false,
+        }
     }
-    walk.ok()
+
+    /// Steps left of [`MAX_INDEX_STEPS`].
+    fn steps_left(&self) -> u64 {
+        MAX_INDEX_STEPS.saturating_sub(self.stats.walked.steps())
+    }
+
+    /// Bytes left of [`MAX_INDEX_CMAP_READ`].
+    fn bytes_left(&self) -> u64 {
+        MAX_INDEX_CMAP_READ.saturating_sub(self.stats.cmap_bytes)
+    }
+
+    /// Ends the build at the face at `index`, with one warning.
+    fn stop(&mut self, index: u32, budget: &str) {
+        if !std::mem::replace(&mut self.stopped, true) {
+            tracing::warn!(
+                target: "tessera_render",
+                face = index,
+                budget,
+                "the fallback index ran out of its budget; later faces are left out"
+            );
+        }
+    }
+
+    /// Walks the character map `table` of the face at `index` into
+    /// [`Self::owner`]: each code point it maps to a glyph goes to `index`
+    /// unless a lower index has it. The walk is bounded by the code space
+    /// (#689, see [`cmap::enumerate`]) and by the steps left of the
+    /// build's budget (#716), which ends the build when the walk runs
+    /// out. A walk that panics leaves that face out (but for what it
+    /// wrote before), with one warning naming the face's index, instead of
+    /// the index thread dying with the index unlanded.
+    fn walk_face(&mut self, index: u32, table: &[u8]) {
+        if self.stopped {
+            return;
+        }
+        let budget = self.steps_left();
+        let owner = &mut self.owner;
+        let walk = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            #[cfg(test)]
+            test_read_hook::during_walk(index);
+            cmap::enumerate(table, CODE_SPACE_U32, budget, |cp, glyph| {
+                if glyph != 0
+                    && let Some(slot) = owner.get_mut(cp as usize)
+                    && index < *slot
+                {
+                    *slot = index;
+                }
+            })
+        }));
+        let Ok(walk) = walk else {
+            tracing::warn!(
+                target: "tessera_render",
+                face = index,
+                "a character map walk panicked; the face is left out of the fallback index"
+            );
+            return;
+        };
+        let total = &mut self.stats.walked;
+        total.code_points += walk.code_points;
+        total.records += walk.records;
+        total.cut |= walk.cut;
+        if walk.cut {
+            self.stop(index, "steps");
+        }
+    }
 }
 
 /// Largest `cmap` table the coverage index reads from a font file: 2 MiB,
@@ -1577,20 +1682,23 @@ enum CmapRead {
     /// The `cmap` is this many bytes, more than [`MAX_INDEX_CMAP_BYTES`];
     /// nothing was read.
     TooLarge(u32),
+    /// The buffer already holds the face's `cmap`: the face before it read
+    /// the same file range.
+    Reused,
+    /// The `cmap` is more bytes than the build may still read; nothing
+    /// was read.
+    OverBudget,
 }
 
 /// The faces `faces` (index into the coverage build's face list, face
-/// index in the file) of the font file at `path`, each handed to `index`
-/// as its `cmap` table. The file is opened once and read,
+/// index in the file) of the font file at `path`, each walked into
+/// `build` from its `cmap` table, unless that is the `cmap` the face
+/// before it read (#716). The file is opened once and read,
 /// never mapped (#668); a face that cannot be read is skipped, and so is
 /// the whole path when it is no longer a regular file (#669, see
 /// [`open_regular_file`]).
-fn index_file(
-    path: &std::path::Path,
-    faces: impl Iterator<Item = (u32, u32)>,
-    mut index: impl FnMut(u32, &[u8]),
-) {
-    let mut file = match open_regular_file(path) {
+fn index_file(path: &std::path::Path, faces: impl Iterator<Item = (u32, u32)>, build: &mut Build) {
+    let file = match open_regular_file(path) {
         Ok(file) => file,
         Err(error) => {
             tracing::debug!(
@@ -1606,14 +1714,21 @@ fn index_file(
     let mut loaded = None;
     let mut warned = false;
     for (face, face_index) in faces {
+        if build.stopped {
+            break;
+        }
         #[cfg(test)]
         test_read_hook::before_face(path);
-        match read_face_cmap(&mut file, face_index, &mut cmap, &mut loaded) {
+        let budget = build.bytes_left();
+        match read_face_cmap(&file, face_index, budget, &mut cmap, &mut loaded) {
             CmapRead::Read => {
                 if let Some(table) = cmap.get(CMAP_FONT_HEADER..) {
-                    index(face, table);
+                    build.stats.cmap_bytes += table.len() as u64;
+                    build.walk_face(face, table);
                 }
             }
+            CmapRead::Reused => build.stats.reused += 1,
+            CmapRead::OverBudget => build.stop(face, "cmap bytes"),
             CmapRead::Missing => {}
             CmapRead::TooLarge(len) => {
                 if !std::mem::replace(&mut warned, true) {
@@ -1667,20 +1782,25 @@ fn open_regular_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
 /// Reads face `face_index`'s `cmap` table from `file` into `buf`, laid out
 /// as a font with that one table (an sfnt header, one table record, then
 /// the table) so swash parses it as it would the whole file: offsets
-/// inside a `cmap` are relative to its start. `loaded` names the file
-/// range `buf` holds, so faces of a collection that share one `cmap` read
-/// it once. Only the collection header, the face's table directory
-/// records the binary search visits and the `cmap` are read; the `cmap`
-/// at most [`MAX_INDEX_CMAP_BYTES`].
+/// inside a `cmap` are relative to its start. `loaded` names the table
+/// directory (its offset in the file) that led to the `cmap` `buf` holds
+/// and that `cmap`'s file range (offset, length), so faces of a
+/// collection that share one `cmap` read it once ([`CmapRead::Reused`]),
+/// and faces that share one table directory read only its offset in the
+/// collection header (#716). Only the collection header, the face's
+/// table directory records the binary search visits and the `cmap` are
+/// read; the `cmap` at most [`MAX_INDEX_CMAP_BYTES`], and only when it is
+/// at most `budget` bytes.
 fn read_face_cmap(
-    file: &mut std::fs::File,
+    file: &std::fs::File,
     face_index: u32,
+    budget: u64,
     buf: &mut Vec<u8>,
-    loaded: &mut Option<(u32, u32)>,
+    loaded: &mut Option<(u32, u32, u32)>,
 ) -> CmapRead {
     const TTCF: u32 = u32::from_be_bytes(*b"ttcf");
     const CMAP: u32 = u32::from_be_bytes(*b"cmap");
-    let Some((start, len)) = (|| {
+    let Some((base, start, len)) = (|| {
         // swash's `raw_data::offset`: a single font is at 0 whatever the
         // index below its count of one.
         let head = read_u32s::<3>(file, 0)?;
@@ -1691,6 +1811,11 @@ fn read_face_cmap(
         } else {
             return None;
         };
+        if let Some(same @ (directory, _, _)) = *loaded
+            && directory == base
+        {
+            return Some(same);
+        }
         let [tag, tables, _] = read_u32s::<3>(file, u64::from(base))?;
         if !is_sfnt(tag) {
             return None;
@@ -1707,7 +1832,7 @@ fn read_face_cmap(
                 std::cmp::Ordering::Equal => {
                     start.checked_add(len)?;
                     // A table at 0 is no table to swash.
-                    return (start != 0).then_some((start, len));
+                    return (start != 0).then_some((base, start, len));
                 }
             }
         }
@@ -1718,8 +1843,12 @@ fn read_face_cmap(
     if len > MAX_INDEX_CMAP_BYTES {
         return CmapRead::TooLarge(len);
     }
-    if *loaded == Some((start, len)) {
-        return CmapRead::Read;
+    if loaded.is_some_and(|(_, at, size)| (at, size) == (start, len)) {
+        *loaded = Some((base, start, len));
+        return CmapRead::Reused;
+    }
+    if u64::from(len) > budget {
+        return CmapRead::OverBudget;
     }
     *loaded = None;
     // `len` is at most MAX_INDEX_CMAP_BYTES, so this fits usize.
@@ -1742,7 +1871,7 @@ fn read_face_cmap(
     if read_exact_at(file, u64::from(start), &mut buf[CMAP_FONT_HEADER..]).is_err() {
         return CmapRead::Missing;
     }
-    *loaded = Some((start, len));
+    *loaded = Some((base, start, len));
     CmapRead::Read
 }
 
@@ -1753,7 +1882,7 @@ fn is_sfnt(tag: u32) -> bool {
 
 /// `N` big-endian `u32`s read from `file` at `offset`; `None` when the
 /// read fails or the file ends first.
-fn read_u32s<const N: usize>(file: &mut std::fs::File, offset: u64) -> Option<[u32; N]> {
+fn read_u32s<const N: usize>(file: &std::fs::File, offset: u64) -> Option<[u32; N]> {
     let mut bytes = [0; 16];
     let bytes = bytes.get_mut(..4 * N)?;
     read_exact_at(file, offset, bytes).ok()?;
@@ -1764,12 +1893,13 @@ fn read_u32s<const N: usize>(file: &mut std::fs::File, offset: u64) -> Option<[u
     Some(words)
 }
 
-/// Fills `out` from `file` at `offset` with `read(2)`; a file that ends
-/// first is an error.
-fn read_exact_at(file: &mut std::fs::File, offset: u64, out: &mut [u8]) -> std::io::Result<()> {
-    use std::io::{Read, Seek, SeekFrom};
-    file.seek(SeekFrom::Start(offset))?;
-    file.read_exact(out)
+/// Fills `out` from `file` at `offset` with `pread(2)`, one call where a
+/// seek and a read took two (#716: a collection's faces each read their
+/// table directory); a file that ends first is an error.
+fn read_exact_at(file: &std::fs::File, offset: u64, out: &mut [u8]) -> std::io::Result<()> {
+    #[cfg(test)]
+    test_read_hook::count_read();
+    std::os::unix::fs::FileExt::read_exact_at(file, out, offset)
 }
 
 /// Test-only hook the coverage build calls before it reads each face of
@@ -1786,6 +1916,17 @@ mod test_read_hook {
     thread_local! {
         static BEFORE_FACE: RefCell<Option<Hook>> = const { RefCell::new(None) };
         static DURING_WALK: RefCell<Option<WalkHook>> = const { RefCell::new(None) };
+        static READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Counts one `pread(2)` of a font file on this thread.
+    pub(super) fn count_read() {
+        READS.with(|reads| reads.set(reads.get() + 1));
+    }
+
+    /// The font file reads on this thread so far (#716).
+    pub(super) fn reads() -> u64 {
+        READS.with(std::cell::Cell::get)
     }
 
     /// Runs `hook` with the face's index in the build at the start of each
@@ -2987,7 +3128,8 @@ mod tests {
     /// font file once (#668: and reads it, where #660 mapped it once),
     /// however many faces a collection (`.ttc`) holds, and lands the same
     /// ranges, in the same first-face-wins order, as the per-face build it
-    /// replaced, which read each whole face through a map.
+    /// replaced, which read each whole face through a map; #716: well
+    /// inside the whole-build budgets.
     #[test]
     fn one_index_build_opens_each_font_file_once() {
         let system = FontSystem::new();
@@ -2997,8 +3139,14 @@ mod tests {
             files < faces,
             "the installed fonts include a collection ({files} files, {faces} faces)"
         );
-        let (index, opens) = Coverage::build_counting_opens(db);
-        assert_eq!(opens, files, "one open per font file ({faces} faces)");
+        let (index, stats) = Coverage::build_with_stats(db);
+        eprintln!("{faces} faces in {files} files: {stats:?}");
+        assert_eq!(stats.opens, files, "one open per font file ({faces} faces)");
+        // #716: the whole-build budgets leave the installed fonts whole,
+        // with room to spare.
+        assert!(!stats.walked.cut, "{stats:?}");
+        assert!(stats.walked.steps() < MAX_INDEX_STEPS / 8, "{stats:?}");
+        assert!(stats.cmap_bytes < MAX_INDEX_CMAP_READ / 8, "{stats:?}");
         assert_eq!(index.ranges, per_face_reference(db));
     }
 
@@ -3036,7 +3184,7 @@ mod tests {
             "{order:?}"
         );
 
-        let (index, opens) = Coverage::build_counting_opens(&db);
+        let (index, BuildStats { opens, .. }) = Coverage::build_with_stats(&db);
         assert_eq!(opens, 2, "SFIndia.ttc and Arial Unicode, once each");
         let reference = per_face_reference(&db);
         assert_eq!(index.ranges, reference);
@@ -3092,7 +3240,7 @@ mod tests {
                 truncate(path, 0);
             }
         })));
-        let (index, opens) = Coverage::build_counting_opens(&db);
+        let (index, BuildStats { opens, .. }) = Coverage::build_with_stats(&db);
         test_read_hook::set(None);
         assert_eq!(opens, 2);
         assert_eq!(index.lookup('A'), monaco, "Menlo's faces are left out");
@@ -3222,10 +3370,10 @@ mod tests {
                 .expect("open");
             std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(24)).expect("seek");
             std::io::Write::write_all(&mut file, &len.to_be_bytes()).expect("write");
-            let mut file = std::fs::File::open(&path).expect("open");
+            let file = std::fs::File::open(&path).expect("open");
             let (mut buf, mut loaded) = (Vec::new(), None);
             assert_eq!(
-                read_face_cmap(&mut file, 0, &mut buf, &mut loaded),
+                read_face_cmap(&file, 0, u64::MAX, &mut buf, &mut loaded),
                 expected,
                 "{len}"
             );
@@ -3234,7 +3382,7 @@ mod tests {
                 assert_eq!(loaded, None);
             } else {
                 assert_eq!(buf.len(), CMAP_FONT_HEADER + MAX_INDEX_CMAP_BYTES as usize);
-                assert_eq!(loaded, Some((28, len)));
+                assert_eq!(loaded, Some((0, 28, len)));
             }
         }
     }
@@ -3249,10 +3397,10 @@ mod tests {
         let path = dir.join("short.ttf");
         font_with_cmap_len(&path, 4096);
         truncate(&path, 28 + 100);
-        let mut file = std::fs::File::open(&path).expect("open");
+        let file = std::fs::File::open(&path).expect("open");
         let (mut buf, mut loaded) = (Vec::new(), None);
         assert_eq!(
-            read_face_cmap(&mut file, 0, &mut buf, &mut loaded),
+            read_face_cmap(&file, 0, u64::MAX, &mut buf, &mut loaded),
             CmapRead::Missing
         );
         assert_eq!(loaded, None);
@@ -3266,9 +3414,36 @@ mod tests {
         std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(20)).expect("seek");
         std::io::Write::write_all(&mut file, &0_u32.to_be_bytes()).expect("write");
         assert_eq!(
-            read_face_cmap(&mut file, 0, &mut buf, &mut loaded),
+            read_face_cmap(&file, 0, u64::MAX, &mut buf, &mut loaded),
             CmapRead::Missing
         );
+    }
+
+    /// #716: a `cmap` record at offset 0 is no table to the lookups, as
+    /// to swash and [`read_face_cmap`]. `FontRef::table` gives the file's
+    /// first bytes for it, and this file's header reads as a `cmap` with
+    /// a symbol record (`numTables` 3, `searchRange` 0) whose subtable,
+    /// at the `rangeShift` offset 60, maps 'A' to glyph 5.
+    #[test]
+    fn a_cmap_at_offset_zero_maps_nothing() {
+        let subtable = cmap_with_groups(12, &[(0x41, 0x41, 5)])[12..].to_vec();
+        let len = u32::try_from(60 + subtable.len()).expect("small");
+        let mut font = b"OTTO".to_vec();
+        for field in [3_u16, 0, 0, 60] {
+            font.extend_from_slice(&field.to_be_bytes());
+        }
+        for (tag, start, len) in [(b"aaaa", 60, 0), (b"cmap", 0, len), (b"zzzz", 60, 0)] {
+            font.extend_from_slice(tag);
+            for field in [0_u32, start, len] {
+                font.extend_from_slice(&field.to_be_bytes());
+            }
+        }
+        font.extend_from_slice(&subtable);
+        let face = swash::FontRef::from_index(&font, 0).expect("an sfnt");
+        let header = face.table(CMAP_TAG).expect("the record");
+        assert_eq!(cmap::map(header, 0x41), 5, "the header reads as a cmap");
+        assert_eq!(cmap_table(&face), None);
+        assert_eq!(face.charmap().map('A'), 0);
     }
 
     /// How long the #669 tests wait for an open or a build that a FIFO
@@ -3418,6 +3593,188 @@ mod tests {
         std::fs::write(path, font).expect("write the font");
     }
 
+    /// Writes a collection (`.ttc`) of `faces` faces of Monaco to `path`,
+    /// every table but `cmap` Monaco's and shared by all faces. With
+    /// `shared`, every face is one table directory, whose `cmap` is
+    /// `cmap_of(0)`; otherwise face `n` has its own copy of the directory,
+    /// whose `cmap` is `cmap_of(n)`. `cmap_of` gives a range (offset,
+    /// length) of `cmaps`, which is written after Monaco's tables (#716:
+    /// the file #689's review indexed, 20 000 faces of one 40-byte `cmap`,
+    /// is `shared` with that many faces).
+    fn write_monaco_collection(
+        path: &std::path::Path,
+        faces: u32,
+        shared: bool,
+        cmaps: &[u8],
+        cmap_of: impl Fn(usize) -> (usize, usize),
+    ) {
+        let mut monaco =
+            std::fs::read("/System/Library/Fonts/Monaco.ttf").expect("Monaco is installed");
+        monaco.resize(monaco.len().next_multiple_of(4), 0);
+        let tables = usize::from(u16::from_be_bytes([monaco[4], monaco[5]]));
+        let directory_len = 12 + 16 * tables;
+        let copies = if shared { 1 } else { faces as usize };
+        let header = 12 + 4 * faces as usize;
+        let data = header + directory_len * copies;
+        let cmaps_at = data + monaco.len();
+        let at = |n: usize| u32::try_from(n).expect("a small collection");
+        let mut file = Vec::with_capacity(cmaps_at + cmaps.len());
+        file.extend_from_slice(b"ttcf");
+        file.extend_from_slice(&0x0001_0000_u32.to_be_bytes());
+        file.extend_from_slice(&faces.to_be_bytes());
+        for face in 0..faces as usize {
+            let copy = if shared { 0 } else { face };
+            file.extend_from_slice(&at(header + directory_len * copy).to_be_bytes());
+        }
+        for copy in 0..copies {
+            let mut directory = monaco[..directory_len].to_vec();
+            for record in (0..tables).map(|t| 12 + 16 * t) {
+                let fields = &mut directory[record..record + 16];
+                let (offset, len) = if &fields[..4] == b"cmap" {
+                    let (offset, len) = cmap_of(copy);
+                    (at(cmaps_at + offset), at(len))
+                } else {
+                    let offset = u32::from_be_bytes(fields[8..12].try_into().expect("4 bytes"));
+                    let len = u32::from_be_bytes(fields[12..16].try_into().expect("4 bytes"));
+                    (offset + at(data), len)
+                };
+                fields[8..12].copy_from_slice(&offset.to_be_bytes());
+                fields[12..16].copy_from_slice(&len.to_be_bytes());
+            }
+            file.extend_from_slice(&directory);
+        }
+        file.extend_from_slice(&monaco);
+        file.extend_from_slice(cmaps);
+        std::fs::write(path, file).expect("write the collection");
+    }
+
+    /// The index over one collection of Monaco faces
+    /// ([`write_monaco_collection`]), built on a helper thread: the index,
+    /// what it cost, how long the build took and how many reads of the
+    /// file it made. Fails when the build
+    /// panics or takes more than four minutes.
+    fn index_monaco_collection(
+        name: &str,
+        faces: u32,
+        shared: bool,
+        cmaps: &[u8],
+        cmap_of: impl Fn(usize) -> (usize, usize),
+    ) -> (Coverage, BuildStats, std::time::Duration, u64) {
+        let dir = font_scratch(name);
+        let path = dir.path().join("Monaco.ttc");
+        write_monaco_collection(&path, faces, shared, cmaps, cmap_of);
+        let mut db = fontdb::Database::new();
+        db.load_font_file(&path).expect("the collection loads");
+        assert_eq!(db.faces().count(), faces as usize);
+        let first = db.faces().next().map(|f| f.id);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let (index, stats) = Coverage::build_with_stats(&db);
+            let elapsed = started.elapsed();
+            let _ = tx.send((index, stats, elapsed, test_read_hook::reads()));
+        });
+        let built = rx
+            .recv_timeout(std::time::Duration::from_secs(240))
+            .expect("the index lands within four minutes, without a panic");
+        assert!(
+            built
+                .0
+                .ranges
+                .iter()
+                .all(|&(_, _, face)| Some(face) == first),
+            "the first face takes every code point"
+        );
+        built
+    }
+
+    /// The ranges `cmap_with_groups(12, &[(0, u32::MAX, 0)])` indexes:
+    /// the glyph is the code point's low 16 bits, 0 (uncovered) at each
+    /// 0x10000th.
+    fn every_code_point_but_each_plane_start() -> Vec<(u32, u32)> {
+        (0..0x11)
+            .map(|plane| ((plane << 16) | 1, (plane << 16) | 0xFFFF))
+            .collect()
+    }
+
+    fn first_last(index: &Coverage) -> Vec<(u32, u32)> {
+        index
+            .ranges
+            .iter()
+            .map(|&(first, last, _)| (first, last))
+            .collect()
+    }
+
+    /// #716: a collection of 20 000 faces sharing one table directory and
+    /// one 40-byte `cmap` whose group reaches `u32::MAX` took 8.9 s to
+    /// index in release (11.2 s here), the walk of the code space once
+    /// per face. A face whose `cmap` is the one the face before it read
+    /// is not walked again, and one that shares its table directory reads
+    /// only the directory's offset: one walk in all, and under 100 ms in
+    /// release (about 20 ms here, at a load of 150).
+    #[test]
+    fn twenty_thousand_faces_of_one_hostile_cmap_walk_it_once() {
+        let cmap = cmap_with_groups(12, &[(0, u32::MAX, 0)]);
+        assert_eq!(cmap.len(), 40);
+        let (index, stats, elapsed, reads) =
+            index_monaco_collection("shared", 20_000, true, &cmap, |_| (0, 40));
+        eprintln!("20 000 faces indexed in {elapsed:?} with {reads} reads: {stats:?}");
+        // Each face reads the collection header and its directory's
+        // offset there; the first one also its directory and `cmap`.
+        assert!(reads < 2 * 20_000 + 16, "{reads} reads");
+        assert_eq!(first_last(&index), every_code_point_but_each_plane_start());
+        assert_eq!(
+            stats.walked,
+            cmap::Walk {
+                code_points: u64::from(CODE_SPACE_U32),
+                records: 1,
+                cut: false,
+            }
+        );
+        assert_eq!((stats.reused, stats.cmap_bytes), (19_999, 40));
+        if cfg!(not(debug_assertions)) {
+            assert!(
+                elapsed < std::time::Duration::from_millis(100),
+                "{elapsed:?}"
+            );
+        }
+    }
+
+    /// #716: faces with their own table directories and their own
+    /// hostile `cmap`s each walk the code space, so the whole build stops
+    /// at [`MAX_INDEX_STEPS`], 64 such walks: the 64th face is cut, the
+    /// rest are not read, and the first face's coverage stands.
+    #[test]
+    fn the_whole_build_walks_at_most_its_step_budget() {
+        let cmap = cmap_with_groups(12, &[(0, u32::MAX, 0)]);
+        let faces = 80;
+        let (index, stats, _, _) =
+            index_monaco_collection("steps", faces, false, &cmap.repeat(80), |copy| {
+                (40 * copy, 40)
+            });
+        assert_eq!(first_last(&index), every_code_point_but_each_plane_start());
+        assert_eq!(stats.walked.steps(), MAX_INDEX_STEPS);
+        assert!(stats.walked.cut);
+        assert_eq!(stats.walked.records, 64);
+        assert_eq!((stats.reused, stats.cmap_bytes), (0, 64 * 40));
+    }
+
+    /// #716: faces with their own `cmap`s of 2 MiB (overlapping ranges of
+    /// one table of zeros, which walks nothing) each read that much, so
+    /// the whole build stops at [`MAX_INDEX_CMAP_READ`]: 64 are read, the
+    /// 65th would pass it and it and the rest are left out.
+    #[test]
+    fn the_whole_build_reads_at_most_its_cmap_budget() {
+        let len = MAX_INDEX_CMAP_BYTES as usize;
+        let faces = 70;
+        let zeros = vec![0; len + 4 * faces as usize];
+        let (index, stats, _, _) =
+            index_monaco_collection("bytes", faces, false, &zeros, |copy| (4 * copy, len));
+        assert_eq!(index.ranges, []);
+        assert_eq!(stats.cmap_bytes, MAX_INDEX_CMAP_READ);
+        assert_eq!((stats.walked, stats.reused), (cmap::Walk::default(), 0));
+    }
+
     /// The index over one font, Monaco with `cmap` as its character map,
     /// built on a helper thread: its ranges (first, last), and how long the
     /// build took. Fails when the build panics or takes more than a minute.
@@ -3457,6 +3814,91 @@ mod tests {
         let (ranges, _) =
             index_monaco_with("wrap", &cmap_with_groups(12, &[(0x41, 0x5A, u32::MAX)]));
         assert_eq!(ranges, [(0x41, 0x41), (0x43, 0x5A)]);
+    }
+
+    /// #716: with the index landed, a face whose format-12 glyph offset
+    /// is near `u32::MAX` is offered for the characters it maps, and the
+    /// lookups that follow went through swash's `Charmap::map`, whose
+    /// glyph arithmetic overflowed: a panic in debug builds in
+    /// `nominal_glyph`, `covers` and `metrics`, and on the render path in
+    /// `classify` and `first_uncovered`. They read the character map with
+    /// Tessera's own reader now, which wraps as the index does. Menlo
+    /// comes first; the hostile Monaco copy maps '/' and '0', 'L' and 'M'
+    /// (Menlo's) and U+E000 to U+E0FF (its own), each group from glyph
+    /// `u32::MAX`: U+E000 is glyph 0xFFFF, U+E001 glyph 0, U+E002 glyph 1.
+    /// Meaningful in debug builds, which the workspace tests are.
+    #[test]
+    fn lookups_in_a_face_with_a_glyph_offset_near_u32_max_wrap_without_a_panic() {
+        let dir = font_scratch("lookups");
+        let path = dir.path().join("Monaco.ttf");
+        let groups = [
+            (0x2F, 0x30, u32::MAX),
+            (0x4C, 0x4D, u32::MAX),
+            (0xE000, 0xE0FF, u32::MAX),
+        ];
+        write_monaco_with_cmap(&path, &cmap_with_groups(12, &groups));
+        let mut db = fontdb::Database::new();
+        db.load_font_file("/System/Library/Fonts/Menlo.ttc")
+            .expect("Menlo is installed");
+        db.load_font_file(&path).expect("the copy loads");
+        let hostile = db.faces().last().map(|f| f.id).expect("the copy");
+        let system = FontSystem::new_with_locale_and_db("en-US".into(), db);
+        let config = FontConfig {
+            family: DEFAULT_FAMILY.into(),
+            size_pt: 13.0,
+            scale: 1.0,
+            fallback: Vec::new(),
+        };
+        let fonts = Fonts::with_system(system, &config, IndexBuild::Never).expect("Menlo");
+        fonts.build_index_now();
+        {
+            let mut inner = fonts.lock();
+            let face = inner.resolve('\u{E002}', FontStyle::Regular).face;
+            assert!(
+                matches!(face.0, FaceRepr::Font { id, .. } if id == hostile),
+                "the index offers the copy: {face:?}"
+            );
+            for (ch, glyph) in [
+                ('\u{E000}', 0xFFFF),
+                ('\u{E001}', 0),
+                ('\u{E002}', 1),
+                ('\u{E0FF}', 0xFE),
+                ('/', 0xFFFF),
+                ('0', 0),
+                ('L', 0xFFFF),
+                ('M', 0),
+                ('A', 0),
+            ] {
+                assert_eq!(inner.nominal_glyph(face, ch), glyph, "{ch:?}");
+                assert_eq!(inner.covers(face, ch), glyph != 0, "{ch:?}");
+            }
+            assert!(inner.metrics(face, 13.0).is_some());
+            // Menlo's '0' gives the cell advance, not the 0.6 em fallback.
+            let menlo = inner.resolve('0', FontStyle::Regular).face;
+            let zero = inner.nominal_glyph(menlo, '0');
+            assert_ne!(zero, 0);
+            let advance = inner
+                .load(menlo)
+                .map(|font| {
+                    font.as_swash()
+                        .glyph_metrics(&[])
+                        .scale(13.0)
+                        .advance_width(zero)
+                })
+                .expect("Menlo loads");
+            let cell = inner.metrics(menlo, 13.0).expect("Menlo").cell_advance;
+            assert!((cell - advance).abs() < 1e-4, "{cell} against {advance}");
+            assert!((cell - 13.0 * 0.6).abs() > 1e-3, "{cell}");
+        }
+        // A plain cell, and a cluster whose combining mark the copy does
+        // not cover: `classify` asks the copy for the cluster's nominal
+        // glyphs, `first_uncovered` asks it and then Menlo.
+        let mut grid = tessera_grid::Grid::new(1, 8);
+        grid.put_str("\u{E002}\u{E003}\u{301}L0");
+        let line = grid.line(0).expect("row 0");
+        let mut shaping = crate::shaping::Shaper::with_fonts(fonts, 13.0, 1.0);
+        let glyphs = shaping.shape_grid_line(line).len();
+        assert_ne!(glyphs, 0);
     }
 
     /// #689: format-12 groups reaching `u32::MAX` walked four billion code
