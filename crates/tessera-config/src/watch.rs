@@ -14,7 +14,7 @@
 //!   that is deleted and recreated by `git checkout` or `rm` plus rewrite is
 //!   followed as well. If the configuration directory or that target
 //!   directory is removed, or `config.toml` exists but cannot be opened
-//!   (permission denied, a symlink cycle), the backend polls at
+//!   (permission denied), the backend polls at
 //!   [`WatchOptions::poll_interval`] until it can register everything
 //!   again, re-reads the file, and goes back to sleeping on kernel events.
 //!   It also registers the `themes/` directory (a theme file created,
@@ -54,8 +54,11 @@
 //!   files every [`WatchOptions::poll_interval`] (all of `profiles/`, up to
 //!   `MAX_PROFILE_FILES`, when the directory itself changed), and of every
 //!   `*.toml` file in `themes/` and `profiles/` every twentieth interval
-//!   (about once a second by default). It is the fallback on platforms without
-//!   `kqueue` and stays available everywhere for tests.
+//!   (about once a second by default). A path of another type than the one
+//!   read there (a `config.toml`, `themes/`, `profiles/` or entry linked to
+//!   `/dev/null`, whose times change on every write to it from anywhere) is
+//!   sampled by its type alone (#708, #712, #721). It is the fallback on
+//!   platforms without `kqueue` and stays available everywhere for tests.
 //!
 //! Either way the files must be quiet for [`WatchOptions::debounce`] before
 //! they are re-read, so rapid successive writes coalesce into one event; a
@@ -88,8 +91,9 @@
 //! 32 of its files (`MAX_PROFILE_FILES_FOLLOWED`), and one per directory
 //! on the way to `config.toml` and to the linked profile files (at most 32
 //! in all, `MAX_CHAIN_DIRS`, through at most eight symbolic links each,
-//! `MAX_DIR_LINKS_FOLLOWED`; past either, or in a cycle, it polls
-//! `config.toml` and `profiles/` instead, every two seconds): at most
+//! `MAX_DIR_LINKS_FOLLOWED`; past either it polls `config.toml` and
+//! `profiles/` instead, every two seconds, and a cycle of links is watched
+//! up to the cycle): at most
 //! about 88. The
 //! application should hold a single [`Watcher`] and fan its events out to
 //! every window rather than watching once per window.
@@ -792,31 +796,21 @@ enum Fingerprint {
 }
 
 impl Fingerprint {
-    fn of(path: &Path) -> Self {
-        match std::fs::metadata(path) {
-            Ok(meta) => Self::Present {
-                modified: meta.modified().ok(),
-                len: meta.len(),
-                identity: identity_of(&meta),
-            },
-            Err(_) => Self::Missing,
-        }
-    }
-
-    /// [`Fingerprint::of`] for a path read as a regular file
-    /// (`config.toml`): anything else is [`Fingerprint::Other`].
+    /// The fingerprint of a path read as a regular file (`config.toml`, a
+    /// theme file): anything else is [`Fingerprint::Other`].
     fn of_file(path: &Path) -> Self {
         Self::of_expected(path, std::fs::FileType::is_file)
     }
 
-    /// [`Fingerprint::of`] for a path listed as a directory (`profiles/`):
-    /// anything else is [`Fingerprint::Other`].
+    /// The fingerprint of a path listed as a directory (`profiles/`,
+    /// `themes/`): anything else is [`Fingerprint::Other`].
     fn of_dir(path: &Path) -> Self {
         Self::of_expected(path, std::fs::FileType::is_dir)
     }
 
-    /// [`Fingerprint::of`] when `path` names a file of the type
-    /// `expected` accepts, [`Fingerprint::Other`] when it names another.
+    /// The metadata of `path` when it names a file of the type `expected`
+    /// accepts (followed through links), [`Fingerprint::Other`] when it
+    /// names another, [`Fingerprint::Missing`] when it names nothing.
     fn of_expected(path: &Path, expected: fn(&std::fs::FileType) -> bool) -> Self {
         match std::fs::metadata(path) {
             Ok(meta) if !expected(&meta.file_type()) => Self::Other(meta.file_type()),
@@ -829,7 +823,7 @@ impl Fingerprint {
         }
     }
 
-    /// [`Fingerprint::of`] for a profile file: `Missing` unless `path`
+    /// The fingerprint of a profile file: `Missing` unless `path`
     /// names a regular file, as the load reads only those. A link to a
     /// directory the listing samples (with the dangling ones) is then no
     /// file in the sample, as it is none to the load (#701 B1).
@@ -849,7 +843,10 @@ impl Fingerprint {
 /// [`Fingerprint`] of every `*.toml` entry the theme lookup would consider
 /// (not hidden, UTF-8 name; at most [`MAX_THEME_DIR_ENTRIES`] listed), in
 /// name order. Following symlinks, so editing the target of a linked theme
-/// file changes it too. A missing or unreadable directory has no entries.
+/// file changes it too. An entry that is no regular file (a link to
+/// `/dev/null`, whose times change on every write to it from anywhere) is
+/// fingerprinted by its type alone ([`Fingerprint::of_file`], #721). A
+/// missing or unreadable directory has no entries.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct ThemesFingerprint(Vec<(String, Fingerprint)>);
 
@@ -867,7 +864,7 @@ impl ThemesFingerprint {
                 if stem.is_empty() || stem.starts_with('.') {
                     return None;
                 }
-                let fingerprint = Fingerprint::of(&entry.path());
+                let fingerprint = Fingerprint::of_file(&entry.path());
                 Some((name, fingerprint))
             })
             .collect();
@@ -982,9 +979,11 @@ struct PollSample {
     /// `config.toml`, by type alone when it is no regular file
     /// ([`Fingerprint::of_file`], #708).
     config: Fingerprint,
-    /// The themes directory's own metadata.
+    /// The themes directory's own metadata, by type alone when it is no
+    /// directory ([`Fingerprint::of_dir`]: a `themes/` linked to
+    /// `/dev/null` is no change on each write there, #721).
     themes_dir: Fingerprint,
-    /// The theme file in use, and its metadata.
+    /// The theme file in use, and its metadata ([`Fingerprint::of_file`]).
     theme_file: Option<(std::path::PathBuf, Fingerprint)>,
     /// Every theme file, refreshed every [`POLL_FULL_THEMES_EVERY`] ticks.
     themes: ThemesFingerprint,
@@ -1004,9 +1003,9 @@ impl PollSample {
                 crate::MAX_PROFILE_FILES,
             ),
             config: Fingerprint::of_file(&store.paths().config_file()),
-            themes_dir: Fingerprint::of(&store.paths().themes_dir()),
+            themes_dir: Fingerprint::of_dir(&store.paths().themes_dir()),
             theme_file: theme_file.map(|path| {
-                let fingerprint = Fingerprint::of(&path);
+                let fingerprint = Fingerprint::of_file(&path);
                 (path, fingerprint)
             }),
             themes: ThemesFingerprint::of(&store.paths().themes_dir()),
@@ -1050,11 +1049,11 @@ fn run_polling(
         let mut current = PollSample {
             profiles,
             config: Fingerprint::of_file(&path),
-            themes_dir: Fingerprint::of(&themes_dir),
+            themes_dir: Fingerprint::of_dir(&themes_dir),
             theme_file: last_seen
                 .theme_file
                 .as_ref()
-                .map(|(file, _)| (file.clone(), Fingerprint::of(file))),
+                .map(|(file, _)| (file.clone(), Fingerprint::of_file(file))),
             themes: last_seen.themes.clone(),
         };
         if full {
@@ -1095,7 +1094,7 @@ fn follow_polled_theme(store: &ConfigStore, sample: &mut PollSample, name: &str)
     let theme_file = active_theme_file(&store.paths().themes_dir(), name, previous);
     if theme_file.as_deref() != previous {
         sample.theme_file = theme_file.map(|file| {
-            let fingerprint = Fingerprint::of(&file);
+            let fingerprint = Fingerprint::of_file(&file);
             (file, fingerprint)
         });
     }
@@ -1152,11 +1151,14 @@ mod native {
         /// `config.toml` whose way to its target changed is seen only here,
         /// and the re-registration it starts follows the new chain (#384,
         /// #393 F3). Empty while the chain cannot be followed (more links or
-        /// directories than the caps, a cycle), in which case the thread
-        /// polls, slowly ([`CAPPED_CHAIN_POLL_INTERVAL`]).
+        /// directories than the caps), in which case the thread polls,
+        /// slowly ([`CAPPED_CHAIN_POLL_INTERVAL`]). A way that runs in a
+        /// cycle of links is watched up to the cycle ([`Walk::cycle`],
+        /// #721).
         chain: Vec<(PathBuf, ChainSlot)>,
         /// Whether the last [`Native::register_chain`] found the chain past
-        /// a cap or in a cycle, or could not walk it through a directory
+        /// a cap or in a cycle (which leaves the backend armed unless the
+        /// root itself is in it, #721), or could not walk it through a directory
         /// it may not search (`EACCES`): polling then waits
         /// [`CAPPED_CHAIN_POLL_INTERVAL`] rather than `poll_interval`, since
         /// nothing will arm the backend until the links or the mode change
@@ -1239,8 +1241,9 @@ mod native {
         /// The error from the most recent [`Native::register_all`] that
         /// could not register every slot, or `None` when it registered
         /// them all. While `Some` the backend is not armed and polls, since
-        /// a path it cannot open (an unreadable file, a symlink cycle)
-        /// could change without any registered watch noticing. Only a
+        /// a path it cannot open (an unreadable file, a `themes/` in a
+        /// symlink cycle; a cycle elsewhere ends the walk, #721) could
+        /// change without any registered watch noticing. Only a
         /// change is logged, so a file that stays unreadable produces one
         /// warning rather than one per poll.
         register_error: Option<String>,
@@ -1303,8 +1306,9 @@ mod native {
     }
 
     /// How often the backend polls while the chain to `config.toml` is
-    /// past [`MAX_DIR_LINKS_FOLLOWED`] or [`MAX_CHAIN_DIRS`], or in a cycle
-    /// (or `poll_interval`, when that is longer): the 2 s at which the
+    /// past [`MAX_DIR_LINKS_FOLLOWED`] or [`MAX_CHAIN_DIRS`], or the root
+    /// is in a cycle of links (or `poll_interval`, when that is longer):
+    /// the 2 s at which the
     /// application looks for a missing configuration directory
     /// (`tessera_app_core::CONFIG_DIR_POLL_INTERVAL`). Such a chain stays
     /// so until someone changes the links, so a fast poll would cost CPU
@@ -1433,6 +1437,29 @@ mod native {
         }
     }
 
+    /// Whether `error` says a path runs in a cycle of symbolic links
+    /// (`ELOOP`): it names nothing, as a missing path does.
+    fn is_cycle(error: &std::io::Error) -> bool {
+        error.raw_os_error() == Some(libc::ELOOP)
+    }
+
+    /// [`register`] for a path whose way [`Native::walk_all`] walks (the
+    /// root, `profiles/`, `config.toml`): one in a cycle of links names
+    /// nothing and counts as missing rather than as an error, since the
+    /// directories up to the cycle are watched ([`Walk::cycle`]) and the
+    /// change that breaks it raises an event on one of them (#721).
+    fn register_walked(
+        queue: &mut kqueue::Watcher,
+        slot: &mut Option<File>,
+        path: &Path,
+        kind: Kind,
+    ) -> std::io::Result<()> {
+        match register(queue, slot, path, kind) {
+            Err(error) if is_cycle(&error) => Ok(()),
+            result => result,
+        }
+    }
+
     /// Registers each of `paths` (theme files followed in case they
     /// change in place), skipping, with a debug log, one that cannot be
     /// registered (unreadable, say) rather than making the backend poll,
@@ -1493,10 +1520,10 @@ mod native {
 
     /// How many symbolic links [`chain_dirs`] follows on the way to
     /// `config.toml` (the configuration directory's and, for a linked
-    /// `config.toml`, its own). A path that needs more, or runs in a
-    /// cycle, is not watched through its chain: the backend polls
-    /// `config.toml` instead, slowly (see [`Native::armed`],
-    /// [`CAPPED_CHAIN_POLL_INTERVAL`]).
+    /// `config.toml`, its own). A path that needs more is not watched
+    /// through its chain: the backend polls `config.toml` instead, slowly
+    /// (see [`Native::armed`], [`CAPPED_CHAIN_POLL_INTERVAL`]). One that
+    /// runs in a cycle is watched up to the cycle ([`Walk::cycle`]).
     pub(crate) const MAX_DIR_LINKS_FOLLOWED: usize = 8;
 
     /// How many directories [`chain_dirs`] lists (S5: each costs one
@@ -1548,21 +1575,41 @@ mod native {
     /// yet), and the directory that would hold it is listed, unless it is
     /// the configuration directory holding a missing `config.toml`: its
     /// creation (a link unlinked and created again, as macOS `ln -sfn`
-    /// does) is then seen (#417 M-A). A [`ChainCapped`] error for more than
-    /// [`MAX_DIR_LINKS_FOLLOWED`] links, which includes every cycle, or
-    /// more than [`MAX_CHAIN_DIRS`] directories, and the error of any
-    /// other I/O failure but "not found".
+    /// does) is then seen (#417 M-A). A cycle of links ends the walk too,
+    /// with the directories met up to it ([`Walk::cycle`], #721). A
+    /// [`ChainCapped`] error for more than [`MAX_DIR_LINKS_FOLLOWED`]
+    /// links (a cycle longer than that, or a link that expands into
+    /// itself, `a -> a/b`) or more than [`MAX_CHAIN_DIRS`] directories,
+    /// and the error of any other I/O failure but "not found".
     #[cfg_attr(
         not(test),
         allow(dead_code, reason = "the tests' view of `walk_chain`")
     )]
     pub(crate) fn chain_dirs(file: &Path) -> std::io::Result<Vec<PathBuf>> {
-        Ok(walk_chain(file)?.into_iter().map(|(dir, _)| dir).collect())
+        Ok(walk_chain(file)?
+            .dirs
+            .into_iter()
+            .map(|(dir, _)| dir)
+            .collect())
+    }
+
+    /// What [`walk_chain`] (and [`Native::walk_all`]) found: the
+    /// directories, each with whether it holds a link the walk follows.
+    #[derive(Debug, Default)]
+    pub(crate) struct Walk {
+        pub(crate) dirs: Vec<(PathBuf, bool)>,
+        /// Whether a way ran in a cycle of symbolic links (`profiles ->
+        /// a`, `a -> profiles`): the walk stopped where it came back to a
+        /// link it had expanded with the same rest of the path, with the
+        /// directories met up to there, which hold every link of the
+        /// cycle, so the change that breaks it raises an event on one of
+        /// them (#721). Such a path names nothing.
+        pub(crate) cycle: bool,
     }
 
     /// [`chain_dirs`], each directory with whether it holds a link the
-    /// walk follows.
-    fn walk_chain(file: &Path) -> std::io::Result<Vec<(PathBuf, bool)>> {
+    /// walk follows, and whether the way runs in a cycle.
+    fn walk_chain(file: &Path) -> std::io::Result<Walk> {
         use std::collections::VecDeque;
         use std::path::Component;
 
@@ -1574,6 +1621,10 @@ mod native {
         let mut resolved = PathBuf::from("/");
         let mut links = 0_usize;
         let mut dirs: Vec<(PathBuf, bool)> = Vec::new();
+        // Each link expanded, with the rest of the path after it: meeting
+        // one again with the same rest is a cycle, since the walk from
+        // there repeats. At most `MAX_DIR_LINKS_FOLLOWED` (S5).
+        let mut expanded: Vec<(PathBuf, Vec<PathBuf>)> = Vec::new();
         // The configuration directory, resolved: where the walk first
         // reaches `config.toml`. It has a watch of its own, so it is listed
         // only as a directory on the way (a chain through it).
@@ -1636,6 +1687,13 @@ mod native {
             if let Some((_, holds_link)) = dirs.iter_mut().find(|(dir, _)| *dir == resolved) {
                 *holds_link = true;
             }
+            let rest: Vec<PathBuf> = pending.iter().cloned().collect();
+            if expanded
+                .iter()
+                .any(|(link, after)| *link == candidate && *after == rest)
+            {
+                return Ok(Walk { dirs, cycle: true });
+            }
             links += 1;
             if links > MAX_DIR_LINKS_FOLLOWED {
                 return Err(ChainCapped::error(format!(
@@ -1643,11 +1701,12 @@ mod native {
                 )));
             }
             let target = std::fs::read_link(&candidate)?;
+            expanded.push((candidate, rest));
             for part in target.components().rev() {
                 pending.push_front(PathBuf::from(part.as_os_str()));
             }
         }
-        Ok(dirs)
+        Ok(Walk { dirs, cycle: false })
     }
 
     /// Whether the profile files a load read (`read`, by stem, with the
@@ -1745,15 +1804,25 @@ mod native {
     /// names what `path` names now: `None` while `path` is missing or
     /// names something of another kind, which [`register`] does not
     /// register either (a `config.toml` that is a directory, a FIFO or a
-    /// link to `/dev/null`, #708).
+    /// link to `/dev/null`, #708), or runs in a cycle of links, which
+    /// [`register_walked`] does not register (#721).
     fn names_now(path: &Path, handle: Option<&File>, kind: Kind) -> bool {
         match handle {
             Some(handle) => still_names(path, handle).unwrap_or(false),
             None => match std::fs::metadata(path) {
                 Ok(meta) => !kind.matches(meta.file_type()),
-                Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+                Err(e) => e.kind() == std::io::ErrorKind::NotFound || is_cycle(&e),
             },
         }
+    }
+
+    /// Whether [`register`] could now watch the file `path` names: it is
+    /// a regular file (followed through links) that opens. For a followed
+    /// file with no handle, whose missing, non-regular or unopenable state
+    /// a chain event leaves as it was unless this turns true.
+    fn watchable(path: &Path) -> bool {
+        std::fs::metadata(path).is_ok_and(|meta| meta.is_file())
+            && crate::load::open_nonblocking(path).is_ok()
     }
 
     impl Native {
@@ -1839,7 +1908,7 @@ mod native {
             // and created again too: while it is missing, the walk still
             // lists the directory that holds it (#417 M-A).
             note(self.register_chain());
-            note(register(
+            note(register_walked(
                 &mut self.queue,
                 &mut self.root_handle,
                 &self.root,
@@ -1871,7 +1940,7 @@ mod native {
                 &self.themes,
                 Kind::Dir,
             ));
-            note(register(
+            note(register_walked(
                 &mut self.queue,
                 &mut self.profiles_handle,
                 &self.profiles,
@@ -1886,7 +1955,7 @@ mod native {
             // With every directory armed first, such a rename either
             // precedes the open (which then sees the new inode) or raises an
             // event on an armed directory.
-            note(register(
+            note(register_walked(
                 &mut self.queue,
                 &mut self.file_handle,
                 &self.file,
@@ -1906,8 +1975,8 @@ mod native {
         /// temporary link woke the thread just before its rename) changes
         /// the next resolution, so a directory the new chain brings in is
         /// not left unwatched. More than [`MAX_DIR_LINKS_FOLLOWED`] + 1
-        /// resolutions that keep changing, a cap or cycle error, or an I/O
-        /// error leave the backend unarmed, polling (an error, see
+        /// resolutions that keep changing, a cap error, or an I/O error
+        /// leave the backend unarmed, polling (an error, see
         /// [`Native::armed`]). After changing resolutions it gives up and
         /// polls at `poll_interval`, not at the slower
         /// [`CAPPED_CHAIN_POLL_INTERVAL`] of a chain past the caps: a
@@ -1926,9 +1995,16 @@ mod native {
             let mut resolved = self.walk_all();
             for _ in 0..=MAX_DIR_LINKS_FOLLOWED {
                 let dirs = match resolved {
-                    Ok(dirs) => dirs,
+                    Ok(walk) => {
+                        // A way in a cycle is watched up to it, and the
+                        // backend stays armed; only while it is not (the
+                        // root itself in the cycle) does it poll, slowly,
+                        // as past a cap (#721).
+                        self.chain_capped = walk.cycle;
+                        walk.dirs
+                    }
                     Err(error) => {
-                        // Past a cap, in a cycle, or behind a directory
+                        // Past a cap, or behind a directory
                         // that cannot be searched (a profile file or
                         // `profiles/` linked into a mode 000 directory,
                         // #489 21.4 M3): that lasts until someone changes
@@ -1978,7 +2054,8 @@ mod native {
                 self.drop_chain(std::mem::take(&mut registered));
                 resolved = self.walk_all();
                 if resolved.as_ref().is_ok_and(|now| {
-                    now.iter()
+                    now.dirs
+                        .iter()
                         .map(|(dir, _)| dir)
                         .eq(self.chain.iter().map(|(dir, _)| dir))
                 }) {
@@ -1999,9 +2076,13 @@ mod native {
         /// once and at most [`MAX_CHAIN_DIRS`] in all (a [`ChainCapped`]
         /// error past it). Not the root nor `profiles/` themselves, which
         /// have watches of their own. A dangling link's walk lists the
-        /// directory where its target would appear.
-        fn walk_all(&self) -> std::io::Result<Vec<(PathBuf, bool)>> {
-            let mut dirs = walk_chain(&self.file)?;
+        /// directory where its target would appear, and one in a cycle
+        /// the directories up to the cycle ([`Walk::cycle`]).
+        fn walk_all(&self) -> std::io::Result<Walk> {
+            let Walk {
+                mut dirs,
+                mut cycle,
+            } = walk_chain(&self.file)?;
             let own: Vec<PathBuf> = [&self.root, &self.profiles]
                 .into_iter()
                 .filter_map(|dir| std::fs::canonicalize(dir).ok())
@@ -2011,7 +2092,9 @@ mod native {
                 .iter()
                 .filter(|path| std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_symlink()));
             for path in std::iter::once(&self.profiles).chain(linked) {
-                let mut more = walk_chain(path)?;
+                let walk = walk_chain(path)?;
+                cycle |= walk.cycle;
+                let mut more = walk.dirs;
                 if std::fs::metadata(path).is_ok()
                     && let Some(dir) = link_dir_of(path)
                 {
@@ -2033,7 +2116,7 @@ mod native {
                     dirs.push((dir, holds_link));
                 }
             }
-            Ok(dirs)
+            Ok(Walk { dirs, cycle })
         }
 
         /// The profile files to follow now, and the state of `profiles/`
@@ -2078,14 +2161,25 @@ mod native {
             self.on_chain(event) && self.chain_unchanged()
         }
 
-        /// Whether `event` is on a registered directory of the chain.
+        /// Whether `event` is on a registered directory of the chain, or on
+        /// the directory holding a linked `config.toml`'s target
+        /// (`link_dir`). Events there are mostly unrelated too: for a
+        /// `config.toml` linked to `/dev/null` (the usual way to disable a
+        /// configuration) that directory is `/dev`, which changes on every
+        /// pty opened or closed anywhere on the system. What such an event
+        /// can change (the target saved by rename, deleted or created
+        /// again, the directory replaced) [`Native::chain_unchanged`]
+        /// checks: the file's handle, or with none the file still of
+        /// another type or missing, and the directory's handle (#721).
         fn on_chain(&self, event: &Event) -> bool {
             let Ident::Fd(fd) = event.ident else {
                 return false;
             };
             self.chain
                 .iter()
-                .any(|(_, slot)| slot.handle().is_some_and(|handle| handle.as_raw_fd() == fd))
+                .filter_map(|(_, slot)| slot.handle())
+                .chain(&self.link_dir_handle)
+                .any(|handle| handle.as_raw_fd() == fd)
         }
 
         /// Whether nothing that leads to `config.toml` changed (the test
@@ -2101,7 +2195,8 @@ mod native {
             let Ok(now) = self.walk_all() else {
                 return false;
             };
-            now.iter()
+            now.dirs
+                .iter()
                 .map(|(dir, _)| dir)
                 .eq(self.chain.iter().map(|(dir, _)| dir))
                 && self.chain.iter().all(|(dir, slot)| match slot {
@@ -2127,20 +2222,44 @@ mod native {
         /// retarget between the registration of the root and the follow,
         /// then back, leaves every handle on the way as it was but the
         /// theme files' on the other root's files, whose saves no event
-        /// reports (#701 F1). A theme file with no handle (not registered
-        /// after an error) is not checked: its failure is the
-        /// registration's ([`Native::register_error`], or best effort),
-        /// and a chain event that reloaded for it would reload each time.
+        /// reports (#701 F1). A theme file with no handle (missing, of
+        /// another type, or not registered after an error) is unchanged
+        /// while it still cannot be watched ([`watchable`]): a dangling
+        /// link into the directory of `config.toml`'s target whose target
+        /// is created there is a change, though the event is on
+        /// `link_dir` (#721 r1 m1). One that exists but cannot be opened
+        /// is not: its failure is the registration's
+        /// ([`Native::register_error`], or best effort), and a chain
+        /// event that reloaded for it would reload each time.
+        ///
+        /// Theme files nobody follows (themes not in use whose links lead
+        /// into that directory) are not checked: a change to one there
+        /// (created, saved, deleted) is reported
+        /// ([`super::ConfigEvent::ThemesChanged`]) with the next settle, an event
+        /// on `themes/` or `config.toml` say, not at once. Before #721
+        /// every event there settled, which saw it by chance; a target
+        /// outside it was never watched.
         fn theme_files_unchanged(&self) -> bool {
-            let in_use = self.theme_file.iter().zip(&self.theme_file_handle);
-            let others = self
-                .unloadable_handles
+            fn followed<'a>(
+                paths: &'a [PathBuf],
+                handles: &'a [(PathBuf, File)],
+            ) -> impl Iterator<Item = (&'a PathBuf, Option<&'a File>)> {
+                paths.iter().map(move |path| {
+                    let handle = handles.iter().find(|(followed, _)| followed == path);
+                    (path, handle.map(|(_, handle)| handle))
+                })
+            }
+            let in_use = self
+                .theme_file
                 .iter()
-                .chain(&self.profile_theme_handles)
-                .map(|(path, handle)| (path, handle));
+                .map(|path| (path, self.theme_file_handle.as_ref()));
             in_use
-                .chain(others)
-                .all(|(path, handle)| still_names(path, handle).unwrap_or(false))
+                .chain(followed(&self.unloadable, &self.unloadable_handles))
+                .chain(followed(&self.profile_themes, &self.profile_theme_handles))
+                .all(|(path, handle)| match handle {
+                    Some(handle) => still_names(path, handle).unwrap_or(false),
+                    None => !watchable(path),
+                })
         }
 
         /// Whether a registration is incomplete: one failed
@@ -2193,7 +2312,8 @@ mod native {
         /// target's directory is missing, or a path exists but could not be
         /// registered (an unreadable `config.toml` is rewritten in place
         /// without any directory event; the chain is past
-        /// [`MAX_DIR_LINKS_FOLLOWED`] or [`MAX_CHAIN_DIRS`], or a cycle;
+        /// [`MAX_DIR_LINKS_FOLLOWED`] or [`MAX_CHAIN_DIRS`], or the root is
+        /// in a cycle of links;
         /// a directory on the way that cannot be read is skipped, see
         /// [`ChainSlot::Unreadable`]), the thread polls
         /// instead (past a cap, every [`CAPPED_CHAIN_POLL_INTERVAL`]): it
@@ -2452,7 +2572,9 @@ mod native {
                     continue;
                 }
                 // An event on a directory on the way to `config.toml` (`~`,
-                // a dotfiles checkout) is mostly unrelated: such events are
+                // a dotfiles checkout, or a linked file's target directory:
+                // `/dev` for a link to `/dev/null`, #721) is mostly
+                // unrelated: such events are
                 // debounced like the others and the chain is walked once at
                 // the end, re-registered and reloaded only if something on
                 // the way changed (`changes_nothing`, #393 m2). They never
@@ -3027,10 +3149,13 @@ mod native {
         }
 
         /// S5: at most [`MAX_DIR_LINKS_FOLLOWED`] links and
-        /// [`MAX_CHAIN_DIRS`] directories; one more, or a cycle, is a
-        /// [`ChainCapped`] error rather than an endless walk.
+        /// [`MAX_CHAIN_DIRS`] directories; one more is a [`ChainCapped`]
+        /// error rather than an endless walk. A cycle ends the walk with
+        /// the directories met up to it, the ones holding its links among
+        /// them (#721); a link that expands into itself (`a -> a/b`) is
+        /// no cycle the walk can tell, and stops at the link cap.
         #[test]
-        fn chain_dirs_refuses_more_than_the_caps_and_cycles() {
+        fn chain_dirs_refuses_more_than_the_caps_and_ends_at_cycles() {
             let (_dir, base) = resolved_tempdir();
             let at_cap = link_chain(&base.join("at"), MAX_DIR_LINKS_FOLLOWED);
             assert!(chain_dirs(&at_cap.join("config.toml")).is_ok());
@@ -3042,9 +3167,28 @@ mod native {
             std::os::unix::fs::symlink(base.join("c2"), base.join("c1")).unwrap();
             std::os::unix::fs::symlink(base.join("c1"), base.join("c2")).unwrap();
             for root in [base.join("c1").join("tessera"), base.join("c1")] {
-                let error = chain_dirs(&root.join("config.toml")).unwrap_err();
-                assert!(ChainCapped::is(&error), "{error}");
+                let walk = walk_chain(&root.join("config.toml")).unwrap();
+                assert!(walk.cycle, "{root:?}");
+                assert!(
+                    walk.dirs.contains(&(base.clone(), true)),
+                    "{root:?}: {:?}",
+                    walk.dirs
+                );
             }
+            std::fs::create_dir(base.join("other")).unwrap();
+            std::os::unix::fs::symlink("../c1/x", base.join("other").join("l")).unwrap();
+            let walk = walk_chain(&base.join("other").join("l").join("config.toml")).unwrap();
+            assert!(walk.cycle);
+            assert!(
+                walk.dirs.contains(&(base.join("other"), true)),
+                "{:?}",
+                walk.dirs
+            );
+            assert!(walk.dirs.contains(&(base.clone(), true)), "{:?}", walk.dirs);
+            assert!(walk_chain(&at_cap.join("config.toml")).is_ok_and(|walk| !walk.cycle));
+            std::os::unix::fs::symlink("grow/b", base.join("grow")).unwrap();
+            let error = chain_dirs(&base.join("grow").join("config.toml")).unwrap_err();
+            assert!(ChainCapped::is(&error), "{error}");
 
             let above = base.ancestors().count();
             let mut deep = base.join("deep");
@@ -4770,6 +4914,376 @@ mod native {
             }
         }
 
+        /// Opens and closes a pty, which creates and removes its device
+        /// node: an event on `/dev`, as any pty opened anywhere raises.
+        fn open_and_close_a_pty() {
+            drop(
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open("/dev/ptmx")
+                    .unwrap(),
+            );
+        }
+
+        /// #721 item 1: an event on the directory holding a linked
+        /// `config.toml`'s target is checked as a chain event: it changes
+        /// nothing while the handles still name what their paths name.
+        /// For a `config.toml` linked to `/dev/null` that directory is
+        /// `/dev`, where every pty opened or closed raises an event, each
+        /// of which reloaded and re-registered before. A target saved by
+        /// rename or deleted in its directory is still a change.
+        /// Deterministic: the events are read off the queue here.
+        #[test]
+        fn events_on_a_linked_targets_directory_are_checked_as_chain_events() {
+            let (_dir, base) = resolved_tempdir();
+            let root = base.join("null");
+            std::fs::create_dir_all(&root).unwrap();
+            std::os::unix::fs::symlink("/dev/null", root.join("config.toml")).unwrap();
+            let paths = ConfigPaths::new(&root);
+            let store = ConfigStore::open(paths.clone()).unwrap();
+            let (mut native, _stop) = Native::open(&paths).unwrap();
+            native.settle(&store);
+            assert!(native.armed());
+            assert_eq!(native.link_dir.as_deref(), Some(Path::new("/dev")));
+            let fd = native
+                .link_dir_handle
+                .as_ref()
+                .expect("/dev is not watched")
+                .as_raw_fd();
+            while native.queue.poll(Some(Duration::ZERO)).is_some() {}
+            open_and_close_a_pty();
+            let event = event_on(&mut native, fd).expect("no event on /dev for a pty");
+            assert!(
+                native.changes_nothing(&event),
+                "a pty opened beside /dev/null is a change: {event:?}"
+            );
+
+            let root = base.join("linked");
+            let dots = base.join("dots");
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::create_dir_all(&dots).unwrap();
+            std::fs::write(dots.join("config.toml"), sized(11)).unwrap();
+            std::os::unix::fs::symlink("../dots/config.toml", root.join("config.toml")).unwrap();
+            let paths = ConfigPaths::new(&root);
+            let store = ConfigStore::open(paths.clone()).unwrap();
+            let (mut native, _stop) = Native::open(&paths).unwrap();
+            native.settle(&store);
+            assert!(native.armed());
+            assert_eq!(
+                native
+                    .link_dir
+                    .as_deref()
+                    .map(|dir| std::fs::canonicalize(dir).unwrap()),
+                Some(dots.clone())
+            );
+            let link_dir_fd = |native: &Native| {
+                native
+                    .link_dir_handle
+                    .as_ref()
+                    .expect("dots/ is not watched")
+                    .as_raw_fd()
+            };
+            let fd = link_dir_fd(&native);
+            std::fs::write(dots.join("noise"), "x").unwrap();
+            let event = event_on(&mut native, fd).expect("no event for the noise");
+            assert!(native.changes_nothing(&event), "noise in dots/ is a change");
+
+            crate::write_atomic(&dots.join("config.toml"), &sized(22)).unwrap();
+            let event = event_on(&mut native, fd).expect("no event for the rename-save");
+            assert!(
+                !native.changes_nothing(&event),
+                "the target saved by rename is no change"
+            );
+            native.rearm();
+            native.settle(&store);
+            let fd = link_dir_fd(&native);
+            while native.queue.poll(Some(Duration::ZERO)).is_some() {}
+            std::fs::remove_file(dots.join("config.toml")).unwrap();
+            let event = event_on(&mut native, fd).expect("no event for the delete");
+            assert!(
+                !native.changes_nothing(&event),
+                "the target deleted is no change"
+            );
+        }
+
+        /// #721 r1 m1, the critic's probe: a theme followed with no handle
+        /// (a dangling link into the directory of `config.toml`'s
+        /// target, `dots/`) whose target is then created there. Events on
+        /// `dots/` are chain events since #721, so the check must see the
+        /// file appear, for each slot that follows theme files; main saw
+        /// it by reloading on every event there. A theme file that
+        /// appears but cannot be opened is no change: its registration
+        /// failed and polls, and a reload per event would not repair it.
+        /// Deterministic: the events are read off the queue here.
+        #[test]
+        fn a_followed_theme_created_in_a_linked_targets_directory_is_a_change() {
+            use std::os::unix::fs::PermissionsExt as _;
+            for slot in [Followed::InUse, Followed::Profile, Followed::Unloadable] {
+                let (_dir, base) = resolved_tempdir();
+                let root = base.join("root");
+                let dots = base.join("dots");
+                std::fs::create_dir_all(root.join("themes")).unwrap();
+                std::fs::create_dir_all(&dots).unwrap();
+                let (config, file, text) = slot.setup("root");
+                std::fs::write(dots.join("config.toml"), config).unwrap();
+                std::os::unix::fs::symlink("../dots/config.toml", root.join("config.toml"))
+                    .unwrap();
+                let link = root.join("themes").join(file);
+                std::os::unix::fs::symlink(format!("../../dots/{file}"), &link).unwrap();
+                let paths = ConfigPaths::new(&root);
+                let store = ConfigStore::open(paths.clone()).unwrap();
+                let (mut native, _stop) = Native::open(&paths).unwrap();
+                native.settle(&store);
+                assert!(native.armed(), "{slot:?}");
+                let followed = native
+                    .theme_file
+                    .iter()
+                    .chain(&native.unloadable)
+                    .chain(&native.profile_themes);
+                assert!(
+                    followed.into_iter().any(|path| *path == link),
+                    "{slot:?}: the dangling theme link is not followed"
+                );
+                let fd = native
+                    .link_dir_handle
+                    .as_ref()
+                    .expect("dots/ is not watched")
+                    .as_raw_fd();
+                while native.queue.poll(Some(Duration::ZERO)).is_some() {}
+                std::fs::write(dots.join("noise"), "x").unwrap();
+                let event = event_on(&mut native, fd).expect("no event for the noise");
+                assert!(
+                    native.changes_nothing(&event),
+                    "{slot:?}: noise in dots/ is a change"
+                );
+
+                let staged = dots.join("theme.new");
+                std::fs::write(&staged, &text).unwrap();
+                std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o000)).unwrap();
+                std::fs::rename(&staged, dots.join(file)).unwrap();
+                let event = event_on(&mut native, fd).expect("no event for the unopenable theme");
+                if std::fs::File::open(dots.join(file)).is_err() {
+                    assert!(
+                        native.changes_nothing(&event),
+                        "{slot:?}: a theme that cannot be opened is a change"
+                    );
+                }
+                std::fs::remove_file(dots.join(file)).unwrap();
+                let event = event_on(&mut native, fd).expect("no event for the delete");
+                assert!(
+                    native.changes_nothing(&event),
+                    "{slot:?}: the delete is a change"
+                );
+
+                std::fs::write(&staged, &text).unwrap();
+                std::fs::rename(&staged, dots.join(file)).unwrap();
+                let event = event_on(&mut native, fd).expect("no event for the theme created");
+                assert!(
+                    !native.changes_nothing(&event),
+                    "{slot:?}: the theme created in dots/ is no change"
+                );
+            }
+        }
+
+        /// #721 item 1, the issue's probe: with `config.toml` linked to
+        /// `/dev/null`, ptys opened and closed further apart than the
+        /// debounce (each a burst of events on `/dev`) neither reload nor
+        /// re-register; before the fix each burst did both. A retarget of
+        /// the link to a real file, and then a rename-save of that file in
+        /// its own directory (an event there, now checked as a chain
+        /// event), are still applied.
+        #[test]
+        fn ptys_beside_a_config_linked_to_dev_null_neither_rearm_nor_reload() {
+            let (_dir, base) = resolved_tempdir();
+            let root = base.join("root");
+            let dots = base.join("dots");
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::create_dir_all(&dots).unwrap();
+            std::fs::write(dots.join("config.toml"), sized(22)).unwrap();
+            let link = root.join("config.toml");
+            std::os::unix::fs::symlink("/dev/null", &link).unwrap();
+            let running = run_native(&root, |native| {
+                assert!(native.armed());
+                assert_eq!(native.link_dir.as_deref(), Some(Path::new("/dev")));
+            });
+            let settled = running.probe.settles();
+            let rearmed = running.probe.rearms();
+            for _ in 0..10 {
+                open_and_close_a_pty();
+                std::thread::sleep(WatchOptions::default().debounce * 2);
+            }
+            std::thread::sleep(WatchOptions::default().debounce * 2);
+            let settles = running.probe.settles() - settled;
+            let rearms = running.probe.rearms() - rearmed;
+
+            retarget(&link, "../dots/config.toml");
+            assert!(
+                applies(&running, 22, Duration::from_secs(5)),
+                "the retarget was missed"
+            );
+            crate::write_atomic(&dots.join("config.toml"), &sized(33)).unwrap();
+            assert!(
+                applies(&running, 33, Duration::from_secs(5)),
+                "the target's rename-save was missed"
+            );
+            assert_eq!((settles, rearms), (0, 0), "(settles, rearms) for 10 ptys");
+        }
+
+        /// The layouts of [`a_link_cycle_on_the_way_is_watched_up_to_it`]:
+        /// a cycle through `base/loop`, outside the configuration directory
+        /// `base/root`.
+        #[derive(Debug, Clone, Copy)]
+        enum Cycle {
+            /// `profiles -> ../loop/p`, `loop/p -> ../root/profiles`.
+            ProfilesDir,
+            /// `profiles/work.toml -> ../../loop/w.toml`,
+            /// `loop/w.toml -> ../root/profiles/work.toml`.
+            ProfileFile,
+            /// `config.toml -> ../loop/c.toml`,
+            /// `loop/c.toml -> ../root/config.toml`.
+            ConfigFile,
+        }
+
+        impl Cycle {
+            const ALL: [Self; 3] = [Self::ProfilesDir, Self::ProfileFile, Self::ConfigFile];
+
+            /// Puts the cycle in `base`; returns the root.
+            fn setup(self, base: &Path) -> PathBuf {
+                let root = base.join("root");
+                let lp = base.join("loop");
+                std::fs::create_dir_all(&root).unwrap();
+                std::fs::create_dir_all(&lp).unwrap();
+                let link = std::os::unix::fs::symlink::<&str, PathBuf>;
+                match self {
+                    Self::ProfilesDir => {
+                        std::fs::write(root.join("config.toml"), sized(11)).unwrap();
+                        link("../loop/p", root.join("profiles")).unwrap();
+                        link("../root/profiles", lp.join("p")).unwrap();
+                    }
+                    Self::ProfileFile => {
+                        std::fs::write(root.join("config.toml"), sized(11)).unwrap();
+                        std::fs::create_dir(root.join("profiles")).unwrap();
+                        link("../../loop/w.toml", root.join("profiles").join("work.toml")).unwrap();
+                        link("../root/profiles/work.toml", lp.join("w.toml")).unwrap();
+                    }
+                    Self::ConfigFile => {
+                        link("../loop/c.toml", root.join("config.toml")).unwrap();
+                        link("../root/config.toml", lp.join("c.toml")).unwrap();
+                    }
+                }
+                root
+            }
+
+            /// Breaks the cycle in `base/loop`, so the way leads to a file
+            /// that `applied` finds applied.
+            fn break_it(self, base: &Path) {
+                let lp = base.join("loop");
+                match self {
+                    Self::ProfilesDir => {
+                        let staged = lp.join("p.new");
+                        std::fs::create_dir(&staged).unwrap();
+                        std::fs::write(staged.join("work.toml"), work_profile("/bin/w")).unwrap();
+                        std::fs::remove_file(lp.join("p")).unwrap();
+                        std::fs::rename(&staged, lp.join("p")).unwrap();
+                    }
+                    // A file renamed over the link (`write_atomic` would
+                    // follow it, and refuses a cycle).
+                    Self::ProfileFile => {
+                        std::fs::write(lp.join("w.new"), work_profile("/bin/w")).unwrap();
+                        std::fs::rename(lp.join("w.new"), lp.join("w.toml")).unwrap();
+                    }
+                    Self::ConfigFile => {
+                        std::fs::write(lp.join("c.new"), sized(22)).unwrap();
+                        std::fs::rename(lp.join("c.new"), lp.join("c.toml")).unwrap();
+                    }
+                }
+            }
+
+            fn applied(self, running: &Running) -> bool {
+                let within = Duration::from_secs(5);
+                match self {
+                    Self::ProfilesDir | Self::ProfileFile => {
+                        applies_profile(running, "work", "/bin/w", within)
+                    }
+                    Self::ConfigFile => applies(running, 22, within),
+                }
+            }
+        }
+
+        /// #721 item 3: a cycle of links on the way to `profiles/`, to a
+        /// profile file or to `config.toml` no longer caps the watcher
+        /// (which then polled every 2 s): the walk lists the directories
+        /// up to the cycle, which hold its links, and the backend stays
+        /// armed and sleeps. Breaking the cycle outside the configuration
+        /// directory raises an event on one of them, and is applied.
+        #[test]
+        fn a_link_cycle_on_the_way_is_watched_up_to_it() {
+            for case in Cycle::ALL {
+                let (_dir, base) = resolved_tempdir();
+                let root = case.setup(&base);
+                let running = run_native(&root, |native| {
+                    assert!(native.armed(), "{case:?}: not armed");
+                    assert!(
+                        native
+                            .chain
+                            .iter()
+                            .any(|(dir, slot)| *dir == base.join("loop")
+                                && matches!(slot, ChainSlot::Armed(_))),
+                        "{case:?}: loop/ is not watched: {:?}",
+                        native.chain
+                    );
+                });
+                let polls = running.probe.polls();
+                std::thread::sleep(Duration::from_millis(300));
+                assert_eq!(running.probe.polls(), polls, "{case:?}: polls");
+                case.break_it(&base);
+                assert!(
+                    case.applied(&running),
+                    "{case:?}: the broken cycle was missed"
+                );
+            }
+        }
+
+        /// #721 item 3: with a cycle on the way, an unrelated event on a
+        /// directory of the cycle changes nothing: a path in the cycle
+        /// names nothing, as a missing one, so it is not reloaded on each
+        /// event there. Deterministic: the events are read off the queue.
+        #[test]
+        fn noise_beside_a_link_cycle_changes_nothing() {
+            for case in Cycle::ALL {
+                let (_dir, base) = resolved_tempdir();
+                let root = case.setup(&base);
+                let paths = ConfigPaths::new(&root);
+                let store = ConfigStore::open(paths.clone()).unwrap();
+                let (mut native, _stop) = Native::open(&paths).unwrap();
+                native.settle(&store);
+                assert!(native.armed(), "{case:?}");
+                let fd = chain_fd(&native, &base.join("loop"));
+                std::fs::write(base.join("loop").join("noise"), "x").unwrap();
+                let event = event_on(&mut native, fd).expect("no event for the noise");
+                assert!(
+                    native.changes_nothing(&event),
+                    "{case:?}: noise is a change"
+                );
+            }
+        }
+
+        /// #721 item 3: a configuration directory that is itself in a
+        /// cycle of links cannot be watched; the backend polls, slowly, as
+        /// past a cap, and the directories of the cycle are watched.
+        #[test]
+        fn a_root_in_a_link_cycle_polls_slowly() {
+            let (_dir, base) = resolved_tempdir();
+            std::os::unix::fs::symlink(base.join("c2"), base.join("c1")).unwrap();
+            std::os::unix::fs::symlink(base.join("c1"), base.join("c2")).unwrap();
+            let (native, _stop) = Native::open(&ConfigPaths::new(base.join("c1"))).unwrap();
+            assert!(native.root_handle.is_none());
+            assert!(!native.armed());
+            assert!(native.chain_capped, "polls fast");
+            assert!(native.chain.iter().any(|(dir, _)| *dir == base));
+        }
+
         /// #701 F2: an `unlink; symlink` retarget whose unlink lands
         /// between the load's `stat` of `config.toml` and its open. The
         /// load finds no file and applies the defaults, which the
@@ -6037,20 +6551,27 @@ mod tests {
         assert_eq!(opts.max_wait, MAX_WATCH_DURATION);
     }
 
-    /// #708, #712: the polling backend samples a `config.toml` or a
-    /// `profiles/` linked to `/dev/null` by type alone, so writes to the
-    /// device, which bump its times on every write from anywhere, re-read
-    /// nothing. Before the fix each tick that saw the device's times move
-    /// re-read the configuration (silently for a `config.toml` refused
-    /// again with the same error). An edit made after the writes shows
-    /// the thread was sampling.
+    /// #708, #712, #721: the polling backend samples a `config.toml`, a
+    /// `profiles/`, a `themes/` or a theme file linked to `/dev/null` by
+    /// type alone, so writes to the device, which bump its times on every
+    /// write from anywhere, re-read nothing. Before the fixes each tick
+    /// that saw the device's times move re-read the configuration
+    /// (silently for a `config.toml` refused again with the same error),
+    /// every twentieth for a theme file. An edit made after the writes
+    /// shows the thread was sampling, and with a theme file linked to
+    /// `/dev/null`, an edit of a real theme file beside it is still seen.
     #[test]
     fn polled_links_to_dev_null_reread_nothing_when_it_is_written() {
-        for link in ["config.toml", "profiles"] {
+        for link in ["config.toml", "profiles", "themes", "themes/null.toml"] {
             let dir = tempfile::tempdir().unwrap();
             let config = dir.path().join("config.toml");
             if link != "config.toml" {
                 std::fs::write(&config, "[appearance]\nfont_size = 11\n").unwrap();
+            }
+            let mine = dir.path().join("themes").join("mine.toml");
+            if link == "themes/null.toml" {
+                std::fs::create_dir(dir.path().join("themes")).unwrap();
+                std::fs::write(&mine, theme_doc("Mine", "#101010")).unwrap();
             }
             std::os::unix::fs::symlink("/dev/null", dir.path().join(link)).unwrap();
             let store = ConfigStore::open(ConfigPaths::new(dir.path())).unwrap();
@@ -6066,9 +6587,10 @@ mod tests {
                 .unwrap();
             let loads = store.load_count();
             // Writes further apart than a tick and the debounce, so each
-            // re-read on its own before the fix; a starved thread samples
-            // fewer of them, which only weakens the check.
-            for _ in 0..10 {
+            // re-read on its own before the fix (a theme file every
+            // twentieth tick, so about five times here); a starved thread
+            // samples fewer of them, which only weakens the check.
+            for _ in 0..20 {
                 std::fs::OpenOptions::new()
                     .write(true)
                     .open("/dev/null")
@@ -6090,7 +6612,62 @@ mod tests {
                 "{link}: {event:?}"
             );
             assert_eq!(reread, 0, "{link}: re-read {reread} times");
+            if link == "themes/null.toml" {
+                std::fs::write(&mine, theme_doc("Mine", "#202020")).unwrap();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    match watcher.recv_timeout(left) {
+                        Ok(ConfigEvent::ThemesChanged) => break,
+                        Ok(_) => {}
+                        Err(e) => panic!("{link}: the theme edit was missed: {e}"),
+                    }
+                }
+            }
         }
+    }
+
+    /// #721: the polling backend's sample of `themes/` linked to
+    /// `/dev/null`, and of a theme file (in use, or listed) linked to it,
+    /// is by type alone, so a write to the device is no change; an edit of
+    /// a real theme file still is. Deterministic: the samples are taken
+    /// here.
+    #[test]
+    fn polled_theme_paths_linked_to_dev_null_are_sampled_by_their_type_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let themes = dir.path().join("themes");
+        std::fs::create_dir(&themes).unwrap();
+        let null = themes.join("null.toml");
+        let mine = themes.join("mine.toml");
+        std::os::unix::fs::symlink("/dev/null", &null).unwrap();
+        std::fs::write(&mine, theme_doc("Mine", "#101010")).unwrap();
+        let store = ConfigStore::open(ConfigPaths::new(dir.path())).unwrap();
+        let other = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("/dev/null", other.path().join("themes")).unwrap();
+        let other = ConfigStore::open(ConfigPaths::new(other.path())).unwrap();
+        let samples = || {
+            (
+                PollSample::of(&store, Some(null.clone())),
+                PollSample::of(&other, None),
+            )
+        };
+        let before = samples();
+        assert!(
+            matches!(before.0.theme_file, Some((_, Fingerprint::Other(_)))),
+            "{before:?}"
+        );
+        assert!(
+            matches!(before.1.themes_dir, Fingerprint::Other(_)),
+            "{before:?}"
+        );
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .and_then(|mut null| std::io::Write::write_all(&mut null, b"x"))
+            .unwrap();
+        assert_eq!(samples(), before, "a write to /dev/null is a change");
+        std::fs::write(&mine, theme_doc("Mine", "#202020")).unwrap();
+        assert_ne!(samples().0, before.0, "a theme edit is no change");
     }
 
     /// #708, #712: a path of another type than the one read there is

@@ -74,7 +74,7 @@ inode and miss the next in-place write. The file's type is checked with `stat` b
 opened, so a FIFO in place of `config.toml` cannot block the watcher.
 
 A path that exists but cannot be registered (`config.toml` with mode 000,
-a symlink cycle, a target in an unreadable directory) is treated the same
+a target in an unreadable directory) is treated the same
 way: the watcher starts anyway, as `ConfigStore::open` tolerates the same
 file, and polls until every registration succeeds, then re-reads the file
 and goes back to kernel events. Giving up on the file instead would miss
@@ -219,8 +219,8 @@ changes only the directory that holds it. The native backend therefore
 resolves the root component by component, as the kernel does, and also
 watches each directory holding a link on the way, at most
 `MAX_DIR_LINKS_FOLLOWED` (8; S5), re-resolving on every re-registration
-so it follows the new target. More links than that, or a cycle, register
-none of them; the backend then counts as not armed and polls, settling
+so it follows the new target. More links than that register none of them
+(a cycle: see the #721 amendment); the backend then counts as not armed and polls, settling
 whenever `config.toml`'s metadata (followed through the links) changes,
 so a retarget is still applied, a poll interval later. The polling
 backend already follows names and needs none of this.
@@ -273,8 +273,8 @@ directory above it swapped by rename (`dirswap`), and a `config.toml`
 symlink through a retargeted directory link (`filelink`), are applied
 from an event, as fast as the poll backend applies them (#393 F3). The
 walk is capped at 8 links (`MAX_DIR_LINKS_FOLLOWED`) and 32 directories
-(`MAX_CHAIN_DIRS`); past either, or in a cycle, nothing on the way is
-registered (S5). A directory on the way that cannot be read (`EACCES`)
+(`MAX_CHAIN_DIRS`); past either nothing on the way is registered (S5); a
+cycle is watched up to it (#721 amendment). A directory on the way that cannot be read (`EACCES`)
 and that the walk only passes through is left unwatched, with a debug
 log, and does not unarm the backend: a change there is seen only from the
 directories below it. One that holds a link the walk follows fails the
@@ -436,3 +436,40 @@ queues it, within the plugin queue's cap), also for a comment edit or an
 edit of a theme file not in use. ADR 0044's settle rule
 for Settings (a pending value goes once a later generation is read) now
 also covers the undone save.
+
+## Amendment: `/dev`, themes and link cycles (#721, 2026-11-26)
+
+**A linked file's target directory is on the way.** An event on the
+directory holding a linked `config.toml`'s target is now checked as a
+chain event: debounced without extending the wait, and re-registered and
+reloaded only when a handle no longer names what its path names (the
+file's, or with no handle the file still missing or of another type, and
+the directory's). For the usual way to disable a configuration,
+`config.toml -> /dev/null`, that directory is `/dev`, which changes on
+every pty opened or closed anywhere on the system; each such event
+reloaded and re-registered before. A target saved by rename, deleted or
+created again in that directory is still a change, and so is a followed
+theme file with no handle (a dangling link into that directory, say) that
+becomes a regular file which opens. One that appears but cannot be opened
+is not: its registration fails and polls. Themes nobody follows whose
+links lead into that directory are not checked; a change to one there is
+reported with the next settle, not at once.
+
+**The poll backend samples themes by type.** `themes/` and each theme
+file are fingerprinted as `profiles/` and `config.toml` have been since
+#708 and #712: a path of another type than the one read there (a link to
+`/dev/null`) by its type alone, so writes to the device re-read nothing.
+
+**A cycle of links is watched up to it.** The walk to `config.toml`,
+`profiles/` or a linked profile file stops where it meets a link it has
+expanded before with the same rest of the path, and returns the
+directories met up to there. They hold every link of the cycle, so the
+change that breaks it, inside the configuration directory or outside, is
+an event on a watched directory. The root, `profiles/` or `config.toml`
+in a cycle names nothing and counts as missing, not as a registration
+error, so the backend stays armed and sleeps instead of polling every
+2 s. Only a root that is itself in a cycle leaves it unarmed; it then
+polls slowly, as past a cap. A link that expands into itself (`a -> a/b`)
+is no cycle the walk can tell; it stops at the link cap as before. The
+`themes/` directory, which the walk does not cover, still counts a cycle
+as a registration error and polls until it is broken.
