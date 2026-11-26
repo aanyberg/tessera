@@ -645,6 +645,87 @@ extension TesseraSession {
         try TesseraCoreError.check(status)
     }
 
+    /// What the core decided for a paste (#471,
+    /// ``pasteCheck(_:)``).
+    public struct PasteCheck: Sendable, Equatable {
+        /// Show the confirmation first; paste only if the user agrees.
+        public let ask: Bool
+        /// Whether the program had bracketed paste (DECSET 2004) on: without
+        /// it, each line of the paste runs as typed.
+        public let bracketed: Bool
+
+        public init(ask: Bool, bracketed: Bool) {
+            self.ask = ask
+            self.bracketed = bracketed
+        }
+    }
+
+    /// Whether pasting `text` asks first, under `[terminal] paste_guard`
+    /// of the configuration in effect and the program's bracketed-paste
+    /// mode now. Sends nothing; a confirmed paste goes through
+    /// ``paste(_:)``. Make `text` contiguous UTF-8 first
+    /// (`String.makeContiguousUTF8()`) so the three calls of a paste copy
+    /// it once.
+    ///
+    /// - Throws: ``TesseraCoreError/sessionNotFound`` once closed.
+    @MainActor
+    public func pasteCheck(_ text: String) throws -> PasteCheck {
+        var text = text
+        var out = TesseraPasteCheck()
+        let status = text.withUTF8 { bytes in
+            bytes.withMemoryRebound(to: CChar.self) { chars in
+                tessera_session_paste_check(core.pointer, id, chars.baseAddress, chars.count, &out)
+            }
+        }
+        try TesseraCoreError.check(status)
+        return PasteCheck(ask: out.ask, bracketed: out.bracketed)
+    }
+
+    /// What the paste confirmation shows of a paste (``pastePreview(_:)``).
+    public struct PastePreview: Sendable, Equatable {
+        /// The first ``maxLines`` lines, each cut at 200 characters, with
+        /// control characters in caret notation (`^[` for ESC) and invisible
+        /// or reordering characters as `<U+XXXX>`: safe to show as it is
+        /// (`docs/security.md` S3).
+        public let text: String
+        /// The paste's lines (a trailing line break ends the last one).
+        public let lines: Int
+        /// Lines left out of ``text``.
+        public let moreLines: Int
+        /// Whether the paste holds control characters, which pasting removes.
+        public let hasControls: Bool
+        /// Whether the paste holds a line break.
+        public let hasLineBreaks: Bool
+
+        /// The most lines ``text`` holds.
+        public static let maxLines = Int(TESSERA_PASTE_PREVIEW_MAX_LINES)
+        /// The most UTF-8 bytes ``text`` holds.
+        public static let maxBytes = Int(TESSERA_PASTE_PREVIEW_MAX_BYTES)
+    }
+
+    /// The core's preview of `text` for the paste confirmation: one pass,
+    /// at most `TESSERA_PASTE_PREVIEW_MAX_BYTES` whatever the paste's size.
+    public static func pastePreview(_ text: String) -> PastePreview {
+        var text = text
+        var info = TesseraPastePreviewInfo()
+        var length = 0
+        var buffer = [UInt8](repeating: 0, count: PastePreview.maxBytes)
+        let status = text.withUTF8 { bytes in
+            bytes.withMemoryRebound(to: CChar.self) { chars in
+                buffer.withUnsafeMutableBufferPointer { out in
+                    tessera_paste_preview(chars.baseAddress, chars.count, out.baseAddress, out.count, &length, &info)
+                }
+            }
+        }
+        // A Swift string is UTF-8 and the buffer always holds a preview.
+        guard status == TESSERA_ERROR_OK else {
+            return PastePreview(text: "", lines: 0, moreLines: 0, hasControls: false, hasLineBreaks: false)
+        }
+        return PastePreview(
+            text: String(decoding: buffer.prefix(length), as: UTF8.self), lines: info.lines,
+            moreLines: info.more_lines, hasControls: info.has_controls, hasLineBreaks: info.has_line_breaks)
+    }
+
     /// Tells the session whether its view has keyboard focus (a new session
     /// is unfocused). The renderer draws an unfocused cursor hollow.
     ///

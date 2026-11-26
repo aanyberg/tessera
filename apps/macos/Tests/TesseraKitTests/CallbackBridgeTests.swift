@@ -335,6 +335,31 @@ final class CallbackBridgeTests: XCTestCase {
         XCTAssertEqual(recorder.events[session.id, default: []], [], "not a delegate event")
     }
 
+    /// The pane's notice (#471) learns each delivery's size and how many
+    /// writes it folds, never the text.
+    func testTheDelegateLearnsTheWritesADeliveryFoldsAndTheLatestSize() async throws {
+        onReaderThread { callbacks in
+            CallbackBridgeTests.writeClipboard(callbacks, "one")
+            CallbackBridgeTests.writeClipboard(callbacks, "three")
+            CallbackBridgeTests.writeClipboard(callbacks, "héllo")
+        }
+        _ = try await drained()
+        XCTAssertEqual(pasteboard.string(forType: .string), "héllo")
+        XCTAssertEqual(recorder.clipboardWrites[7], [TesseraClipboardWrite(bytes: 6, writes: 3)], "one report")
+        onReaderThread { callbacks in CallbackBridgeTests.writeClipboard(callbacks, "x") }
+        _ = try await drained()
+        XCTAssertEqual(recorder.clipboardWrites[7]?.last, TesseraClipboardWrite(bytes: 1, writes: 1), "counted afresh")
+        // Nothing for a closed session, nor for empty text.
+        onReaderThread { callbacks in
+            callbacks.on_session_clipboard!(callbacks.user_data, 7, nil, 0)
+            CallbackBridgeTests.writeClipboard(callbacks, "")
+        }
+        bridge.unregister(7)
+        onReaderThread { callbacks in CallbackBridgeTests.writeClipboard(callbacks, "closed") }
+        _ = try await drained()
+        XCTAssertEqual(recorder.clipboardWrites[7]?.count, 2)
+    }
+
     func testClipboardWritesAfterCloseOrShutdownAreDropped() async throws {
         bridge.unregister(7)
         onReaderThread { callbacks in CallbackBridgeTests.writeClipboard(callbacks, "closed") }

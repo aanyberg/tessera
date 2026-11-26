@@ -26,12 +26,14 @@ use tessera_app_core::input::{
 };
 use tessera_ffi::{
     App, Callbacks, Error, HANDLE_KEY_BINDINGS_ONLY, InputOutcome, Key, KeyEvent, KeyEventKind,
-    Modifiers, MouseButton, MouseEvent, MouseEventKind, NO_COMMAND, ScrollEvent, ScrollPosition,
+    Modifiers, MouseButton, MouseEvent, MouseEventKind, NO_COMMAND, PASTE_PREVIEW_MAX_BYTES,
+    PASTE_PREVIEW_MAX_LINES, PasteCheck, PastePreviewInfo, ScrollEvent, ScrollPosition,
     ScrollTarget, SpawnOptions, tessera_app_free, tessera_app_keymap_json, tessera_app_new,
-    tessera_app_set_callbacks, tessera_session_close, tessera_session_handle_key,
-    tessera_session_paste, tessera_session_scroll_position, tessera_session_scroll_to,
-    tessera_session_send_key, tessera_session_send_mouse, tessera_session_send_scroll,
-    tessera_session_set_focus, tessera_session_spawn, tessera_test_with_core,
+    tessera_app_set_callbacks, tessera_paste_preview, tessera_session_close,
+    tessera_session_handle_key, tessera_session_paste, tessera_session_paste_check,
+    tessera_session_scroll_position, tessera_session_scroll_to, tessera_session_send_key,
+    tessera_session_send_mouse, tessera_session_send_scroll, tessera_session_set_focus,
+    tessera_session_spawn, tessera_test_with_core,
 };
 
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -668,6 +670,155 @@ fn signal(pid: u32, signal: &str) -> bool {
         .status()
         .expect("kill runs")
         .success()
+}
+
+/// `tessera_session_paste_check` (#471): the default guard asks for a
+/// multi-line paste until the child turns on bracketed paste, for controls
+/// in either mode, and fails cleanly on bad arguments.
+#[test]
+fn the_paste_check_follows_the_childs_bracketed_paste() {
+    let outputs = Box::leak(Box::new(Outputs::default()));
+    let app = Handle::new(outputs);
+    let id = app.spawn("/bin/sh", &["-c", "echo ready; exec cat"]);
+    wait_ticks("the child to start", || app.row(id, 0).starts_with("ready"));
+    let check = |id: u64, text: &[u8]| {
+        let mut out = PasteCheck {
+            ask: true,
+            bracketed: true,
+        };
+        // SAFETY: live handle; `text` readable for its length; `out` writable.
+        let code = unsafe {
+            tessera_session_paste_check(app.0, id, text.as_ptr().cast(), text.len(), &raw mut out)
+        };
+        (code, out.ask, out.bracketed)
+    };
+    assert_eq!(check(id, b"a\nb"), (Error::Ok, true, false));
+    assert_eq!(check(id, b"ab"), (Error::Ok, false, false));
+    assert_eq!(check(id, b""), (Error::Ok, false, false));
+    // The terminal sees the child turn bracketed paste on.
+    app.core(|core| core.feed_for_test(SessionId::from_raw(id), b"\x1b[?2004h"))
+        .expect("live session");
+    assert_eq!(check(id, b"a\nb"), (Error::Ok, false, true));
+    assert_eq!(check(id, b"a\x1b[201~b"), (Error::Ok, true, true));
+    // Failures leave `*out` all false.
+    assert_eq!(
+        check(u64::MAX, b"a"),
+        (Error::SessionNotFound, false, false)
+    );
+    assert_eq!(
+        check(id, &[0xff, 0xfe]),
+        (Error::InvalidArgument, false, false)
+    );
+    // SAFETY: NULL arguments are checked before any is read.
+    unsafe {
+        assert_eq!(
+            tessera_session_paste_check(app.0, id, ptr::null(), 0, ptr::null_mut()),
+            Error::NullPointer
+        );
+        let mut out = PasteCheck::default();
+        assert_eq!(
+            tessera_session_paste_check(ptr::null_mut(), id, ptr::null(), 0, &raw mut out),
+            Error::NullPointer
+        );
+        assert_eq!(
+            tessera_session_paste_check(app.0, id, ptr::null(), 3, &raw mut out),
+            Error::NullPointer
+        );
+    }
+}
+
+/// `tessera_paste_preview` (#471): bounded output whatever the paste, the
+/// size-query protocol of the other text calls, and its counts.
+#[test]
+fn the_paste_preview_is_bounded_and_escaped() {
+    let preview = |text: &[u8], cap: usize| {
+        let mut buf = vec![0u8; cap];
+        let mut len = usize::MAX;
+        let mut info = PastePreviewInfo::default();
+        // SAFETY: `text` readable, `buf` writable for `cap`, outputs writable.
+        let code = unsafe {
+            tessera_paste_preview(
+                text.as_ptr().cast(),
+                text.len(),
+                if cap == 0 {
+                    ptr::null_mut()
+                } else {
+                    buf.as_mut_ptr()
+                },
+                cap,
+                &raw mut len,
+                &raw mut info,
+            )
+        };
+        buf.truncate(len.min(cap));
+        (code, String::from_utf8(buf).unwrap(), len, info)
+    };
+    let (code, text, len, info) = preview(b"a\x1b[201~\r\nb\x7f", 64);
+    assert_eq!((code, text.as_str(), len), (Error::Ok, "a^[[201~\nb^?", 12));
+    assert_eq!(
+        info,
+        PastePreviewInfo {
+            lines: 2,
+            more_lines: 0,
+            has_controls: true,
+            has_line_breaks: true,
+        }
+    );
+    // Too small: nothing written, the size needed stored, the counts too.
+    let (code, _, len, info) = preview(b"abc\n", 0);
+    assert_eq!((code, len, info.lines), (Error::InvalidArgument, 3, 1));
+    // 16 MiB of lines fits the documented bound.
+    let big = b"0123456789".repeat(1_677_721);
+    let mut big = big.chunks(300).collect::<Vec<_>>().join(&b'\n');
+    big.truncate(16 << 20);
+    let (code, text, len, info) = preview(&big, PASTE_PREVIEW_MAX_BYTES);
+    assert_eq!(code, Error::Ok);
+    assert!(len <= PASTE_PREVIEW_MAX_BYTES);
+    assert_eq!(text.lines().count(), PASTE_PREVIEW_MAX_LINES);
+    assert_eq!(info.more_lines, info.lines - PASTE_PREVIEW_MAX_LINES);
+    assert!(!info.has_controls);
+    assert!(info.has_line_breaks);
+    // Invalid UTF-8 and NULL outputs.
+    assert_eq!(preview(&[0xc3], 16).0, Error::InvalidArgument);
+    let mut info = PastePreviewInfo::default();
+    // SAFETY: NULL outputs are checked before anything is read or written.
+    unsafe {
+        assert_eq!(
+            tessera_paste_preview(
+                ptr::null(),
+                0,
+                ptr::null_mut(),
+                0,
+                ptr::null_mut(),
+                &raw mut info
+            ),
+            Error::NullPointer
+        );
+        let mut len = 0;
+        assert_eq!(
+            tessera_paste_preview(
+                ptr::null(),
+                2,
+                ptr::null_mut(),
+                0,
+                &raw mut len,
+                &raw mut info
+            ),
+            Error::NullPointer
+        );
+        assert_eq!(
+            tessera_paste_preview(
+                ptr::null(),
+                0,
+                ptr::null_mut(),
+                0,
+                &raw mut len,
+                &raw mut info
+            ),
+            Error::Ok
+        );
+        assert_eq!(len, 0);
+    }
 }
 
 #[test]

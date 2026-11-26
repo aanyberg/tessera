@@ -83,9 +83,10 @@ pub use error::Error;
 pub use input::tessera_test_with_core;
 pub use input::{
     HANDLE_KEY_BINDINGS_ONLY, InputOutcome, Key, KeyEvent, KeyEventKind, Modifiers, MouseButton,
-    MouseEvent, MouseEventKind, NO_COMMAND, ScrollEvent, tessera_session_handle_key,
-    tessera_session_paste, tessera_session_send_key, tessera_session_send_mouse,
-    tessera_session_send_scroll, tessera_session_set_focus,
+    MouseEvent, MouseEventKind, NO_COMMAND, PASTE_PREVIEW_MAX_BYTES, PASTE_PREVIEW_MAX_LINES,
+    PasteCheck, PastePreviewInfo, ScrollEvent, tessera_paste_preview, tessera_session_handle_key,
+    tessera_session_paste, tessera_session_paste_check, tessera_session_send_key,
+    tessera_session_send_mouse, tessera_session_send_scroll, tessera_session_set_focus,
 };
 pub use keymap::tessera_app_keymap_json;
 pub use notify::{

@@ -1501,6 +1501,167 @@ pub unsafe extern "C" fn tessera_session_paste(
     })
 }
 
+/// The most bytes `tessera_paste_preview` writes: a buffer this large always
+/// holds a preview.
+pub const PASTE_PREVIEW_MAX_BYTES: usize = 16_079;
+/// The most lines a paste preview shows; the rest are counted.
+pub const PASTE_PREVIEW_MAX_LINES: usize = 20;
+
+// Literals, so cbindgen writes them into the header; the core's are the
+// bounds.
+const _: () = assert!(PASTE_PREVIEW_MAX_BYTES == tessera_app_core::PREVIEW_MAX_BYTES);
+const _: () = assert!(PASTE_PREVIEW_MAX_LINES == tessera_app_core::PREVIEW_MAX_LINES);
+
+/// What `tessera_session_paste_check` decided for a paste (#471).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PasteCheck {
+    /// Show the confirmation first, and paste only if the user agrees.
+    pub ask: bool,
+    /// Whether the program had bracketed paste (DECSET 2004) on: without
+    /// it, each line of the paste runs as typed.
+    pub bracketed: bool,
+}
+
+/// What `tessera_paste_preview` counted in a paste (#471).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PastePreviewInfo {
+    /// The paste's lines (a trailing line break ends the last one; an
+    /// empty paste has none).
+    pub lines: usize,
+    /// Lines the preview leaves out, after its first
+    /// `TESSERA_PASTE_PREVIEW_MAX_LINES`.
+    pub more_lines: usize,
+    /// Whether the paste holds a control character that pasting removes
+    /// (C0 other than tab, line feed and carriage return, DEL or C1).
+    pub has_controls: bool,
+    /// Whether the paste holds a line break (`\n` or `\r`): without
+    /// bracketed paste each one is a Return.
+    pub has_line_breaks: bool,
+}
+
+/// Decides whether pasting `text` into session `session_id` asks first:
+/// under `[terminal] paste_guard` of the configuration in effect,
+/// `"unbracketed"` (the default) asks for text with a line break (`\n`, a
+/// lone `\r`, `\r\n`) while the program has not turned on bracketed paste
+/// (DECSET 2004), and for text with a control character (C0 other than
+/// tab, line feed and carriage return, DEL or C1) in either mode;
+/// `"always"` asks for every non-empty paste; `"off"` never asks. An empty
+/// paste never asks. Stores the decision and the mode it saw in `*out`;
+/// sends nothing. Paste a confirmed text with `tessera_session_paste`,
+/// which reads the mode again.
+///
+/// Call from the UI (main) thread only.
+///
+/// Returns `TESSERA_ERROR_NULL_POINTER` if `app` or `out` is `NULL`, or
+/// `text` is `NULL` with a non-zero `len`; `TESSERA_ERROR_SESSION_NOT_FOUND`
+/// if the id is not a live session; `TESSERA_ERROR_INVALID_ARGUMENT` if the
+/// bytes are not UTF-8. On failure `*out` is all `false` (when `out` is not
+/// `NULL`).
+///
+/// # Safety
+///
+/// `app` must be `NULL` or a live handle; `out` `NULL` or writable. `text`
+/// must point to `len` readable bytes; it may be `NULL` when `len` is 0.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tessera_session_paste_check(
+    app: *mut App,
+    session_id: u64,
+    text: *const c_char,
+    len: usize,
+    out: *mut PasteCheck,
+) -> Error {
+    ffi_guard!("tessera_session_paste_check", {
+        if out.is_null() {
+            return Error::NullPointer;
+        }
+        // SAFETY: non-null and writable per the contract.
+        unsafe { out.write(PasteCheck::default()) };
+        // SAFETY: the caller passes NULL or a live handle.
+        let Some(app) = (unsafe { App::from_ptr(app) }) else {
+            return Error::NullPointer;
+        };
+        // SAFETY: `text` points to `len` readable bytes per the contract.
+        let text = match unsafe { utf8(text, len, Error::NullPointer) } {
+            Ok(text) => text.unwrap_or_default(),
+            Err(code) => return code,
+        };
+        match app.core.paste_check(SessionId::from_raw(session_id), text) {
+            Ok(check) => {
+                let check = PasteCheck {
+                    ask: check.decision == tessera_app_core::PasteDecision::Ask,
+                    bracketed: check.bracketed,
+                };
+                // SAFETY: as above.
+                unsafe { out.write(check) };
+                Error::Ok
+            }
+            Err(error) => error::report("tessera_session_paste_check", &error),
+        }
+    })
+}
+
+/// Writes the preview of `text` that the paste confirmation shows: its
+/// first `TESSERA_PASTE_PREVIEW_MAX_LINES` lines joined by `\n`, each cut
+/// at 200 characters with `…`, with control characters in caret notation
+/// (`ESC` as `^[`, DEL as `^?`) and C1, bidirectional, zero-width and other
+/// invisible formatting characters as `<U+XXXX>`, so the sheet neither
+/// hides nor reorders text. One pass over `text`, whatever its length; the
+/// preview is at most `TESSERA_PASTE_PREVIEW_MAX_BYTES`. Stores the
+/// preview's length in bytes in `*len`, writes its UTF-8 bytes (no NUL
+/// terminator) to `buf` when `cap` holds them all, and stores the paste's
+/// line counts in `*info`.
+///
+/// Returns `TESSERA_ERROR_NULL_POINTER` if `len` or `info` is `NULL`, or
+/// `text` is `NULL` with a non-zero `text_len`, or `buf` is `NULL` with a
+/// preview to write; `TESSERA_ERROR_INVALID_ARGUMENT` if the bytes are not
+/// UTF-8 (`*len` 0) or the preview is longer than `cap` (nothing is
+/// written, `*len` holds the size needed).
+///
+/// # Safety
+///
+/// `text` must point to `text_len` readable bytes (it may be `NULL` when
+/// `text_len` is 0); `buf` must be `NULL` or valid for `cap` bytes of
+/// writes; `len` and `info` `NULL` or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tessera_paste_preview(
+    text: *const c_char,
+    text_len: usize,
+    buf: *mut u8,
+    cap: usize,
+    len: *mut usize,
+    info: *mut PastePreviewInfo,
+) -> Error {
+    ffi_guard!("tessera_paste_preview", {
+        if len.is_null() || info.is_null() {
+            return Error::NullPointer;
+        }
+        // SAFETY: non-null and writable per the contract.
+        unsafe {
+            len.write(0);
+            info.write(PastePreviewInfo::default());
+        }
+        // SAFETY: `text` points to `text_len` readable bytes per the contract.
+        let text = match unsafe { utf8(text, text_len, Error::NullPointer) } {
+            Ok(text) => text.unwrap_or_default(),
+            Err(code) => return code,
+        };
+        let preview = tessera_app_core::paste_preview(text);
+        // SAFETY: as above.
+        unsafe {
+            info.write(PastePreviewInfo {
+                lines: preview.lines,
+                more_lines: preview.more_lines,
+                has_controls: preview.has_controls,
+                has_line_breaks: preview.has_breaks,
+            });
+        }
+        // SAFETY: `len` and `buf` per the contract.
+        unsafe { crate::selection::copy_out(&preview.text, buf, cap, len) }
+    })
+}
+
 /// Tells session `session_id` whether its view has keyboard focus.
 ///
 /// The core records the state (a new session starts unfocused). When the

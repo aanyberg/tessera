@@ -63,6 +63,10 @@ final class SessionRouter: TesseraAppDelegate {
         controller(for: session)?.session(session, didChangeRemote: remote)
     }
 
+    func session(_ session: TesseraSession, didWriteClipboard write: TesseraClipboardWrite) {
+        controller(for: session)?.session(session, didWriteClipboard: write)
+    }
+
     func sessionDidRingBell(_ session: TesseraSession) {
         // Bells are coalesced per delivery, but a program ringing continuously
         // still gets one delivery after another: beep at most every 100 ms.

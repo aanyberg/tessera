@@ -134,6 +134,27 @@ int main(void) {
     EXPECT(tessera_session_send_scroll(app, id, &scroll, &outcome), TESSERA_ERROR_OK);
     EXPECT_OUTCOME(outcome, TESSERA_INPUT_OUTCOME_IGNORED);
 
+    /* The paste guard (#471): a multi-line paste asks while the shell has
+     * not turned on bracketed paste; the preview escapes controls. */
+    TesseraPasteCheck check = {.ask = false, .bracketed = true};
+    static const char lines[] = "a\nb";
+    EXPECT(tessera_session_paste_check(app, id, lines, strlen(lines), &check), TESSERA_ERROR_OK);
+    if (!check.ask || check.bracketed) {
+        fprintf(stderr, "paste check: ask %d bracketed %d\n", check.ask, check.bracketed);
+        return 1;
+    }
+    char shown[TESSERA_PASTE_PREVIEW_MAX_BYTES];
+    size_t shown_len = 0;
+    TesseraPastePreviewInfo info = {0};
+    static const char hostile[] = "x\x1b[201~y\n";
+    EXPECT(tessera_paste_preview(hostile, strlen(hostile), (uint8_t *)shown, sizeof shown, &shown_len, &info),
+           TESSERA_ERROR_OK);
+    if (shown_len != 9 || memcmp(shown, "x^[[201~y", 9) != 0 || info.lines != 1 || info.more_lines != 0 ||
+        !info.has_controls) {
+        fprintf(stderr, "paste preview: %zu bytes, %zu lines\n", shown_len, info.lines);
+        return 1;
+    }
+
     /* "exit " by paste, then "3" and Return by key. */
     static const char paste[] = "exit ";
     EXPECT(tessera_session_paste(app, id, paste, strlen(paste)), TESSERA_ERROR_OK);

@@ -27,7 +27,8 @@ internal import TesseraCore
 /// exit. The
 /// clipboard text (OSC 52) goes to ``pasteboard``, not to the delegate,
 /// through one app-wide ``ClipboardThrottle`` (at most 10 writes a second,
-/// the latest held; ADR 0022 D-RATE52). So at most one delivery per session
+/// the latest held; ADR 0022 D-RATE52); the delegate learns only its size
+/// and how many writes the delivery folds (#471, for the pane's notice). So at most one delivery per session
 /// is queued at any time; a delivery reports what happened since the
 /// previous one; and the exit, the core's last callback for a session, is
 /// always delivered last.
@@ -165,7 +166,11 @@ final class CallbackBridge {
                 // Empty text never touches the clipboard (ADR 0022).
                 guard let text, len > 0 else { return }
                 let copy = String(decoding: UnsafeBufferPointer(start: text, count: len), as: UTF8.self)
-                CallbackBridge.from(userData)?.receive(for: id) { $0.clipboard = copy }
+                CallbackBridge.from(userData)?.receive(for: id) {
+                    $0.clipboard = copy
+                    // Saturating: a count, never a queue (S6).
+                    if $0.clipboardWrites < Int.max { $0.clipboardWrites += 1 }
+                }
             },
             on_config_applied: { userData, generation in
                 CallbackBridge.from(userData)?.receiveConfiguration(generation: generation)
@@ -222,6 +227,9 @@ final class CallbackBridge {
         var title: String?
         var remote: TesseraRemote?
         var clipboard: String?
+        /// The clipboard writes received since the last delivery; only the
+        /// latest one's text is kept.
+        var clipboardWrites = 0
         var bell = false
         var commandFinished: TesseraCommandFinish?
         var exit: (code: Int32, signal: Int32)?
@@ -374,6 +382,10 @@ final class CallbackBridge {
         }
         if let text = events.clipboard, !isShutDown, sessions[id] != nil {
             offerClipboard(.init(session: id, text: text))
+            if let (delegate, session) = target() {
+                let write = TesseraClipboardWrite(bytes: text.utf8.count, writes: max(1, events.clipboardWrites))
+                delegate.session(session, didWriteClipboard: write)
+            }
         }
         if events.bell, let (delegate, session) = target() {
             delegate.sessionDidRingBell(session)

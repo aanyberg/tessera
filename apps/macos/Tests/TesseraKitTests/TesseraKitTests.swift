@@ -92,6 +92,14 @@ final class Recorder: TesseraAppDelegate {
         loadFailures += 1
     }
 
+    /// Every `session(_:didWriteClipboard:)`, by session, in order.
+    private(set) var clipboardWrites: [UInt64: [TesseraClipboardWrite]] = [:]
+
+    func session(_ session: TesseraSession, didWriteClipboard write: TesseraClipboardWrite) {
+        XCTAssertTrue(Thread.isMainThread, "delegate called off the main thread")
+        clipboardWrites[session.id, default: []].append(write)
+    }
+
     /// How many `fontIndexDidLand()` calls came.
     private(set) var fontIndexLandings = 0
 

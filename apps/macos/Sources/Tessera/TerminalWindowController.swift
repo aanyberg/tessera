@@ -230,6 +230,12 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, NSMe
         }
     }
 
+    /// The pane's program wrote the clipboard: the pane shows its notice
+    /// (#471), whichever pane has the focus.
+    func session(_ session: TesseraSession, didWriteClipboard write: TesseraClipboardWrite) {
+        pane(for: session)?.view.showClipboardNotice(write)
+    }
+
     /// A clean exit (code 0) closes the pane, and with the last pane the
     /// tab; any other exit keeps it open, showing the status, like
     /// Terminal.app.

@@ -178,6 +178,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var increasesContrast: @MainActor () -> Bool = {
         NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast
     }
+    /// Where programs' clipboard writes (OSC 52) go: the general pasteboard.
+    /// Tests set a named one, so the user's clipboard is never changed.
+    var programPasteboard: NSPasteboard = .general {
+        didSet { core?.pasteboard = programPasteboard }
+    }
     /// Reads the system's Reduce Motion setting, which
     /// ``applyDisplayOptions()`` gives every scroll bar (it stays on the
     /// Swift side, ADR 0041). Tests replace it.
@@ -1046,6 +1051,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func startCore() throws -> TesseraApp {
         let core = try TesseraApp()
         core.delegate = router
+        core.pasteboard = programPasteboard
         self.core = core
         router.onConfigurationApplied = { [weak self] in
             self?.readAppAppearance()
