@@ -119,6 +119,11 @@ ad-hoc signed build ships as before; its release notes tell users to run
 `pull_request` events. If only some of the six secrets are set the release
 fails, so a half-configured setup cannot silently ship an unsigned build.
 
+**Update signing key (maintainer step).** In-app updates (ADR 0050, built in #764) need an EdDSA key pair
+that only the maintainer can create: run Sparkle's `generate_keys`, put the public key in `SUPublicEDKey`, and store
+the exported private key as the Actions secret `SPARKLE_ED_PRIVATE_KEY`. The numbered steps and what a lost or
+leaked key means are in ADR 0050, D3. Until #764 lands the secret is unused.
+
 **Entitlements.** The hardened runtime needs none beyond the existing
 `Tessera.entitlements` (`app-sandbox` = false; the app starts the user's login
 shell, so it is not sandboxed). The Metal renderer needs no JIT or
