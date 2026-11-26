@@ -25,6 +25,13 @@ downward only, so a change in `tessera-vt` or `tessera-grid` reaches most of the
 `tessera-cli` only itself. The targeted run is a feedback loop, not a gate: it can miss what only the whole workspace
 shows (build scripts, the FFI header, the Swift consumers).
 
+**The app's tests run on a core with test hooks.** `just app-test` and `just app-test-only` build the xcframework from
+a core with tessera-ffi's `test-hooks` feature, so that the hosted tests can call its test hooks (#650; declared in
+`apps/macos/Tests/TesseraTests/CoreTestHooks.h`, never in `TesseraCore.h`). `just xcframework`, `just app` and the
+release workflow build it without features, and `just archive` refuses an xcframework whose core has any (it reads
+`TesseraCore.xcframework/features`). A test that needs a hook fails, naming the cause, on a host without it, for
+example after a test run from Xcode on a core from `just xcframework`.
+
 **A worktree's built app is from its last run.** `just app` and `just app-test` build into the worktree's own
 `apps/macos/DerivedData`, and `just run` opens whatever is there: the app from the last build in that worktree, not
 from the branch you have checked out now. Before an eye check, rebuild (`just app`) or look at the branch the

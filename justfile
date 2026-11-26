@@ -45,13 +45,13 @@ config-docs:
 config-docs-check:
     cargo xtask config-docs --check
 
-# Build the Rust static library for both macOS architectures (release)
-core-release:
-    cargo build --release -p tessera-ffi --target aarch64-apple-darwin
-    cargo build --release -p tessera-ffi --target x86_64-apple-darwin
+# Build the Rust static library for both macOS architectures (release); `features` (tessera-ffi's, comma-separated) is for the app's test runs only: `just app-test` passes test-hooks, everything else none
+core-release features="":
+    cargo build --release -p tessera-ffi --target aarch64-apple-darwin {{ if features != "" { "--features " + quote(features) } else { "" } }}
+    cargo build --release -p tessera-ffi --target x86_64-apple-darwin {{ if features != "" { "--features " + quote(features) } else { "" } }}
 
-# Produce a universal TesseraCore.xcframework with the generated header
-xcframework: core-release
+# Produce a universal TesseraCore.xcframework with the generated header (the same header whatever the features: cbindgen leaves the test hooks out); `just xcframework` builds the release core, without features
+xcframework features="": (core-release features)
     rm -rf {{xcframework}} target/xcframework
     mkdir -p target/xcframework/include
     cp target/include/TesseraCore.h target/xcframework/include/
@@ -64,6 +64,8 @@ xcframework: core-release
         -library target/xcframework/libtessera_ffi.a \
         -headers target/xcframework/include \
         -output {{xcframework}}
+    # What `just archive` reads: a release is archived only from a core built without features
+    printf '%s' {{quote(features)}} > {{quote(xcframework + "/features")}}
 
 # Open the development window: a login shell drawn by the core's renderer in a winit window (no Xcode needed)
 devwin:
@@ -85,7 +87,7 @@ test_timeouts := "-test-timeouts-enabled YES -default-test-execution-time-allowa
 
 # scripts/app-test-watchdog.sh ends a hung test host after TESSERA_APP_TEST_HANG_SECONDS (150) with a stack sample in apps/macos/build/app-test-hang-sample.log (#228)
 # Run the app's XCTest suites (headless, Thread Sanitizer): TesseraKitTests (wrapper), then TesseraTests (windows and tabs, hosted by Tessera.app); full logs in apps/macos/build/app-test*.log; a pass of both writes apps/macos/build/app-test-pass (HEAD sha and clean|dirty)
-app-test: xcframework xcodeproj
+app-test: (xcframework "test-hooks") xcodeproj
     mkdir -p {{quote(build_dir)}}
     rm -f {{quote(build_dir + "/app-test-hang-sample.log")}}
     rm -f {{quote(build_dir + "/app-test-pass")}}
@@ -99,7 +101,7 @@ app-test: xcframework xcodeproj
     printf '%s %s\n' "$(git rev-parse HEAD)" "$(if [ -z "$(git status --porcelain)" ]; then echo clean; else echo dirty; fi)" > {{quote(build_dir + "/app-test-pass")}}
 
 # The one way to run part of the app's XCTest suites (one test, a class or a filtered set, mutation runs included): `just app-test-only TesseraKit TesseraKitTests/KeymapTests/testChord`. The first argument is the scheme (TesseraKit or Tessera), the others are -only-testing selectors (Target/Class[/test]). It runs through scripts/app-test-watchdog.sh like `just app-test`, so a dead test host ends the run (exit 97) instead of stalling it; never run a bare `xcodebuild test` (a 9.5 hour hang, wave 26). Log: apps/macos/build/app-test-only.log; it does not write app-test-pass
-app-test-only $scheme +$selectors: xcframework xcodeproj
+app-test-only $scheme +$selectors: (xcframework "test-hooks") xcodeproj
     mkdir -p {{quote(build_dir)}}
     set -o pipefail; scripts/app-test-watchdog.sh xcodebuild test -project {{quote(app_dir + "/Tessera.xcodeproj")}} -scheme "$scheme" -enableThreadSanitizer YES {{test_timeouts}} \
         ${${=selectors}/#/-only-testing:} \
@@ -132,6 +134,8 @@ terminfo-ssh host:
 # Release: archive the app (Release, universal, ad-hoc signed); version = CFBundleShortVersionString (numeric), build = CFBundleVersion
 archive version="0.2.1" build="1": xcodeproj
     test -d {{quote(xcframework)}} || { echo "missing {{xcframework}}: run 'just xcframework' first" >&2; exit 1 }
+    features="$(cat {{quote(xcframework + "/features")}} 2>/dev/null || echo unknown)"; [ -z "$features" ] \
+        || { echo "{{xcframework}} has a core built with features ($features; just app-test builds test-hooks): run 'just xcframework' first" >&2; exit 1 }
     rm -rf {{quote(archive_path)}}
     mkdir -p {{quote(build_dir)}}
     set -o pipefail; xcodebuild archive -project {{quote(app_dir + "/Tessera.xcodeproj")}} -scheme Tessera -configuration Release \
