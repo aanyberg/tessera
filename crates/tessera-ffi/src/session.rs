@@ -202,8 +202,9 @@ unsafe fn os_str<'a>(ptr: *const c_char) -> &'a OsStr {
 /// be started, a thread could not be created, or the arguments and the
 /// environment together exceed what the system lets a program start with
 /// (`ARG_MAX`, 1 MiB on macOS, less a tenth kept for the system; this
-/// process's whole environment counts). Nothing is left running after a
-/// failure, and `*out_id` is set to 0.
+/// process's environment counts, less the variables the child does not
+/// inherit, which `tessera_pty::CHILD_ENV_FILTER` lists, #737). Nothing is
+/// left running after a failure, and `*out_id` is set to 0.
 ///
 /// # Safety
 ///

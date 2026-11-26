@@ -109,3 +109,37 @@ via `COLORTERM`) rather than from terminfo.
   on every ssh (surprising, and runs code on hosts the user did not ask us
   to touch). Kitty's `ssh` kitten approach remains possible later as a
   plugin.
+
+## Amendment: the child does not inherit Tessera's own or dyld's variables (#737, 2026-11-26)
+
+Decided in #217 item 4. The child inherits the app's environment except
+what `tessera_pty::CHILD_ENV_FILTER` strips, which is applied before the
+variables of decision 4 are set, so they always reach it:
+
+- every `TESSERA_*` variable: Tessera's own settings and test hooks
+  (`TESSERA_CONFIG_DIR`, `TESSERA_WINDOW_BLUR_RADIUS`,
+  `TESSERA_SKIP_GPU_TESTS`, ...), and a parent session's
+  `TESSERA_SESSION_ID` when the app was started from a Tessera shell;
+  except `TESSERA_SHELL_INTEGRATION`, the user's opt-out (ADR 0021);
+- every `DYLD_*` variable: `DYLD_INSERT_LIBRARIES` and the library paths
+  set for the app by Xcode, a test runner or whatever launched it would
+  load code into every program the shell runs that dyld does not restrict
+  (dyld already ignores them for system binaries such as `/bin/zsh`, not
+  for a Homebrew shell);
+- every `__XPC_DYLD_*` variable, the same loader controls handed on
+  through launchd and XPC;
+- what an Xcode scheme launch or XCTest adds for the app: every `XCTest*`
+  (`XCTestConfigurationFilePath`, which the app reads only to know that it
+  hosts tests, `XCTestBundleInjectPath`, `XCTestSessionIdentifier`), every
+  `XCInjectBundle*` (`XCInjectBundleInto`) and every `__XCODE_*`
+  (`__XCODE_BUILT_PRODUCTS_DIR_PATHS`). `LD_PRELOAD` is not listed: it
+  does nothing on macOS.
+
+Everything else is kept, so a variable from `launchctl setenv` or from
+the shell that ran `open` still reaches the shell. The filter applies to
+inherited variables only: what Tessera sets for the child (decision 4's
+table, the shell integration's variables, a caller's `SpawnOptions::env`)
+is never filtered. Every spawn path applies it, the built-in start and the
+profile fallback (#728) included. `crates/tessera-pty/tests/child_env.rs`
+starts a process with these variables set and reads its child's
+environment.

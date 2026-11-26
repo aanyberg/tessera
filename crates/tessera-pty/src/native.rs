@@ -1252,12 +1252,13 @@ fn page_size() -> Option<usize> {
 /// its terminating NUL, one pointer per string, one terminating `NULL`
 /// pointer per array, and the executable's path.
 ///
-/// The environment is the one `portable-pty` builds: this process's
-/// variables plus `SHELL`, overridden by the injected and caller
-/// variables. The path counted is the program as given, or `$SHELL` for a
-/// login shell (`portable-pty` falls back to the password database's shell
-/// when `$SHELL` is not executable); a `PATH` lookup or that fallback may
-/// lengthen it, which the headroom in [`ExecLimits::check`] covers.
+/// The environment is the one [`build_command`] leaves: this process's
+/// variables that a child [`inherits`](crate::inherits) plus `SHELL`,
+/// overridden by the injected and caller variables. The path counted is
+/// the program as given, or `$SHELL` for a login shell (`portable-pty`
+/// falls back to the password database's shell when `$SHELL` is not
+/// executable); a `PATH` lookup or that fallback may lengthen it, which
+/// the headroom in [`ExecLimits::check`] covers.
 fn exec_bytes(command: &CommandBuilder, options: &SpawnOptions) -> ExecFootprint {
     use std::collections::BTreeSet;
     use std::ffi::{OsStr, OsString};
@@ -2104,6 +2105,10 @@ fn closed_error() -> io::Error {
     io::Error::new(io::ErrorKind::BrokenPipe, "pty writer is closed")
 }
 
+/// The `portable-pty` command for `options`: its program and arguments,
+/// working directory and environment ([`SpawnOptions`]: the inherited
+/// variables a child [`inherits`](crate::inherits), then the injected
+/// ones, then the caller's).
 fn build_command(options: &SpawnOptions) -> CommandBuilder {
     let mut command = match &options.program {
         Program::LoginShell => CommandBuilder::new_default_prog(),
@@ -2114,6 +2119,13 @@ fn build_command(options: &SpawnOptions) -> CommandBuilder {
             CommandBuilder::from_argv(argv)
         }
     };
+    // `portable-pty` starts from this process's whole environment; what it
+    // must not pass on goes first, so nothing set below is removed (#737).
+    for (key, _) in std::env::vars_os() {
+        if !crate::inherits(&key) {
+            command.env_remove(&key);
+        }
+    }
     for (key, value) in options.injected_env() {
         command.env(key, value);
     }
@@ -2365,6 +2377,31 @@ mod tests {
     }
 
     #[test]
+    fn the_command_leaves_out_what_a_child_does_not_inherit() {
+        // Cargo and nextest run tests with `DYLD_FALLBACK_LIBRARY_PATH` set
+        // on macOS, so this process usually has a variable to strip.
+        let options = SpawnOptions::command("/bin/sh", "s");
+        let command = build_command(&options);
+        for (key, value) in std::env::vars_os() {
+            if options.injected_env().iter().any(|(k, _)| key == *k) {
+                continue;
+            }
+            let expected = crate::inherits(&key).then_some(value.as_os_str());
+            assert_eq!(command.get_env(&key), expected, "{key:?}");
+        }
+        // What the caller sets is kept whatever its name.
+        let set = build_command(
+            &options
+                .clone()
+                .env("DYLD_INSERT_LIBRARIES", "x")
+                .env("TESSERA_CONFIG_DIR", "y"),
+        );
+        assert_eq!(set.get_env("DYLD_INSERT_LIBRARIES"), Some(OsStr::new("x")));
+        assert_eq!(set.get_env("TESSERA_CONFIG_DIR"), Some(OsStr::new("y")));
+        assert_eq!(set.get_env(crate::SESSION_ID_VAR), Some(OsStr::new("s")));
+    }
+
+    #[test]
     fn exec_bytes_count_strings_nuls_and_pointers() {
         const POINTER: usize = size_of::<*const u8>();
         let base = SpawnOptions::command("/bin/sh", "s");
@@ -2387,7 +2424,9 @@ mod tests {
         // every inherited and injected variable.
         let inherited: usize = std::env::vars_os()
             .filter(|(key, _)| {
-                key != "SHELL" && !base.injected_env().iter().any(|(k, _)| key == *k)
+                key != "SHELL"
+                    && crate::inherits(key)
+                    && !base.injected_env().iter().any(|(k, _)| key == *k)
             })
             .map(|(key, value)| key.len() + value.len() + 2 + POINTER)
             .sum();
