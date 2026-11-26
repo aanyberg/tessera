@@ -295,3 +295,28 @@ rcexit | E32 | 3.2 5.1 5.3 | PROMPT_COMMAND='s=$? f=$-; set +x; exec 2>&7 >&6; e
 rcexit | E33 | 3.2 5.1 5.3 | PROMPT_COMMAND='s=$? f=$-; set +x; exec 2>&7 >&6; echo "pc=$s f=${f//s/}"'\nexec 6>&1 7>&2 >/dev/null 2>/dev/null\nBASH_XTRACEFD=1\nset -T\ntrap '[[ $BASH_SUBSHELL == 0 ]] || echo sub' DEBUG\nset -x\nfalse | echo "it=[$(trap -p INT)] f=${-//s/} v=[$(compgen -v _tessera_si_rc_)]" | lines: pc=1 f=himxBHT / it=[sub] f=himBHT v=[sub] / pc=0 f=himBHT
 rcexit | E34 | 3.2 5.1 5.3 | PROMPT_COMMAND='s=$? f=$-; set +x; exec 2>&7 >&6; echo "pc=$s f=${f//s/}"'\nexec 6>&1 7>&2 >/dev/null 2>/dev/null 5>xt\nBASH_XTRACEFD=5\nset -x\nfalse | echo "it=[$(trap -p INT)] v=[$(compgen -v _tessera_si_rc_)]" | lines: pc=1 f=himxBH / it=[] v=[] / pc=0 f=himBH
 rcexit | E35 | 3.2 5.1 5.3 | PROMPT_COMMAND='s=$? f=$-; set +x; exec 2>&7 >&6; echo "pc=$s f=${f//s/}"'\nexec 6>&1 7>&2 >/dev/null 2>/dev/null 5>xt\nBASH_XTRACEFD=5\nset -T\ntrap ': dbg' DEBUG\nset -x\nfalse | awk '/_tessera_si_rc_status=/ { a = 1 } a && /-lt 256/ { exit } a' xt > ck; echo "n=$(grep -cE 'set [-+]T|trap -p' ck) it=[$(trap -p INT)] v=[$(compgen -v _tessera_si_rc_)]" | lines: pc=1 f=himxBHT / n=0 it=[] v=[] / pc=0 f=himBHT
+# The prompt's DEBUG trap read (`{ builtin trap -p DEBUG >&3; } 3>&1`)
+# under `set -x` with BASH_XTRACEFD=3 (bash 4.1 and later) took the fork's
+# trace of `trap -p` (#740): a DEBUG trap the user set at a prompt was
+# taken for something else and lost (bash alone runs it). The head turns
+# `set -x` off for the read and back on right after it. Each row sets the
+# trap at a prompt with `set -x` on and the trace going to /dev/null (the
+# user's entry, which runs after the head, turns `set -x` off and puts
+# the terminal back, keeping `$-` in `f`), then checks that the trap runs
+# for `echo a` and that `set -x` was back on for that entry ($- as bash
+# alone leaves it, but for `s`, which 5.x adds): E36 with
+# BASH_XTRACEFD=3, E37 with 1 and E38 with 2. E39 (5.1 and later) is E36
+# with an array PROMPT_COMMAND (our element's read, no redirections: on
+# 3.2 the trace goes to standard error). E40 (5.1 and later, as E39)
+# traces to a file: no line of it traces our `builtin trap -p` or
+# `builtin set -x` (the read is not traced, and `set -x` is not traced
+# when it turns on), and the user's entry's `set +x` is traced at both prompts, as
+# bash alone traces it (`set -x` was back on). (Measured before the
+# fix: E36, E39 and E40 failed on 5.3; E37 and E38 passed, as with the
+# fix.) A Ctrl-C between the head's switches is
+# tests/bash_rows.rs `a_ctrl_c_in_the_heads_read_keeps_set_x`.
+rcexit | E36 | 3.2 5.1 5.3 | PROMPT_COMMAND='f=$-; set +x; exec 2>&7 >&6'\nexec 6>&1 7>&2 >/dev/null 2>/dev/null 3>/dev/null\nBASH_XTRACEFD=3\nset -x | trap 'case $BASH_COMMAND in "echo a") echo D;; esac' DEBUG; exec >/dev/null 2>/dev/null; set -x\necho a; echo "f=${f//s/}" | lines: D / a / f=himxBH
+rcexit | E37 | 3.2 5.1 5.3 | PROMPT_COMMAND='f=$-; set +x; exec 2>&7 >&6'\nexec 6>&1 7>&2 >/dev/null 2>/dev/null\nBASH_XTRACEFD=1\nset -x | trap 'case $BASH_COMMAND in "echo a") echo D;; esac' DEBUG; exec >/dev/null 2>/dev/null; set -x\necho a; echo "f=${f//s/}" | lines: D / a / f=himxBH
+rcexit | E38 | 3.2 5.1 5.3 | PROMPT_COMMAND='f=$-; set +x; exec 2>&7 >&6'\nexec 6>&1 7>&2 >/dev/null 2>/dev/null\nBASH_XTRACEFD=2\nset -x | trap 'case $BASH_COMMAND in "echo a") echo D;; esac' DEBUG; exec >/dev/null 2>/dev/null; set -x\necho a; echo "f=${f//s/}" | lines: D / a / f=himxBH
+rcexit | E39 | 5.1 5.3 | PROMPT_COMMAND=(:)\nexec 3>/dev/null\nBASH_XTRACEFD=3\nset -x | trap 'case $BASH_COMMAND in "echo a") echo D;; esac' DEBUG\necho a; echo "f=${-//s/}" | lines: D / a / f=himxBH
+rcexit | E40 | 5.1 5.3 | PROMPT_COMMAND='set +x'\nexec 5>xt\nBASH_XTRACEFD=5\nset -x | trap ': dbg' DEBUG; set -x\necho "n=$(grep -cE '^[+]+ builtin (trap -p|set -x)' xt) u=$(grep -cE '^[+]+ set [+]x$' xt)" | lines: n=0 u=2

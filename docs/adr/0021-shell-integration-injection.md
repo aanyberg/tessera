@@ -1049,3 +1049,52 @@ is safe there, as standard output is /dev/null for that read.
   line. The rows run on 3.2 and 5.3; 5.1 only where
   `TESSERA_TEST_BASH51` names one, which CI does not set.
 - `SCRIPTS_VERSION` is 18.
+
+## Amendment: `set -x` in the prompt's DEBUG trap read (#740, 2026-11-26)
+
+The head reads the DEBUG trap in place at every prompt with
+`{ builtin trap -p DEBUG >&3; } 3>&1 1>/dev/null` in a command
+substitution. Under `set -x` with `BASH_XTRACEFD=3` (bash 4.1 and later)
+the fork traced `builtin trap -p DEBUG` to descriptor 3, the read, so a
+DEBUG trap the user set at a prompt was taken for something else and
+lost (bash alone runs it), as recorded in the #733 amendment. The head
+now turns `set -x` off for the read and back on right after it, before
+our trap is installed; run while it is off, `builtin set -x` adds no
+trace line (the user sees the trace of `[[ -o xtrace ]]`, the head's
+assignment and `builtin set +x` in place of the read's own). The test
+runs in `_tessera_si_precmd` (string `PROMPT_COMMAND`) or
+`_tessera_si_element` (array), which picks the head text for the
+prompt, `_tessera_si_h_x` or `_tessera_si_h_full`: inside our function
+no DEBUG trap of the user's runs for it without `set -T` (under
+`set -T` it runs there too, as for our other functions), so with
+`set -x` off the one `[[ -o xtrace || -n $_tessera_si_xoff ]]` test is
+the whole cost (about 0.5 µs per call on 3.2 and 5.3; per-prompt time
+unchanged against main within noise). A head stopped between the
+switches (a Ctrl-C in the read's fork, which under `set -T` lasts as
+long as the user's trap takes there) leaves `_tessera_si_xoff` set: the
+next prompt's test turns `set -x` back on first (bash runs
+PROMPT_COMMAND again right after such a Ctrl-C). The flag is set before
+`set +x` and cleared only after `set -x`: the user's DEBUG trap runs
+before each of the head's commands, and a Ctrl-C while it runs before
+the restore stops the head there, so `set -x` is never off with the flag
+empty (#740 B1). Clearing it adds one trace line per prompt under
+`set -x`, `_tessera_si_xoff=`, after the restore. With `set -x` on,
+the user's DEBUG trap also runs for the two switches, as it does for the
+head's other first commands (P17).
+
+- Rows `rcexit` E36 (`BASH_XTRACEFD=3`), E37 (1) and E38 (2) set a DEBUG
+  trap at a prompt under `set -x` and check that it runs for the next
+  command and that `$-` is as bash alone leaves it; E39 is E36 with an
+  array `PROMPT_COMMAND`; E40 (`BASH_XTRACEFD=5`, a file) checks that
+  the trace has no line of our `builtin trap -p` or `builtin set -x`
+  and traces the user's `set +x` at both prompts, as bash alone.
+  `a_ctrl_c_in_the_heads_read_keeps_set_x` (5.3) stops the head in the
+  read's fork, and `a_ctrl_c_before_the_heads_restore_keeps_set_x`
+  (5.3, string and array) in the user's DEBUG trap right before the
+  head's `builtin set -x`; both check that `set -x` is back and the flag
+  cleared.
+  E36, E39 and E40 failed before the fix on 5.3; E37 and E38 passed
+  then too (standard output is /dev/null for the read, standard error is
+  not read). E36 to E38 run on 3.2 and 5.3, E39 and E40 on 5.3 (5.1 where
+  `TESSERA_TEST_BASH51` names one).
+- `SCRIPTS_VERSION` is 19.
