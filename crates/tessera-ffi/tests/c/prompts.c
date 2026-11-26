@@ -3,7 +3,8 @@
  * and run by scripts/ffi-c-test.sh: spawn /bin/sh printing two commands
  * with their OSC 133 marks around 30 plain lines on a 24-row screen, wait
  * until Select Last Output selects the last command's output (polls are
- * counted, so a loaded machine stretches the wait instead of failing it),
+ * counted, so a loaded machine stretches the wait instead of failing it;
+ * an earlier selection too long to copy counts as not there yet),
  * then walk the prompts with tessera_session_scroll_to_prompt and
  * ask tessera_session_has_command_output and the exit-status marks'
  * tessera_session_command_at, including NULL pointers and an unknown
@@ -83,9 +84,19 @@ int main(void) {
     /* The history reaches 12 lines with "hi\n", before the marks after it
      * are parsed: until the next prompt's mark is in, the last finished
      * command is the first one, so wait for the selection itself. 6000
-     * polls of 10 ms: a minute on an idle machine. */
+     * polls of 10 ms: a minute on an idle machine.
+     *
+     * The shell's tty output is line-buffered, so the second printf
+     * reaches the terminal one line at a time. Once its first line (the
+     * second prompt's A) is parsed and before its last (D and the live
+     * prompt's A), the first command's output runs to the second prompt:
+     * "out1" to "30", longer than `text`. Copy then returns
+     * TESSERA_ERROR_INVALID_ARGUMENT with the size it needs in `len` and
+     * writes nothing (#749): that is "not yet", like a false `selected`.
+     * Any other failure, or that code with a size `text` holds, fails. */
     char text[64];
     size_t len = 0;
+    size_t too_long = 0;
     for (int polls = 0;; polls++) {
         bool selected = false;
         EXPECT(tessera_session_select_last_output(app, id, &selected), TESSERA_ERROR_OK);
@@ -93,16 +104,24 @@ int main(void) {
         EXPECT(tessera_session_scroll_position(app, id, &position), TESSERA_ERROR_OK);
         len = 0;
         if (selected) {
-            EXPECT(tessera_session_selection_text(app, id, (uint8_t *)text, sizeof text, &len),
-                   TESSERA_ERROR_OK);
+            TesseraError copied =
+                tessera_session_selection_text(app, id, (uint8_t *)text, sizeof text, &len);
+            if (copied == TESSERA_ERROR_INVALID_ARGUMENT && len > sizeof text) {
+                too_long = len;
+                len = 0;
+            } else {
+                EXPECT(copied, TESSERA_ERROR_OK);
+            }
         }
         if (selected && position.history == 12 && len == 2 && memcmp(text, "hi", 2) == 0) {
             break;
         }
         if (polls == 6000) {
-            fprintf(stderr, "timed out waiting for the output (history %llu, selected \"%.*s\")\n",
+            fprintf(stderr,
+                    "timed out waiting for the output (history %llu, selected \"%.*s\", last "
+                    "selection too long for the buffer: %zu bytes)\n",
                     (unsigned long long)position.history, (int)(len < sizeof text ? len : sizeof text),
-                    text);
+                    text, too_long);
             return 1;
         }
         struct timespec pause = {.tv_sec = 0, .tv_nsec = 10 * 1000 * 1000};
