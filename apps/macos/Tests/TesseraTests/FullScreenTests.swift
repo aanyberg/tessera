@@ -63,7 +63,7 @@ private struct WindowLayout: Equatable, Codable, CustomStringConvertible {
         bounds = content.bounds
         contentLayoutRect = window.contentLayoutRect
         panes = controller.paneContainer.frame
-        backdrop = content.titlebarBackdrop?.frame
+        backdrop = content.windowBackdrop?.maskedRegions.first { $0 == content.titlebarTint?.frame }
         tint = content.titlebarTint?.frame
         titlebarInset = content.titlebarInset
         contentMinSize = window.contentMinSize

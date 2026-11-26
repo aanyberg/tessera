@@ -10,20 +10,19 @@ import TesseraKit
 /// system's material and the panes fill this view. A translucent window
 /// (ADR 0043, E7) has a transparent title bar over full-size content, so the
 /// title bar and tab bar draw no band of their own. Under them, the strip is
-/// always blurred by a ``PaneBackdropView`` (whatever the panes' own blur
-/// setting) so the title, the tab titles and the traffic lights stay legible
+/// always blurred (whatever the panes' own blur setting, while
+/// `blur_radius` is above 0) so the title, the tab titles and the traffic lights stay legible
 /// over a busy desktop, and a ``StripTintView`` over the blur gives each pane
 /// that touches the top of the panes its session's configured background
 /// across its own width, as the pane draws it over its own blur. The panes
 /// stay below the title bar and tab bar, and a switch keeps the window's
 /// frame, so they keep their size and the sessions are not resized.
 ///
-/// With `[appearance] blur_radius` above 0 (ADR 0045), a translucent window
-/// whose translucent panes all ask for blur is blurred whole at that radius
-/// (``WindowBlurRadius``) and the panes' own blur is hidden; otherwise, or
-/// if the call is not available, each pane keeps its material blur. The
-/// strip keeps its material either way (D4): over a window blurred at a
-/// radius it shows its own blur, not the radius.
+/// The blur is one ``WindowBackdropView`` per window (#491, ADR 0045
+/// amendment), under everything, at the strength of `[appearance]
+/// blur_radius` and masked to the strip and the translucent panes that ask
+/// for blur, inside the window's rounded corners; radius 0 is no blur and
+/// no effect view.
 ///
 /// In native full screen (ADR 0043 D7) the title bar and tab bar move into
 /// AppKit's full-screen toolbar window, where there is no desktop behind
@@ -38,11 +37,11 @@ import TesseraKit
 final class TerminalWindowContentView: NSView {
     let paneContainer: PaneContainerView
 
-    /// The blur under the title bar and tab bar of a translucent window,
-    /// whether or not a pane of the tab is blurred; `nil` while opaque.
-    private(set) var titlebarBackdrop: PaneBackdropView?
+    /// The window's one blur (``updateWindowBlur()``): `nil` while it
+    /// blurs nothing (opaque, or radius 0).
+    private(set) var windowBackdrop: WindowBackdropView?
 
-    /// The theme's tint over ``titlebarBackdrop``, the same size; `nil`
+    /// The theme's tint over the strip's blur, the strip's size; `nil`
     /// while opaque.
     private(set) var titlebarTint: StripTintView?
 
@@ -79,22 +78,13 @@ final class TerminalWindowContentView: NSView {
     private var unclippedStripHeight: CGFloat = 0
 
     /// `[appearance] blur_radius` for this window, 0 while Reduce
-    /// Transparency is on (``AppDelegate`` sets it on every window);
-    /// a change applies at once (``updateWindowBlur()``).
-    var blurRadius: UInt32 = 0 {
+    /// Transparency is on (``AppDelegate`` sets it on every window; the
+    /// default until then); a change applies at once (``updateWindowBlur()``).
+    var blurRadius: UInt32 = WindowBlurRadius.defaultRadius {
         didSet {
             if blurRadius != oldValue { updateWindowBlur() }
         }
     }
-
-    /// The radius last set on the window and the window number it was set
-    /// on, and whether the call reported no failure; `nil` before the
-    /// first. The call is made again only when one of them changes.
-    private(set) var appliedBlur: (windowNumber: Int, radius: UInt32, succeeded: Bool)?
-
-    /// Whether the window is blurred at ``blurRadius`` now, with the panes'
-    /// own blur hidden.
-    private(set) var usesBlurRadius = false
 
     /// What the title bar and the strip under it are for a window
     /// (ADR 0043 D7).
@@ -229,73 +219,63 @@ final class TerminalWindowContentView: NSView {
             // window's smallest size too tall (#417 M6).
             unclippedStripHeight = 0
         }
-        if translucent, titlebarBackdrop == nil {
-            let view = PaneBackdropView(frame: .zero)
-            view.autoresizingMask = []
-            addSubview(view, positioned: .below, relativeTo: paneContainer)
-            titlebarBackdrop = view
+        if translucent, titlebarTint == nil {
             let tint = StripTintView(frame: .zero)
-            addSubview(tint, positioned: .above, relativeTo: view)
+            addSubview(tint, positioned: .below, relativeTo: paneContainer)
             titlebarTint = tint
-        } else if !translucent, let titlebarBackdrop {
-            titlebarBackdrop.removeFromSuperview()
-            self.titlebarBackdrop = nil
-            titlebarTint?.removeFromSuperview()
-            titlebarTint = nil
+        } else if !translucent, let titlebarTint {
+            titlebarTint.removeFromSuperview()
+            self.titlebarTint = nil
         }
         placeSubviews()
         updateWindowBlur()
     }
 
-    /// The radius the window asks for now: ``blurRadius`` while the window
-    /// is translucent and every translucent pane of the tab, hidden ones
-    /// included, asks for blur (ADR 0045, option ii); 0 otherwise, an opaque
-    /// window included.
-    var wantedBlurRadius: UInt32 {
-        let panes = paneContainer.panes.map(\.view)
-        let translucent = panes.filter { !$0.isBackgroundOpaque }
-        guard !translucent.isEmpty, translucent.allSatisfy({ $0.backgroundAppearance?.blur == true }) else {
-            return 0
+    /// The parts of the window its blur covers, in this view: the strip
+    /// under the title bar and tab bar, and every shown pane that asks for
+    /// blur (``TerminalSurfaceView/wantsBlur``); none while the window is
+    /// opaque.
+    var blurRegions: [NSRect] {
+        guard let titlebarTint else { return [] }
+        var regions: [NSRect] = []
+        if !titlebarTint.frame.isEmpty { regions.append(titlebarTint.frame) }
+        for pane in paneContainer.panes
+        where pane.view.wantsBlur && pane.view.window === window && !pane.view.isHiddenOrHasHiddenAncestor {
+            let frame = convert(pane.view.bounds, from: pane.view).intersection(bounds)
+            if !frame.isEmpty { regions.append(frame) }
         }
-        return min(blurRadius, WindowBlurRadius.maximum)
+        return regions
     }
 
-    /// Sets the window's blur radius to ``wantedBlurRadius`` once the window
-    /// is on screen (before, the call has no effect), when the radius or the
-    /// window number changed; then hides each pane's own blur while the
-    /// radius blurs the window, and shows it otherwise. Radius 0 is set only
-    /// on a window that had another, so a window that never asks for one
-    /// makes no call. While the window is off screen (an unselected tab,
-    /// minimized, the app hidden) it keeps the state it has, as the radius
-    /// set on it stays (#405 m1): an update meanwhile (a theme reload) does
-    /// not show the panes' material, which would flash as it comes back.
+    /// Makes the window's blur what it asks for now: with ``blurRadius``
+    /// above 0 and ``blurRegions`` to cover, one ``windowBackdrop`` under
+    /// everything, filling this view, at the radius's strength and masked
+    /// to those regions inside the window's rounded corners; otherwise
+    /// none. What is already right is left alone.
     func updateWindowBlur() {
-        guard let window else { return }
-        let radius = wantedBlurRadius
-        var active = usesBlurRadius
-        if let number = WindowBlurRadius.windowNumber(window) {
-            active = false
-            if let appliedBlur, appliedBlur.windowNumber == number, appliedBlur.radius == radius {
-                active = appliedBlur.succeeded && radius > 0
-            } else if radius == 0, appliedBlur?.windowNumber != number || appliedBlur?.radius == 0 {
-                appliedBlur = (number, 0, true)
-            } else {
-                let succeeded = WindowBlurRadius.set(radius, windowNumber: number)
-                appliedBlur = (number, radius, succeeded)
-                active = succeeded && radius > 0
+        guard let window, !holdsPanes else { return }
+        let radius = min(blurRadius, WindowBlurRadius.maximum)
+        let regions = radius > 0 ? blurRegions : []
+        guard !regions.isEmpty else {
+            if let windowBackdrop {
+                windowBackdrop.removeFromSuperview()
+                self.windowBackdrop = nil
             }
+            return
         }
-        usesBlurRadius = active
-        for pane in paneContainer.panes {
-            pane.view.backdrop?.isHidden = active
+        let view: WindowBackdropView
+        if let windowBackdrop {
+            view = windowBackdrop
+        } else {
+            view = WindowBackdropView(frame: bounds)
+            // Under the strip's tint and the panes.
+            addSubview(view, positioned: .below, relativeTo: subviews.first)
+            windowBackdrop = view
         }
-    }
-
-    /// The window came back on screen (unhidden, deminiaturized), or went
-    /// off or under another: a radius waiting for a window number is set
-    /// now. A first show is ``TerminalWindow``'s ordering in.
-    @objc private func windowOcclusionDidChange(_ notification: Notification) {
-        updateWindowBlur()
+        if view.frame != bounds { view.frame = bounds }
+        let strength = WindowBlurRadius.strength(radius)
+        if view.alphaValue != strength { view.alphaValue = strength }
+        view.setMask(regions: regions, cornerRadius: WindowBlurRadius.cornerRadius(of: window))
     }
 
     /// The window's tab may be shown now (#409, #405 n1): its tab was
@@ -327,11 +307,14 @@ final class TerminalWindowContentView: NSView {
         windowDidBecomeVisible()
     }
 
-    /// Tints the strip again from the panes now at the top (their frames or
-    /// their appearance changed). Cheap: a few panes at most, each with its
-    /// appearance as last read.
+    /// Masks the blur and tints the strip again from the panes now (their
+    /// frames or their appearance changed). Cheap: a few panes at most, each
+    /// with its appearance as last read; the mask is drawn again only when
+    /// it changes.
     func updateTitlebarTint() {
-        guard !holdsPanes, let titlebarTint else { return }
+        guard !holdsPanes else { return }
+        updateWindowBlur()
+        guard let titlebarTint else { return }
         let segments = paneContainer.topEdgePanes.map { pane in
             (
                 minX: titlebarTint.convert(NSPoint(x: pane.frame.minX, y: 0), from: paneContainer).x,
@@ -374,8 +357,6 @@ final class TerminalWindowContentView: NSView {
             self.tabRowSpacer = nil
         }
         if let window {
-            NotificationCenter.default.removeObserver(
-                self, name: NSWindow.didChangeOcclusionStateNotification, object: window)
             NotificationCenter.default.removeObserver(self, name: NSWindow.didDeminiaturizeNotification, object: window)
         }
         NotificationCenter.default.removeObserver(self, name: NSApplication.didUnhideNotification, object: nil)
@@ -396,16 +377,12 @@ final class TerminalWindowContentView: NSView {
         // Posted on the main thread; the centre keeps no reference to this
         // view.
         NotificationCenter.default.addObserver(
-            self, selector: #selector(windowOcclusionDidChange(_:)),
-            name: NSWindow.didChangeOcclusionStateNotification, object: window)
-        NotificationCenter.default.addObserver(
             self, selector: #selector(windowDidDeminiaturize(_:)), name: NSWindow.didDeminiaturizeNotification,
             object: window)
         NotificationCenter.default.addObserver(
             self, selector: #selector(applicationDidUnhide(_:)), name: NSApplication.didUnhideNotification,
             object: nil)
         placeSubviews()
-        updateWindowBlur()
     }
 
     /// Lays the panes out in ``paneArea`` and the blur above them, and
@@ -437,7 +414,6 @@ final class TerminalWindowContentView: NSView {
             window.titlebarAppearsTransparent = layout.titlebarTransparent
         }
         let strip = NSRect(x: bounds.minX, y: area.maxY, width: bounds.width, height: layout.stripHeight)
-        titlebarBackdrop?.frame = strip
         titlebarTint?.frame = strip
         updateTitlebarTint()
         // Only a full-size (translucent) window has a strip: an opaque one

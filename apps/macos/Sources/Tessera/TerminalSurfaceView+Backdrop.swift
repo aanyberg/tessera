@@ -2,18 +2,16 @@ import AppKit
 import TesseraKit
 
 /// Translucency and background blur (#42, ADR 0043), per pane: the core
-/// draws each session's background at its profile's opacity, and a pane
-/// whose session asks for blur gets a ``PaneBackdropView`` under its render
-/// view, which blurs what is behind the window there. A window is opaque
+/// draws each session's background at its profile's opacity, and a
+/// translucent pane whose session asks for blur (``wantsBlur``) is blurred
+/// by its window's one ``WindowBackdropView`` (#491), at the window's
+/// radius, where the pane is. A window is opaque
 /// only while every pane of its tab is, a pane hidden behind a maximized
 /// one included (E7): so a hidden translucent pane keeps the window, and
 /// with it the blurred strip under the title bar, translucent, which keeps
 /// a maximize from changing the window. The core forces every pane
 /// opaque and unblurred while the system's Reduce Transparency is on (E8,
-/// ``AppDelegate/applyDisplayOptions()``). While the window is blurred
-/// whole at `blur_radius` (ADR 0045), ``TerminalWindowContentView`` hides
-/// each pane's backdrop, which would otherwise show its material, not the
-/// radius.
+/// ``AppDelegate/applyDisplayOptions()``).
 ///
 /// The scroll bar's overlay knob is drawn for the session's background too
 /// (``TerminalScroller/themeBackground``).
@@ -31,6 +29,13 @@ extension TerminalSurfaceView {
         return backgroundAppearance.opaque
     }
 
+    /// Whether the window blurs what is behind this pane: its session asks
+    /// for blur and its background is translucent (an opaque one would hide
+    /// the blur); `false` without a surface.
+    var wantsBlur: Bool {
+        surface.isAttached && backgroundAppearance?.blur == true && !isBackgroundOpaque
+    }
+
     /// The tint of the strip above this pane in a translucent window
     /// (#388): its session's configured background at its alpha, as last
     /// read; `nil` without a surface (the pane draws nothing either).
@@ -41,10 +46,9 @@ extension TerminalSurfaceView {
             alpha: CGFloat(color.alpha))
     }
 
-    /// Reads the session's appearance, shows or removes the blur under the
-    /// render view to match, and has the window follow its panes. Called on
-    /// attach and on every appearance change. Without a surface the pane is
-    /// left unblurred.
+    /// Reads the session's appearance and has the window follow its panes
+    /// (opacity, title bar, blur). Called on attach and on every appearance
+    /// change. Without a surface the pane is left unblurred.
     func updateBackdrop() {
         let appearance: TesseraSession.Appearance?
         do {
@@ -55,17 +59,6 @@ extension TerminalSurfaceView {
         }
         backgroundAppearance = appearance
         scroller.themeBackground = appearance?.background
-        let blur = surface.isAttached && (appearance?.blur ?? false)
-        if blur, backdrop == nil {
-            let view = PaneBackdropView(frame: bounds)
-            // Under everything the pane draws: the text, the scroll bar, the
-            // find bar and a dimming shade.
-            addSubview(view, positioned: .below, relativeTo: renderView)
-            backdrop = view
-        } else if !blur, let backdrop {
-            backdrop.removeFromSuperview()
-            self.backdrop = nil
-        }
         paneOpacityDidChange()
     }
 
@@ -94,37 +87,5 @@ extension TerminalSurfaceView {
         window.isOpaque = opaque
         window.backgroundColor = opaque ? .windowBackgroundColor : .clear
         window.invalidateShadow()
-    }
-}
-
-/// The blur under a translucent pane and under a translucent window's title
-/// bar and tab bar (ADR 0043): what is behind the window, blurred through the
-/// `.fullScreenUI` material (`.underWindowBackground` gave the theme's
-/// colours a grey cast; `.popover` is the alternative); active whether or
-/// not the window is key, so the pane does not change when the focus moves
-/// to another window. It fills the pane it blurs, or the strip above the
-/// panes, and takes no clicks, the pointer or accessibility. Its material is
-/// a constant the tests pin. It sets no appearance of its own, so it draws
-/// in the app's (`app_appearance`, #365: dark, light or the system's) as the
-/// window's effective appearance resolves it; whether it looks right under
-/// each (with a dark theme at 0.7 and 0.5 opacity) is an eye check.
-@MainActor
-final class PaneBackdropView: NSVisualEffectView {
-    override init(frame: NSRect) {
-        super.init(frame: frame)
-        blendingMode = .behindWindow
-        material = .fullScreenUI
-        state = .active
-        autoresizingMask = [.width, .height]
-        setAccessibilityElement(false)
-    }
-
-    @available(*, unavailable)
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) is not supported")
-    }
-
-    override func hitTest(_ point: NSPoint) -> NSView? {
-        nil
     }
 }

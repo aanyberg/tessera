@@ -687,6 +687,7 @@ impl ConfigEditor {
             &mut Vec::new(),
         )
         .map_err(unsupported)?;
+        let retired = retire_0_2_blur_radius_comment(&mut doc, &path.0);
         let mut expected = toml::Value::Table(self.plain.clone());
         plain_edit(&mut expected, &path.0, Some(value.clone()));
         let before = self.warnings.clone().unwrap_or_default();
@@ -701,7 +702,14 @@ impl ConfigEditor {
                 warnings: vec![unknown],
             });
         }
-        self.check(path, &doc.to_string(), &expected, &[], &before, rejected)
+        self.check(
+            path,
+            &doc.to_string(),
+            &expected,
+            &retired,
+            &before,
+            rejected,
+        )
     }
 
     /// Removes the value, table or array element at `path`; `Ok(false)`
@@ -2287,6 +2295,39 @@ fn inner_comments(value: &Value, out: &mut Vec<String>) {
         }
         raw_comments(array.trailing(), out);
     }
+}
+
+/// Takes the 0.2.x template's comment ([`crate::load::BLUR_RADIUS_0_2_COMMENT`],
+/// "No effect in 0.2.0 ...") off the lines above `[appearance]
+/// blur_radius` when `steps` sets that key, returning the lines taken: the
+/// user chose the value, so it is no longer the template's 0, which the
+/// loader reads as the default (#491), and the comment is wrong since 0.3.0.
+fn retire_0_2_blur_radius_comment(doc: &mut DocumentMut, steps: &[Step]) -> Vec<String> {
+    let [Step::Key(table), Step::Key(key)] = steps else {
+        return Vec::new();
+    };
+    if table != "appearance" || key != "blur_radius" {
+        return Vec::new();
+    }
+    let Some(mut key) = doc
+        .get_mut("appearance")
+        .and_then(Item::as_table_like_mut)
+        .and_then(|appearance| appearance.key_mut("blur_radius"))
+    else {
+        return Vec::new();
+    };
+    let [first, second] = crate::load::BLUR_RADIUS_0_2_COMMENT;
+    let prefix = raw_text(key.leaf_decor().prefix());
+    let lines = format!("{first}\n{second}\n");
+    let Some(kept) = prefix.strip_suffix(lines.as_str()) else {
+        return Vec::new();
+    };
+    if !(kept.is_empty() || kept.ends_with('\n')) {
+        return Vec::new();
+    }
+    let kept = kept.to_owned();
+    key.leaf_decor_mut().set_prefix(kept);
+    vec![first.to_owned(), second.to_owned()]
 }
 
 /// Puts `moved` on lines of their own above `key` of `table`, indented

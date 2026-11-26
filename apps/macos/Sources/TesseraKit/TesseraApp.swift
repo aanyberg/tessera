@@ -419,13 +419,11 @@ public final class TesseraApp {
         }
     }
 
-    /// `[appearance] blur_radius` in effect (ADR 0045): the window's blur
-    /// radius, 0 to 64, clamped by the core. 0 keeps each pane's own
-    /// material blur; above 0 a window whose translucent panes all ask for
-    /// blur is blurred whole at that radius. It does not change with
+    /// `[appearance] blur_radius` in effect (ADR 0045, #491): how strongly a
+    /// translucent window blurs what is behind it, 0 to 64, clamped by the
+    /// core; 0 is no blur. It does not change with
     /// ``DisplayOptions/reduceTransparency``: the caller sets no radius then.
-    /// Read again after a configuration is applied. The app does not call
-    /// it in 0.2.0 (#490); the rework in 0.3.0 does (#491).
+    /// Read again after a configuration is applied.
     ///
     /// - Throws: ``TesseraCoreError/nullPointer`` after ``shutdown()``.
     public func blurRadius() throws -> UInt32 {

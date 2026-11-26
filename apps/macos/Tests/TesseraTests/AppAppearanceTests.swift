@@ -129,9 +129,8 @@ final class AppAppearanceTests: XCTestCase {
             var targets: [(name: String, item: (any NSAppearanceCustomization)?)] = [(name, controller.window)]
             let content = controller.window?.contentView as? TerminalWindowContentView
             guard controller.panes.allSatisfy(\.view.surface.isAttached) else { return targets }
-            targets += [("\(name): the title bar's blur", content?.titlebarBackdrop)]
+            targets += [("\(name): the title bar's blur", content?.windowBackdrop)]
             targets += [("\(name): the title bar's tint", content?.titlebarTint)]
-            targets += controller.panes.map { ("\(name): the pane's blur", $0.view.backdrop) }
             return targets
         }
     }
@@ -247,11 +246,8 @@ final class AppAppearanceTests: XCTestCase {
             let content = controller.window?.contentView as? TerminalWindowContentView
             assertAdaptiveMaterials(in: content, name, file: file, line: line)
             guard translucent, controller.panes.allSatisfy(\.view.surface.isAttached) else { continue }
-            assertDraws(dark: dark, content?.titlebarBackdrop, "\(name): the title bar's blur", file: file, line: line)
+            assertDraws(dark: dark, content?.windowBackdrop, "\(name): the title bar's blur", file: file, line: line)
             assertDraws(dark: dark, content?.titlebarTint, "\(name): the title bar's tint", file: file, line: line)
-            for pane in controller.panes {
-                assertDraws(dark: dark, pane.view.backdrop, "\(name): the pane's blur", file: file, line: line)
-            }
         }
     }
 

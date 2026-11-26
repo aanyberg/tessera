@@ -1,11 +1,10 @@
 import SwiftUI
 
 /// Appearance: the app's own appearance (app-wide, #365), the theme (and
-/// importing one), the font, the window's opacity and blur, the cursor and
-/// the dimming of inactive panes; but for the app's appearance, the
-/// `[appearance]` table every profile follows where it sets nothing of its
-/// own. No blur radius in 0.2.0 (#490): the slider returns with the rework
-/// in 0.3.0 (#491).
+/// importing one), the font, the window's opacity, blur and blur radius, the
+/// cursor and the dimming of inactive panes; but for the app's appearance,
+/// the `[appearance]` table every profile follows where it sets nothing of
+/// its own.
 struct AppearancePane: View {
     let model: SettingsModel
 
@@ -24,6 +23,9 @@ struct AppearancePane: View {
         SettingsField(
             key: "appearance.blur", title: "Blur the background", control: .toggle,
             note: "While the opacity is below 100 %. Reduce Transparency in System Settings turns both off."),
+        SettingsField(
+            key: "appearance.blur_radius", title: "Blur radius", control: .integerSlider(0...64, zeroTitle: "Off"),
+            note: "How strongly the window blurs what is behind it. Off is no blur, also under the title bar."),
     ]
     static let cursor = [
         SettingsField(key: "appearance.cursor_shape", title: "Cursor", control: .choice(SettingsField.cursorShapes)),

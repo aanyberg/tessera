@@ -358,6 +358,12 @@ impl Config {
         });
         warnings.extend(config.keys.take_placed_warnings());
         warnings.extend(invalid_lenient_values(text, &root));
+        // #491: the 0.2.x template's `blur_radius = 0`, then no change from
+        // the standard blur, reads as the default; a 0 the user wrote is
+        // no blur. In memory only: the file is never rewritten.
+        if config.appearance.blur_radius == 0 && has_0_2_template_blur_radius(text) {
+            config.appearance.blur_radius = crate::Appearance::default().blur_radius;
+        }
         warnings.extend(config.normalize().into_iter().map(|warning| {
             let at = match &warning {
                 Warning::OutOfRange { path, .. } => position(&root, &dotted_steps(path)),
@@ -1025,6 +1031,35 @@ fn invalid_lenient_values(text: &str, root: &toml::de::DeTable<'_>) -> Vec<(usiz
         ));
     }
     warnings
+}
+
+/// The two comment lines above `blur_radius = 0` in the template the app
+/// wrote in 0.2.0 and 0.2.1 (`default_config.toml` at `v0.2.0` and
+/// `v0.2.1`), when 0 kept the standard blur (#491).
+pub(crate) const BLUR_RADIUS_0_2_COMMENT: [&str; 2] = [
+    "# Blur radius for the whole window (0 to 64). No effect in 0.2.0: every",
+    "# pane that asks for blur keeps the standard blur. It returns in 0.3.0.",
+];
+
+/// Whether `text` holds the 0.2.x template's line `blur_radius = 0`,
+/// untouched: in `[appearance]`, right under [`BLUR_RADIUS_0_2_COMMENT`].
+/// A 0 without that comment, under an edited one, or written differently
+/// is the user's (#491).
+fn has_0_2_template_blur_radius(text: &str) -> bool {
+    let mut table = "";
+    let mut above = ["", ""];
+    for line in text.lines() {
+        if line.trim_start().starts_with('[') {
+            table = line.trim();
+        } else if line == "blur_radius = 0"
+            && table == "[appearance]"
+            && above == BLUR_RADIUS_0_2_COMMENT
+        {
+            return true;
+        }
+        above = [above[1], line];
+    }
+    false
 }
 
 /// `[appearance]`'s ranges: font size, opacity, blur radius and pane
@@ -2434,9 +2469,9 @@ mod tests {
     fn blur_radius_is_an_integer_up_to_64() {
         let max = crate::Appearance::MAX_BLUR_RADIUS;
         assert_eq!(max, 64);
-        assert_eq!(Config::default().appearance.blur_radius, 0);
+        assert_eq!(Config::default().appearance.blur_radius, 48);
         for (text, expected) in [
-            ("", 0),
+            ("", 48),
             ("[appearance]\nblur_radius = 0\n", 0),
             ("[appearance]\nblur_radius = 1\n", 1),
             ("[appearance]\nblur_radius = 20\n", 20),
@@ -2487,6 +2522,68 @@ mod tests {
     /// The window is blurred, not a session, so a profile's radius is
     /// dropped with a warning and `[appearance]`'s applies to every
     /// profile, as for `dim_inactive_panes`.
+    /// #491: the 0.2.0 and 0.2.1 templates wrote `blur_radius = 0` (then
+    /// the standard blur) under a comment saying so; untouched, it reads as
+    /// the default. A 0 the user wrote is no blur.
+    #[test]
+    fn the_0_2_templates_blur_radius_reads_as_the_default() {
+        let default = Config::default().appearance.blur_radius;
+        for template in [
+            include_str!("../tests/fixtures/default-config-0.2.0.toml"),
+            include_str!("../tests/fixtures/default-config-0.2.1.toml"),
+        ] {
+            assert!(template.contains("\nblur_radius = 0\n"));
+            let loaded = Config::from_toml_lenient(template).unwrap();
+            assert_eq!(loaded.config.appearance.blur_radius, default, "untouched");
+            assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+            let crlf = template.replace('\n', "\r\n");
+            let loaded = Config::from_toml_lenient(&crlf).unwrap();
+            assert_eq!(loaded.config.appearance.blur_radius, default, "CRLF");
+            for (edited, expected) in [
+                (template.replace("It returns in 0.3.0.", "Off, please."), 0),
+                (
+                    template.replace("# pane that asks", "# a pane that asks"),
+                    0,
+                ),
+                (
+                    template.replace("\nblur_radius = 0\n", "\nblur_radius = 0 # off\n"),
+                    0,
+                ),
+                (
+                    template.replace("\nblur_radius = 0\n", "\nblur_radius = 5\n"),
+                    5,
+                ),
+            ] {
+                let loaded = Config::from_toml_lenient(&edited).unwrap();
+                assert_eq!(loaded.config.appearance.blur_radius, expected, "{edited}");
+            }
+            // The same lines in a profile's appearance are still ignored
+            // with a warning, and the window keeps the default.
+            let block = format!(
+                "[[profiles]]\nname = \"p\"\n[profiles.appearance]\n{}\n{}\nblur_radius = 0\n",
+                BLUR_RADIUS_0_2_COMMENT[0], BLUR_RADIUS_0_2_COMMENT[1]
+            );
+            let loaded = Config::from_toml_lenient(&block).unwrap();
+            assert!(
+                matches!(&loaded.warnings[..], [Warning::OutOfRange { path, .. }] if path == "profiles[0].appearance.blur_radius"),
+                "{:?}",
+                loaded.warnings
+            );
+            assert_eq!(loaded.config.appearance.blur_radius, default);
+        }
+        for bare in [
+            "[appearance]\nblur_radius = 0\n".to_owned(),
+            "[appearance]\n# Off.\nblur_radius = 0\n".to_owned(),
+            format!(
+                "[terminal]\n{}\n{}\nblur_radius = 0\n[appearance]\nblur_radius = 0\n",
+                BLUR_RADIUS_0_2_COMMENT[0], BLUR_RADIUS_0_2_COMMENT[1]
+            ),
+        ] {
+            let loaded = Config::from_toml_lenient(&bare).unwrap();
+            assert_eq!(loaded.config.appearance.blur_radius, 0, "{bare}");
+        }
+    }
+
     #[test]
     fn blur_radius_in_a_profile_is_ignored_with_a_warning() {
         let text = "[appearance]\nblur_radius = 12\n[[profiles]]\nname = \"a\"\n\
@@ -2525,7 +2622,8 @@ mod tests {
                     .resolve_profile(Some("a"))
                     .appearance
                     .blur_radius,
-                0
+                Config::default().appearance.blur_radius,
+                "{value}: the window's default"
             );
         }
         // Both window keys in one profile: one warning each, in order.

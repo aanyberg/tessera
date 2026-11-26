@@ -219,6 +219,8 @@ final class PaneContainerView: NSView, NSSplitViewDelegate, NSMenuItemValidation
         pane.view.autoresizingMask = [.width, .height]
         root.autoresizingMask = []
         root.isHidden = true
+        // The window's blur leaves out the hidden panes (#491 B1).
+        paneFrameDidChange()
         updateDimming()
         return true
     }
@@ -247,6 +249,7 @@ final class PaneContainerView: NSView, NSSplitViewDelegate, NSMenuItemValidation
         if root.frame != bounds {
             root.frame = bounds
         }
+        paneFrameDidChange()
         paneMinimumSizeDidChange()
         updateDimming()
         return true

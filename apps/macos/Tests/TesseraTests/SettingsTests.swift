@@ -204,14 +204,18 @@ final class SettingsTests: XCTestCase {
     static let integerSlider = SettingsField(
         key: "appearance.blur_radius", title: "Blur radius", control: .integerSlider(0...64, zeroTitle: "Off"))
 
-    /// #490: Appearance has no blur radius slider, only the blur toggle.
-    func testAppearanceHasTheBlurToggleAndNoBlurRadius() {
+    /// #491: Appearance has the blur toggle and the blur radius slider,
+    /// 0 to 64 with Off at 0; a profile cannot set the radius.
+    func testAppearanceHasTheBlurToggleAndTheBlurRadius() throws {
         let keys = AppearancePane.fields.map(\.key)
         XCTAssertTrue(keys.contains("appearance.blur"), "\(keys)")
-        XCTAssertFalse(keys.contains("appearance.blur_radius"), "\(keys)")
-        XCTAssertFalse(
-            AppearancePane.fields.contains { if case .integerSlider = $0.control { true } else { false } },
-            "no integer slider: \(keys)")
+        let field = try XCTUnwrap(AppearancePane.fields.first { $0.key == "appearance.blur_radius" }, "\(keys)")
+        guard case .integerSlider(let range, let zeroTitle) = field.control else {
+            return XCTFail("an integer slider: \(field.control)")
+        }
+        XCTAssertEqual(range, 0...Int64(WindowBlurRadius.maximum))
+        XCTAssertEqual(zeroTitle, "Off")
+        XCTAssertFalse(ProfilesPane.appearanceFields.contains { $0.key == "appearance.blur_radius" })
     }
 
     /// An integer slider writes whole numbers within its range, coalesced
@@ -779,6 +783,7 @@ final class SettingsTests: XCTestCase {
             Edit(key: "appearance.font_size", value: .float(15), line: "font_size = 15.0"),
             Edit(key: "appearance.opacity", value: .float(0.5), line: "opacity = 0.5"),
             Edit(key: "appearance.blur", value: .bool(true), line: "blur = true"),
+            Edit(key: "appearance.blur_radius", value: .integer(20), line: "blur_radius = 20"),
             Edit(key: "appearance.cursor_shape", value: .string("beam"), line: #"cursor_shape = "beam""#),
             Edit(key: "appearance.cursor_blink", value: .bool(true), line: "cursor_blink = true"),
             Edit(key: "appearance.dim_inactive_panes", value: .float(0.3), line: "dim_inactive_panes = 0.3"),
@@ -2567,7 +2572,7 @@ extension SettingsTests {
     /// draws or the app shares.
     func testTheProfileAppearanceFieldsLeaveOutTheWindowAndAppKeys() {
         let left = Set(AppearancePane.fields.map(\.key)).subtracting(ProfilesPane.appearanceFields.map(\.key))
-        XCTAssertEqual(left, ["appearance.dim_inactive_panes", "appearance.app_appearance"])
+        XCTAssertEqual(left, ["appearance.dim_inactive_panes", "appearance.blur_radius", "appearance.app_appearance"])
     }
 }
 

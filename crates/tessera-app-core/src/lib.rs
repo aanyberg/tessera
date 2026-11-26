@@ -2588,9 +2588,8 @@ impl App {
     /// [`tessera_config::Appearance::MAX_BLUR_RADIUS`] (ADR 0045): a loaded
     /// configuration is clamped already, and a larger value in one built
     /// another way ([`App::apply_config`]) is lowered here. 0
-    /// keeps each pane's own material blur; above 0 the host blurs the
-    /// whole window at that radius while every translucent pane of its
-    /// tab asks for blur. It is the configured value whatever the display
+    /// is no blur; above 0 the host blurs a translucent window's title bar
+    /// and tab bar and each translucent pane that asks for blur. It is the configured value whatever the display
     /// options say: under Reduce Transparency no session is translucent or
     /// blurred, and the host sets no radius then. A window-level key, so
     /// no profile changes it. When a configuration applied changes it the

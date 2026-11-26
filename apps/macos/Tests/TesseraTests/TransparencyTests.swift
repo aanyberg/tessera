@@ -74,7 +74,7 @@ private struct TimedOut: Error, CustomStringConvertible {
 }
 
 /// Translucency and background blur per pane (#42, ADR 0043): each pane
-/// follows its session's profile, a blurred one has a ``PaneBackdropView``
+/// follows its session's profile, a blurred one is in its window's ``WindowBackdropView``
 /// under its text, the window is opaque only while every pane of the tab
 /// is, through splits, closes, a maximized pane and the dimming shade, and
 /// the system's Reduce Transparency makes every pane opaque and unblurred.
@@ -159,22 +159,8 @@ final class TransparencyTests: XCTestCase {
         _ pane: Pane, _ expected: Bool, _ what: String, file: StaticString = #filePath, line: UInt = #line
     ) {
         let view = pane.view
-        let backdrops = view.subviews.filter { $0 is NSVisualEffectView }
-        guard expected else {
-            XCTAssertNil(view.backdrop, "\(what): no backdrop", file: file, line: line)
-            XCTAssertTrue(backdrops.isEmpty, "\(what): no effect view left", file: file, line: line)
-            return
-        }
-        guard let backdrop = view.backdrop else {
-            return XCTFail("\(what): a backdrop", file: file, line: line)
-        }
-        XCTAssertEqual(backdrops.count, 1, "\(what): one effect view", file: file, line: line)
-        XCTAssertTrue(view.subviews.first === backdrop, "\(what): under the render view and the rest", file: file, line: line)
-        XCTAssertEqual(backdrop.frame, view.bounds, "\(what): filling the pane", file: file, line: line)
-        XCTAssertEqual(backdrop.blendingMode, .behindWindow, "\(what)", file: file, line: line)
-        XCTAssertEqual(backdrop.material, .fullScreenUI, "\(what): no grey cast (#363)", file: file, line: line)
-        XCTAssertEqual(backdrop.state, .active, "\(what): blurred in a window that is not key", file: file, line: line)
-        XCTAssertNil(backdrop.hitTest(NSPoint(x: 5, y: 5)), "\(what): takes no clicks", file: file, line: line)
+        XCTAssertTrue(effectViews(in: view).isEmpty, "\(what): no effect view of its own (#491)", file: file, line: line)
+        XCTAssertEqual(view.isBlurredByWindow, expected, "\(what): blurred by the window", file: file, line: line)
     }
 
     /// Asserts the window's title bar of `controller`'s tab (#363): standard
@@ -212,22 +198,23 @@ final class TransparencyTests: XCTestCase {
             "\(what): the smallest size keeps the panes at theirs", file: file, line: line)
         let effects = content.subviews.filter { $0 is NSVisualEffectView }
         guard translucent else {
-            XCTAssertNil(content.titlebarBackdrop, "\(what): no blur under the title bar", file: file, line: line)
+            XCTAssertNil(content.windowBackdrop, "\(what): no blur", file: file, line: line)
             XCTAssertNil(content.titlebarTint, "\(what): no tint under the title bar", file: file, line: line)
             XCTAssertFalse(
                 content.subviews.contains { $0 is StripTintView }, "\(what): no tint view left", file: file, line: line)
             XCTAssertTrue(effects.isEmpty, "\(what): no effect view left", file: file, line: line)
             return
         }
-        guard let backdrop = content.titlebarBackdrop else {
+        guard let backdrop = content.windowBackdrop else {
             return XCTFail("\(what): a blur under the title bar", file: file, line: line)
         }
         XCTAssertEqual(effects.count, 1, "\(what): one effect view", file: file, line: line)
         XCTAssertTrue(content.subviews.first === backdrop, "\(what): under the panes", file: file, line: line)
         XCTAssertEqual(
-            backdrop.frame,
+            backdrop.maskedRegions.first,
             NSRect(x: 0, y: area.maxY, width: content.bounds.width, height: content.bounds.maxY - area.maxY),
             "\(what): filling the title bar and tab bar", file: file, line: line)
+        XCTAssertEqual(backdrop.frame, content.bounds, "\(what): one blur for the window", file: file, line: line)
         XCTAssertEqual(backdrop.blendingMode, .behindWindow, "\(what)", file: file, line: line)
         XCTAssertEqual(backdrop.material, .fullScreenUI, "\(what): the panes' material", file: file, line: line)
         XCTAssertEqual(backdrop.state, .active, "\(what): blurred in a window that is not key", file: file, line: line)
@@ -241,7 +228,7 @@ final class TransparencyTests: XCTestCase {
         XCTAssertEqual(
             content.subviews.firstIndex(of: tint), content.subviews.firstIndex(of: backdrop).map { $0 + 1 },
             "\(what): the tint right over the blur", file: file, line: line)
-        XCTAssertEqual(tint.frame, backdrop.frame, "\(what): the tint fills the strip", file: file, line: line)
+        XCTAssertEqual(backdrop.maskedRegions.first, tint.frame, "\(what): the tint fills the strip", file: file, line: line)
         XCTAssertNil(tint.hitTest(NSPoint(x: tint.frame.midX, y: tint.frame.midY)), "\(what)", file: file, line: line)
         XCTAssertFalse(tint.isAccessibilityElement(), "\(what)", file: file, line: line)
     }
@@ -448,15 +435,15 @@ final class TransparencyTests: XCTestCase {
 
         content.updateTitlebar(translucent: true)
         assertTitlebar(controller, translucent: true, "translucent")
-        XCTAssertNil(pane.view.backdrop, "translucent: the pane keeps its own setting, no blur")
+        XCTAssertFalse(pane.view.isBlurredByWindow, "translucent: the pane keeps its own setting, no blur")
         XCTAssertEqual(window.frame, frame, "translucent: the window keeps its frame")
         XCTAssertEqual(controller.paneContainer.frame.size, size, "translucent: the panes keep their size")
         XCTAssertEqual(pane.view.coreResizeCount, resizes, "translucent: the pane never resized")
 
-        let backdrop = content.titlebarBackdrop
+        let backdrop = content.windowBackdrop
         content.updateTitlebar(translucent: true)
         assertTitlebar(controller, translucent: true, "translucent again")
-        XCTAssertTrue(content.titlebarBackdrop === backdrop, "translucent again: the same blur is kept")
+        XCTAssertTrue(content.windowBackdrop === backdrop, "translucent again: the same blur is kept")
         XCTAssertEqual(window.frame, frame, "translucent again: the window keeps its frame")
 
         for _ in 0..<10 {
@@ -669,7 +656,7 @@ final class TransparencyTests: XCTestCase {
         assertTitlebar(controller, translucent: true, "before")
         try Self.config.replacingOccurrences(of: "blur = true", with: "blur = false")
             .write(to: dir.appendingPathComponent("config.toml"), atomically: true, encoding: .utf8)
-        try await waitUntil("the reload turns the blur off") { frosted.view.backdrop == nil }
+        try await waitUntil("the reload turns the blur off") { !frosted.view.isBlurredByWindow }
         assertBackdrop(frosted, false, "after")
         XCTAssertEqual(frosted.view.backgroundAppearance?.opaque, false)
         XCTAssertEqual(frosted.view.backgroundAppearance?.blur, false)
@@ -713,7 +700,7 @@ final class TransparencyTests: XCTestCase {
 
         try host.core.setDisplayOptions(.init(reduceTransparency: false))
         try await waitUntil("the panes are translucent again") { try !self.isOpaque(controller) }
-        try await waitUntil("the blur is back") { frosted.view.backdrop != nil && late.view.backdrop != nil }
+        try await waitUntil("the blur is back") { frosted.view.isBlurredByWindow && late.view.isBlurredByWindow }
         assertTitlebar(controller, translucent: true, "turned off")
         XCTAssertEqual(
             all.map(\.view.coreResizeCount), lateResizes, "turned off: the title bar's change resizes no pane")
@@ -735,15 +722,15 @@ final class TransparencyTests: XCTestCase {
         XCTAssertTrue(controller.paneContainer.activePane === focused)
         func assertOrder(_ what: String) {
             XCTAssertTrue(dimmed.view.subviews.last is PaneDimView, "\(what): the shade on top")
-            XCTAssertTrue(dimmed.view.subviews.first === dimmed.view.backdrop, "\(what): the backdrop at the bottom")
+            XCTAssertTrue(dimmed.view.isBlurredByWindow, "\(what): blurred by the window")
         }
         assertOrder("dimmed")
         for round in 0..<2 {
             try host.core.setDisplayOptions(.init(reduceTransparency: true))
-            try await waitUntil("the backdrop goes, round \(round)") { dimmed.view.backdrop == nil }
+            try await waitUntil("the backdrop goes, round \(round)") { !dimmed.view.isBlurredByWindow }
             XCTAssertTrue(dimmed.view.subviews.last is PaneDimView, "the shade stays")
             try host.core.setDisplayOptions(.init(reduceTransparency: false))
-            try await waitUntil("the backdrop is back, round \(round)") { dimmed.view.backdrop != nil }
+            try await waitUntil("the backdrop is back, round \(round)") { dimmed.view.isBlurredByWindow }
             assertOrder("round \(round)")
         }
     }
@@ -774,11 +761,9 @@ final class TransparencyTests: XCTestCase {
         weak var weakController: TerminalWindowController?
         weak var weakPane: Pane?
         weak var weakView: TerminalSurfaceView?
-        weak var weakBackdrop: PaneBackdropView?
         weak var weakSession: TesseraSession?
-        weak var weakFirstBackdrop: PaneBackdropView?
         weak var weakTint: StripTintView?
-        weak var weakStripBlur: PaneBackdropView?
+        weak var weakStripBlur: WindowBackdropView?
         try autoreleasepool {
             let controller = try host.open(profile: nil)
             weakController = controller
@@ -786,25 +771,22 @@ final class TransparencyTests: XCTestCase {
             try requireSurfaces(controller.panes)
             weakPane = pane
             weakView = pane.view
-            weakBackdrop = pane.view.backdrop
             weakSession = pane.session
-            weakFirstBackdrop = controller.panes.first?.view.backdrop
             let content = controller.window?.contentView as? TerminalWindowContentView
             weakTint = content?.titlebarTint
-            weakStripBlur = content?.titlebarBackdrop
+            weakStripBlur = content?.windowBackdrop
             pane.view.inputContext?.deactivate()
         }
-        XCTAssertNotNil(weakBackdrop, "the pane was blurred")
         XCTAssertNotNil(weakStripBlur, "the strip was blurred")
         XCTAssertNotNil(weakTint, "the strip was tinted")
         autoreleasepool { weakController?.closeFocusedPane(nil) }
         try await waitUntil("the closed pane is freed") {
-            weakPane == nil && weakView == nil && weakBackdrop == nil && weakSession == nil
+            weakPane == nil && weakView == nil && weakSession == nil
         }
-        XCTAssertNotNil(weakFirstBackdrop, "the other pane keeps its blur")
+        XCTAssertNotNil(weakStripBlur, "the window keeps its blur")
         autoreleasepool { weakController?.window?.close() }
         try await waitUntil("the tab is freed") {
-            weakController == nil && weakFirstBackdrop == nil && weakTint == nil && weakStripBlur == nil
+            weakController == nil && weakTint == nil && weakStripBlur == nil
         }
     }
 }
@@ -874,14 +856,14 @@ final class ReduceTransparencySettingTests: XCTestCase {
             throw XCTSkip("the core could not attach a renderer to the view (no GPU can present, or no font)")
         }
         XCTAssertTrue(window.isOpaque, "reduced from the start")
-        XCTAssertNil(pane.view.backdrop)
+        XCTAssertFalse(pane.view.isBlurredByWindow)
 
         reduces = false
         postSettingChange()
-        try await waitUntil("translucent and blurred") { !window.isOpaque && pane.view.backdrop != nil }
+        try await waitUntil("translucent and blurred") { !window.isOpaque && pane.view.isBlurredByWindow }
 
         reduces = true
         postSettingChange()
-        try await waitUntil("opaque again") { window.isOpaque && pane.view.backdrop == nil }
+        try await waitUntil("opaque again") { window.isOpaque && !pane.view.isBlurredByWindow }
     }
 }
