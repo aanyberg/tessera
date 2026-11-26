@@ -82,6 +82,10 @@ pub(crate) struct State {
     /// [`ConfigStore::config`] that reacts before the event is sent.
     #[cfg(test)]
     on_apply: Option<fn(&ConfigPaths)>,
+    /// How many times [`ConfigStore::load_from_disk_identified`] ran: a
+    /// re-read that reports nothing (the same error again) still counts.
+    #[cfg(test)]
+    loads: std::sync::atomic::AtomicUsize,
 }
 
 /// A load of `config.toml` from disk, before it is applied.
@@ -164,6 +168,8 @@ impl ConfigStore {
                 on_broadcast: None,
                 #[cfg(test)]
                 on_apply: None,
+                #[cfg(test)]
+                loads: std::sync::atomic::AtomicUsize::new(0),
             })),
         }
     }
@@ -302,6 +308,12 @@ impl ConfigStore {
         self.write().subscribers.retain(|(other, _)| *other != id);
     }
 
+    /// How many loads from disk ran on this store (all its watchers').
+    #[cfg(test)]
+    pub(crate) fn load_count(&self) -> usize {
+        self.read().loads.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Number of registered event channels (live watcher threads).
     #[cfg(test)]
     pub(crate) fn subscriber_count(&self) -> usize {
@@ -357,6 +369,10 @@ impl ConfigStore {
     /// ([`WentTo`]). The watcher compares them with the ones it
     /// registered (#697, #701).
     pub(crate) fn load_from_disk_identified(&self) -> (WentTo, Result<FromDisk, Error>) {
+        #[cfg(test)]
+        self.read()
+            .loads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (config, from) = self.load_config_file();
         let mut went_to = WentTo {
             config,

@@ -1270,13 +1270,15 @@ pub(crate) fn read_capped(path: &Path, limit: u64, what: &str) -> Result<Vec<u8>
 
 /// [`read_capped`], with the identity of the file it went to: from the
 /// open handle once there is one, before that from the path's metadata
-/// (a file too large, or not a regular one, is refused unopened), and
-/// `None` when even that fails (a missing file) or when the open fails
-/// after it. A path that `stat`s and then does not open is mid-swap (an
-/// `unlink; symlink` retarget, #701 F2) or unreadable: either way the
-/// load read no file, and the stat's file is not the one it describes. A
-/// watcher's registration opens the path too, so an unreadable file has no
-/// identity there either.
+/// (a file too large is refused unopened), and `None` when even that
+/// fails (a missing file), when the path names no regular file (a
+/// directory, a FIFO, a device such as `/dev/null`) or when the open
+/// fails after the `stat`. A path that `stat`s and then does not open is
+/// mid-swap (an `unlink; symlink` retarget, #701 F2) or unreadable: either
+/// way the load read no file, and the stat's file is not the one it
+/// describes. A watcher's registration opens the path too, so an
+/// unreadable file has no identity there either; nor does a path that
+/// names no regular file, which it does not register (#708).
 pub(crate) fn read_capped_identified(
     path: &Path,
     limit: u64,
@@ -1305,7 +1307,10 @@ pub(crate) fn read_capped_found(
     };
     let found = FileId::of(&meta);
     if let Err(error) = check_regular_file(path, &meta, limit, what) {
-        return (found, found, Err(error.into()));
+        // A file too large went to that file; anything but a regular file
+        // went to none the load reads (#708).
+        let went_to = if meta.is_file() { found } else { None };
+        return (found, went_to, Err(error.into()));
     }
     #[cfg(test)]
     before_read_open(path);

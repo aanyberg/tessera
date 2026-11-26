@@ -771,6 +771,13 @@ impl Backend {
 enum Fingerprint {
     #[default]
     Missing,
+    /// Something of another type than the one read there (not a regular
+    /// file where a file is read, not a directory where one is listed:
+    /// [`Fingerprint::of_file`], [`Fingerprint::of_dir`]), by its type
+    /// alone. The read refuses it whatever its times, and the times of a
+    /// device change on every write to it from anywhere (`/dev/null`'s),
+    /// so they would make each sample a change (#708, #712).
+    Other(std::fs::FileType),
     Present {
         modified: Option<SystemTime>,
         len: u64,
@@ -784,6 +791,32 @@ enum Fingerprint {
 impl Fingerprint {
     fn of(path: &Path) -> Self {
         match std::fs::metadata(path) {
+            Ok(meta) => Self::Present {
+                modified: meta.modified().ok(),
+                len: meta.len(),
+                identity: identity_of(&meta),
+            },
+            Err(_) => Self::Missing,
+        }
+    }
+
+    /// [`Fingerprint::of`] for a path read as a regular file
+    /// (`config.toml`): anything else is [`Fingerprint::Other`].
+    fn of_file(path: &Path) -> Self {
+        Self::of_expected(path, std::fs::FileType::is_file)
+    }
+
+    /// [`Fingerprint::of`] for a path listed as a directory (`profiles/`):
+    /// anything else is [`Fingerprint::Other`].
+    fn of_dir(path: &Path) -> Self {
+        Self::of_expected(path, std::fs::FileType::is_dir)
+    }
+
+    /// [`Fingerprint::of`] when `path` names a file of the type
+    /// `expected` accepts, [`Fingerprint::Other`] when it names another.
+    fn of_expected(path: &Path, expected: fn(&std::fs::FileType) -> bool) -> Self {
+        match std::fs::metadata(path) {
+            Ok(meta) if !expected(&meta.file_type()) => Self::Other(meta.file_type()),
             Ok(meta) => Self::Present {
                 modified: meta.modified().ok(),
                 len: meta.len(),
@@ -852,7 +885,9 @@ impl ThemesFingerprint {
 pub(crate) const MAX_PROFILE_FILES_FOLLOWED: usize = 32;
 
 /// A cheap identity of the state of `profiles/`: the directory's own
-/// [`Fingerprint`] and that of each profile file
+/// [`Fingerprint`] (by type alone when it is no directory,
+/// [`Fingerprint::of_dir`]: a `profiles/` linked to `/dev/null` is no
+/// change on each write there, #712) and that of each profile file
 /// [`crate::profile_files::list_first`] finds, in stem order, followed by
 /// the dangling links it reports (a target that appears changes them).
 /// Following symbolic links, so a linked file's target saved by rename
@@ -894,7 +929,7 @@ impl ProfilesFingerprint {
 
     /// [`ProfilesFingerprint::listed`] with the directory sampled now.
     fn of(dir: &Path, limit: usize) -> Self {
-        Self::listed(dir, Fingerprint::of(dir), limit)
+        Self::listed(dir, Fingerprint::of_dir(dir), limit)
     }
 
     /// The same files sampled again, the first `limit` of them; the others
@@ -941,6 +976,8 @@ const POLL_FULL_THEMES_EVERY: u32 = 20;
 /// What the polling backend compares from one tick to the next.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PollSample {
+    /// `config.toml`, by type alone when it is no regular file
+    /// ([`Fingerprint::of_file`], #708).
     config: Fingerprint,
     /// The themes directory's own metadata.
     themes_dir: Fingerprint,
@@ -963,7 +1000,7 @@ impl PollSample {
                 &store.paths().profiles_dir(),
                 crate::MAX_PROFILE_FILES,
             ),
-            config: Fingerprint::of(&store.paths().config_file()),
+            config: Fingerprint::of_file(&store.paths().config_file()),
             themes_dir: Fingerprint::of(&store.paths().themes_dir()),
             theme_file: theme_file.map(|path| {
                 let fingerprint = Fingerprint::of(&path);
@@ -999,7 +1036,7 @@ fn run_polling(
         let now = Instant::now();
         tick = tick.wrapping_add(1);
         let full = tick.is_multiple_of(POLL_FULL_THEMES_EVERY);
-        let profiles_dir_now = Fingerprint::of(&profiles_dir);
+        let profiles_dir_now = Fingerprint::of_dir(&profiles_dir);
         let profiles = if full || profiles_dir_now != last_seen.profiles.dir {
             ProfilesFingerprint::listed(&profiles_dir, profiles_dir_now, crate::MAX_PROFILE_FILES)
         } else {
@@ -1009,7 +1046,7 @@ fn run_polling(
         };
         let mut current = PollSample {
             profiles,
-            config: Fingerprint::of(&path),
+            config: Fingerprint::of_file(&path),
             themes_dir: Fingerprint::of(&themes_dir),
             theme_file: last_seen
                 .theme_file
@@ -1690,7 +1727,7 @@ mod native {
                 tail.files
                     .iter()
                     .all(|(sampled, fingerprint)| match fingerprint {
-                        super::Fingerprint::Missing => true,
+                        super::Fingerprint::Missing | super::Fingerprint::Other(_) => true,
                         super::Fingerprint::Present {
                             identity: (ino, ..),
                             ..
@@ -1701,15 +1738,18 @@ mod native {
             })
     }
 
-    /// Whether `handle` (the registration of `path`) still names what
-    /// `path` names now: `None` while `path` is missing.
-    fn names_now(path: &Path, handle: Option<&File>) -> bool {
+    /// Whether `handle` (the registration of `path` as a `kind`) still
+    /// names what `path` names now: `None` while `path` is missing or
+    /// names something of another kind, which [`register`] does not
+    /// register either (a `config.toml` that is a directory, a FIFO or a
+    /// link to `/dev/null`, #708).
+    fn names_now(path: &Path, handle: Option<&File>, kind: Kind) -> bool {
         match handle {
             Some(handle) => still_names(path, handle).unwrap_or(false),
-            None => matches!(
-                std::fs::metadata(path),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound
-            ),
+            None => match std::fs::metadata(path) {
+                Ok(meta) => !kind.matches(meta.file_type()),
+                Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+            },
         }
     }
 
@@ -2066,13 +2106,13 @@ mod native {
                     ChainSlot::Missing => false,
                     ChainSlot::Unreadable => true,
                 })
-                && names_now(&self.root, self.root_handle.as_ref())
+                && names_now(&self.root, self.root_handle.as_ref(), Kind::Dir)
                 && link_dir_of(&self.file) == self.link_dir
                 && self
                     .link_dir
                     .as_deref()
-                    .is_none_or(|dir| names_now(dir, self.link_dir_handle.as_ref()))
-                && names_now(&self.file, self.file_handle.as_ref())
+                    .is_none_or(|dir| names_now(dir, self.link_dir_handle.as_ref(), Kind::Dir))
+                && names_now(&self.file, self.file_handle.as_ref(), Kind::File)
                 && self.theme_files_unchanged()
                 && self.sample_profiles().1 == self.profiles_seen
         }
@@ -2275,7 +2315,7 @@ mod native {
         fn reread(&mut self, store: &ConfigStore, reread: super::Reread) {
             // Before the load: a change after this sample is either read
             // by the load or seen as a difference on the next poll.
-            self.config_seen = super::Fingerprint::of(&self.file);
+            self.config_seen = super::Fingerprint::of_file(&self.file);
             // The profile files are read by the load, so they are followed
             // before it: a write after the registration raises an event, one
             // before is read. A changed set rearms everything, the chain
@@ -2323,7 +2363,7 @@ mod native {
         /// settle began, as far as metadata tell: what a poll while the
         /// backend is not armed looks at.
         fn changed_unseen(&self) -> bool {
-            super::Fingerprint::of(&self.file) != self.config_seen
+            super::Fingerprint::of_file(&self.file) != self.config_seen
                 || self.sample_profiles().1 != self.profiles_seen
         }
 
@@ -4556,6 +4596,177 @@ mod native {
             }
         }
 
+        /// What sits where the load expects a regular file in
+        /// [`non_regular_files_are_not_reloaded_by_chain_events`].
+        #[derive(Debug, Clone, Copy)]
+        enum NonRegular {
+            /// `config.toml` is a directory (#708).
+            ConfigDir,
+            /// `config.toml` is a FIFO (#708).
+            ConfigFifo,
+            /// `config.toml` is a link to `/dev/null` (#708, #712).
+            ConfigDevNull,
+            /// `profiles/work.toml` is a link to `/dev/null` (#712).
+            ProfileDevNull,
+            /// `profiles/work.toml` is a FIFO (#712).
+            ProfileFifo,
+            /// `profiles/work.toml` is a link to a FIFO (#712).
+            ProfileFifoLink,
+            /// `profiles/` itself is a link to `/dev/null` (#712).
+            ProfilesDevNull,
+        }
+
+        impl NonRegular {
+            const ALL: [Self; 7] = [
+                Self::ConfigDir,
+                Self::ConfigFifo,
+                Self::ConfigDevNull,
+                Self::ProfileDevNull,
+                Self::ProfileFifo,
+                Self::ProfileFifoLink,
+                Self::ProfilesDevNull,
+            ];
+
+            /// Puts the case in the tree `tree` (`<root>/gen0/tessera`).
+            fn setup(self, tree: &Path) {
+                let config = tree.join("config.toml");
+                let profiles = tree.join("profiles");
+                let work = profiles.join("work.toml");
+                match self {
+                    Self::ConfigDir => std::fs::create_dir(&config).unwrap(),
+                    Self::ConfigFifo => mkfifo(&config),
+                    Self::ConfigDevNull => {
+                        std::os::unix::fs::symlink("/dev/null", &config).unwrap();
+                    }
+                    Self::ProfilesDevNull => {
+                        std::fs::write(&config, sized(11)).unwrap();
+                        std::os::unix::fs::symlink("/dev/null", &profiles).unwrap();
+                    }
+                    Self::ProfileDevNull | Self::ProfileFifo | Self::ProfileFifoLink => {
+                        std::fs::write(&config, sized(11)).unwrap();
+                        std::fs::create_dir(&profiles).unwrap();
+                        std::fs::write(profiles.join("home.toml"), work_profile("/bin/true"))
+                            .unwrap();
+                        match self {
+                            Self::ProfileDevNull => {
+                                std::os::unix::fs::symlink("/dev/null", &work).unwrap();
+                            }
+                            Self::ProfileFifo => mkfifo(&work),
+                            _ => {
+                                mkfifo(&tree.join("fifo"));
+                                std::os::unix::fs::symlink("../fifo", &work).unwrap();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        /// Writes a byte to `/dev/null`, which bumps its modification time
+        /// as any process's write to it does.
+        fn touch_dev_null() {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/null")
+                .and_then(|mut null| std::io::Write::write_all(&mut null, b"x"))
+                .unwrap();
+        }
+
+        /// #708, #712: a `config.toml` or profile entry that is not a
+        /// regular file (a directory, a FIFO, a link to `/dev/null`), or a
+        /// `profiles/` linked to `/dev/null`, is refused by the load and
+        /// registered by no handle: the handles still describe what the
+        /// store holds, so an unrelated event on a directory of the chain
+        /// changes nothing, however often the device's times change. Before
+        /// the fixes such a `config.toml` counted as a load that went to
+        /// another file than the one registered (its `stat`'s identity),
+        /// and a `/dev/null` entry's modification time, which any write
+        /// to it bumps, made each chain event a change. Nor does a poll of
+        /// an unarmed backend see a change. Deterministic: the events are
+        /// read off the queue here.
+        #[test]
+        fn non_regular_files_are_not_reloaded_by_chain_events() {
+            let mut reloaded = Vec::new();
+            for case in NonRegular::ALL {
+                let (_dir, base) = resolved_tempdir();
+                let home = base.join("home");
+                let tree = home.join("gen0").join("tessera");
+                std::fs::create_dir_all(&tree).unwrap();
+                case.setup(&tree);
+                std::os::unix::fs::symlink("gen0", home.join("cfg")).unwrap();
+                let paths = ConfigPaths::new(home.join("cfg").join("tessera"));
+                let store = ConfigStore::open(paths.clone()).unwrap();
+                let (mut native, _stop) = Native::open(&paths).unwrap();
+                native.settle(&store);
+                assert!(native.armed(), "{case:?}");
+
+                touch_dev_null();
+                // What a poll of an unarmed backend compares.
+                if native.changed_unseen() {
+                    reloaded.push((case, "a poll"));
+                }
+                std::fs::write(home.join("noise"), "x").unwrap();
+                let fd = chain_fd(&native, &home);
+                let event = event_on(&mut native, fd).expect("no event for the noise");
+                if !native.changes_nothing(&event) {
+                    reloaded.push((case, "a chain event"));
+                }
+            }
+            assert!(reloaded.is_empty(), "reloaded by: {reloaded:?}");
+        }
+
+        /// #708, #712: [`non_regular_files_are_not_reloaded_by_chain_events`]
+        /// with the thread running: bursts of chain events (and writes to
+        /// `/dev/null`) further apart than the debounce, each of which
+        /// reloaded and re-registered before the fixes, neither reload nor
+        /// re-register. An edit of `config.toml` made after them, which the
+        /// thread must read past them to see, is the only change: it
+        /// settles once (up to three times if its directory events, three
+        /// for the `ConfigDir` case, land in separate debounce windows)
+        /// and re-registers a few times.
+        #[test]
+        fn chain_noise_beside_non_regular_files_neither_rearms_nor_reloads() {
+            for case in [
+                NonRegular::ConfigDir,
+                NonRegular::ProfileDevNull,
+                NonRegular::ProfilesDevNull,
+            ] {
+                let (_dir, base) = resolved_tempdir();
+                let home = base.join("home");
+                let tree = home.join("gen0").join("tessera");
+                std::fs::create_dir_all(&tree).unwrap();
+                case.setup(&tree);
+                std::os::unix::fs::symlink("gen0", home.join("cfg")).unwrap();
+                let running = run_native(&home.join("cfg").join("tessera"), |native| {
+                    assert!(native.armed(), "{case:?}");
+                });
+                let settled = running.probe.settles();
+                let rearmed = running.probe.rearms();
+                for _ in 0..10 {
+                    touch_dev_null();
+                    for i in 0..5 {
+                        std::fs::write(home.join(format!("noise-{i}")), "x").unwrap();
+                    }
+                    std::thread::sleep(WatchOptions::default().debounce * 2);
+                }
+                let config = tree.join("config.toml");
+                if matches!(case, NonRegular::ConfigDir) {
+                    std::fs::remove_dir(&config).unwrap();
+                }
+                crate::write_atomic(&config, &sized(22)).unwrap();
+                assert!(applies(&running, 22, Duration::from_secs(5)), "{case:?}");
+                let settles = running.probe.settles() - settled;
+                let rearms = running.probe.rearms() - rearmed;
+                let max_settles = if matches!(case, NonRegular::ConfigDir) {
+                    3
+                } else {
+                    2
+                };
+                assert!(settles <= max_settles, "{case:?}: settled {settles} times");
+                assert!(rearms <= 4, "{case:?}: re-registered {rearms} times");
+            }
+        }
+
         /// #701 F2: an `unlink; symlink` retarget whose unlink lands
         /// between the load's `stat` of `config.toml` and its open. The
         /// load finds no file and applies the defaults, which the
@@ -5821,5 +6032,109 @@ mod tests {
         .clamped();
         assert_eq!(opts.debounce, Duration::from_millis(100));
         assert_eq!(opts.max_wait, MAX_WATCH_DURATION);
+    }
+
+    /// #708, #712: the polling backend samples a `config.toml` or a
+    /// `profiles/` linked to `/dev/null` by type alone, so writes to the
+    /// device, which bump its times on every write from anywhere, re-read
+    /// nothing. Before the fix each tick that saw the device's times move
+    /// re-read the configuration (silently for a `config.toml` refused
+    /// again with the same error). An edit made after the writes shows
+    /// the thread was sampling.
+    #[test]
+    fn polled_links_to_dev_null_reread_nothing_when_it_is_written() {
+        for link in ["config.toml", "profiles"] {
+            let dir = tempfile::tempdir().unwrap();
+            let config = dir.path().join("config.toml");
+            if link != "config.toml" {
+                std::fs::write(&config, "[appearance]\nfont_size = 11\n").unwrap();
+            }
+            std::os::unix::fs::symlink("/dev/null", dir.path().join(link)).unwrap();
+            let store = ConfigStore::open(ConfigPaths::new(dir.path())).unwrap();
+            let poll_interval = Duration::from_millis(10);
+            let debounce = Duration::from_millis(20);
+            let watcher = store
+                .watch(WatchOptions {
+                    backend: WatchBackend::Poll,
+                    poll_interval,
+                    debounce,
+                    ..WatchOptions::default()
+                })
+                .unwrap();
+            let loads = store.load_count();
+            // Writes further apart than a tick and the debounce, so each
+            // re-read on its own before the fix; a starved thread samples
+            // fewer of them, which only weakens the check.
+            for _ in 0..10 {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open("/dev/null")
+                    .and_then(|mut null| std::io::Write::write_all(&mut null, b"x"))
+                    .unwrap();
+                std::thread::sleep((poll_interval + debounce) * 2);
+            }
+            let reread = store.load_count() - loads;
+            // Replaces the link itself (a rename over it), not its target.
+            let staged = dir.path().join("staged.toml");
+            std::fs::write(&staged, "[appearance]\nfont_size = 22\n").unwrap();
+            std::fs::rename(&staged, &config).unwrap();
+            let event = watcher
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap_or_else(|e| panic!("{link}: no event for the edit: {e}"));
+            assert!(
+                matches!(&event, ConfigEvent::Changed(changed)
+                    if (changed.config.appearance.font_size - 22.0).abs() < f32::EPSILON),
+                "{link}: {event:?}"
+            );
+            assert_eq!(reread, 0, "{link}: re-read {reread} times");
+        }
+    }
+
+    /// #708, #712: a path of another type than the one read there is
+    /// fingerprinted by its type alone, so a write to `/dev/null`, which
+    /// bumps its times, is no change; one of the type read keeps its
+    /// times, and a missing one stays `Missing`.
+    #[test]
+    fn a_path_of_another_type_is_fingerprinted_by_its_type_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config.toml");
+        std::fs::write(&file, "").unwrap();
+        let null = Path::new("/dev/null");
+        let samples = || {
+            [
+                Fingerprint::of_file(null),
+                Fingerprint::of_dir(null),
+                Fingerprint::of_file(dir.path()),
+                Fingerprint::of_dir(&file),
+            ]
+        };
+        let before = samples();
+        assert!(
+            before.iter().all(|f| matches!(f, Fingerprint::Other(_))),
+            "{before:?}"
+        );
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(null)
+            .and_then(|mut null| std::io::Write::write_all(&mut null, b"x"))
+            .unwrap();
+        assert_eq!(samples(), before);
+        assert_ne!(
+            Fingerprint::of_file(null),
+            Fingerprint::of_file(dir.path()),
+            "a device and a directory are told apart"
+        );
+        assert!(matches!(
+            Fingerprint::of_file(&file),
+            Fingerprint::Present { len: 0, .. }
+        ));
+        assert!(matches!(
+            Fingerprint::of_dir(dir.path()),
+            Fingerprint::Present { .. }
+        ));
+        assert_eq!(
+            Fingerprint::of_file(&dir.path().join("missing")),
+            Fingerprint::Missing
+        );
     }
 }
