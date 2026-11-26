@@ -19,21 +19,43 @@ fn font_size_doc(size: u32) -> String {
     format!("[appearance]\nfont_size = {size}\n")
 }
 
-/// Rewrites `path` in place with `doc`, which is as long as what it holds
-/// (the [`font_size_doc`]s of two-digit sizes), waiting `stall` between
-/// the open and the write. It never truncates: `std::fs::write` empties
-/// the file first, and a writer stalled past the debounce there has the
-/// watcher read the empty file, which loads as the defaults (#720 B1).
+/// Rewrites `path` in place with `doc`, waiting `stall` between the open
+/// and the write. It never truncates: `std::fs::write` empties the file
+/// first, and a writer stalled past the debounce there has the watcher
+/// read the empty file, which loads as the defaults (#720 B1), so a test
+/// that takes the next event as its write's would fail on a right answer
+/// (#731). A `doc` shorter than what the file holds is padded with
+/// newlines to its length, which changes nothing it means, and the whole
+/// is one `write(2)`, as `save` in `tests/watch_themes.rs` does: however
+/// late the watcher reads, it sees the old document or the new one.
 fn rewrite_in_place(path: &std::path::Path, doc: &str, stall: Duration) {
     use std::io::Write as _;
     let mut file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
-    assert_eq!(
-        file.metadata().unwrap().len(),
-        u64::try_from(doc.len()).unwrap(),
-        "an in-place rewrite of another length"
-    );
+    let old = usize::try_from(file.metadata().unwrap().len()).unwrap();
+    let mut doc = doc.to_owned();
+    if doc.len() < old {
+        doc.push_str(&"\n".repeat(old - doc.len()));
+    }
     std::thread::sleep(stall);
-    file.write_all(doc.as_bytes()).unwrap();
+    let written = file.write(doc.as_bytes()).unwrap();
+    assert_eq!(written, doc.len(), "{}: one write", path.display());
+}
+
+/// Saves `doc` to `path`: in place with no stall ([`rewrite_in_place`]),
+/// or, where `path` names no file, written to a hidden file beside it and
+/// renamed there, as `save` in `tests/watch_themes.rs` does, so the
+/// watcher never reads a file created but not yet written.
+fn save(path: &std::path::Path, doc: &str) {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => rewrite_in_place(path, doc, Duration::ZERO),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let name = path.file_name().unwrap().to_str().unwrap();
+            let part = path.with_file_name(format!(".{name}.part"));
+            std::fs::write(&part, doc).unwrap();
+            std::fs::rename(&part, path).unwrap();
+        }
+        Err(error) => panic!("{}: {error}", path.display()),
+    }
 }
 
 /// How long a test waits for an event that is due (#253 item 9, #262 N2).
@@ -79,7 +101,7 @@ fn font_size_edit_is_observed_within_500ms() {
         assert_eq!(store.config().appearance.font_size, 13.0);
 
         let started = Instant::now();
-        std::fs::write(store.paths().config_file(), font_size_doc(17)).unwrap();
+        save(&store.paths().config_file(), &font_size_doc(17));
 
         let event = watcher
             .recv_timeout(LIMIT)
@@ -125,7 +147,7 @@ fn rapid_writes_are_debounced_into_one_event() {
         let mut written = Vec::new();
         let first_write = Instant::now();
         for size in 14..=20 {
-            std::fs::write(&path, font_size_doc(size)).unwrap();
+            save(&path, &font_size_doc(size));
             written.push(Instant::now());
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -169,9 +191,10 @@ fn rename_save_and_delete_are_observed() {
         // Editors commonly write a sibling file and rename it over the target.
         // The configuration directory is watched, so a writer stalled past
         // the debounce after creating it has that creation re-read the old
-        // file (`Unchanged`) before the rename's `Changed`, and a re-read
-        // of the file recreated empty finds the defaults applied (#720):
-        // those steps skip `Unchanged` ([`next_changed`]).
+        // file, which reports nothing since #731 (it was an `Unchanged`
+        // before the rename's `Changed`, #720), and a re-read of the file
+        // recreated empty finds the defaults applied: those steps skip
+        // `Unchanged` ([`next_changed`]).
         let tmp = path.with_extension("toml.new");
         std::fs::write(&tmp, font_size_doc(18)).unwrap();
         std::fs::rename(&tmp, &path).unwrap();
@@ -199,7 +222,7 @@ fn invalid_edit_reports_error_and_keeps_last_good_config() {
         let (_dir, store, watcher) = open_watched(options(backend));
         let path = store.paths().config_file();
 
-        std::fs::write(&path, "[appearance\n").unwrap();
+        save(&path, "[appearance\n");
         let event = watcher.recv_timeout(EVENTUALLY).expect("event");
         assert!(
             matches!(event, ConfigEvent::Invalid(_)),
@@ -208,7 +231,7 @@ fn invalid_edit_reports_error_and_keeps_last_good_config() {
         assert_eq!(*store.config(), Config::default());
         assert!(store.last_error().is_some());
 
-        std::fs::write(&path, font_size_doc(15)).unwrap();
+        save(&path, &font_size_doc(15));
         let changed = expect_changed(watcher.recv_timeout(EVENTUALLY).expect("event"), backend);
         assert_eq!(changed.config.appearance.font_size, 15.0);
         assert!(store.last_error().is_none());
@@ -221,7 +244,7 @@ fn repairing_file_to_unchanged_config_still_emits_changed() {
         let (_dir, store, watcher) = open_watched(options(backend));
         let path = store.paths().config_file();
 
-        std::fs::write(&path, "[appearance\n").unwrap();
+        save(&path, "[appearance\n");
         let event = watcher.recv_timeout(EVENTUALLY).expect("event");
         assert!(matches!(event, ConfigEvent::Invalid(_)), "{event:?}");
 
@@ -274,7 +297,7 @@ fn comment_only_edit_reports_unchanged_once() {
         let path = store.paths().config_file();
         let mut text = std::fs::read_to_string(&path).unwrap();
         text.push_str("\n# trailing comment\n");
-        std::fs::write(&path, text).unwrap();
+        save(&path, &text);
         let event = watcher
             .recv_timeout(EVENTUALLY)
             .unwrap_or_else(|e| panic!("{backend:?}: the re-read reported nothing: {e}"));
@@ -295,45 +318,63 @@ fn comment_only_edit_reports_unchanged_once() {
 
 /// A save undone inside the debounce (another app restores the text it
 /// replaced) is read as one unchanged configuration: the watcher reports
-/// `Unchanged`, never nothing, and applies nothing (#535).
+/// `Unchanged`, never nothing, and applies nothing (#535). So is one of a
+/// profile file, which leaves `config.toml` alone (#731: the files the
+/// load reads include the profile files).
 #[test]
 fn a_save_undone_inside_the_debounce_reports_unchanged() {
     for backend in BACKENDS {
-        let dir = tempfile::tempdir().unwrap();
-        let paths = ConfigPaths::new(dir.path());
-        std::fs::write(paths.config_file(), font_size_doc(13)).unwrap();
-        let store = ConfigStore::open(paths).unwrap();
-        let watcher = store
-            .watch(WatchOptions {
-                backend,
-                poll_interval: Duration::from_millis(10),
-                // Long enough that a loaded machine still lands the undo
-                // inside it.
-                debounce: Duration::from_millis(500),
-                ..Default::default()
-            })
-            .unwrap();
-        let before = store.config();
-        let path = store.paths().config_file();
-        std::fs::write(&path, font_size_doc(14)).unwrap();
-        std::thread::sleep(Duration::from_millis(40));
-        std::fs::write(&path, font_size_doc(13)).unwrap();
-        let event = watcher
-            .recv_timeout(EVENTUALLY)
-            .unwrap_or_else(|e| panic!("{backend:?}: the re-read reported nothing: {e}"));
-        assert!(
-            matches!(event, ConfigEvent::Unchanged),
-            "{backend:?}: {event:?}"
-        );
-        assert!(
-            watcher.recv_timeout(Duration::from_millis(300)).is_err(),
-            "{backend:?}: reported once"
-        );
-        assert!(
-            Arc::ptr_eq(&before, &store.config()),
-            "{backend:?}: nothing applied"
-        );
-        assert_eq!(store.config().appearance.font_size, 13.0);
+        for profile in [false, true] {
+            let what = format!("{backend:?} profile={profile}");
+            let dir = tempfile::tempdir().unwrap();
+            let paths = ConfigPaths::new(dir.path());
+            std::fs::write(paths.config_file(), font_size_doc(13)).unwrap();
+            std::fs::create_dir_all(paths.profiles_dir()).unwrap();
+            let profile_file = paths.profiles_dir().join("a.toml");
+            std::fs::write(&profile_file, "command = \"/bin/a1\"\n").unwrap();
+            let store = ConfigStore::open(paths).unwrap();
+            let watcher = store
+                .watch(WatchOptions {
+                    backend,
+                    poll_interval: Duration::from_millis(10),
+                    // Long enough that a loaded machine still lands the undo
+                    // inside it.
+                    debounce: Duration::from_millis(500),
+                    ..Default::default()
+                })
+                .unwrap();
+            while watcher.try_recv().is_ok() {}
+            let before = store.config();
+            let (path, edit, undo) = if profile {
+                (
+                    profile_file,
+                    "command = \"/bin/a2\"\n".to_owned(),
+                    "command = \"/bin/a1\"\n".to_owned(),
+                )
+            } else {
+                (
+                    store.paths().config_file(),
+                    font_size_doc(14),
+                    font_size_doc(13),
+                )
+            };
+            save(&path, &edit);
+            std::thread::sleep(Duration::from_millis(40));
+            save(&path, &undo);
+            let event = watcher
+                .recv_timeout(EVENTUALLY)
+                .unwrap_or_else(|e| panic!("{what}: the re-read reported nothing: {e}"));
+            assert!(matches!(event, ConfigEvent::Unchanged), "{what}: {event:?}");
+            assert!(
+                watcher.recv_timeout(Duration::from_millis(300)).is_err(),
+                "{what}: reported once"
+            );
+            assert!(
+                Arc::ptr_eq(&before, &store.config()),
+                "{what}: nothing applied"
+            );
+            assert_eq!(store.config().appearance.font_size, 13.0, "{what}");
+        }
     }
 }
 
@@ -345,7 +386,7 @@ fn zero_poll_interval_does_not_spin_and_still_works() {
         debounce: Duration::from_millis(30),
         ..Default::default()
     });
-    std::fs::write(store.paths().config_file(), font_size_doc(22)).unwrap();
+    save(&store.paths().config_file(), &font_size_doc(22));
     let changed = expect_changed(
         watcher.recv_timeout(EVENTUALLY).expect("event"),
         WatchBackend::Poll,
@@ -375,7 +416,7 @@ fn huge_max_wait_and_poll_interval_still_observe_an_edit() {
             max_wait: Duration::MAX,
             ..Default::default()
         });
-        std::fs::write(store.paths().config_file(), font_size_doc(24)).unwrap();
+        save(&store.paths().config_file(), &font_size_doc(24));
         let event = watcher
             .recv_timeout(EVENTUALLY)
             .unwrap_or_else(|e| panic!("{backend:?}: no event within 500 ms: {e}"));
@@ -383,7 +424,7 @@ fn huge_max_wait_and_poll_interval_still_observe_an_edit() {
         assert_eq!(changed.config.appearance.font_size, 24.0);
 
         // A second edit proves the thread survived the first debounce.
-        std::fs::write(store.paths().config_file(), font_size_doc(25)).unwrap();
+        save(&store.paths().config_file(), &font_size_doc(25));
         let event = watcher
             .recv_timeout(EVENTUALLY)
             .unwrap_or_else(|e| panic!("{backend:?}: thread died after the first edit: {e}"));
@@ -407,7 +448,7 @@ fn huge_debounce_keeps_the_thread_alive_and_stoppable() {
             max_wait: Duration::MAX,
             ..Default::default()
         });
-        std::fs::write(store.paths().config_file(), font_size_doc(26)).unwrap();
+        save(&store.paths().config_file(), &font_size_doc(26));
         assert!(
             matches!(
                 watcher.recv_timeout(Duration::from_millis(200)),
@@ -454,7 +495,7 @@ fn native_backend_is_event_driven_not_polled() {
         debounce: Duration::from_millis(50),
         ..Default::default()
     });
-    std::fs::write(store.paths().config_file(), font_size_doc(23)).unwrap();
+    save(&store.paths().config_file(), &font_size_doc(23));
     let changed = expect_changed(
         watcher.recv_timeout(EVENTUALLY).expect("kernel event"),
         WatchBackend::Native,
@@ -565,7 +606,7 @@ fn every_watcher_on_a_store_receives_every_event() {
         let first = store.watch(options(backend)).unwrap();
         let second = store.watch(options(backend)).unwrap();
 
-        std::fs::write(store.paths().config_file(), font_size_doc(17)).unwrap();
+        save(&store.paths().config_file(), &font_size_doc(17));
         for (name, watcher) in [("first", &first), ("second", &second)] {
             let changed = next_changed(watcher, backend, name);
             assert_eq!(
@@ -577,7 +618,7 @@ fn every_watcher_on_a_store_receives_every_event() {
 
         // Dropping one watcher does not affect the other.
         drop(first);
-        std::fs::write(store.paths().config_file(), font_size_doc(18)).unwrap();
+        save(&store.paths().config_file(), &font_size_doc(18));
         let changed = next_changed(&second, backend, "second");
         assert_eq!(changed.config.appearance.font_size, 18.0);
         expect_only_unchanged(&second, backend, "second");
@@ -592,7 +633,7 @@ fn invalid_edit_is_reported_once_to_each_of_two_watchers() {
         let first = store.watch(options(backend)).unwrap();
         let second = store.watch(options(backend)).unwrap();
 
-        std::fs::write(store.paths().config_file(), "[appearance\n").unwrap();
+        save(&store.paths().config_file(), "[appearance\n");
         for (name, watcher) in [("first", &first), ("second", &second)] {
             let event = watcher
                 .recv_timeout(EVENTUALLY)
@@ -608,7 +649,7 @@ fn invalid_edit_is_reported_once_to_each_of_two_watchers() {
         }
 
         // A different error after the first is still news.
-        std::fs::write(store.paths().config_file(), "[x\n").unwrap();
+        save(&store.paths().config_file(), "[x\n");
         for watcher in [&first, &second] {
             let event = watcher.recv_timeout(EVENTUALLY).expect("second error");
             assert!(matches!(event, ConfigEvent::Invalid(_)), "{event:?}");
@@ -642,7 +683,7 @@ fn symlink_target_deleted_and_recreated_is_followed() {
         expect_invalid(watcher.recv_timeout(EVENTUALLY).expect("delete"), backend);
         assert_eq!(store.config().appearance.font_size, 10.0, "{backend:?}");
 
-        std::fs::write(&target, font_size_doc(14)).unwrap();
+        save(&target, &font_size_doc(14));
         let changed = expect_changed(
             watcher
                 .recv_timeout(EVENTUALLY)
@@ -652,7 +693,7 @@ fn symlink_target_deleted_and_recreated_is_followed() {
         assert_eq!(changed.config.appearance.font_size, 14.0, "{backend:?}");
 
         // An in-place edit of the recreated target is still seen too.
-        std::fs::write(&target, font_size_doc(15)).unwrap();
+        save(&target, &font_size_doc(15));
         let changed = expect_changed(watcher.recv_timeout(EVENTUALLY).expect("edit"), backend);
         assert_eq!(changed.config.appearance.font_size, 15.0, "{backend:?}");
 
@@ -688,7 +729,7 @@ fn symlink_target_directory_removed_and_recreated_is_followed() {
         assert_eq!(store.config().appearance.font_size, 10.0, "{backend:?}");
 
         std::fs::create_dir(&dotfiles).unwrap();
-        std::fs::write(&target, font_size_doc(16)).unwrap();
+        save(&target, &font_size_doc(16));
         let changed = expect_changed(
             watcher
                 .recv_timeout(EVENTUALLY)
@@ -697,7 +738,7 @@ fn symlink_target_directory_removed_and_recreated_is_followed() {
         );
         assert_eq!(changed.config.appearance.font_size, 16.0, "{backend:?}");
 
-        std::fs::write(&target, font_size_doc(17)).unwrap();
+        save(&target, &font_size_doc(17));
         let changed = expect_changed(watcher.recv_timeout(EVENTUALLY).expect("after"), backend);
         assert_eq!(changed.config.appearance.font_size, 17.0, "{backend:?}");
     }
@@ -712,8 +753,9 @@ fn symlink_target_directory_removed_and_recreated_is_followed() {
 /// Each step skips the `Unchanged` reports that may come before its
 /// `Changed` (#720, [`next_changed`]): the native backend watches the
 /// target's directory, so a writer stalled past the debounce between
-/// creating the temporary file and renaming it has the creation re-read
-/// the old file first ([`symlink_target_rename_save_stalled_past_the_debounce_is_observed`]).
+/// creating the temporary file and renaming it had the creation re-read
+/// the old file first and report `Unchanged`, which it no longer does
+/// (#731, [`a_stalled_rename_save_reports_only_its_change`]).
 #[cfg(unix)]
 #[test]
 fn symlink_target_rename_save_then_in_place_write_is_observed() {
@@ -757,12 +799,12 @@ fn symlink_target_rename_save_then_in_place_write_is_observed() {
 /// watcher: it reproduces #720 by stalling each of its writers past the
 /// debounce, as a loaded CI runner did. The native backend watches the
 /// directory of the link's target, so the temporary file's creation
-/// alone starts a re-read that finds the old file and reports `Unchanged`
-/// (#535) before the rename's `Changed`: taking the first event as the
-/// rename's fails here as it did on CI. The in-place write stalls between
-/// its open and its write, so a writer that truncated first
-/// (`std::fs::write`) would have both backends read an empty file, which
-/// loads as the defaults ([`rewrite_in_place`]).
+/// alone could start a re-read that finds the old file; that re-read
+/// reported `Unchanged` (#535) before the rename's `Changed` until #731,
+/// so taking the first event as the rename's failed here as it did on CI.
+/// The in-place write stalls between its open and its write, so a writer
+/// that truncated first (`std::fs::write`) would have both backends read
+/// an empty file, which loads as the defaults ([`rewrite_in_place`]).
 #[cfg(unix)]
 #[test]
 fn symlink_target_rename_save_stalled_past_the_debounce_is_observed() {
@@ -806,6 +848,140 @@ fn symlink_target_rename_save_stalled_past_the_debounce_is_observed() {
     }
 }
 
+/// #535, kept by #731: a theme file added to `themes/` leaves the
+/// configuration alone, and its re-read still reports `Unchanged`, before
+/// the `ThemesChanged`, so a host that lists the themes when a
+/// configuration is announced (Settings) sees the new one. Only a re-read
+/// that finds both the files the load reads and `themes/` as they were
+/// reports nothing.
+#[test]
+fn a_theme_file_added_reports_unchanged_then_themes_changed() {
+    for backend in BACKENDS {
+        let (_dir, store, watcher) = open_watched(WatchOptions {
+            backend,
+            poll_interval: Duration::from_millis(10),
+            debounce: Duration::from_millis(30),
+            ..Default::default()
+        });
+        let themes = store.paths().themes_dir();
+        let part = themes.join(".added.toml.part");
+        std::fs::write(&part, "name = \"Added\"\nbackground = \"#202020\"\n").unwrap();
+        std::fs::rename(&part, themes.join("added.toml")).unwrap();
+        let mut events = Vec::new();
+        while events.len() < 2 {
+            match watcher.recv_timeout(EVENTUALLY) {
+                Ok(event) => events.push(event),
+                Err(e) => panic!("{backend:?}: after {events:?}: {e}"),
+            }
+        }
+        assert!(
+            matches!(
+                events[..],
+                [ConfigEvent::Unchanged, ConfigEvent::ThemesChanged]
+            ),
+            "{backend:?}: {events:?}"
+        );
+    }
+}
+
+/// Where [`a_stalled_rename_save_reports_only_its_change`] saves.
+#[derive(Debug, Clone, Copy)]
+enum Saved {
+    /// `config.toml`, its temporary file beside it.
+    Config,
+    /// A linked `config.toml`'s target, its temporary file beside that.
+    #[cfg(unix)]
+    LinkTarget,
+    /// A profile file, its temporary file in `profiles/`.
+    Profile,
+}
+
+/// #731: a rename-save whose writer stalls past the debounce between
+/// creating its temporary file and renaming it over the file is one
+/// event, the rename's `Changed` with the new value, on both backends and
+/// wherever the file is. The temporary file's creation starts a re-read
+/// (the native backend watches the directories, the polling one samples
+/// `profiles/` itself), which finds the files the load reads as they were
+/// and so reports nothing: an `Unchanged` there would have a host that
+/// waits to see the save (Settings, through `on_config_applied`) read the
+/// old value and settle on it until the `Changed` came. Hidden names, as
+/// `write_atomic` and the editor use.
+#[test]
+fn a_stalled_rename_save_reports_only_its_change() {
+    /// Ten times the debounce below: the re-read the temporary file starts
+    /// is over long before the rename, on all but a starved machine, where
+    /// the two coalesce and the test still holds.
+    const STALL: Duration = Duration::from_millis(500);
+    let saved = [
+        Saved::Config,
+        #[cfg(unix)]
+        Saved::LinkTarget,
+        Saved::Profile,
+    ];
+    for backend in BACKENDS {
+        for place in saved {
+            let what = format!("{backend:?} {place:?}");
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("Tessera");
+            let paths = ConfigPaths::new(&root);
+            std::fs::create_dir_all(paths.profiles_dir()).unwrap();
+            let (file, doc) = match place {
+                Saved::Config => {
+                    std::fs::write(paths.config_file(), font_size_doc(13)).unwrap();
+                    (paths.config_file(), font_size_doc(14))
+                }
+                #[cfg(unix)]
+                Saved::LinkTarget => {
+                    let dotfiles = dir.path().join("dotfiles");
+                    std::fs::create_dir(&dotfiles).unwrap();
+                    let target = dotfiles.join("tessera.toml");
+                    std::fs::write(&target, font_size_doc(13)).unwrap();
+                    std::os::unix::fs::symlink(&target, paths.config_file()).unwrap();
+                    (target, font_size_doc(14))
+                }
+                Saved::Profile => {
+                    std::fs::write(paths.config_file(), font_size_doc(13)).unwrap();
+                    let profile = paths.profiles_dir().join("a.toml");
+                    std::fs::write(&profile, "command = \"/bin/a1\"\n").unwrap();
+                    (profile, "command = \"/bin/a2\"\n".to_owned())
+                }
+            };
+            let store = ConfigStore::open(paths).unwrap();
+            let watcher = store
+                .watch(WatchOptions {
+                    backend,
+                    poll_interval: Duration::from_millis(10),
+                    debounce: Duration::from_millis(50),
+                    ..Default::default()
+                })
+                .unwrap();
+            while watcher.try_recv().is_ok() {}
+
+            let name = file.file_name().unwrap().to_str().unwrap();
+            let tmp = file.with_file_name(format!(".{name}.731.tmp"));
+            std::fs::write(&tmp, &doc).unwrap();
+            std::thread::sleep(STALL);
+            std::fs::rename(&tmp, &file).unwrap();
+
+            let event = watcher
+                .recv_timeout(EVENTUALLY)
+                .unwrap_or_else(|e| panic!("{what}: the rename was not reported: {e}"));
+            let changed = expect_changed(event, backend);
+            match place {
+                Saved::Profile => assert_eq!(
+                    changed.config.profiles[0].command.as_deref(),
+                    Some("/bin/a2"),
+                    "{what}"
+                ),
+                _ => assert_eq!(changed.config.appearance.font_size, 14.0, "{what}"),
+            }
+            if let Ok(event) = watcher.recv_timeout(Duration::from_millis(300)) {
+                panic!("{what}: then {event:?}");
+            }
+        }
+    }
+}
+
 #[test]
 fn removing_and_recreating_the_root_directory_is_followed() {
     for backend in BACKENDS {
@@ -833,7 +1009,7 @@ fn removing_and_recreating_the_root_directory_is_followed() {
 
         // And kernel events are back in use afterwards: a further write is
         // still seen.
-        std::fs::write(paths.config_file(), font_size_doc(31)).unwrap();
+        save(&paths.config_file(), &font_size_doc(31));
         let changed = expect_changed(watcher.recv_timeout(EVENTUALLY).expect("after"), backend);
         assert_eq!(changed.config.appearance.font_size, 31.0);
     }
@@ -873,7 +1049,7 @@ fn unreadable_then_restored_file_is_followed() {
         assert!(store.last_error().is_none(), "{backend:?}");
 
         // An in-place rewrite afterwards is seen as before.
-        std::fs::write(&path, font_size_doc(45)).unwrap();
+        save(&path, &font_size_doc(45));
         let changed = expect_changed(
             watcher
                 .recv_timeout(EVENTUALLY)
@@ -929,7 +1105,7 @@ fn watch_starts_over_an_unopenable_file_and_recovers() {
             .watch(options(backend))
             .unwrap_or_else(|e| panic!("{backend:?}: watch failed on a cycle: {e}"));
         std::fs::remove_file(&other).unwrap();
-        std::fs::write(&other, font_size_doc(22)).unwrap();
+        save(&other, &font_size_doc(22));
         let changed = expect_changed(
             watcher
                 .recv_timeout(EVENTUALLY)
@@ -1032,11 +1208,17 @@ fn write_config(dir: &std::path::Path, font_size: u32, clipboard_write: bool) {
     std::fs::create_dir_all(dir).unwrap();
     std::fs::write(
         dir.join("config.toml"),
-        format!(
-            "[appearance]\nfont_size = {font_size}\n[terminal]\nclipboard_write = {clipboard_write}\n"
-        ),
+        config_doc(font_size, clipboard_write),
     )
     .unwrap();
+}
+
+/// The `config.toml` [`write_config`] writes.
+#[cfg(unix)]
+fn config_doc(font_size: u32, clipboard_write: bool) -> String {
+    format!(
+        "[appearance]\nfont_size = {font_size}\n[terminal]\nclipboard_write = {clipboard_write}\n"
+    )
 }
 
 /// Points the symlink `link` at `target` atomically (a new link renamed
@@ -1092,7 +1274,7 @@ fn retargeting_a_symlinked_configuration_directory_is_followed() {
         assert!(!config.terminal.clipboard_write, "{backend:?}: writes off");
         assert!(!store.config().terminal.clipboard_write, "{backend:?}");
 
-        write_config(&gen2.join("tessera"), 21, false);
+        save(&gen2.join("tessera/config.toml"), &config_doc(21, false));
         expect_font_size(
             &watcher,
             21.0,
@@ -1127,7 +1309,7 @@ fn retargeting_a_link_above_the_configuration_directory_is_followed() {
         let config = expect_font_size(&watcher, 20.0, &format!("{backend:?} retarget"));
         assert!(!config.terminal.clipboard_write, "{backend:?}: writes off");
 
-        write_config(&gen2.join("tessera"), 21, false);
+        save(&gen2.join("tessera/config.toml"), &config_doc(21, false));
         expect_font_size(
             &watcher,
             21.0,
@@ -1165,7 +1347,7 @@ fn a_retarget_past_the_link_cap_is_applied_by_polling() {
         let config = expect_font_size(&watcher, 20.0, &format!("{backend:?} retarget"));
         assert!(!config.terminal.clipboard_write, "{backend:?}: writes off");
 
-        write_config(&gen2.join("tessera"), 21, false);
+        save(&gen2.join("tessera/config.toml"), &config_doc(21, false));
         expect_font_size(
             &watcher,
             21.0,

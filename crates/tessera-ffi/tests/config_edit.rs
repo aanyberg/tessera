@@ -96,9 +96,11 @@ fn settled(applied: &AtomicU64, n: u64) -> u64 {
 
 /// Waits for the announcements of one write after `n` and returns the
 /// settled count: one for the apply, plus at most one `Unchanged` from a
-/// re-read that read the file before the write's rename or after it was
-/// applied (a slow `fsync` or a late event on a loaded machine, #535).
-/// More is a double announcement.
+/// re-read whose sample of the files raced the load: the watcher samples
+/// the files the load reads, then loads, so a write landing between the
+/// two is loaded by one re-read and still differs from its sample at the
+/// next, which finds it applied and reports `Unchanged` (a late event on
+/// a loaded machine, #535, #731). More is a double announcement.
 fn applied_once(applied: &AtomicU64, n: u64, what: &str) -> u64 {
     let seen = settled(applied, n + 1);
     assert!(

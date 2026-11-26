@@ -8,7 +8,7 @@ use crate::load::{
 };
 use crate::paths::ConfigPaths;
 use crate::theme::{ResolvedTheme, Theme};
-use crate::watch::{ConfigEvent, ThemesFingerprint, WatchOptions, Watcher};
+use crate::watch::{ConfigEvent, ReadFingerprint, ThemesFingerprint, WatchOptions, Watcher};
 use crate::{Config, Error};
 
 /// Holds the configuration currently applied to the application and keeps it
@@ -72,6 +72,10 @@ pub(crate) struct State {
     /// The themes directory's state when a watcher last sampled it, `None`
     /// before the first sample; see [`ConfigStore::record_themes`].
     themes: Option<ThemesFingerprint>,
+    /// The files a load reads (`config.toml` and the profile files) as a
+    /// watcher sampled them before its last re-read, `None` before the
+    /// first; see [`ConfigStore::record_read`].
+    read: Option<ReadFingerprint>,
     /// Called after each [`ConfigStore::broadcast`], on the broadcasting
     /// thread: a subscriber that reacts to an event before the watcher
     /// thread goes on, for tests of what the watcher does after reporting.
@@ -164,6 +168,7 @@ impl ConfigStore {
                 subscribers: Vec::new(),
                 next_subscription: 0,
                 themes: None,
+                read: None,
                 #[cfg(test)]
                 on_broadcast: None,
                 #[cfg(test)]
@@ -493,6 +498,25 @@ impl ConfigStore {
             .as_ref()
             .is_some_and(|previous| *previous != themes);
         state.themes = Some(themes);
+        news
+    }
+
+    /// Records the files a load reads as a watcher sampled them before a
+    /// re-read.
+    ///
+    /// Returns whether one of them changed since the sample recorded
+    /// before: `true` for the first sample too. A re-read that finds the
+    /// configuration applied reports [`ConfigEvent::Unchanged`] only then
+    /// (or when `themes/` changed), so the temporary file of a stalled
+    /// rename-save, created beside `config.toml` a debounce or more before
+    /// its rename, reports nothing: the host is not told the file was
+    /// read before the save is on disk (#731). Kept in the store, as the
+    /// themes state is, so of several watchers of one store the first to
+    /// sample a change reports it.
+    pub(crate) fn record_read(&self, read: ReadFingerprint) -> bool {
+        let mut state = self.write();
+        let news = state.read.as_ref() != Some(&read);
+        state.read = Some(read);
         news
     }
 

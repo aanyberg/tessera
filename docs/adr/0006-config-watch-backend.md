@@ -405,15 +405,14 @@ after a change on disk loads successfully and the store finds nothing new
 (`ConfigStore::apply` returns `None`): a save undone inside the debounce,
 a rewrite with the same text, a comment-only edit, a change in
 `themes/` or `profiles/` that leaves the configuration alone (then before
-its `ThemesChanged`), or the temporary file of a rename-save created
-beside `config.toml` (or beside a linked `config.toml`'s target) a
-debounce or more before its rename, whose own `Changed` then follows
-(#720). Every re-read of a good file thus reports `Changed`
-or `Unchanged`. The catch-up when a watcher starts sends nothing for an
-unchanged file, and a repeated load error still sends nothing. Several
-watchers of one store each send their own `Unchanged`, so one change can
-reach a watcher as a `Changed` and, from the other watcher's re-read, an
-`Unchanged`.
+its `ThemesChanged`). Until #731 the temporary file of a rename-save
+created a debounce or more before its rename sent one too (#720); see
+the #731 amendment. Every re-read of a good file that finds changed
+files thus reports `Changed` or `Unchanged`. The catch-up when a watcher
+starts sends nothing for an unchanged file, and a repeated load error
+still sends nothing. Several watchers of one store each sent their own
+`Unchanged` until #731; they now share one sample of the files, so only
+the first to re-read a change reports it (see the #731 amendment).
 
 app-core handles `Unchanged` without restyling: no look generation, no
 session look, no `on_appearance_changed`. It moves the configuration
@@ -473,3 +472,49 @@ polls slowly, as past a cap. A link that expands into itself (`a -> a/b`)
 is no cycle the walk can tell; it stops at the link cap as before. The
 `themes/` directory, which the walk does not cover, still counts a cycle
 as a registration error and polls until it is broken.
+
+## Amendment: an unchanged re-read of unchanged files is quiet (#731, 2026-11-26)
+
+**Context.** A rename-save whose temporary file was created a debounce or
+more before its rename (a slow write or `fsync`, a loaded machine) settled
+twice: once at the temporary file, finding the configuration applied,
+which sent `Unchanged`, and once at the rename, which sent `Changed`. The
+`Unchanged` moved the configuration generation first, so Settings, which
+drops a pending value once it reads a later generation (ADR 0044), showed
+the old value until the `Changed` was applied.
+
+**Decision.** Before each load, the watcher samples what the load reads:
+`config.toml` (modification time, length, inode and change time, or for a
+path of another type its type alone, as the poll backend samples it) and
+each `*.toml` file in `profiles/` (the directory's own fingerprint left
+out). The sample is kept on the store. A re-read that finds the
+configuration applied sends `Unchanged` only when that sample differs from
+the one the previous re-read took, or when `themes/` changed (then still
+before its `ThemesChanged`). A temporary file is hidden and not a
+`*.toml` file (`.config.toml.<pid>.<n>.tmp` from `write_atomic`), so it
+changes no sample and its re-read sends nothing; the `Changed` at the
+rename is the save's one announcement. On a file system with fine
+timestamps (APFS, exFAT), a save undone inside the debounce, a rewrite
+with the same text and a comment-only edit still change the sample and
+still send `Unchanged`, so #535 holds there; see the known limit below
+for HFS+ and FAT. Several watchers of one
+store share the sample: the first to re-read after a change reports it,
+and the others, finding the files as sampled, send nothing, where before
+each sent its own `Unchanged`. Every consumer of `Unchanged` (app-core's
+generation and `on_config_applied`, Settings' settle rule) is unchanged.
+
+**Consequences.** Each settle stats `config.toml` and lists `profiles/`
+once more (at most `MAX_PROFILE_FILES` files). On APFS and exFAT any
+write to a file the load reads moves its change time, so no edit of one
+goes unreported.
+
+**Known limit: coarse timestamps.** HFS+ keeps modification and change
+times to 1 s, and FAT to 2 s; FAT also reuses inode numbers on rename.
+There, an in-place change that keeps the file's length and its undo
+within one timestamp tick leave the sample as it was, and so does a
+rename-save and its undo inside the debounce on FAT: the re-read sends
+no `Unchanged`. The stale draft #535 fixed returns only in that case: a
+configuration directory on such a file system (in practice FAT) and
+another writer undoing a save within about 100 ms of it. Settings then
+shows its saved value until the next apply or until its window opens
+again.
