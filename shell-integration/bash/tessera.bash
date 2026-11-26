@@ -701,10 +701,21 @@ if [[ $- == *i* && -n "${TESSERA_SHELL_INTEGRATION-}" && "${TESSERA_SHELL_INTEGR
         _tessera_si_close_out
         _tessera_si_disarm=
         _tessera_si_armed=
+        # Under `set -x` the head turns it off for its DEBUG trap read
+        # (_tessera_si_h_x): the test is here, in a function, so without
+        # `set -T` no DEBUG trap of the user's runs for it. A head stopped
+        # between the switches (a Ctrl-C in the read's fork, as long as the
+        # user's trap takes there under `set -T`) left _tessera_si_xoff
+        # set: `set -x` comes back here, at the next prompt.
+        if [[ -o xtrace || -n $_tessera_si_xoff ]]; then
+            [[ -z $_tessera_si_xoff ]] || builtin set -x
+            _tessera_si_h=$_tessera_si_h_x
+        else
+            _tessera_si_h=$_tessera_si_h_full
+        fi
         # bash 5.1+: once bash-preexec is loaded and PROMPT_COMMAND is an
         # array, the head installs no trap of ours (bash-preexec's own runs;
         # the tail hands the shell to bash-preexec's hooks, _tessera_si_to_bp).
-        _tessera_si_h=$_tessera_si_h_full
         if [[ -n "$_tessera_si_arrays" && -z "$_tessera_si_bp" &&
             -n "${bash_preexec_imported-}${__bp_imported-}" ]] && _tessera_si_is_array; then
             _tessera_si_h='_tessera_si_epipe='
@@ -1005,7 +1016,14 @@ builtin eval "$_tessera_si_prev_trap" && _tessera_si_nop'
         fi
         # The copies for the C, only when a trap of ours will close them.
         _tessera_si_open_out
-        _tessera_si_go=$_tessera_si_h_full
+        # `set -x` off for the read, and back after a stopped head, as in
+        # _tessera_si_precmd.
+        if [[ -o xtrace || -n $_tessera_si_xoff ]]; then
+            [[ -z $_tessera_si_xoff ]] || builtin set -x
+            _tessera_si_go=$_tessera_si_h_x
+        else
+            _tessera_si_go=$_tessera_si_h_full
+        fi
         builtin return 0
     }
 
@@ -1274,6 +1292,9 @@ builtin eval "$_tessera_si_prev_trap" && _tessera_si_nop'
     _tessera_si_tail=
     _tessera_si_h=
     _tessera_si_h_full=
+    _tessera_si_h_x=
+    # Set while the head has `set -x` off for its read (_tessera_si_h_x).
+    _tessera_si_xoff=
     # Set by the head at each prompt, cleared by the tail (see
     # _tessera_si_headless).
     _tessera_si_headran=
@@ -1430,6 +1451,18 @@ case ${FUNCNAME[0]-} in _tessera_si_*) _tessera_si_now= ;; esac'
         # _tessera_si_precmd returns 0; the eval ends with the user's
         # status, handed on as the first command of an `&&` list.
         _tessera_si_h_full=$_tessera_si_read_trap$'\nbuiltin trap -- "$_tessera_si_trap" DEBUG\n_tessera_si_pass && _tessera_si_nop'
+        # Under `set -x` with BASH_XTRACEFD=3 (bash 4.1 and later) the
+        # fork's trace of `trap -p` went into the read as well (#740): the
+        # user's trap was taken for something else and lost. The head
+        # _tessera_si_precmd or _tessera_si_element picks under `set -x`
+        # turns it off for the read and back on right after it (run while
+        # it is off, `builtin set -x` adds no trace line), as the --rcfile
+        # route's INT trap check does (#733). _tessera_si_xoff is set
+        # before `set +x` and cleared only after `set -x` (one trace line,
+        # `_tessera_si_xoff=`): the user's DEBUG trap runs before each of
+        # these commands, and a Ctrl-C in it stops the head there, so
+        # `set -x` is never off with the flag empty.
+        _tessera_si_h_x=$'_tessera_si_xoff=1\nbuiltin set +x\n'$_tessera_si_read_trap$'\nbuiltin set -x\n_tessera_si_xoff=\nbuiltin trap -- "$_tessera_si_trap" DEBUG\n_tessera_si_pass && _tessera_si_nop'
         _tessera_si_h=$_tessera_si_h_full
         # shellcheck disable=SC2016
         _tessera_si_head_el='_tessera_si_precmd && builtin eval "$_tessera_si_h" && _tessera_si_nop'

@@ -589,7 +589,7 @@ mod rcexit {
     pub(super) const TESTED: &[&str] = &[
         "E1", "E2", "E3", "E4", "E5", "E6", "E7", "E8", "E9", "E10", "E11", "E12", "E13", "E14",
         "E15", "E16", "E17", "E18", "E19", "E20", "E21", "E22", "E23", "E24", "E25", "E26", "E27",
-        "E28", "E29", "E30", "E31", "E32", "E33", "E34", "E35",
+        "E28", "E29", "E30", "E31", "E32", "E33", "E34", "E35", "E36", "E37", "E38", "E39", "E40",
     ];
     row_tests!(rcexit_row:
         e1 => "E1", e2 => "E2", e3 => "E3", e4 => "E4", e5 => "E5", e6 => "E6", e7 => "E7",
@@ -597,7 +597,8 @@ mod rcexit {
         e14 => "E14", e15 => "E15", e16 => "E16", e17 => "E17", e18 => "E18", e19 => "E19",
         e20 => "E20", e21 => "E21", e22 => "E22", e23 => "E23", e24 => "E24", e25 => "E25",
         e26 => "E26", e27 => "E27", e28 => "E28", e29 => "E29", e30 => "E30", e31 => "E31",
-        e32 => "E32", e33 => "E33", e34 => "E34", e35 => "E35",
+        e32 => "E32", e33 => "E33", e34 => "E34", e35 => "E35", e36 => "E36", e37 => "E37",
+        e38 => "E38", e39 => "E39", e40 => "E40",
     );
 }
 
@@ -1384,6 +1385,81 @@ fn a_ctrl_c_in_the_bashrc_keeps_the_marks() {
         }
     }
     report("#713 marks", &failures);
+}
+
+/// #740: a Ctrl-C while the head's DEBUG trap read has `set -x` off (in
+/// the fork, where the user's trap runs under `set -T`) stops the head
+/// between the switches; `set -x` comes back at the next prompt (bash
+/// runs `PROMPT_COMMAND` again after the Ctrl-C), and the flag is cleared.
+/// The trap holds the fork once (it removes `slow`), with the trace on
+/// /dev/null through descriptor 3 (bash 4.1 and later).
+#[test]
+fn a_ctrl_c_in_the_heads_read_keeps_set_x() {
+    let startup = "set -T\ntrap '[[ $BASH_SUBSHELL == 0 || ! -e slow ]] || { rm slow; echo READY >&2; \
+                   s=$SECONDS; while (( SECONDS - s < 4 )); do :; done; }' DEBUG\n\
+                   exec 3>/dev/null\nBASH_XTRACEFD=3\nset -x";
+    let line = "echo \"x=${-//[^x]/} xo=[$_tessera_si_xoff]\"";
+    let mut failures = Vec::new();
+    for program in bashes("5.1 5.3", "#740 stopped head") {
+        let output = Run {
+            program: &program,
+            route: Route::Rcfile,
+            injected: true,
+            startup,
+            args: None,
+            env: &[],
+            ahead: false,
+        }
+        .lines(&[": > slow", "^C READY", line, line]);
+        let got = transcript(&output.text);
+        if !output.injected || got != ["READY", "x=x xo=[]", "x=x xo=[]"] {
+            failures.push(format!(
+                "{}: got {got:?}: {:?}",
+                program.display(),
+                output.text
+            ));
+        }
+    }
+    report("#740 stopped head", &failures);
+}
+
+/// #740 B1: a Ctrl-C while the user's DEBUG trap runs at top level for the
+/// head's `builtin set -x` (no `set -T` needed) stops the head with
+/// `set -x` still off; the flag is still set there, so `set -x` comes back
+/// when bash runs `PROMPT_COMMAND` again, and the flag is cleared. String
+/// and array `PROMPT_COMMAND`; the trace goes to /dev/null through
+/// descriptor 3 (bash 4.1 and later).
+#[test]
+fn a_ctrl_c_before_the_heads_restore_keeps_set_x() {
+    let trap = "trap 'case $BASH_COMMAND in \"builtin set -x\") [[ -e $HOME/slow ]] && \
+                { rm -f $HOME/slow; echo READY; sleep 3; } ;; esac' DEBUG\n\
+                exec 3>/dev/null\nBASH_XTRACEFD=3\nset -x";
+    let line = "echo \"x=${-//[^x]/} xo=[$_tessera_si_xoff]\"";
+    let mut failures = Vec::new();
+    for program in bashes("5.1 5.3", "#740 B1") {
+        for mode in ["", "PROMPT_COMMAND=(:)\n"] {
+            let startup = format!("{mode}{trap}");
+            let output = Run {
+                program: &program,
+                route: Route::Rcfile,
+                injected: true,
+                startup: &startup,
+                args: None,
+                env: &[],
+                ahead: false,
+            }
+            .lines(&[": > $HOME/slow", "^C READY", line]);
+            let got = transcript(&output.text);
+            if !output.injected || got != ["READY", "x=x xo=[]"] {
+                failures.push(format!(
+                    "{} {mode:?}: got {got:?}: {:?}",
+                    program.display(),
+                    output.text
+                ));
+            }
+        }
+    }
+    report("#740 B1", &failures);
 }
 
 /// #676: the --rcfile route's end runs also when there is no startup file
