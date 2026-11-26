@@ -90,8 +90,8 @@ pub use tessera_config::{
     WatchOptions,
 };
 pub use tessera_pty::{
-    ExitStatus, ForegroundProcess, MAX_FOREGROUND_NAME_BYTES, Program, PtyError, PtySize,
-    SpawnOptions,
+    ExitStatus, ForegroundProcess, LookupStep, MAX_FOREGROUND_NAME_BYTES, Program, PtyError,
+    PtySize, SpawnOptions,
 };
 pub use tessera_shell_integration::Cwd;
 
@@ -578,9 +578,12 @@ impl App {
     /// sizes are then those of the start without it).
     /// [`PtyError::ProgramTimedOut`] when the file system gave no answer
     /// within 5 s while the program was looked up (a stalled network
-    /// volume), and [`PtyError::ProgramLookupBusy`] when the lookup was not
-    /// made because four earlier lookups or `#!` checks are still waiting
-    /// for the file system (#602).
+    /// volume; the error names the step that stalled: the working
+    /// directory, `$SHELL` or the program, #661), and
+    /// [`PtyError::ProgramLookupBusy`] when the lookup was not made because
+    /// four earlier lookups or `#!` checks are still waiting for the file
+    /// system (#602), and for the built-in profile's start the helper kept
+    /// for it as well (#661).
     /// [`Error::ReaderThread`] when a session thread (reader or input
     /// writer) cannot be created (the child is then hung up).
     pub fn spawn_session(&self, options: SpawnOptions) -> Result<SessionId> {
@@ -625,17 +628,44 @@ impl App {
     /// [`edit::MAX_DISPLAY_NAME_LEN`] bytes. The warning logged names the
     /// profile by its index and the `errno` only (#333).
     ///
-    /// Limit (#602): while four earlier program lookups are stuck (the
-    /// helper cap), the built-in start's own lookup is refused too, so no
-    /// default shell starts and the tab fails with the profile's
-    /// [`PtyError::ProgramLookupBusy`] ("too many earlier program checks
-    /// are still waiting"). Once a stuck lookup ends, both starts run
-    /// again. Keeping a helper free for the built-in start is #661.
+    /// No second start is made after a [`PtyError::ProgramTimedOut`] whose
+    /// stalled step the built-in start would repeat (#661): `$SHELL`
+    /// (checked by every start, so a login shell on a stalled volume fails
+    /// the tab at 5 s instead of 10 s, with the error naming the login
+    /// shell, not the profile's command), the working directory when the
+    /// caller's `options` ask for the same one, or the program when the
+    /// profile did not change it. The tab then fails with that error.
+    ///
+    /// A start of the built-in profile (no profile, one that changes
+    /// neither the program nor the directory, and the second start above)
+    /// looks its program up on a helper kept for it when every shared one
+    /// is taken ([`NativePty::spawn_builtin`], #661): while four earlier
+    /// lookups are stuck on a stalled volume, a profile's start is refused
+    /// with [`PtyError::ProgramLookupBusy`] at once and its default shell
+    /// still starts. With no helper free it waits for whichever frees
+    /// first; only with that helper stuck too (its own lookup stalled: at
+    /// most four plus one stuck) is the built-in start refused at once as
+    /// well, and the tab fails with the profile's error.
+    ///
+    /// After a [`PtyError::ProgramLookupBusy`] whose `stalled` step the
+    /// built-in start would repeat (as above), the second start's lookup
+    /// ends when the first one's would have, or 1 s after it starts if that
+    /// is later (#661 B1): a tab refused only after waiting for a helper
+    /// does not wait a second 5 s on that stall in its fallback, so it
+    /// takes at most about 6 s in all, and a fallback refused just as the
+    /// stuck lookups time out still has the time a healthy login shell
+    /// needs. After one whose step it would not repeat (four tabs stuck on
+    /// a profile's command, say), the second start gets its own 5 s, as
+    /// after a [`PtyError::ProgramTimedOut`] of such a step (#661 F1): the
+    /// fallbacks of five such tabs queue on the one helper kept for them,
+    /// and a slow but healthy login shell takes each a while.
     ///
     /// # Errors
     ///
     /// As for [`App::spawn_session`]. When the second start fails too, the
-    /// first start's error.
+    /// first start's error, except after a [`PtyError::ProgramLookupBusy`]
+    /// whose second start timed out: then that [`PtyError::ProgramTimedOut`],
+    /// which names the step that stalled.
     pub fn spawn_session_with_profile(
         &self,
         options: SpawnOptions,
@@ -653,7 +683,13 @@ impl App {
         };
         let profiled = profile::apply(original.clone(), &resolved);
         let changed = profiled != original;
-        let error = match self.spawn_pty(&profiled) {
+        let since = Instant::now();
+        let first: &Spawn = if changed {
+            &NativePty::spawn
+        } else {
+            &move |options| NativePty::spawn_builtin(options, since)
+        };
+        let error = match self.spawn_pty(&profiled, first) {
             Ok(started) => {
                 let Started {
                     pty,
@@ -672,6 +708,18 @@ impl App {
             return Err(error);
         };
         let index = self.config().profiles.iter().position(|p| p.name == name);
+        if let Error::Pty(PtyError::ProgramTimedOut { stalled, .. }) = &error
+            && profile::repeats_stalled_step(*stalled, &profiled, &original)
+        {
+            tracing::warn!(
+                target: "tessera_app_core",
+                profile = ?index,
+                stalled = %stalled,
+                "a profile's session could not start and the built-in profile \
+                 would wait on the same lookup; not trying it"
+            );
+            return Err(error);
+        }
         tracing::warn!(
             target: "tessera_app_core",
             profile = ?index,
@@ -679,19 +727,45 @@ impl App {
             "a profile's session could not start; trying the built-in profile once"
         );
         let mut notice = profile::fallback_notice(name, errno);
+        // After a refusal for want of a helper whose taken helpers wait on
+        // a step the retry repeats, the retry's lookup ends when the first
+        // one's would have, but gets at least 1 s (#661 B1): no second 5 s
+        // on that stall, and time enough for a healthy login shell. Taken
+        // helpers waiting on a step the retry does not ask about leave it
+        // its own 5 s, as after a timed-out lookup of such a step (#661 F1):
+        // fallbacks queued behind each other on the reserved helper need
+        // it.
+        let busy = matches!(error, Error::Pty(PtyError::ProgramLookupBusy { .. }));
+        let shared = matches!(
+            &error,
+            Error::Pty(PtyError::ProgramLookupBusy { stalled, .. })
+                if profile::repeats_stalled_step(*stalled, &profiled, &original)
+        );
+        let since = if shared { since } else { Instant::now() };
         // One retry, as the built-in profile; its failure reports the
-        // profile's, the one the user asked for.
+        // profile's, the one the user asked for, except that a refusal for
+        // want of a helper names no stalled path where the retry's timed-out
+        // lookup does.
         let Started {
             pty,
             events,
             size,
             notice: started_notice,
-        } = self.spawn_pty(&original).map_err(|_| error)?;
+        } = self
+            .spawn_pty(&original, &move |options| {
+                NativePty::spawn_builtin(options, since)
+            })
+            .map_err(|retry| match retry {
+                Error::Pty(PtyError::ProgramTimedOut { .. }) if busy => retry,
+                _ => error,
+            })?;
         notice.extend_from_slice(&started_notice);
         self.attach_with_profile(id, pty, events, size, None, &notice)
     }
 
-    /// Starts `options` on a new PTY, with shell integration applied.
+    /// Starts `options` on a new PTY with `spawn` ([`NativePty::spawn`],
+    /// or [`NativePty::spawn_builtin`] for the built-in profile's start),
+    /// with shell integration applied.
     ///
     /// When the injection takes the spawn over the `execve` size limit
     /// ([`PtyError::ArgumentsTooLong`]), `options` are started once more as
@@ -707,7 +781,7 @@ impl App {
     /// The start's error; after the retry, the retry's, which is the error
     /// shell integration off gives (an environment too large without the
     /// injection too is refused as it is then).
-    fn spawn_pty(&self, options: &SpawnOptions) -> Result<Started> {
+    fn spawn_pty(&self, options: &SpawnOptions, spawn: &Spawn) -> Result<Started> {
         let injected = shell_integration::injected(
             options,
             self.config().terminal.shell_integration,
@@ -715,7 +789,7 @@ impl App {
         );
         let mut notice = Vec::new();
         if let Some(injected) = injected {
-            match NativePty::spawn(&injected) {
+            match spawn(&injected) {
                 Ok((pty, events)) => {
                     return Ok(Started {
                         pty: Box::new(pty),
@@ -737,7 +811,7 @@ impl App {
                 Err(error) => return Err(error.into()),
             }
         }
-        let (pty, events) = NativePty::spawn(options)?;
+        let (pty, events) = spawn(options)?;
         Ok(Started {
             pty: Box::new(pty),
             events,
@@ -2982,6 +3056,10 @@ impl fmt::Debug for App {
     }
 }
 
+/// [`NativePty::spawn`] or [`NativePty::spawn_builtin`], for
+/// [`App::spawn_pty`].
+type Spawn = dyn Fn(&SpawnOptions) -> Result<(NativePty, PtyEvents), PtyError>;
+
 /// A PTY [`App::spawn_pty`] started.
 struct Started {
     pty: Box<dyn Pty>,
@@ -4364,9 +4442,15 @@ mod tests {
     /// refused because earlier lookups are still waiting with `EAGAIN`.
     #[test]
     fn a_timed_out_or_refused_program_lookup_falls_back() {
-        let errno = fallback_errno(&Error::Pty(PtyError::ProgramTimedOut { path_bytes: 1 }));
+        let errno = fallback_errno(&Error::Pty(PtyError::ProgramTimedOut {
+            path_bytes: 1,
+            stalled: LookupStep::Program,
+        }));
         assert_eq!(errno, Ok(Some(nix::errno::Errno::ETIMEDOUT as i32)));
-        let errno = fallback_errno(&Error::Pty(PtyError::ProgramLookupBusy { path_bytes: 1 }));
+        let errno = fallback_errno(&Error::Pty(PtyError::ProgramLookupBusy {
+            path_bytes: 1,
+            stalled: LookupStep::Program,
+        }));
         assert_eq!(errno, Ok(Some(nix::errno::Errno::EAGAIN as i32)));
         let notice = String::from_utf8(profile::fallback_notice("p", errno.unwrap())).unwrap();
         assert_eq!(
