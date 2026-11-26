@@ -85,10 +85,10 @@ fn setup(backend: WatchBackend, theme: &str) -> (tempfile::TempDir, ConfigStore,
     (dir, store, watcher)
 }
 
-/// Every event that arrives within `window`, but the
-/// [`ConfigEvent::Unchanged`] of each re-read of the unchanged
-/// `config.toml` a change in `themes/` causes (#535): these tests are
-/// about the themes events.
+/// Every event that arrives within `window`, but
+/// [`ConfigEvent::Unchanged`]: these tests are about the themes events. A
+/// change in `themes/` alone sends none since #745 (it did from #535), but
+/// a test that also writes `config.toml` may see one.
 fn drain(watcher: &Watcher, window: Duration) -> Vec<ConfigEvent> {
     let deadline = Instant::now() + window;
     let mut events = Vec::new();

@@ -4,6 +4,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use tessera_config::edit::{ConfigEditor, import_theme};
 use tessera_config::{
     Config, ConfigEvent, ConfigPaths, ConfigStore, WatchBackend, WatchOptions, Watcher,
     write_atomic,
@@ -848,14 +849,12 @@ fn symlink_target_rename_save_stalled_past_the_debounce_is_observed() {
     }
 }
 
-/// #535, kept by #731: a theme file added to `themes/` leaves the
-/// configuration alone, and its re-read still reports `Unchanged`, before
-/// the `ThemesChanged`, so a host that lists the themes when a
-/// configuration is announced (Settings) sees the new one. Only a re-read
-/// that finds both the files the load reads and `themes/` as they were
-/// reports nothing.
+/// A theme file added to `themes/` leaves the configuration alone and is
+/// reported by its `ThemesChanged` alone: the re-read it starts finds the
+/// files the load reads as they were, so it sends no `Unchanged` (#745;
+/// from #535 until then it sent one first).
 #[test]
-fn a_theme_file_added_reports_unchanged_then_themes_changed() {
+fn a_theme_file_added_reports_themes_changed_alone() {
     for backend in BACKENDS {
         let (_dir, store, watcher) = open_watched(WatchOptions {
             backend,
@@ -867,21 +866,97 @@ fn a_theme_file_added_reports_unchanged_then_themes_changed() {
         let part = themes.join(".added.toml.part");
         std::fs::write(&part, "name = \"Added\"\nbackground = \"#202020\"\n").unwrap();
         std::fs::rename(&part, themes.join("added.toml")).unwrap();
-        let mut events = Vec::new();
-        while events.len() < 2 {
-            match watcher.recv_timeout(EVENTUALLY) {
-                Ok(event) => events.push(event),
-                Err(e) => panic!("{backend:?}: after {events:?}: {e}"),
-            }
-        }
+        let event = watcher
+            .recv_timeout(EVENTUALLY)
+            .unwrap_or_else(|e| panic!("{backend:?}: the theme was not reported: {e}"));
         assert!(
-            matches!(
-                events[..],
-                [ConfigEvent::Unchanged, ConfigEvent::ThemesChanged]
-            ),
-            "{backend:?}: {events:?}"
+            matches!(event, ConfigEvent::ThemesChanged),
+            "{backend:?}: {event:?}"
         );
+        if let Ok(event) = watcher.recv_timeout(Duration::from_millis(300)) {
+            panic!("{backend:?}: then {event:?}");
+        }
     }
+}
+
+/// A base16 scheme for [`import_then_late_save`] to import.
+const OCEAN: &str = "scheme: \"Ocean\"\nauthor: \"x\"\nbase00: \"2b303b\"\nbase01: \"343d46\"\nbase02: \"4f5b66\"\nbase03: \"65737e\"\nbase04: \"a7adba\"\nbase05: \"c0c5ce\"\nbase06: \"dfe1e8\"\nbase07: \"eff1f5\"\nbase08: \"bf616a\"\nbase09: \"d08770\"\nbase0A: \"ebcb8b\"\nbase0B: \"a3be8c\"\nbase0C: \"96b5b4\"\nbase0D: \"8fa1b3\"\nbase0E: \"b48ead\"\nbase0F: \"ab7967\"\n";
+
+/// #745: Settings' Import Theme ([`import_theme`] into `themes/`, then a
+/// save of `appearance.theme`) with the save late, after the watcher
+/// settled the import: `ThemesChanged` and then the save's `Changed`,
+/// never an `Unchanged`. The import's re-read finds `config.toml` as it
+/// was; an `Unchanged` from it would move the configuration generation
+/// past the one Settings queued its save at, and Settings would show the
+/// old theme until the `Changed` came.
+///
+/// The save waits for the import's `ThemesChanged` rather than for a
+/// time, so it is late on any machine. The import links its temporary
+/// file (`.ocean.<pid>.<n>.edit`, not a `*.toml` file) to `ocean.toml`
+/// and then unlinks it, and both change the theme file's change time, so
+/// an import slower than the debounce between the two settles twice: a
+/// second `ThemesChanged` may come before the `Changed`, or after it when
+/// it settles with the save. Nothing else may come.
+fn import_then_late_save(backend: WatchBackend) {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = ConfigPaths::new(dir.path().join("Tessera"));
+    std::fs::create_dir_all(paths.themes_dir()).unwrap();
+    std::fs::write(paths.config_file(), font_size_doc(13)).unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let source = elsewhere.path().join("ocean.yaml");
+    std::fs::write(&source, OCEAN).unwrap();
+    let store = ConfigStore::open(paths).unwrap();
+    let watcher = store
+        .watch(WatchOptions {
+            backend,
+            poll_interval: Duration::from_millis(10),
+            debounce: Duration::from_millis(30),
+            ..Default::default()
+        })
+        .unwrap();
+    while watcher.try_recv().is_ok() {}
+
+    let imported = import_theme(&store.paths().themes_dir(), &source).unwrap();
+    let event = watcher
+        .recv_timeout(EVENTUALLY)
+        .unwrap_or_else(|e| panic!("{backend:?}: the import was not reported: {e}"));
+    assert!(
+        matches!(event, ConfigEvent::ThemesChanged),
+        "{backend:?}: the import's first event: {event:?}"
+    );
+
+    let mut editor = ConfigEditor::open(&store.paths().config_file()).unwrap();
+    editor
+        .set("appearance.theme", toml::Value::String(imported.id.clone()))
+        .unwrap();
+    assert!(editor.save().unwrap(), "{backend:?}: saved");
+    let changed = loop {
+        match watcher.recv_timeout(EVENTUALLY) {
+            Ok(ConfigEvent::Changed(changed)) => break changed,
+            Ok(ConfigEvent::ThemesChanged) => {}
+            Ok(other) => panic!("{backend:?}: before the save's Changed: {other:?}"),
+            Err(e) => panic!("{backend:?}: the save was not reported: {e}"),
+        }
+    };
+    assert_eq!(changed.config.appearance.theme, imported.id, "{backend:?}");
+    assert_eq!(store.theme().name, "Ocean", "{backend:?}: resolves");
+    loop {
+        match watcher.recv_timeout(Duration::from_millis(300)) {
+            Ok(ConfigEvent::ThemesChanged) => {}
+            Ok(event) => panic!("{backend:?}: then {event:?}"),
+            Err(_) => break,
+        }
+    }
+}
+
+#[test]
+fn an_imported_theme_saved_late_reports_no_unchanged_natively() {
+    import_then_late_save(WatchBackend::Native);
+}
+
+#[test]
+fn an_imported_theme_saved_late_reports_no_unchanged_when_polled() {
+    import_then_late_save(WatchBackend::Poll);
 }
 
 /// Where [`a_stalled_rename_save_reports_only_its_change`] saves.
