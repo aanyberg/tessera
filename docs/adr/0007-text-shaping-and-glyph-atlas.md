@@ -84,9 +84,9 @@ blocking (#669): the open is non-blocking (`O_NONBLOCK`, `O_NOCTTY`) and
 the descriptor is checked with `fstat` before anything is read, so a
 FIFO with no writer cannot hold the index thread, and the index lands
 from the other files.
-Shaping and rasterisation still read a face through the map cosmic-text
-keeps for it (`make_shared_face_data`), so a font truncated in place
-while in use can still raise `SIGBUS` there. The index
+Shaping and rasterisation read a user font's face from a copy in memory
+and a system font's through the map cosmic-text keeps for it (#683
+amendment below). The index
 records the first covering face, often a Bold cut, so the style is
 drawn from that face's family: the face for the requested style if it
 covers the character, else (for italic) the upright face at the
@@ -515,3 +515,90 @@ index exactly as before (the same 5 563 ranges, 1.98 million code
 points and 864 030 records walked), and the build takes about 15 ms in
 release where it took 13 ms (best of 7 per run, runs alternated at a
 load of 30 to 40): the records are now read through the recursion.
+
+## Amendment: user fonts are read into memory, system fonts stay mapped (#683, 2026-11-26)
+
+fontdb's scan (`load_system_fonts`) opened every font file with a
+blocking `open(2)` and mapped it to parse its faces, and cosmic-text maps
+each face in use for shaping and rasterisation
+(`make_shared_face_data`). Another process that truncated a mapped font
+in place made the next touch of a page past the new end raise `SIGBUS`,
+which killed the app, and a FIFO put at a font path blocked the open for
+ever. A `SIGBUS` handler was not chosen: unwinding out of shaping from a
+signal handler is not sound in Rust.
+
+The fonts are now loaded by `font_scan`, in fontdb's macOS order:
+
+- **System fonts stay mapped.** `/System/Library/Fonts` and the
+  `com_apple_MobileAsset_Font*` directories of `/System/Library/AssetsV2`
+  are SIP-protected and only ever replaced whole, so fontdb scans and
+  maps them as before.
+- **User fonts are read, never mapped.** `/Library/Fonts`,
+  `/Network/Library/Fonts` and `~/Library/Fonts` are walked by Tessera:
+  each file is opened non-blocking (`O_NONBLOCK`, `O_NOCTTY`) and checked
+  by `fstat` of the descriptor to be a regular file, the check #669 gave
+  the coverage index, so a FIFO, socket or device never blocks the scan.
+  The scan reads only what fontdb's face parse looks at: the collection
+  header, the table records ttf-parser's own lookup visits (its
+  `binary_search_by`, step for step, so an unsorted table directory finds
+  the tables fontdb's parse finds, no more and no fewer), and the `OS/2`,
+  `name` and `post` tables, which it hands fontdb as a small font of
+  those tables alone, then records the face against the real file. A file
+  of at most 8 MiB (`MAX_OWNED_FONT_BYTES`, almost every Latin, Nerd Font
+  and icon font) gets a lazily read source (`OwnedFontFile`, a
+  `Source::SharedFile` whose data is read whole into memory, with the same
+  non-blocking open, the first time any of its faces is used): a
+  truncation in place after that changes nothing, and one before it leaves
+  the file empty to the parser, so its faces fail to load and their
+  characters fall back to the next face.
+- **Owned bytes have a process budget.** The bytes read count against
+  32 MiB for the whole process (`MAX_OWNED_TOTAL_BYTES`), taken when a
+  file is actually read and given back when its font database drops. A
+  file whose read would pass the budget is not read: before its first
+  load its faces are turned back into a `Source::File`
+  (`make_face_data_unshared`, which keeps the face IDs) and mapped, as a
+  file over 8 MiB is.
+- **Faces stay lazy.** The scan reads a few KiB per face, not the files
+  (fontdb's mapped scan touched about as much), and a file is read
+  whole only when a face of it is first used, so the memory cost is the
+  user font files in use, not the installed set. A typical configuration
+  (Menlo and the system fallbacks) uses no user font and costs nothing; a
+  user family costs its files' size for each style in use, at most 32 MiB
+  in all. Measured on the development machine (release build, the
+  installed fonts loaded, 440 glyphs of ASCII, CJK, emoji and symbols
+  shaped and drawn in the four styles, `/usr/bin/time -l`, before /
+  after): Menlo, peak RSS 19.3-19.6 / 18.2-18.3 MB, footprint 9.6-10.0 /
+  9.4-9.5 MB; Cascadia Code (user files of about 0.7 MB), footprint
+  10.0-10.5 / 11.1-11.3 MB; a user family of 17-18 MB files, footprint
+  11.0-11.4 MB before, 80.3-80.6 MB with a 32 MiB per-file cap and no
+  budget, 10.5 MB (three runs) with the 8 MiB cap, which maps those
+  files; Menlo with the 8 MiB cap and the budget, footprint 8.8-9.0 MB.
+  The scan takes as long as fontdb's (12-23 ms).
+  The coverage index reads the files itself, as before, and never
+  touches the copies.
+- **Each face loads once.** A user directory's symlink into a directory
+  the system pass loads (`/Library/Fonts/Arial Unicode.ttf` on macOS) is
+  skipped by the walk and left to that pass, which maps it.
+
+**Residual.** System fonts, user font files larger than 8 MiB, and the
+user files whose read the 32 MiB budget refused stay (or become)
+`Source::File` and are mapped by cosmic-text when a face of them is used,
+with fontdb's blocking open. Truncating such a user font in place while
+it is in use can still raise `SIGBUS`, and a FIFO swapped in at its path
+just before that open can block it. The scan itself never maps or blocks
+on them. A read that fails or is refused for any other reason (the file
+went away, is no longer a regular file, or grew while it was read) is
+kept as empty for the font database's life: those faces stay unloadable
+until the app restarts. A read that races a truncation in place (the file
+shrinks between its `fstat` and the end of the read) keeps the bytes it
+got, and only those count against the budget: a face whose tables lie
+past them fails to load, or draws `.notdef` for the glyphs that do, as
+an empty read would, and never raises `SIGBUS`.
+
+The scan's bounds (directory depth, faces per collection, the size of
+each table it reads) are in `docs/security.md`. It parses every
+installed face exactly as fontdb's own parse does (a test compares the
+two over the system and user fonts, and a property test compares the
+scan's table lookup with `ttf_parser::RawFace::table`, a direct
+dev-dependency of `tessera-render` at fontdb's version, over shuffled
+table directories).

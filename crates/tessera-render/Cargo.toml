@@ -41,6 +41,9 @@ wgpu = { version = "30", default-features = false, features = ["metal", "wgsl", 
 png.workspace = true
 # Property tests of the character map walk against swash's (#689).
 proptest.workspace = true
+# The table lookup fontdb's parse runs, as the reference the user font
+# scan's lookup is tested against (#683). fontdb's version: bump together.
+ttf-parser = "0.25.1"
 # Enables `test-hooks` for this crate's integration tests.
 tessera-render = { path = ".", features = ["test-hooks"] }
 # Scratch directories removed when a test ends, failing or not (#698).
