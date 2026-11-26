@@ -571,9 +571,10 @@ pub struct Profile {
     pub command: Option<String>,
     /// Starting directory; `~` at the start is your home directory. A
     /// directory that does not exist falls back to your home directory
-    /// with a warning; one that exists but cannot be entered starts your
-    /// login shell in your home directory, with a line in the new session
-    /// saying so. Used only when the session is not given a directory of
+    /// with a warning; one that exists but cannot be entered, or is on a
+    /// volume that gives no answer within 5 s, starts your login shell in
+    /// your home directory, with a line in the new session saying so.
+    /// Used only when the session is not given a directory of
     /// its own; unset means your home directory. One with a NUL character
     /// is ignored with a warning, as if unset.
     pub working_directory: Option<String>,

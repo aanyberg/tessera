@@ -44,7 +44,14 @@ is run directly, anything else through `/bin/sh -c`. An explicit program
 wins over the profile's command. `working_directory` is used when the
 caller gave no directory; `~` and `~/...` are the home directory, and a
 directory that does not exist falls back to the home directory with a
-warning that names the directory (escaped) and never the command (S8).
+warning that carries the directory's length only, never the path or the
+command (S8). The directory reaches the spawn unchecked: before #673 the
+profile code stated it on the caller, the app's main thread, with no time
+bound, so one on a stalled volume held the app for the whole stall
+(53.9 s measured). Now the spawn's bounded program lookup (#554) states it
+first, on its helper, and the warning is logged there; a directory that
+gives no answer within the lookup's 5 s is a `PtyError::ProgramTimedOut`,
+which falls back as below.
 
 **A profile that cannot start (#333).** When what the profile changed
 fails to start (a `working_directory` that exists but cannot be entered, a

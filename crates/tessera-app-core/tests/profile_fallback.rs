@@ -502,6 +502,74 @@ fn a_command_whose_lookup_never_answers_starts_the_default_shell_at_home() {
     panic!("the held lookup did not return on release");
 }
 
+/// #673: a profile `working_directory` on a volume that never answers
+/// (its stat held) holds the caller, the app's main thread, no longer than
+/// the bounded lookup's timeout: the directory is stated on the lookup's
+/// helper only, never on the calling thread, and the default shell starts
+/// in `$HOME` with an `ETIMEDOUT` notice. Neither the warning nor the
+/// notice names the directory.
+#[test]
+fn a_working_directory_that_never_answers_does_not_hold_the_caller() {
+    let root = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let volume = root.path().join("stalled-volume");
+    std::fs::create_dir(&volume).unwrap();
+    let app = app(
+        &root,
+        config(
+            &[("stalled", None, Some(volume.to_str().unwrap()))],
+            "Default",
+        ),
+    );
+    let held = HeldLookup::new(&volume);
+    let started = Instant::now();
+    let (id, logged) = warnings(|| {
+        app.spawn_session_with_profile(options(home.path()), Some("stalled"))
+            .expect("the fallback starts")
+    });
+    let waited = started.elapsed();
+    let (callers, finished) = test_hooks::program_lookup_calls(&volume);
+    assert_eq!(
+        callers,
+        ["pty-spawn-program"],
+        "the directory was not stated on the lookup's helper alone"
+    );
+    assert_eq!(finished, 0, "the held stat returned before the fallback");
+    assert!(
+        waited >= test_hooks::PROGRAM_LOOKUP_TIMEOUT,
+        "fell back after {waited:?}, before the lookup's time was up"
+    );
+    assert!(
+        waited < test_hooks::PROGRAM_LOOKUP_TIMEOUT + Duration::from_secs(2),
+        "the caller was held {waited:?}"
+    );
+    let reason = std::io::Error::from_raw_os_error(nix::errno::Errno::ETIMEDOUT as i32).to_string();
+    let reason = reason.split(" (os error").next().unwrap();
+    let rows = wait_for_row(&app, id, &notice("stalled", reason));
+    assert_eq!(rows[0], notice("stalled", reason), "{rows:?}");
+    assert_a_shell_in(&app, id, home.path());
+    app.close_session(id).unwrap();
+    assert!(
+        logged.iter().any(|line| line.contains("could not start")
+            && line.contains(&format!(
+                "errno=Some({})",
+                nix::errno::Errno::ETIMEDOUT as i32
+            ))),
+        "{logged:?}"
+    );
+    for line in &logged {
+        assert!(!line.contains("stalled-volume"), "{logged:?}");
+    }
+    drop(held);
+    for _ in 0..OUTPUT_ATTEMPTS {
+        if test_hooks::program_lookup_calls(&volume).1 == 1 {
+            return;
+        }
+        thread::sleep(POLL);
+    }
+    panic!("the held stat did not return on release");
+}
+
 /// #602: a profile whose program lookup could not start its helper thread
 /// (the process out of threads) starts the default shell with the
 /// thread start's `EAGAIN` in the notice, not a timeout.
