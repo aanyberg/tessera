@@ -261,7 +261,10 @@ pub enum ConfigEvent {
     /// change on disk, and the configuration it loaded is the one already
     /// applied: a save another writer undid inside the debounce, a rewrite
     /// with the same text, a change in `themes/` or `profiles/` that left
-    /// the configuration alone. Sent instead of a
+    /// the configuration alone, or the temporary file of a rename-save
+    /// that was created beside `config.toml` (or beside a linked
+    /// `config.toml`'s target) a debounce or more before its rename, whose
+    /// own `Changed` then follows (#720). Sent instead of a
     /// [`Changed`](ConfigEvent::Changed), so every re-read of a successful
     /// load reports one or the other, and an application that waits to
     /// see a value it saved can tell "read, and not there" from "not read

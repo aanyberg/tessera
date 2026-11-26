@@ -19,6 +19,23 @@ fn font_size_doc(size: u32) -> String {
     format!("[appearance]\nfont_size = {size}\n")
 }
 
+/// Rewrites `path` in place with `doc`, which is as long as what it holds
+/// (the [`font_size_doc`]s of two-digit sizes), waiting `stall` between
+/// the open and the write. It never truncates: `std::fs::write` empties
+/// the file first, and a writer stalled past the debounce there has the
+/// watcher read the empty file, which loads as the defaults (#720 B1).
+fn rewrite_in_place(path: &std::path::Path, doc: &str, stall: Duration) {
+    use std::io::Write as _;
+    let mut file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    assert_eq!(
+        file.metadata().unwrap().len(),
+        u64::try_from(doc.len()).unwrap(),
+        "an in-place rewrite of another length"
+    );
+    std::thread::sleep(stall);
+    file.write_all(doc.as_bytes()).unwrap();
+}
+
 /// How long a test waits for an event that is due (#253 item 9, #262 N2).
 /// Only `font_size_edit_is_observed_within_500ms` asserts a latency
 /// ([`LIMIT`]); every other wait only needs the event to arrive, so it is
@@ -150,15 +167,20 @@ fn rename_save_and_delete_are_observed() {
         let path = store.paths().config_file();
 
         // Editors commonly write a sibling file and rename it over the target.
+        // The configuration directory is watched, so a writer stalled past
+        // the debounce after creating it has that creation re-read the old
+        // file (`Unchanged`) before the rename's `Changed`, and a re-read
+        // of the file recreated empty finds the defaults applied (#720):
+        // those steps skip `Unchanged` ([`next_changed`]).
         let tmp = path.with_extension("toml.new");
         std::fs::write(&tmp, font_size_doc(18)).unwrap();
         std::fs::rename(&tmp, &path).unwrap();
-        let changed = expect_changed(watcher.recv_timeout(EVENTUALLY).expect("rename"), backend);
+        let changed = next_changed(&watcher, backend, "rename-save");
         assert_eq!(changed.config.appearance.font_size, 18.0);
 
         // An in-place write to the renamed-in file is still seen.
-        std::fs::write(&path, font_size_doc(19)).unwrap();
-        let changed = expect_changed(watcher.recv_timeout(EVENTUALLY).expect("write"), backend);
+        rewrite_in_place(&path, &font_size_doc(19), Duration::ZERO);
+        let changed = next_changed(&watcher, backend, "in-place write");
         assert_eq!(changed.config.appearance.font_size, 19.0);
 
         // Deleting the file applies the defaults; recreating it is seen too.
@@ -166,7 +188,7 @@ fn rename_save_and_delete_are_observed() {
         let changed = expect_changed(watcher.recv_timeout(EVENTUALLY).expect("delete"), backend);
         assert_eq!(*changed.config, Config::default());
         std::fs::write(&path, font_size_doc(21)).unwrap();
-        let changed = expect_changed(watcher.recv_timeout(EVENTUALLY).expect("recreate"), backend);
+        let changed = next_changed(&watcher, backend, "recreate");
         assert_eq!(changed.config.appearance.font_size, 21.0);
     }
 }
@@ -686,6 +708,12 @@ fn symlink_target_directory_removed_and_recreated_is_followed() {
 /// edited in place: the in-place write must reach the new inode's watch.
 /// Repeated because the race it guards (the rename landing while the watch
 /// re-registers) is narrow.
+///
+/// Each step skips the `Unchanged` reports that may come before its
+/// `Changed` (#720, [`next_changed`]): the native backend watches the
+/// target's directory, so a writer stalled past the debounce between
+/// creating the temporary file and renaming it has the creation re-read
+/// the old file first ([`symlink_target_rename_save_stalled_past_the_debounce_is_observed`]).
 #[cfg(unix)]
 #[test]
 fn symlink_target_rename_save_then_in_place_write_is_observed() {
@@ -706,25 +734,69 @@ fn symlink_target_rename_save_then_in_place_write_is_observed() {
             let saved = 11 + 2 * i;
             std::fs::write(&tmp, font_size_doc(saved.into())).unwrap();
             std::fs::rename(&tmp, &target).unwrap();
-            let changed = expect_changed(
-                watcher
-                    .recv_timeout(EVENTUALLY)
-                    .unwrap_or_else(|e| panic!("{backend:?} #{i}: rename-save not seen: {e}")),
-                backend,
-            );
+            let changed = next_changed(&watcher, backend, &format!("#{i} rename-save"));
             assert_eq!(
                 changed.config.appearance.font_size,
                 f32::from(saved),
                 "{backend:?}"
             );
 
-            std::fs::write(&target, font_size_doc((saved + 1).into())).unwrap();
-            let changed = expect_changed(
-                watcher
-                    .recv_timeout(EVENTUALLY)
-                    .unwrap_or_else(|e| panic!("{backend:?} #{i}: in-place write not seen: {e}")),
-                backend,
+            rewrite_in_place(&target, &font_size_doc((saved + 1).into()), Duration::ZERO);
+            let changed = next_changed(&watcher, backend, &format!("#{i} in-place write"));
+            assert_eq!(
+                changed.config.appearance.font_size,
+                f32::from(saved + 1),
+                "{backend:?} #{i}"
             );
+        }
+    }
+}
+
+/// Guards the test logic of
+/// [`symlink_target_rename_save_then_in_place_write_is_observed`], not the
+/// watcher: it reproduces #720 by stalling each of its writers past the
+/// debounce, as a loaded CI runner did. The native backend watches the
+/// directory of the link's target, so the temporary file's creation
+/// alone starts a re-read that finds the old file and reports `Unchanged`
+/// (#535) before the rename's `Changed`: taking the first event as the
+/// rename's fails here as it did on CI. The in-place write stalls between
+/// its open and its write, so a writer that truncated first
+/// (`std::fs::write`) would have both backends read an empty file, which
+/// loads as the defaults ([`rewrite_in_place`]).
+#[cfg(unix)]
+#[test]
+fn symlink_target_rename_save_stalled_past_the_debounce_is_observed() {
+    /// Five times the default debounce (100 ms): the re-read a stalled
+    /// writer starts is over before it goes on, on all but a starved
+    /// runner, where the two coalesce and the test still holds.
+    const STALL: Duration = Duration::from_millis(500);
+    for backend in BACKENDS {
+        let dir = tempfile::tempdir().unwrap();
+        let dotfiles = dir.path().join("dotfiles");
+        std::fs::create_dir(&dotfiles).unwrap();
+        let target = dotfiles.join("tessera.toml");
+        std::fs::write(&target, font_size_doc(10)).unwrap();
+        let root = dir.path().join("Tessera");
+        std::fs::create_dir(&root).unwrap();
+        std::os::unix::fs::symlink(&target, root.join("config.toml")).unwrap();
+
+        let store = ConfigStore::open(ConfigPaths::new(&root)).unwrap();
+        let watcher = store.watch(options(backend)).unwrap();
+        let tmp = dotfiles.join("tessera.toml.tmp");
+        for i in 0..2_u16 {
+            let saved = 11 + 2 * i;
+            std::fs::write(&tmp, font_size_doc(saved.into())).unwrap();
+            std::thread::sleep(STALL);
+            std::fs::rename(&tmp, &target).unwrap();
+            let changed = next_changed(&watcher, backend, &format!("#{i} stalled rename-save"));
+            assert_eq!(
+                changed.config.appearance.font_size,
+                f32::from(saved),
+                "{backend:?} #{i}"
+            );
+
+            rewrite_in_place(&target, &font_size_doc((saved + 1).into()), STALL);
+            let changed = next_changed(&watcher, backend, &format!("#{i} stalled in-place write"));
             assert_eq!(
                 changed.config.appearance.font_size,
                 f32::from(saved + 1),

@@ -403,9 +403,12 @@ until the window opened again.
 **Decision.** The watcher sends `ConfigEvent::Unchanged` when a re-read
 after a change on disk loads successfully and the store finds nothing new
 (`ConfigStore::apply` returns `None`): a save undone inside the debounce,
-a rewrite with the same text, a comment-only edit, or a change in
+a rewrite with the same text, a comment-only edit, a change in
 `themes/` or `profiles/` that leaves the configuration alone (then before
-its `ThemesChanged`). Every re-read of a good file thus reports `Changed`
+its `ThemesChanged`), or the temporary file of a rename-save created
+beside `config.toml` (or beside a linked `config.toml`'s target) a
+debounce or more before its rename, whose own `Changed` then follows
+(#720). Every re-read of a good file thus reports `Changed`
 or `Unchanged`. The catch-up when a watcher starts sends nothing for an
 unchanged file, and a repeated load error still sends nothing. Several
 watchers of one store each send their own `Unchanged`, so one change can
