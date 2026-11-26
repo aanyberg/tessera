@@ -22,7 +22,8 @@ restore. A dispatch input `force` bypasses that. It runs only on `main`.
 - The fixed set in `scripts/perf-cases.rs`, run through `cargo xtask ab` with the last measured SHA as base: `feed`
   (parse and print, no scrollback), `scroll` (into a scrollback of 10 000 lines), `search` (literal and regex over
   it) as instructions; `heap_idle` and `heap_scrollback` as live heap bytes of a `Terminal`, counted by the probe's
-  allocator. The corpus is generated from a fixed seed. Changing it moves every number once, so it is a trend
+  allocator. #51 added `cat`, `rewrap` and `vtebench` (instructions), `heap_lines_plain` and `heap_lines_mixed` (heap)
+  and `rss_1m` (resident bytes); see "Case set of #51" below. The corpus is generated from a fixed seed. Changing it moves every number once, so it is a trend
   break to note in the PR that changes it.
 
 **D3. Bars.** Instructions head/base at most 1.02 in at least one of three independent probe builds (the noise-floor
@@ -62,3 +63,66 @@ ignored. The PR-time bars stay with `cargo xtask ab` in the implementer's and th
   it first. The self-test stubs the probe, so it does not catch this.
 - Hosted-runner variance can still produce a false `regressed` line (three builds make it unlikely, not impossible);
   such an issue is closed with the evidence.
+
+## Case set of #51 (2026-11-26)
+
+#51 (scrollback memory) added six cases, a trend break for nothing older: the five cases above keep their corpora.
+
+- `cat`: 8 MiB of plain ASCII source-like lines (0 to 119 characters, about a third wrap at 80 columns; 256 KiB of
+  lines repeated) fed in 4 KiB reads into a 24x80 terminal with the default 10 000 lines of scrollback.
+- `rewrap`: the `scroll` corpus filling the default scrollback, then twenty width changes between 80 and 100 columns.
+- `vtebench`: the ten benchmarks of vtebench 0.3.1 (alacritty) at 80x24, each repeated to vtebench's 1 MiB, after a
+  RIS, once each. The shell scripts are reproduced in Rust byte for byte (checked against the scripts' own output with
+  `onlcr` applied, FNV-1a equal for all ten), so the job needs neither vtebench nor its scripts. vtebench itself
+  installs (`cargo install vtebench --version 0.3.1 --locked`) and runs headless under `tessera-devtool run`, which
+  drains the PTY into a `Terminal`; its numbers are wall times of a write into the PTY, so they are recorded below
+  once, not run by the job (a hosted runner's wall time backs no bar, D8).
+- `heap_lines_plain`, `heap_lines_mixed`: the heap of 10 000 lines of scrollback, full 80-column lines of printable
+  ASCII, or of coloured words (8- and 256-colour SGR, bold), CJK, a combining sequence and an emoji; the difference
+  between the same terminal fed the same lines with the default scrollback and with none. Divide by 10 000 for the
+  bytes per line that #51's bar (256 bytes per plain 80-column cold line) is measured in.
+- `rss_1m`: a terminal holding 1 000 000 lines of plain 80-column scrollback, the lines generated as they are fed.
+  The job runs the probe under `/usr/bin/time -l` and records the peak resident set minus that of the probe's empty
+  case in the heap fields (bar as for heap: at most 1.02x). The highest of three runs per side counts: the system can
+  only take pages away from a run, and one reading of the job's first local run came out 1.4 % low.
+
+Baselines at `6ad4b0c0` (main when #51 started), measured with `cargo xtask ab` and the probe on the M-series Mac of
+the factory (release build, best of 5 pairs; the 1-minute load beside each number):
+
+| case | measure | baseline | load |
+| --- | --- | --- | --- |
+| `cat` | instructions | 2 248 343 201 (about 267 per byte) | 13.5 |
+| `cat` | wall, best | 79.9 ms for 8 389 504 bytes, about 105 MB/s | 13.5 |
+| `vtebench` | instructions | 3 779 487 031 | 13.5 |
+| `vtebench` | wall, best | 199.8 ms for 11 071 011 bytes, about 55 MB/s | 13.5 |
+| `rewrap` | instructions | 1 814 612 296 (about 73 000 000 per re-wrap of 10 024 lines) | 13.5 |
+| `rewrap` | wall, best | 91.5 ms; net of the fill (about 17 ms) 3.7 ms per re-wrap, 0.37 ms per 1 000 lines of this corpus | 13.5 |
+| `feed` | instructions | 1 464 526 932 | 12.8 |
+| `scroll` | instructions | 1 007 668 964 (about 25 000 per line) | 12.8 |
+| `search` | instructions | 417 843 017 | 12.8 |
+| `heap_idle` | heap bytes | 40 304 | 12.1 |
+| `heap_scrollback` | heap bytes | 17 256 611 | 12.1 |
+| `heap_lines_plain` | heap bytes | 16 640 000: **1 664 bytes per plain 80-column line** | 12.1 |
+| `heap_lines_mixed` | heap bytes | 17 809 034: 1 781 bytes per mixed line | 12.1 |
+| `rss_1m` | resident bytes | 1 894 825 984 (1 807 MiB, 1 895 bytes per line; three runs per side within 0.3 %) | 11.2-11.8 |
+
+The case's instruction counts include generating its corpus: 10.6 M for `cat`, 110 M for `vtebench`, 27 M for the
+`scroll` corpus of `rewrap`. The heap cases count requested bytes; `rss_1m` shows what the allocator rounds them to
+(1 600 requested bytes of cells take a 1 792-byte block on macOS, see `crates/tessera-grid/src/scrollback.rs`).
+
+vtebench 0.3.1 run headless (`tessera-devtool run 'vtebench -s --max-secs 3 --dat …' --cols 80 --rows 24`, release
+build, load 12.8 at the start and 12.1 at the end): median milliseconds per sample of at least 1 MiB and the
+throughput that makes.
+
+| benchmark | samples | median ms | MB/s |
+| --- | --- | --- | --- |
+| cursor_motion | 114 | 17 | 75.0 |
+| dense_cells | 364 | 9 | 149.8 |
+| light_cells | 313 | 8 | 131.2 |
+| scrolling | 49 | 61 | 17.2 |
+| scrolling_bottom_region | 45 | 49 | 21.4 |
+| scrolling_bottom_small_region | 39 | 57 | 18.4 |
+| scrolling_fullscreen | 207 | 13 | 80.7 |
+| scrolling_top_region | 56 | 51 | 20.6 |
+| scrolling_top_small_region | 57 | 49 | 21.4 |
+| unicode | 202 | 13 | 85.1 |

@@ -176,8 +176,9 @@ Memory efficiency is a first-class goal next to speed. When a brief names no bar
 
 These bars bind at review time. The scheduled `perf.yml` job (ADR 0049, `docs/software-factory.md`) catches what
 slips past them: every other day it measures main against the last measured SHA on a fixed case set (feed, scroll,
-search, idle heap, full-scrollback heap; the heap cases measure a `Terminal` only, about a third of an idle
-session, and session-level growth stays with the #216 budgets) and runs the release timing bars, and a case past its bar opens or comments
+search, `cat` throughput, rewrap, vtebench's ten streams; idle heap, full-scrollback heap, heap per plain and per mixed
+scrollback line, the resident set of 1 000 000 lines; the heap cases measure a `Terminal` only, about a third of an
+idle session, and session-level growth stays with the #216 budgets; the baselines are in ADR 0049) and runs the release timing bars, and a case past its bar opens or comments
 on a `type:bug` issue naming the SHA range. It never gates a PR. `just perf-job-test` checks its logic offline.
 
 What the job enforces on its GitHub runner, and what it leaves to `just check` and local runs (#682): the absolute

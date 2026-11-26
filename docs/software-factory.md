@@ -399,9 +399,10 @@ Agents use these instead of rebuilding the setup in every run:
   `scripts/quality-gate.sh`, the #216 byte budgets among them, minus the startup wall-time budget a runner cannot meet,
   run with `--no-fail-fast`; what the job enforces is listed in `docs/testing.md`) and the fixed case set of
   `scripts/perf-cases.rs` (feed,
-  scroll, search through `cargo xtask ab` against the last measured SHA that had no regression; idle and
-  full-scrollback heap of a `Terminal` only, about a third of an idle session, through the probe's counting allocator;
-  session-level growth is guarded by the #216 budgets in the release timing step). One JSON line per case (`sha`, `base`, `instructions`,
+  scroll, search, cat, rewrap and vtebench through `cargo xtask ab` against the last measured SHA that had no
+  regression; idle and full-scrollback heap of a `Terminal` only, about a third of an idle session, and the heap of
+  10 000 plain or mixed scrollback lines, through the probe's counting allocator; the peak resident set of 1 000 000
+  lines through `/usr/bin/time -l`; session-level growth is guarded by the #216 budgets in the release timing step). One JSON line per case (`sha`, `base`, `instructions`,
   `heap_bytes`, `ratio`, `status`) is appended to `perf-state/perf.jsonl`, kept in the Actions cache between runs and
   uploaded as the `perf-trend` artifact. A case over 1.02 in all three probe builds, or a heap over 1.02 of the
   baseline's, opens or comments on a `type:bug` issue ("perf: the scheduled performance job found a regression")
