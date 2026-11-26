@@ -28,8 +28,9 @@ use tessera_ffi::{
     tessera_session_close, tessera_session_resize, tessera_session_spawn, tessera_session_write,
     tessera_surface_attach, tessera_surface_detach, tessera_surface_metrics,
     tessera_surface_render, tessera_surface_resize, tessera_surface_set_font_size,
-    tessera_test_hold_font_index, tessera_test_surface_panic,
-    tessera_test_surface_shows_provisional_faces, tessera_test_with_core,
+    tessera_test_font_index_builds, tessera_test_hold_font_index, tessera_test_share_font_index,
+    tessera_test_surface_panic, tessera_test_surface_shows_provisional_faces,
+    tessera_test_with_core,
 };
 
 /// How long freeing the application may take.
@@ -1106,6 +1107,26 @@ fn shows_provisional_faces(app: &Handle, id: u64) -> bool {
     let read = unsafe { tessera_test_surface_shows_provisional_faces(app.0, id, &raw mut shows) };
     assert_eq!(read, Error::Ok);
     shows
+}
+
+/// The shared font index hooks (#660) refuse a NULL count and answer
+/// otherwise; turning sharing off, the default, is accepted. What sharing
+/// does is tessera-render's `shared_fonts` test.
+#[test]
+fn the_font_index_sharing_hooks_answer_and_refuse_null() {
+    // SAFETY: NULL is refused.
+    assert_eq!(
+        unsafe { tessera_test_font_index_builds(ptr::null_mut()) },
+        Error::NullPointer
+    );
+    let mut builds = u64::MAX;
+    // SAFETY: a writable u64.
+    assert_eq!(
+        unsafe { tessera_test_font_index_builds(&raw mut builds) },
+        Error::Ok
+    );
+    assert_ne!(builds, u64::MAX, "the count was written");
+    assert_eq!(tessera_test_share_font_index(false), Error::Ok);
 }
 
 /// #594: when the font fallback index lands, the core calls

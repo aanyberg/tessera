@@ -62,6 +62,21 @@ reproduce locally, run the affected classes under TSan with `-test-iterations 20
 and a concurrent `cargo build`). On main that gave 1 hang in 60 iterations of `TabVisibilityTests` and
 `PromptNavigationTests`, and none in 40 with terminal windows not restorable.
 
+**A SEGV inside Thread Sanitizer's `munmap` interceptor is a runtime defect, not a test failure (#609, #660).** In CI
+run 45038033580 the test host crashed about 0.1 s into `AppAppearanceTests.testEachValueReachesEveryWindowTheAppOpens`:
+the `tessera-font-index` thread unmapped a font file and the runtime faulted in its own bookkeeping for the range
+(`wrap_munmap` → `__tsan::UnmapShadow` → `__tsan::MetaMap::ResetRange`), then aborted on a recursive lock in its
+crash handler, so the log has `ThreadSanitizer:DEADLYSIGNAL` and no stack, and only the `.ips` names the thread. The
+same family as #496. It does not reproduce locally (0 of 40 runs). Each core loads its fonts on its first surface,
+scanning (and fontdb mapping) every system font and starting an index build, and tests replace the core hundreds of
+times a run, so the mapping churn was the exposure. Since #691 the index reads font files and maps none. The test
+host also turns on `tessera_test_share_font_index` before the first test (`HostDisplaySettings`), so every core in
+the process shares one scan and one index: a full run builds the index once, plus once for the #594 test that holds
+it (a load while the indexes are held builds its own). Production keeps one per core. The appearance test asserts
+its seven cores build at most one. A `ThreadSanitizer: SEGV on unknown address 0x0 ... in __pthread_kill` from
+`TerminationSignalChild.mark` belongs to a passing test: `TerminationSignalTests`' children raise `SIGSEGV` on
+purpose (#625) and the log quotes their reports. The test that failed is in the log's `Failing tests:` list.
+
 ## Hung runs: the test watchdog
 
 Every XCTest run goes through `scripts/app-test-watchdog.sh` (`just app-test`, `just app-test-only`; `just test` wraps

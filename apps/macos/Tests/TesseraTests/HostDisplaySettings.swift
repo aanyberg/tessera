@@ -11,7 +11,9 @@ import XCTest
 /// never fade). A test that needs one on sets the app delegate's read
 /// itself and calls ``pin(_:)`` in its tearDown. It also holds the run to
 /// ``LiveWindows/bound`` and turns window animations off
-/// (``turnOffWindowAnimations()``).
+/// (``turnOffWindowAnimations()``), and has every core of the host share one
+/// scan of the installed fonts and one font fallback index
+/// (``shareTheFontIndex()``).
 @objc(TesseraTestsHostDisplaySettings)
 final class HostDisplaySettings: NSObject, XCTestObservation {
     override init() {
@@ -23,6 +25,7 @@ final class HostDisplaySettings: NSObject, XCTestObservation {
     func testBundleWillStart(_ testBundle: Bundle) {
         MainActor.assumeIsolated {
             Self.turnOffWindowAnimations()
+            Self.shareTheFontIndex()
             // A child of TerminationSignalTests or FullScreenToggleTests
             // runs no test.
             FullScreenToggleChild.runIfRequested()
@@ -67,6 +70,20 @@ final class HostDisplaySettings: NSObject, XCTestObservation {
     }
 
     static let windowAnimationsKey = "NSAutomaticWindowAnimationsEnabled"
+
+    /// Every core the host starts from now on shares one scan of the
+    /// installed fonts and one font fallback index
+    /// (`tessera_test_share_font_index`, #660), where each core would build
+    /// its own on its first surface: tests replace the core hundreds of
+    /// times in a run, and Thread Sanitizer's `munmap` interceptor once
+    /// faulted under that churn (docs/testing.md). Nothing is opened before
+    /// the first test, so no core has loaded fonts yet. A host without the
+    /// core's test hooks skips it; the tests that need them fail on their
+    /// own.
+    static func shareTheFontIndex() {
+        guard TesseraTestsCoreTestHooksLinked() else { return }
+        _ = tessera_test_share_font_index(true)
+    }
 
     /// All three read as off, applied at once (the scroll bars' default
     /// and the core's options follow).

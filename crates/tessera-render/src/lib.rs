@@ -63,14 +63,14 @@ mod theme;
 
 pub use atlas::{AtlasLayer, AtlasSlot, AtlasStats, DEFAULT_ATLAS_SIZE, GlyphAtlas, GlyphKey};
 pub use error::RenderError;
-#[cfg(feature = "test-hooks")]
-#[doc(hidden)]
-pub use font::hold_fallback_index;
 pub use font::{
     DEFAULT_FAMILY, DEFAULT_FONT_SIZE_PT, EMOJI_FAMILY, FaceId, FontConfig, Fonts,
     MAX_FONT_SIZE_PT, MAX_SCALE, MIN_FONT_SIZE_PT, SYSTEM_FALLBACK, StyleSupport,
     sanitize_font_size,
 };
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub use font::{fallback_index_builds, hold_fallback_index, share_installed_fonts};
 pub use frame::{
     CommandStatus, CursorShape, CursorState, FrameInput, GutterMark, Overlay, OverlayKind,
     Selection, SelectionKind,

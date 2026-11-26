@@ -37,8 +37,20 @@ int32_t tessera_test_surface_shows_provisional_faces(
 /// process-wide; 0 takes the delay away (#722).
 int32_t tessera_test_delay_program_lookup(const char *_Nullable path, uint64_t delay_ms) __attribute__((weak_import));
 
+/// Makes every font database loaded from now on, by any core in the
+/// process, share one scan of the installed fonts and one font fallback
+/// index (`share` true), so the host builds the index once however often a
+/// test replaces the core; a load while the indexes are held builds its own
+/// (#660, docs/testing.md). The host turns it on before the first test.
+int32_t tessera_test_share_font_index(bool share) __attribute__((weak_import));
+
+/// Writes to `*out` how many font fallback indexes the process has started
+/// building (#660).
+int32_t tessera_test_font_index_builds(uint64_t *_Nullable out) __attribute__((weak_import));
+
 /// Whether the host exports the hooks above.
 static inline bool TesseraTestsCoreTestHooksLinked(void) {
     return &tessera_test_hold_font_index != NULL && &tessera_test_surface_shows_provisional_faces != NULL
-        && &tessera_test_delay_program_lookup != NULL;
+        && &tessera_test_delay_program_lookup != NULL && &tessera_test_share_font_index != NULL
+        && &tessera_test_font_index_builds != NULL;
 }
