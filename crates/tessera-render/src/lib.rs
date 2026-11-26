@@ -49,6 +49,7 @@ mod cmap;
 mod damage;
 mod error;
 mod font;
+mod font_scan;
 mod frame;
 mod gpu;
 mod offscreen;

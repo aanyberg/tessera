@@ -25,6 +25,7 @@ use crate::atlas::GlyphKey;
 use crate::boxdraw;
 use crate::cmap;
 use crate::error::RenderError;
+use crate::font_scan;
 
 /// Family used when the configured one is not installed.
 ///
@@ -488,6 +489,10 @@ struct Chain {
 
 pub(crate) struct Inner {
     system: FontSystem,
+    /// Faces of `system` whose file is read into memory on first use;
+    /// each is admitted by [`Self::face_traits`], before its first load
+    /// (#683).
+    owned: font_scan::OwnedFaces,
     scaler: ScaleContext,
     /// `families[0]` is the primary; the rest are fallbacks, each spelled
     /// as the font database spells it.
@@ -564,7 +569,8 @@ impl Fonts {
     /// second (more in debug builds), so create one `Fonts` per process and
     /// share it.
     pub fn new(config: &FontConfig) -> Result<Self, RenderError> {
-        Self::with_system(FontSystem::new(), config, IndexBuild::Background(None))
+        let (system, owned) = font_scan::installed_font_system();
+        Self::with_fonts(system, owned, config, IndexBuild::Background(None))
     }
 
     /// [`Self::new`], calling `notice` once the background coverage index
@@ -581,15 +587,30 @@ impl Fonts {
         config: &FontConfig,
         notice: impl FnOnce() + Send + 'static,
     ) -> Result<Self, RenderError> {
-        Self::with_system(
-            FontSystem::new(),
+        let (system, owned) = font_scan::installed_font_system();
+        Self::with_fonts(
+            system,
+            owned,
             config,
             IndexBuild::Background(Some(Box::new(notice))),
         )
     }
 
+    /// [`Self::with_fonts`] over `system` with no lazily read user fonts.
+    #[cfg(test)]
     fn with_system(
         system: FontSystem,
+        config: &FontConfig,
+        index: IndexBuild,
+    ) -> Result<Self, RenderError> {
+        Self::with_fonts(system, font_scan::OwnedFaces::default(), config, index)
+    }
+
+    /// The fonts of `system`, whose faces in `owned` are read into memory
+    /// on first use (#683).
+    fn with_fonts(
+        system: FontSystem,
+        owned: font_scan::OwnedFaces,
         config: &FontConfig,
         index: IndexBuild,
     ) -> Result<Self, RenderError> {
@@ -650,6 +671,7 @@ impl Fonts {
 
         let mut inner = Inner {
             system,
+            owned,
             scaler: ScaleContext::new(),
             families,
             chain,
@@ -702,7 +724,8 @@ impl Fonts {
     /// it with [`Self::build_index_now`].
     #[cfg(test)]
     pub(crate) fn without_index(config: &FontConfig) -> Result<Self, RenderError> {
-        Self::with_system(FontSystem::new(), config, IndexBuild::Never)
+        let (system, owned) = font_scan::installed_font_system();
+        Self::with_fonts(system, owned, config, IndexBuild::Never)
     }
 
     /// Builds the coverage index on this thread and lands it, as the
@@ -877,7 +900,12 @@ impl Inner {
 
     /// What [`synthesise`] needs to know about face `id`, read from the
     /// face loaded at its own weight.
+    ///
+    /// Every [`FaceId`] of a font is made from what this returns, so this
+    /// is where a lazily read user face is admitted (#683), before any
+    /// load of it, and [`Self::load`] needs no check of its own.
     fn face_traits(&mut self, id: fontdb::ID) -> Option<Face<fontdb::ID>> {
+        self.owned.admit(&mut self.system, id);
         let info = self.system.db().face(id)?;
         let italic = info.style != fontdb::Style::Normal;
         let weight = info.weight;
@@ -1757,7 +1785,7 @@ fn index_file(path: &std::path::Path, faces: impl Iterator<Item = (u32, u32)>, b
 /// with `fstat`, so a swap between the check and the open cannot slip
 /// through. A regular file reads the same with `O_NONBLOCK` set. Opening
 /// a socket fails by itself.
-fn open_regular_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+pub(crate) fn open_regular_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
     let file = std::fs::OpenOptions::new()
         .read(true)
@@ -1876,13 +1904,13 @@ fn read_face_cmap(
 }
 
 /// Whether `tag` opens an sfnt table directory (swash's `is_font`).
-fn is_sfnt(tag: u32) -> bool {
+pub(crate) fn is_sfnt(tag: u32) -> bool {
     matches!(&tag.to_be_bytes(), [0, 1, 0, 0] | b"OTTO" | b"true")
 }
 
 /// `N` big-endian `u32`s read from `file` at `offset`; `None` when the
 /// read fails or the file ends first.
-fn read_u32s<const N: usize>(file: &std::fs::File, offset: u64) -> Option<[u32; N]> {
+pub(crate) fn read_u32s<const N: usize>(file: &std::fs::File, offset: u64) -> Option<[u32; N]> {
     let mut bytes = [0; 16];
     let bytes = bytes.get_mut(..4 * N)?;
     read_exact_at(file, offset, bytes).ok()?;
@@ -1896,7 +1924,11 @@ fn read_u32s<const N: usize>(file: &std::fs::File, offset: u64) -> Option<[u32; 
 /// Fills `out` from `file` at `offset` with `pread(2)`, one call where a
 /// seek and a read took two (#716: a collection's faces each read their
 /// table directory); a file that ends first is an error.
-fn read_exact_at(file: &std::fs::File, offset: u64, out: &mut [u8]) -> std::io::Result<()> {
+pub(crate) fn read_exact_at(
+    file: &std::fs::File,
+    offset: u64,
+    out: &mut [u8],
+) -> std::io::Result<()> {
     #[cfg(test)]
     test_read_hook::count_read();
     std::os::unix::fs::FileExt::read_exact_at(file, out, offset)
@@ -4034,5 +4066,170 @@ mod tests {
         let (ranges, _) =
             index_monaco_with("format13", &cmap_with_groups(13, &[(0, u32::MAX, 1); 4]));
         assert_eq!(ranges, []);
+    }
+
+    /// Fonts over Menlo (a system font, mapped) and the user font
+    /// directory `dir` (read into memory, #683), with `family` primary and
+    /// `fallback` configured, and no coverage index.
+    fn fonts_with_user_dir(dir: &std::path::Path, family: &str, fallback: &[&str]) -> Fonts {
+        let budget = Box::leak(Box::new(font_scan::OwnedBudget::new(
+            font_scan::MAX_OWNED_TOTAL_BYTES,
+        )));
+        fonts_with_budget(dir, family, fallback, budget)
+    }
+
+    /// [`fonts_with_user_dir`], the user fonts' owned bytes counted
+    /// against `budget`.
+    fn fonts_with_budget(
+        dir: &std::path::Path,
+        family: &str,
+        fallback: &[&str],
+        budget: &'static font_scan::OwnedBudget,
+    ) -> Fonts {
+        let mut db = fontdb::Database::new();
+        db.load_font_file("/System/Library/Fonts/Menlo.ttc")
+            .expect("Menlo is installed");
+        let owned = font_scan::load_user_fonts_dir(&mut db, dir, budget);
+        let system = FontSystem::new_with_locale_and_db("en-US".into(), db);
+        let config = FontConfig {
+            family: family.into(),
+            size_pt: 13.0,
+            scale: 1.0,
+            fallback: fallback.iter().map(|&f| f.to_owned()).collect(),
+        };
+        Fonts::with_fonts(system, owned, &config, IndexBuild::Never).expect("fonts")
+    }
+
+    /// The first family name of `face`.
+    fn family_of(inner: &Inner, face: FaceId) -> Option<String> {
+        let FaceRepr::Font { id, .. } = face.0 else {
+            return None;
+        };
+        let info = inner.system.db().face(id)?;
+        info.families.first().map(|(name, _)| name.clone())
+    }
+
+    /// The face that draws `ch` and the glyphs its shaping and rasterising
+    /// give, one (glyph, ink pixels) pair per glyph.
+    fn shape_and_draw(inner: &mut Inner, ch: char) -> (FaceId, Vec<(u16, usize)>) {
+        let face = inner.resolve(ch, FontStyle::Regular).face;
+        let drawn = inner
+            .shape(face, &ch.to_string(), 26.0)
+            .iter()
+            .map(|glyph| {
+                let key = GlyphKey {
+                    face_id: face,
+                    glyph_id: glyph.glyph_id,
+                    size_px_64: 26 * 64,
+                    subpixel_x: 0,
+                    synthetic_bold: false,
+                    synthetic_italic: false,
+                    cell_size: [16, 32],
+                    baseline_px: 24,
+                };
+                let ink = inner.rasterize(&key).map_or(0, |image| {
+                    image.data.iter().filter(|&&byte| byte != 0).count()
+                });
+                (glyph.glyph_id, ink)
+            })
+            .collect();
+        (face, drawn)
+    }
+
+    /// #683: a user font in use that another process truncates in place
+    /// keeps shaping and drawing from the copy in memory. Mapped, as before
+    /// #683, the next read of its glyphs past the file's new end raised
+    /// `SIGBUS` and killed the process (this test's).
+    #[test]
+    fn a_user_font_truncated_in_place_while_in_use_keeps_drawing() {
+        let dir = font_scratch("in-use");
+        let path = dir.path().join("Monaco.ttf");
+        std::fs::copy("/System/Library/Fonts/Monaco.ttf", &path).expect("copy Monaco");
+        let fonts = fonts_with_user_dir(dir.path(), "Monaco", &[]);
+        let mut inner = fonts.lock();
+        let text: Vec<char> = ('!'..='~').collect();
+        let before: Vec<_> = text
+            .iter()
+            .map(|&ch| shape_and_draw(&mut inner, ch))
+            .collect();
+        let copy = before[0].0;
+        assert_eq!(
+            family_of(&inner, copy).as_deref(),
+            Some("Monaco"),
+            "the copy draws: {copy:?}"
+        );
+        truncate(&path, 0);
+        for (&ch, want) in text.iter().zip(&before) {
+            let got = shape_and_draw(&mut inner, ch);
+            assert_eq!(&got, want, "{ch:?} after the truncation");
+            assert!(got.1.iter().all(|&(glyph, _)| glyph != 0), "{ch:?}");
+        }
+        assert!(
+            before
+                .iter()
+                .any(|(_, glyphs)| glyphs.iter().any(|&(_, ink)| ink > 0))
+        );
+    }
+
+    /// #683: a user font whose read the owned budget refuses is mapped
+    /// before its first load, as a file over the per-file cap is, and draws
+    /// exactly as the copy in memory does. Read without that admission, it
+    /// would be an empty source and fail to load.
+    #[test]
+    fn a_user_font_over_the_owned_budget_is_mapped_and_draws() {
+        let dir = font_scratch("over-budget");
+        std::fs::copy(
+            "/System/Library/Fonts/Monaco.ttf",
+            dir.path().join("Monaco.ttf"),
+        )
+        .expect("copy Monaco");
+        let text: Vec<char> = ('!'..='~').collect();
+        let draw = |fonts: &Fonts| -> Vec<_> {
+            let mut inner = fonts.lock();
+            let drawn: Vec<_> = text
+                .iter()
+                .map(|&ch| shape_and_draw(&mut inner, ch))
+                .collect();
+            assert_eq!(family_of(&inner, drawn[0].0).as_deref(), Some("Monaco"));
+            drawn
+        };
+        let owned = draw(&fonts_with_user_dir(dir.path(), "Monaco", &[]));
+        let budget = Box::leak(Box::new(font_scan::OwnedBudget::new(1)));
+        let fonts = fonts_with_budget(dir.path(), "Monaco", &[], budget);
+        assert_eq!(draw(&fonts), owned);
+        assert_eq!(budget.used(), 0, "nothing read into memory");
+    }
+
+    /// #683: a user font truncated in place before any face of it is used
+    /// draws nothing: its characters fall back past it, here to Menlo's
+    /// `.notdef`, and nothing crashes. The scan read only its tables, so
+    /// nothing of it was in memory yet. An untruncated copy (the control)
+    /// draws the characters itself.
+    #[test]
+    fn a_user_font_truncated_before_its_first_use_falls_back() {
+        let groups = [(0xE000, 0xE0FF, 36)];
+        for truncated in [false, true] {
+            let dir = font_scratch("first-use");
+            let path = dir.path().join("Monaco.ttf");
+            write_monaco_with_cmap(&path, &cmap_with_groups(12, &groups));
+            let fonts = fonts_with_user_dir(dir.path(), DEFAULT_FAMILY, &["Monaco"]);
+            if truncated {
+                truncate(&path, 0);
+            }
+            let mut inner = fonts.lock();
+            let (face, glyphs) = shape_and_draw(&mut inner, '\u{E010}');
+            let family = family_of(&inner, face);
+            if truncated {
+                assert_ne!(family.as_deref(), Some("Monaco"), "{face:?}");
+                assert!(glyphs.iter().all(|&(glyph, _)| glyph == 0), "{glyphs:?}");
+                // The ASCII the primary face draws is untouched.
+                let (menlo, ascii) = shape_and_draw(&mut inner, 'A');
+                assert_eq!(family_of(&inner, menlo).as_deref(), Some("Menlo"));
+                assert!(ascii.iter().all(|&(glyph, ink)| glyph != 0 && ink > 0));
+            } else {
+                assert_eq!(family.as_deref(), Some("Monaco"), "{face:?}");
+                assert_eq!(glyphs.first().map(|&(glyph, _)| glyph), Some(52));
+            }
+        }
     }
 }
