@@ -20,15 +20,19 @@
 # status, note}; status is ok, regressed or noisy (the instrument could not back a verdict: a loaded machine, or one
 # without instruction counters such as a GitHub macOS runner, where `ratio` is the wall-time ratio and the heap cases
 # still bind). A line is a number for
-# the case's own kind (instructions for feed, scroll and search; heap bytes for heap_idle and heap_scrollback) and
-# null for the other.
+# the case's own kind (instructions for feed, scroll, search, cat, rewrap and vtebench; heap bytes for heap_idle,
+# heap_scrollback, heap_lines_plain and heap_lines_mixed; peak resident bytes for rss_1m, in the heap fields) and null
+# for the other.
 #
 # The baseline is the newest SHA none of whose lines is `regressed`, so a regression that stays does not become the
 # new normal. Bars: instructions head/base <= PERF_JOB_BAR (1.02) in at least one of PERF_JOB_BUILDS (3) independent
-# probe builds; heap head <= base * PERF_JOB_BAR.
+# probe builds; heap and resident head <= base * PERF_JOB_BAR.
 #
 # Test hooks (scripts/test-perf-job.sh): PERF_JOB_AB (default `cargo xtask ab`), PERF_JOB_PROBE (default the built
-# probe binary; called `<case> <side>`, prints the checksum), PERF_JOB_GH (default `gh`), PERF_JOB_WORK (scratch).
+# probe binary; called `<case> <side>`, prints the checksum), PERF_JOB_RSS (default `/usr/bin/time -l` around the
+# probe; called `<probe> <case> <side>`, prints the peak resident bytes; the highest of PERF_JOB_RSS_RUNS (3) runs per
+# side counts), PERF_JOB_GH (default `gh`), PERF_JOB_WORK
+# (scratch).
 #
 # Bash 3.2 compatible (the macOS system bash).
 set -euo pipefail
@@ -39,8 +43,10 @@ gh_cmd="${PERF_JOB_GH:-gh}"
 bar="${PERF_JOB_BAR:-1.02}"
 builds="${PERF_JOB_BUILDS:-3}"
 pairs="${PERF_JOB_PAIRS:-15}"
-instr_cases="feed scroll search"
-heap_cases="heap_idle heap_scrollback"
+rss_runs="${PERF_JOB_RSS_RUNS:-3}"
+instr_cases="feed scroll search cat rewrap vtebench"
+heap_cases="heap_idle heap_scrollback heap_lines_plain heap_lines_mixed"
+rss_cases="rss_1m"
 issue_title="perf: the scheduled performance job found a regression"
 failed_title="perf: the scheduled performance job failed"
 
@@ -50,6 +56,17 @@ failed_title="perf: the scheduled performance job failed"
 runner_skips="test(=startup_to_the_first_frame_stays_within_its_budget)"
 
 die() { echo "perf-job: $*" >&2; exit 2; }
+
+# The peak resident bytes of one probe run (macOS `time -l` reports bytes). Args: probe case side.
+peak_rss() {
+    if [[ -n "${PERF_JOB_RSS:-}" ]]; then
+        $PERF_JOB_RSS "$@"
+        return
+    fi
+    local report
+    report="$(/usr/bin/time -l "$1" bench "$2" "$3" 2>&1 > /dev/null)" || return 1
+    printf '%s\n' "$report" | awk '/maximum resident set size/ { print $1; exit }'
+}
 
 sub="${1:-}"; [[ -n "$sub" ]] || die "usage: perf-job.sh check|run|failed|timing-packages|timing-filter ..."
 shift
@@ -253,6 +270,32 @@ run)
         else status=regressed; fi
         ratio="$(awk -v h="$head_heap" -v b="$base_heap" 'BEGIN { printf "%.4f", (b > 0 ? h / b : 1) }')"
         line "$c" "$base" "" "" "$ratio" "$head_heap" "$base_heap" "$status" "$note" >> "$results"
+    done
+    # Resident cases: the peak resident set of the case's run minus that of the probe's empty case (the binary and the
+    # runtime), so the number is what the case's data costs in pages. The highest of PERF_JOB_RSS_RUNS runs counts: the
+    # system can only take pages away from a run (compression under memory pressure), which read 1.4 % low once on a
+    # loaded Mac (#51), near the 2 % bar.
+    for c in $rss_cases; do
+        reading=""
+        for side in head base; do
+            empty="$(peak_rss "$probe_bin" __empty "$side")" || die "no resident reading for the empty case ($side)"
+            [[ "$empty" =~ ^[0-9]+$ ]] || die "no resident reading for the empty case ($side): '$empty'"
+            full=0
+            for ((run_no = 1; run_no <= rss_runs; run_no++)); do
+                one="$(peak_rss "$probe_bin" "$c" "$side")" || die "no resident reading for $c ($side)"
+                [[ "$one" =~ ^[0-9]+$ ]] || die "no resident reading for $c ($side): '$one'"
+                if (( one > full )); then full="$one"; fi
+            done
+            reading="$reading $((full > empty ? full - empty : 0))"
+        done
+        # shellcheck disable=SC2086 # intentional split of the two readings
+        set -- $reading
+        head_rss="$1" base_rss="$2"
+        if awk -v h="$head_rss" -v b="$base_rss" -v r="$bar" 'BEGIN { exit !(h <= b * r) }'; then status=ok
+        else status=regressed; fi
+        ratio="$(awk -v h="$head_rss" -v b="$base_rss" 'BEGIN { printf "%.4f", (b > 0 ? h / b : 1) }')"
+        line "$c" "$base" "" "" "$ratio" "$head_rss" "$base_rss" "$status" \
+            "peak resident bytes (time -l) over the empty probe's${note:+; $note}" >> "$results"
     done
 
     cat "$results" >> "$jsonl"

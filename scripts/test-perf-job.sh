@@ -65,8 +65,19 @@ for ((i = 1; i <= $#; i++)); do
     if [[ "${!i}" == --body-file ]]; then j=$((i + 1)); cat "${!j}" > "$PERF_STUB/body-$(wc -l < "$PERF_STUB/gh.log" | tr -d ' ').md"; fi
 done
 STUB
-chmod +x "$tmp/ab" "$tmp/probe" "$tmp/gh"
-export PERF_STUB="$stub" PERF_JOB_AB="$tmp/ab" PERF_JOB_PROBE="$tmp/probe" PERF_JOB_GH="$tmp/gh"
+# rss <probe> <case> <side>: the empty case's 500 under a case's 1000500 (rss-head-<case> overrides the head's; a
+# queue rss-queue-<side>-<case> gives one reading per call first).
+cat > "$tmp/rss" <<'STUB'
+#!/usr/bin/env bash
+[[ "$2" == __empty ]] && { echo 500; exit 0; }
+[[ -f "$PERF_STUB/rss-fail" ]] && exit 1
+q="$PERF_STUB/rss-queue-$3-$2"
+if [[ -s "$q" ]]; then head -n 1 "$q"; sed -i.bak '1d' "$q"; rm -f "$q.bak"; exit 0; fi
+rss=1000500; [[ "$3" == head ]] && rss="$(cat "$PERF_STUB/rss-head-$2" 2>/dev/null || echo 1000500)"
+echo "$rss"
+STUB
+chmod +x "$tmp/ab" "$tmp/probe" "$tmp/gh" "$tmp/rss"
+export PERF_STUB="$stub" PERF_JOB_AB="$tmp/ab" PERF_JOB_PROBE="$tmp/probe" PERF_JOB_GH="$tmp/gh" PERF_JOB_RSS="$tmp/rss"
 unset GITHUB_OUTPUT GITHUB_RUN_ID GITHUB_REPOSITORY
 
 reset() { rm -rf "$stub"; mkdir -p "$stub"; : > "$stub/gh.log"; : > "$stub/ab.log"; }
@@ -83,13 +94,17 @@ GITHUB_OUTPUT="$tmp/gho" "$script" check --state "$s" --head "$A" > /dev/null
 [[ "$(cat "$tmp/gho")" == "skip=true" ]] || fail "check must write skip=true to GITHUB_OUTPUT"
 
 # 2. One JSON line per case, with the SHA, instructions and heap bytes; no issue for a clean run.
-[[ "$(wc -l < "$s/perf.jsonl" | tr -d ' ')" == 5 ]] || fail "expected 5 lines, got $(wc -l < "$s/perf.jsonl")"
-for c in feed scroll search heap_idle heap_scrollback; do
+all_cases="feed scroll search cat rewrap vtebench heap_idle heap_scrollback heap_lines_plain heap_lines_mixed rss_1m"
+[[ "$(wc -l < "$s/perf.jsonl" | tr -d ' ')" == 11 ]] || fail "expected 11 lines, got $(wc -l < "$s/perf.jsonl")"
+for c in $all_cases; do
     jq -e --arg c "$c" --arg a "$A" 'select(.case == $c and .sha == $a and .status == "ok")' "$s/perf.jsonl" > /dev/null \
         || fail "no ok line for $c at $A"
 done
 jq -e 'select(.case == "feed") | .instructions == 1000000000 and .ratio == 1' "$s/perf.jsonl" > /dev/null || fail "feed instructions"
 jq -e 'select(.case == "heap_idle") | .heap_bytes == 1000 and .base_heap_bytes == 1000' "$s/perf.jsonl" > /dev/null || fail "heap bytes"
+jq -e 'select(.case == "rss_1m") | .heap_bytes == 1000000 and .base_heap_bytes == 1000000 and .instructions == null' \
+    "$s/perf.jsonl" > /dev/null || fail "resident bytes are the case's peak over the empty probe's"
+jq -e 'select(.case == "vtebench") | .instructions == 1000000000' "$s/perf.jsonl" > /dev/null || fail "vtebench instructions"
 jq -e 'select(.case == "feed") | .note | startswith("baseline")' "$s/perf.jsonl" > /dev/null || fail "the first run says it is a baseline"
 [[ ! -s "$stub/gh.log" ]] || fail "a clean run must not call gh"
 grep -q "init base=$A" "$stub/ab.log" || fail "the baseline run compares $A with itself"
@@ -115,7 +130,11 @@ run "$s" "$A" || fail "baseline run failed"
 reset
 printf '1.080\n1.070\n1.090\n' > "$stub/ratio-search"
 echo 1030 > "$stub/heap-head-heap_scrollback"
+echo 1030500 > "$stub/rss-head-rss_1m"
 run "$s" "$B" || fail "regression run failed: $(cat "$tmp/out.log")"
+jq -e --arg b "$B" 'select(.sha == $b and .case == "rss_1m") | .status == "regressed" and .heap_bytes == 1030000 and .ratio == 1.03' \
+    "$s/perf.jsonl" > /dev/null || fail "a resident set 3 % over must be regressed"
+grep -q '| rss_1m | regressed' "$stub"/body-*.md || fail "the issue must list the resident case"
 jq -e --arg b "$B" 'select(.sha == $b and .case == "search") | .status == "regressed"' "$s/perf.jsonl" > /dev/null || fail "search must be regressed"
 jq -e --arg b "$B" 'select(.sha == $b and .case == "heap_scrollback") | .status == "regressed" and .heap_bytes == 1030' "$s/perf.jsonl" > /dev/null || fail "heap must be regressed"
 jq -e --arg b "$B" 'select(.sha == $b and .case == "feed") | .status == "ok"' "$s/perf.jsonl" > /dev/null || fail "feed must stay ok"
@@ -151,11 +170,28 @@ s="$tmp/s7b"
 touch "$stub/no-counters"
 echo 1030 > "$stub/heap-head-heap_idle"
 run "$s" "$A" || fail "a run without counters must not fail: $(cat "$tmp/out.log")"
-[[ "$(wc -l < "$s/perf.jsonl" | tr -d ' ')" == 5 ]] || fail "no counters: expected 5 lines"
+[[ "$(wc -l < "$s/perf.jsonl" | tr -d ' ')" == 11 ]] || fail "no counters: expected 11 lines"
 jq -e 'select(.case == "feed") | .status == "noisy" and .instructions == null and .ratio == 1.125 and (.note | test("no instruction counters"))' \
     "$s/perf.jsonl" > /dev/null || fail "no counters: feed must be noisy with the wall ratio and a note"
 [[ "$(grep -c '^init' "$stub/ab.log")" == 1 ]] || fail "no counters: no second probe build"
 jq -e 'select(.case == "heap_idle") | .status == "regressed"' "$s/perf.jsonl" > /dev/null || fail "no counters: the heap bar still binds"
+
+# 7b2. The highest of three resident readings counts: one low reading on the base side does not hide a regression,
+# and one low reading on the head side is not a gain.
+reset
+s="$tmp/s7b2"
+printf '1000500\n960500\n1000500\n' > "$stub/rss-queue-base-rss_1m"
+printf '1030500\n1000500\n1000500\n' > "$stub/rss-queue-head-rss_1m"
+run "$s" "$A" || fail "resident runs failed: $(cat "$tmp/out.log")"
+jq -e 'select(.case == "rss_1m") | .status == "regressed" and .heap_bytes == 1030000 and .base_heap_bytes == 1000000' \
+    "$s/perf.jsonl" > /dev/null || fail "the highest of three resident readings per side must count"
+
+# 7c. A resident reading that cannot be taken fails the run (no line is written for a half-measured set).
+reset
+s="$tmp/s7c"
+touch "$stub/rss-fail"
+expect "a failed resident reading fails the run" bash -c "! PERF_JOB_WORK='$tmp/work-7c' '$script' run --state '$s' --head $A"
+[[ ! -s "$s/perf.jsonl" ]] || fail "a failed resident reading must not append lines"
 
 # 8. The gate's release timing step is what the job runs: its packages and filter come out of quality-gate.sh.
 pk="$("$script" timing-packages)"

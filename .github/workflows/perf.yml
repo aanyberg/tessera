@@ -11,8 +11,10 @@ name: Perf
 # 2. The gate's release timing bars, the #216 budget tests included, minus the tests whose bar is an absolute wall
 #    time measured on a local Mac (`perf-job.sh timing-filter`): this runner cannot meet those, `just check` and
 #    local runs enforce them. The byte budgets (idle and full-scrollback heap) and the ratio bars are enforced here.
-# 3. A fixed case set (feed, scroll, search, idle heap, full-scrollback
-#    heap) against the last measured SHA without a regression.
+# 3. A fixed case set (feed, scroll, search, cat, rewrap, vtebench; idle heap,
+#    full-scrollback heap, heap per plain and per mixed scrollback line; the
+#    resident set of 1M lines) against the last measured SHA without a
+#    regression.
 #
 # A red timing step does not stop the case set, the state or the trend; it is
 # reported as its own issue ("failed", not "found a regression").
