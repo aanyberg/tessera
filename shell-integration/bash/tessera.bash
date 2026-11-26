@@ -324,7 +324,15 @@ fi' INT
         # too, before `trap -p` (#726): what it writes, to any descriptor,
         # could land in the read, and under extdebug a non-zero status
         # skips `trap -p`. So `set -T` is off for the read, and back on
-        # right after (extdebug itself stays on).
+        # right after (extdebug itself stays on). Under `set -x` with
+        # BASH_XTRACEFD=1 (bash 4.1 and later) the fork's trace of
+        # `trap -p` went into the read the same way (#733): `set -x` is
+        # off for it too, turned off first and back on last, so that
+        # neither the other switch nor the restore adds a trace line.
+        if [[ -o xtrace ]]; then
+            _tessera_si_rc_x=1
+            builtin set +x
+        fi
         if [[ -o functrace ]]; then
             _tessera_si_rc_ft=1
             builtin set +T
@@ -334,6 +342,9 @@ fi' INT
         fi
         if [[ -n "${_tessera_si_rc_ft-}" ]]; then
             builtin set -T
+        fi
+        if [[ -n "${_tessera_si_rc_x-}" ]]; then
+            builtin set -x
         fi
         # (Above 255 the trap saw bash's internal status for a syntax error,
         # 257 or 258, where bash alone shows source's 2 on 5.x.)
@@ -346,7 +357,7 @@ fi' INT
         if [[ -n "${_tessera_si_rc_e-}" ]]; then
             builtin set -e
         fi
-        builtin unset _tessera_si_rc_depth _tessera_si_rc_q _tessera_si_rc_seen _tessera_si_rc_e _tessera_si_rc_int _tessera_si_rc_ft
+        builtin unset _tessera_si_rc_depth _tessera_si_rc_q _tessera_si_rc_seen _tessera_si_rc_e _tessera_si_rc_int _tessera_si_rc_ft _tessera_si_rc_x
     else
         _tessera_si_rc_status=0
     fi
