@@ -476,7 +476,42 @@ machine measured here), on the index thread. Three changes:
   `classify` and `first_uncovered` on the render path. The full fix was
   chosen over skipping code points whose glyph arithmetic overflows: it
   is a binary search of about 60 lines, and the index and the lookups
-  then agree on every face. It reads a subtable only up to the `cmap`
-  table's stated length, where swash read it up to the end of the file,
+  then agree on every well-formed face (#725 below: not on unsorted
+  records, until the walk followed the search). It reads a subtable
+  only up to the `cmap` table's stated length, where swash read it up
+  to the end of the file,
   and a `cmap` record at offset 0 is no table, as it is to swash and to
   the index. Shaping (harfrust, through read-fonts) already wrapped.
+
+## Amendment: the index walks the lookup's binary search (#725, 2026-11-26)
+
+#716's claim that the index and the lookups agree held only for
+well-formed tables. The walk took a subtable's groups or segments in
+turn, but `cmap::map` binary-searches them, which assumes they are
+sorted and do not overlap. For unsorted records the walk claimed code
+points the search never reaches: with groups (U+0050 to U+0060),
+(U+0010 to U+0020), (U+0030 to U+0040) the index gave U+0055 to the
+face, `map` found nothing, and `resolve` drew it as `.notdef` from that
+face though a later face covered it.
+
+`cmap::enumerate` now walks that binary search as a tree: the record at
+the midpoint sends the code points below its first to the records below
+it, maps those it holds, and sends those above it to the records above
+it, each record read at most once and only when a code point reaches
+it, each code point at most once. The index then claims a code point
+for a face exactly where `map` gives it a glyph, for any table (a
+property test compares the two over hostile tables), with three
+documented differences, only the first of them a claim `map` does not
+make: format 4 yields U+FFFF where a segment maps it, which swash's
+`map` never does; a format whose high byte is set is walked as nothing;
+and a symbol subtable's U+0000 to U+00FF are not claimed again for its
+U+F000 to U+F0FF. The alternative, checking each claimed code point
+with `map`, costs a binary search per code point; the tree costs what
+the walk in turn did, at most one walk of the code space plus one step
+per record, and fewer for overlapping records (a 2 MiB `cmap` of
+overlapping groups reaching `u32::MAX` now reads one group, not
+174 760). For a well-formed table nothing changes: the installed fonts
+index exactly as before (the same 5 563 ranges, 1.98 million code
+points and 864 030 records walked), and the build takes about 15 ms in
+release where it took 13 ms (best of 7 per run, runs alternated at a
+load of 30 to 40): the records are now read through the recursion.

@@ -3903,12 +3903,13 @@ mod tests {
 
     /// #689: format-12 groups reaching `u32::MAX` walked four billion code
     /// points each, and the 2 MiB `cmap` cap holds about 174 000 groups.
-    /// Each is cut at the code space and walked only above the code
-    /// points the groups before it reached, so the build at the cap costs
-    /// one walk of the code space: this test fails at its one-minute bound
-    /// otherwise. After the first group, the second covers the rest of the
-    /// code space but each 0x10000th code point (glyph 0); the remaining
-    /// groups add nothing.
+    /// Each is cut at the code space and no code point is walked twice, so
+    /// the build at the cap costs at most one walk of the code space: this
+    /// test fails at its one-minute bound otherwise. The walk follows the
+    /// lookup's binary search (#725), whose first group read, a middle
+    /// one, covers the code space but each 0x10000th code point (glyph 0):
+    /// the first group, (U+0041, U+005A), is never reached, by the lookup
+    /// or the walk.
     #[test]
     fn format12_groups_reaching_u32_max_cost_one_walk_of_the_code_space() {
         let count = (MAX_INDEX_CMAP_BYTES as usize - 28) / 12;
@@ -3920,11 +3921,81 @@ mod tests {
             "{}",
             cmap.len()
         );
+        assert_eq!(
+            cmap::map(&cmap, 0x41),
+            0x41,
+            "U+0041 should map through the middle group (glyph 0x41), not the first group"
+        );
         let (ranges, elapsed) = index_monaco_with("reach", &cmap);
-        let mut expected = vec![(0x41, 0xFFFF)];
-        expected.extend((1..0x11).map(|plane| ((plane << 16) | 1, (plane << 16) | 0xFFFF)));
-        assert_eq!(ranges, expected);
+        assert_eq!(ranges, every_code_point_but_each_plane_start());
         eprintln!("{count} groups indexed in {elapsed:?}");
+    }
+
+    /// #725: a face whose format-12 groups are unsorted, (U+E050, U+E060),
+    /// (U+E010, U+E020), (U+E030, U+E040), was given U+E050 to U+E060 by
+    /// the index, which walked the groups in turn, but the lookups' binary
+    /// search never reaches that first group: `resolve` offered the face
+    /// for U+E055, which then drew as `.notdef` though a later face covers
+    /// it. The index follows the lookup's search: the later face draws
+    /// U+E055, and the unsorted face still draws what its lookup finds.
+    #[test]
+    fn an_unsorted_cmap_claims_only_what_its_lookup_finds() {
+        let dir = font_scratch("unsorted");
+        let unsorted = dir.path().join("Unsorted.ttf");
+        let covering = dir.path().join("Covering.ttf");
+        let groups = [
+            (0xE050, 0xE060, 1),
+            (0xE010, 0xE020, 2),
+            (0xE030, 0xE040, 3),
+        ];
+        write_monaco_with_cmap(&unsorted, &cmap_with_groups(12, &groups));
+        write_monaco_with_cmap(&covering, &cmap_with_groups(12, &[(0xE000, 0xE0FF, 1)]));
+        let mut db = fontdb::Database::new();
+        db.load_font_file("/System/Library/Fonts/Menlo.ttc")
+            .expect("Menlo is installed");
+        db.load_font_file(&unsorted)
+            .expect("the unsorted copy loads");
+        let unsorted = db.faces().last().map(|f| f.id).expect("the copy");
+        db.load_font_file(&covering)
+            .expect("the covering copy loads");
+        let covering = db.faces().last().map(|f| f.id).expect("the copy");
+        let index = Coverage::build(&db);
+        for (cp, face) in [
+            (0xE00F, covering),
+            (0xE010, unsorted),
+            (0xE020, unsorted),
+            (0xE021, covering),
+            (0xE035, unsorted),
+            (0xE041, covering),
+            (0xE050, covering),
+            (0xE055, covering),
+            (0xE060, covering),
+        ] {
+            let ch = char::from_u32(cp).expect("a scalar");
+            assert_eq!(index.lookup(ch), Some(face), "U+{cp:04X}");
+        }
+        let system = FontSystem::new_with_locale_and_db("en-US".into(), db);
+        let config = FontConfig {
+            family: DEFAULT_FAMILY.into(),
+            size_pt: 13.0,
+            scale: 1.0,
+            fallback: Vec::new(),
+        };
+        let fonts = Fonts::with_system(system, &config, IndexBuild::Never).expect("Menlo");
+        fonts.build_index_now();
+        let mut inner = fonts.lock();
+        for (ch, face, glyph) in [
+            ('\u{E055}', covering, 0x56),
+            ('\u{E015}', unsorted, 7),
+            ('\u{E035}', unsorted, 8),
+        ] {
+            let resolved = inner.resolve(ch, FontStyle::Regular).face;
+            assert!(
+                matches!(resolved.0, FaceRepr::Font { id, .. } if id == face),
+                "{ch:?} from {resolved:?}"
+            );
+            assert_eq!(inner.nominal_glyph(resolved, ch), glyph, "{ch:?}");
+        }
     }
 
     /// #689: a panic in a face's character map walk leaves that face out
