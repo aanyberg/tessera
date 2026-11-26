@@ -263,3 +263,17 @@ rcexit | E23 | 3.2 5.1 5.3 | trap 'if [[ $BASH_COMMAND == "builtin unset _tesser
 # status 0 (no command after the end), E25 with 1 under `set -T`.
 rcexit | E24 | 3.2 5.1 5.3 | PROMPT_COMMAND=:\ntrap 'if [[ -z ${_tessera_si_rc_depth+x} && -z $(trap -p INT) ]]; then trap - DEBUG; echo READY; s=$SECONDS; while (( SECONDS - s < 4 )); do :; done; fi' DEBUG | ^C READY\necho "it=[$(trap -p INT)]" | lines: READY / it=[]
 rcexit | E25 | 3.2 5.1 5.3 | PROMPT_COMMAND=:\nset -T\ntrap 'if [[ -z ${_tessera_si_rc_depth+x} && -z $(trap -p INT) ]]; then trap - DEBUG; echo READY; s=$SECONDS; while (( SECONDS - s < 4 )); do :; done; fi' DEBUG\nfalse | ^C READY\necho "it=[$(trap -p INT)] t=${-//[^T]/}" | lines: READY / it=[] t=T
+# A DEBUG trap of the file's under `set -T` or `shopt -s extdebug` runs in
+# the route's command substitutions too (#726): one that writes to standard
+# output (E26, E27) or to descriptor 3 (E28, E29), or, under extdebug, one
+# whose non-zero status skips the next command there (E30). The check that
+# our INT trap is still the one in place runs with `set -T` off, so the
+# trap is removed after the file, and the startup status, `set -T` and
+# extdebug come out as bash alone leaves them. (Measured before the fix:
+# E26 left the trap on 3.2 and 5.3, E27 on 5.3; with a read through
+# descriptor 3, E28 on 3.2 and 5.3, E29 and E30 on 5.3.)
+rcexit | E26 | 3.2 5.1 5.3 | PROMPT_COMMAND='echo "pc=$?"'\nset -T\ntrap '[[ $BASH_SUBSHELL == 0 ]] || echo sub' DEBUG\nfalse | echo "it=[$(trap -p INT)] t=${-//[^T]/}" | lines: pc=1 / it=[sub] t=T / pc=0
+rcexit | E27 | 3.2 5.1 5.3 | PROMPT_COMMAND='echo "pc=$?"'\nshopt -s extdebug\ntrap '[[ $BASH_SUBSHELL == 0 ]] || echo sub' DEBUG\nfalse | shopt -q extdebug; x=$?; echo "it=[$(trap -p INT)] t=${-//[^T]/} x=$x" | lines: pc=1 / it=[sub] t=T x=0 / pc=0
+rcexit | E28 | 3.2 5.1 5.3 | PROMPT_COMMAND='echo "pc=$?"'\nexec 3>/dev/null\nset -T\ntrap '[[ $BASH_SUBSHELL == 0 ]] || echo sub >&3' DEBUG\nfalse | echo "it=[$(trap -p INT)] t=${-//[^T]/}" | lines: pc=1 / it=[] t=T / pc=0
+rcexit | E29 | 3.2 5.1 5.3 | PROMPT_COMMAND='echo "pc=$?"'\nexec 3>/dev/null\nshopt -s extdebug\ntrap '[[ $BASH_SUBSHELL == 0 ]] || echo sub >&3' DEBUG\nfalse | shopt -q extdebug; x=$?; echo "it=[$(trap -p INT)] t=${-//[^T]/} x=$x" | lines: pc=1 / it=[] t=T x=0 / pc=0
+rcexit | E30 | 3.2 5.1 5.3 | PROMPT_COMMAND='echo "pc=$?"'\nshopt -s extdebug\ntrap '[[ $BASH_SUBSHELL == 0 ]]' DEBUG\nfalse | shopt -q extdebug; x=$?; trap -p INT > it; read -r l < it; echo "it=[$l] t=${-//[^T]/} x=$x" | lines: pc=1 / it=[] t=T x=0 / pc=0
