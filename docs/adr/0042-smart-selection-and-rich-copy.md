@@ -814,3 +814,40 @@ search and 150 ms a click on 8000 characters, three times
 `SMART_RULE_ATTEMPT_BOUND` (50 ms). That is not new (the regex crate's
 engine took 115 ms on it before), but the attempt bound does not hold for
 a fallback search; #687 restores it.
+
+## Amendment: the fallback gate counts work, not states (#687, 2026-11-25)
+
+**Why.** States x bytes did not bound a PikeVM search. The PikeVM scans
+a `Sparse` state's transitions one by one, so the #649 rule `\b C*bC{990}`
+(C a class of 64 one-byte members) took about 120 ms a search at 7.99 M
+units. The 34 ms the #649 amendment gave for the gate was also measured
+with about half the states live. With every state live at every byte
+(`\b[ab]*[ab]{990}c`, no match), one search at 8 000 000 took 33 ms of
+thread CPU time, and the 64-member classes took 193 ms.
+
+**The gate.** A state of the captures program now counts one unit, a
+`Sparse` state a sixteenth more for each transition (64 members: 5 units,
+against the 3.9 measured), and a look-around state two (a Unicode `\B`
+before each byte measured 1.4). The work per byte times the window's bytes
+must stay within `SMART_FALLBACK_UNITS`, lowered from 8 000 000 to
+5 000 000, so the most a unit costs (a run of one-byte states, 4.2 ns)
+gives about 21 ms for the PikeVM at the gate. The slot gate still counts states alone.
+
+**Measured** (release, thread CPU time, fastest of three, load about 10;
+the test `hostile_smart_rules_at_the_fallback_gate_take_one_attempt_at_most`
+runs these in the release timing step): at the gate, a run of one-byte
+states 20.9 ms; classes of 64 one-byte members 15.6 ms; the #649 rule
+9.7 ms (1007 bytes, where 8000 took 120 ms before); `\B` before each byte
+15.7 ms in ASCII and 12.3 ms in Latin; an alternation 18.6 ms; optional
+bytes 17.8 ms; 20 branches of 300 or more bytes 18.1 ms. These are the PikeVM alone. A fallback attempt is the lazy DFA run up to
+its quit plus the PikeVM: measured 32.7 ms worst case on a cold cache,
+estimated at most about 40 ms, under the 50 ms attempt bound. On 8000 bytes the #649
+rule is now over the gate and selects nothing at once.
+
+**Cost.** A rule whose work times its window passes 5 000 000 selects
+nothing on a line that is not ASCII, as before. This now happens on
+smaller windows: about 0.6 of the old size for a program of one-byte
+states, and an eighth for one of 64-member classes. No built-in rule is
+affected. The largest, the compressed IPv6 rule (131 states, 146 units),
+needs 4.78 M on the widest 32 KiB window (tested). The count adds one word
+to what each rule keeps about its program, and no allocation.

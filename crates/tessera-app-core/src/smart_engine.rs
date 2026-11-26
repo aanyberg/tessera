@@ -31,10 +31,11 @@
 //!    `find_iter`, each search on the rule's DFA until it quits or gives
 //!    up and then on a `PikeVM` of the same program (#649: not the regex
 //!    crate's own engine, whose backtracker's stack has no bound). It runs
-//!    only when its compiled program's states times the window's bytes are
-//!    at most [`SMART_FALLBACK_UNITS`] (the `PikeVM` costs a few to about
-//!    15 nanoseconds per state and byte) and its states times its capture
-//!    slots fit
+//!    only when its compiled program's work per byte (its states, a class
+//!    of many ranges and a look-around counting more, #687) times the
+//!    window's bytes is at most [`SMART_FALLBACK_UNITS`] (the `PikeVM`
+//!    costs at most about 4.2 nanoseconds a unit) and its states times its
+//!    capture slots fit
 //!    [`SMART_FALLBACK_SLOT_BYTES`]; past either the rule has no match for
 //!    that click, with one warning per rule index. A rule whose DFA cache
 //!    regex-automata raises past [`SMART_RULE_CACHE_BYTES`] has no
@@ -70,10 +71,13 @@ use tessera_config::{
 /// DFA cache at most twice (a warm cache that fills is reset and the search
 /// retried cold) or runs the fallback within [`SMART_FALLBACK_UNITS`].
 /// About 25 ms was the worst seen on a loaded machine, over thousands of
-/// random patterns, for a DFA search. A fallback search does not hold to
-/// it: a `PikeVM` search at the fallback's gate takes up to about 120 ms,
-/// and a click about 150 ms ([`SMART_FALLBACK_UNITS`]; 115 ms with the
-/// regex crate's engine before #649; #687 restores the bound). With the
+/// random patterns, for a DFA search, and, for a fallback attempt (the lazy DFA
+/// run up to its quit, then the `PikeVM`), 32.7 ms measured worst case on a
+/// cold cache and an estimated 40 ms at most, with the `PikeVM` search at
+/// the gate with every state live about 21 ms of it
+/// ([`SMART_FALLBACK_UNITS`], #687; before it a class of 64 one-byte
+/// members took about 190 ms there, 115 ms with the regex crate's engine
+/// before #649). With the
 /// click budget
 /// ([`crate::selection::SMART_RULE_BUDGET`]) checked after each costly
 /// search (the first on a cold cache, a reset, or the fallback) and every
@@ -83,18 +87,26 @@ use tessera_config::{
 pub const SMART_RULE_ATTEMPT_BOUND: Duration = Duration::from_millis(50);
 
 /// The most work a smart-selection rule may give its fallback in one
-/// search (#518): its compiled program's states (capture groups included)
-/// times the scan window's bytes. Past it the rule has no match for that
-/// click. Re-measured on the fallback's `PikeVM` (#649), one search costs
-/// 4.3 ns a unit with every state live at every byte (`[ab]*a[ab]{300}`
-/// and `[ab]*a[ab]{1000}` on random `a` and `b`, 34 ms at the gate), but a
-/// state whose class is many single bytes scans them one by one: a class
-/// of 64 one-byte members (`\b C*bC{990}`) costs 14.8 ns a unit, about
-/// 120 ms a search and 150 ms a click on 8000 characters, three times
-/// [`SMART_RULE_ATTEMPT_BOUND`] (the regex crate's engine took 115 ms
-/// before #649; #687 restores the bound). Every built-in rule stays under
-/// the gate on a full 32 KiB window (the largest, 131 states, at 4.3 M).
-pub const SMART_FALLBACK_UNITS: usize = 8_000_000;
+/// search (#518, #687): its compiled program's work per byte times the
+/// scan window's bytes. A state of the program (capture groups included)
+/// is one unit, a `Sparse` state a sixteenth more for each of its
+/// transitions (the `PikeVM` scans them one by one) and a look-around state
+/// one more (`state_work`). Past it the rule has no match for that
+/// click. Measured on the fallback's `PikeVM` (#687, thread CPU time,
+/// release, load about 10), one search at the gate with every state live
+/// at every byte takes about 21 ms for a run of one-byte states
+/// (`\b[ab]*[ab]{990}c` on random `a` and `b`, 4.2 ns a unit, the most
+/// per unit), 15.6 ms for classes of 64 one-byte members (`\b C*C{990}c`),
+/// 15.7 ms with a Unicode `\B` before each byte and 18.6 ms for an
+/// alternation, the `PikeVM` alone. A fallback attempt adds the DFA run up to
+/// its quit: measured 32.7 ms worst case on a cold cache, estimated at most
+/// 40 ms, under [`SMART_RULE_ATTEMPT_BOUND`]. Counted as states alone, the classes of 64 members cost 3.9
+/// times a unit (`\b C*bC{990}` of #687 took 120 ms a search, 150 ms a
+/// click, at 7.99 M units under the old gate of 8 000 000). Every
+/// built-in rule stays under the gate on a full 32 KiB window (the
+/// largest, the compressed IPv6 rule of 131 states, counts 146 units
+/// a byte, 4.78 M).
+pub const SMART_FALLBACK_UNITS: usize = 5_000_000;
 
 /// The most memory a smart-selection rule's fallback `PikeVM` may take in
 /// its slot tables (S5, #590): its compiled program's states (capture
@@ -424,7 +436,7 @@ impl SmartEngines {
         let rule = self.rules.rules().get(index)?;
         engine
             .fallback_states(rule.pattern())
-            .map(|cost| cost.states.saturating_mul(bytes))
+            .map(|cost| cost.work.saturating_mul(bytes))
     }
 
     /// The bytes rule `index`'s fallback slot tables take, as the gate
@@ -448,6 +460,25 @@ struct FallbackCost {
     states: usize,
     /// Its capture slots (two per group, the whole match included).
     slots: usize,
+    /// What a `PikeVM` search costs per byte of the window at most, in
+    /// units of one state ([`state_work`], #687).
+    work: usize,
+}
+
+/// What one state of a fallback program costs a `PikeVM` search per byte
+/// at most, in sixteenths of a unit ([`SMART_FALLBACK_UNITS`], #687): a
+/// unit for every state, and a sixteenth more for each transition of a
+/// `Sparse` state, which the `PikeVM` scans one by one (a class of 64
+/// one-byte members counts 5 units, about 3.9 times a byte's cost as
+/// measured), and a unit more for a look-around state, which a Unicode word
+/// boundary evaluates by decoding the characters on both sides (1.4 times a
+/// byte's cost measured with `\B` before each byte).
+fn state_work(state: &thompson::State) -> usize {
+    match state {
+        thompson::State::Sparse(sparse) => 16 + sparse.transitions.len(),
+        thompson::State::Look { .. } => 32,
+        _ => 16,
+    }
 }
 
 impl FallbackCost {
@@ -461,7 +492,7 @@ impl FallbackCost {
     /// [`SMART_FALLBACK_UNITS`] and [`SMART_FALLBACK_SLOT_BYTES`].
     fn within(self, bytes: usize) -> bool {
         self.slot_bytes() <= SMART_FALLBACK_SLOT_BYTES
-            && self.states.saturating_mul(bytes) <= SMART_FALLBACK_UNITS
+            && self.work.saturating_mul(bytes) <= SMART_FALLBACK_UNITS
     }
 }
 
@@ -553,6 +584,12 @@ impl RuleEngine {
                 .map(|nfa| FallbackCost {
                     states: nfa.states().len(),
                     slots: nfa.group_info().slot_len(),
+                    work: nfa
+                        .states()
+                        .iter()
+                        .map(state_work)
+                        .sum::<usize>()
+                        .div_ceil(16),
                 })
         })
     }
@@ -895,6 +932,7 @@ pub(crate) fn multi_script(count: usize, mut seed: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
     use std::time::Instant;
 
     use proptest::prelude::*;
@@ -1245,22 +1283,24 @@ mod tests {
     }
 
     /// #518: the fallback runs on a window whose work is exactly
-    /// [`SMART_FALLBACK_UNITS`] and not on one byte more. `\ba{244}` has
-    /// 250 states with captures, so a 32 000-byte window is the gate.
+    /// [`SMART_FALLBACK_UNITS`] and not on one byte more. `\ba{243}` counts
+    /// 250 units (249 states with captures, one of them a look, #687), so
+    /// a 20 000-byte window is the gate.
     #[test]
     fn the_fallback_runs_up_to_the_gate_and_not_one_byte_past() {
-        let rule = engines(&[r"\ba{244}"]);
+        let rule = engines(&[r"\ba{243}"]);
         let at_gate = SMART_FALLBACK_UNITS / 250;
+        assert_eq!(at_gate, 20_000);
         assert_eq!(rule.fallback_units(0, at_gate), Some(SMART_FALLBACK_UNITS));
         let window = |bytes: usize| {
-            let mut text = format!("{} \u{e9}", "a".repeat(244));
+            let mut text = format!("{} \u{e9}", "a".repeat(243));
             text.push_str(&" ".repeat(bytes - text.len()));
             text
         };
         WARNINGS.with(|warnings| warnings.set(0));
         assert_eq!(
             scan(&rule, 0, &window(at_gate)),
-            (vec![Range { start: 0, end: 244 }], Scanned::Done),
+            (vec![Range { start: 0, end: 243 }], Scanned::Done),
             "at the gate"
         );
         assert!(!rule.warned(0));
@@ -1270,6 +1310,193 @@ mod tests {
             "one byte past it"
         );
         assert_eq!(WARNINGS.with(std::cell::Cell::get), 1);
+    }
+
+    /// A class of the 64 even ASCII bytes, `\x00` to `\x7e`: one `Sparse`
+    /// state of 64 one-byte transitions, which the `PikeVM` scans one by
+    /// one (#687).
+    fn sparse_class() -> String {
+        let members = (0..0x80_u8)
+            .step_by(2)
+            .fold(String::new(), |mut members, byte| {
+                let _ = write!(members, "\\x{byte:02x}"); // writing to a String cannot fail
+                members
+            });
+        format!("(?-u:[{members}])")
+    }
+
+    /// A line of at most `bytes` bytes that is not ASCII: characters drawn
+    /// from `chars` by `seed`, then `é`.
+    fn line_from(chars: &str, bytes: usize, mut seed: u64) -> String {
+        let chars: Vec<char> = chars.chars().collect();
+        let mut text = String::new();
+        loop {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let c = chars[usize::try_from(seed % chars.len() as u64).unwrap()];
+            if text.len() + c.len_utf8() + '\u{e9}'.len_utf8() > bytes {
+                break;
+            }
+            text.push(c);
+        }
+        text.push('\u{e9}');
+        text
+    }
+
+    /// #687: the gate counts what a `PikeVM` search costs per byte, not
+    /// states alone: a state is one unit, a `Sparse` state (a class of
+    /// many ranges, scanned one by one) a sixteenth more for each
+    /// transition, and a look-around state (a Unicode word boundary
+    /// decodes characters on both sides) two. Sixteen more repeats add 16
+    /// units of `a`, 16 x 5 of a class of 64 one-byte members, 16 x 18 / 16
+    /// of a class of two, and 16 x 3 of `\Ba`.
+    #[test]
+    fn the_gate_counts_a_class_by_its_transitions_and_a_look_twice() {
+        let work = |pattern: &str| {
+            engines(&[pattern])
+                .fallback_units(0, 1)
+                .expect("it may fall back")
+        };
+        let grown = |unit: &str| {
+            work(&format!(r"\b(?:{unit}){{32}}")) - work(&format!(r"\b(?:{unit}){{16}}"))
+        };
+        assert_eq!(grown("a"), 16, "one byte");
+        assert_eq!(grown(&sparse_class()), 16 * 5, "64 one-byte members");
+        assert_eq!(grown("(?-u:[ac])"), 18, "two members");
+        assert_eq!(grown(r"\Ba"), 16 * 3, "a look and a byte");
+        // The whole program: `\ba{243}` has 249 states with captures and
+        // one look, 250 units.
+        assert_eq!(work(r"\ba{243}"), 250);
+    }
+
+    /// #687: the rule of the issue, `\b C*bC{990}` with C a class of 64
+    /// one-byte members, took about 120 ms a search (150 ms a click) on
+    /// 8000 characters of random `b` and `z` and an `é`, though its
+    /// states times bytes (7.99 M) were under the old gate. Its work now
+    /// counts each class five times: over the gate, it selects nothing at
+    /// once, without running the fallback, and warns once; on a line of
+    /// 1000 bytes it is within the gate and finds what the regex crate
+    /// finds.
+    #[test]
+    fn a_wide_sparse_class_is_over_the_gate_where_its_search_would_outlast_an_attempt() {
+        let class = sparse_class();
+        let pattern = format!(r"\b{class}*b{class}{{990}}");
+        let rule = engines(&[&pattern]);
+        let long = line_from("bz", 8002, 7);
+        assert!(long.len() >= 8000, "{}", long.len());
+        assert!(
+            rule.fallback_units(0, long.len())
+                .is_some_and(|units| units > SMART_FALLBACK_UNITS)
+        );
+        FALLBACK_RUNS.with(|runs| runs.set(0));
+        WARNINGS.with(|warnings| warnings.set(0));
+        let started = crate::thread_cpu_time();
+        for _ in 0..3 {
+            assert_eq!(scan(&rule, 0, &long), (Vec::new(), Scanned::Nothing));
+        }
+        let spent = crate::thread_cpu_time().saturating_sub(started);
+        assert_eq!(FALLBACK_RUNS.with(std::cell::Cell::get), 0, "no fallback");
+        assert_eq!(WARNINGS.with(std::cell::Cell::get), 1, "one warning");
+        assert!(rule.warned(0));
+        eprintln!("three clicks over the gate: {spent:?}");
+        #[cfg(not(debug_assertions))]
+        assert!(spent < Duration::from_millis(3), "{spent:?}");
+        let short = format!("{}\u{e9}", "b".repeat(995));
+        assert!(
+            rule.fallback_units(0, short.len())
+                .is_some_and(|units| units <= SMART_FALLBACK_UNITS)
+        );
+        let spans = reference(&pattern, &short);
+        assert_eq!(spans, vec![Range { start: 0, end: 995 }]);
+        assert_eq!(scan(&rule, 0, &short), (spans, Scanned::Done));
+        assert_eq!(FALLBACK_RUNS.with(std::cell::Cell::get), 1, "it fell back");
+    }
+
+    /// #687: one fallback search on the widest window the gate admits
+    /// takes at most [`SMART_RULE_ATTEMPT_BOUND`], for programs whose every
+    /// state is live at every byte: a run of one-byte states, classes of
+    /// 64 one-byte members, a Unicode `\B` before each byte (ASCII and
+    /// Latin), an alternation and optional bytes, and a wide alternation of
+    /// long branches; plus the rule of the issue. Each scan is one search
+    /// that finds nothing (the trailing `c` never comes) or, for the issue's
+    /// rule, a few. On the thread's CPU clock, the fastest of three.
+    /// Release builds only: the bound is for the shipped code. Measured on
+    /// a 4+6-core M-series laptop at a load of about 10 (#687): the run of
+    /// one-byte states, the most per unit, about 35 ms; each other family
+    /// under 30 ms. Before #687 (8 000 000 states times bytes) the classes
+    /// of 64 members took about 210 ms and the run 55 ms.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn hostile_smart_rules_at_the_fallback_gate_take_one_attempt_at_most() {
+        let class = sparse_class();
+        // Branches of different lengths: regex-syntax lifts a common
+        // prefix out of an alternation.
+        let wide: Vec<String> = (300..320).map(|i| format!("[ab]{{{i}}}c")).collect();
+        let families = [
+            (r"\b[ab]*[ab]{990}c".to_owned(), "ab", "one-byte states"),
+            (
+                format!(r"\b{class}*{class}{{990}}c"),
+                "bz",
+                "64-member classes",
+            ),
+            (
+                format!(r"\b{class}*b{class}{{990}}"),
+                "bz",
+                "the rule of #687",
+            ),
+            (
+                r"\b[ab]*(?:\B[ab]){990}c".to_owned(),
+                "ab",
+                r"\B before each byte",
+            ),
+            (
+                r"\b[\u{e9}\u{f1}]*(?:\B[\u{e9}\u{f1}]){600}c".to_owned(),
+                "\u{e9}\u{f1}",
+                r"\B before é and ñ",
+            ),
+            (
+                r"\b[ab]*(?:[ab]|[ab]a|[ab]b|[ab]aa){500}c".to_owned(),
+                "ab",
+                "an alternation",
+            ),
+            (r"\b[ab]*(?:[ab]?){990}c".to_owned(), "ab", "optional bytes"),
+            (
+                format!(r"\b[ab]*(?:{})", wide.join("|")),
+                "ab",
+                "a wide alternation",
+            ),
+        ];
+        for (pattern, chars, family) in &families {
+            let rule = engines(&[pattern]);
+            let work = rule.fallback_units(0, 1).expect("it may fall back");
+            let text = line_from(chars, SMART_FALLBACK_UNITS / work, 0x687);
+            let units = rule.fallback_units(0, text.len()).unwrap();
+            assert!(units <= SMART_FALLBACK_UNITS, "{family}: {units} units");
+            assert!(
+                units > SMART_FALLBACK_UNITS - 4 * work,
+                "{family}: at the gate"
+            );
+            let spans = reference(pattern, &text);
+            let mut fastest = Duration::MAX;
+            for _ in 0..3 {
+                FALLBACK_RUNS.with(|runs| runs.set(0));
+                let started = crate::thread_cpu_time();
+                let scanned = scan(&rule, 0, &text);
+                fastest = fastest.min(crate::thread_cpu_time().saturating_sub(started));
+                assert_eq!(scanned, (spans.clone(), Scanned::Done), "{family}");
+                assert_eq!(FALLBACK_RUNS.with(std::cell::Cell::get), 1, "{family}");
+            }
+            eprintln!(
+                "{family}: {work} units a byte, {} bytes, fastest {fastest:?}, {} matches",
+                text.len(),
+                spans.len()
+            );
+            assert!(
+                fastest <= SMART_RULE_ATTEMPT_BOUND,
+                "{family}: fastest scan {fastest:?}, over {SMART_RULE_ATTEMPT_BOUND:?}"
+            );
+        }
     }
 
     /// #649 B2: a rule whose program raises its DFA's cache past
@@ -1457,6 +1684,7 @@ mod tests {
         let at_cap = FallbackCost {
             states: 256,
             slots: 128,
+            work: 256,
         };
         assert_eq!(at_cap.slot_bytes(), SMART_FALLBACK_SLOT_BYTES);
         assert!(at_cap.within(1), "at the cap");
@@ -1510,7 +1738,8 @@ mod tests {
 
     /// #590 (B1 of the 590e review): a 1011-byte rule within the window
     /// gate whose slot tables would take about 177 MiB (23 007 states, 502
-    /// slots) is over the slot gate: on a 160-column line of `éx` its click
+    /// slots) is over the slot gate: on a 120-column line of `éx` (within
+    /// the window gate since #687 only up to 217 bytes) its click
     /// selects nothing from it, with one over-the-gate warning, and the
     /// regex crate never runs, so nothing is kept for it in that crate's
     /// cache pool; what the rule keeps is its own DFA cache, within its cap.
@@ -1519,7 +1748,7 @@ mod tests {
         let pattern = format!(r"\bx(?:{}){{23}}", "(a?)".repeat(250));
         assert_eq!(pattern.len(), 1011);
         let rule = engines(&[&pattern]);
-        let text = "\u{e9}x".repeat(75);
+        let text = "\u{e9}x".repeat(60);
         assert!(
             rule.fallback_units(0, text.len())
                 .is_some_and(|units| units <= SMART_FALLBACK_UNITS),
@@ -1589,6 +1818,16 @@ mod tests {
             }
         }
         assert!(matched > 1000, "{matched} matches");
+        // #687: the largest work, the compressed IPv6 rule's, on the widest
+        // window.
+        let most = (0..engines.rules().len())
+            .filter_map(|index| engines.fallback_units(index, crate::selection::SMART_SCAN_BYTES))
+            .max();
+        eprintln!("the most work of a built-in rule: {most:?}");
+        assert!(
+            most.is_some_and(|units| units <= SMART_FALLBACK_UNITS),
+            "{most:?}"
+        );
         // 8 of the 15 rules have a Unicode `\b`: each fell back on both.
         assert_eq!(FALLBACK_RUNS.with(std::cell::Cell::get), 8 * 2);
         assert!(!(0..engines.rules().len()).any(|index| engines.warned(index)));
