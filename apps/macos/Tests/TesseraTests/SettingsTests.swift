@@ -1024,6 +1024,115 @@ final class SettingsTests: XCTestCase {
         return opened
     }
 
+    /// The panes' identifiers, in toolbar order.
+    private static let paneIdentifiers = SettingsWindowController.panes.map(\.identifier)
+
+    /// A Settings window whose toolbar takes a stale item list, as one
+    /// whose AppKit object lands at the address of an earlier, freed one's
+    /// takes that toolbar's last list (#742), shows every pane in order,
+    /// the first selected, and its items select their pane. Opened as the
+    /// menu opens it; the toolbar is named after a list the test set (as
+    /// AppKit names it after the address), and nothing else is done to it.
+    ///
+    /// The only guard of the stale list: the tests that press toolbar
+    /// items put the panes' items back themselves before they press
+    /// (#703's `pressToolbarItem`), so they would pass over a regression.
+    func testSettingsShowsEveryPaneOverAStaleToolbarList() async throws {
+        try autoreleasepool { _ = try openSettings(config: "") }
+        appDelegate.settingsWindowController?.close()
+        addTeardownBlock { @MainActor in TesseraTestsNameTabViewControllerToolbars(nil) }
+        let panes = Self.paneIdentifiers
+        let lists = [[], ["appearance", "profiles"], Array(panes.reversed()), Array(panes.dropLast())]
+        for list in lists {
+            let name = Self.staleToolbarName(list)
+            TesseraTestsNameTabViewControllerToolbars(name)
+            let closed = try await opened { controller in
+                TesseraTestsNameTabViewControllerToolbars(nil)
+                let toolbar = try XCTUnwrap(controller.window?.toolbar)
+                let tabs = try XCTUnwrap(controller.tabs)
+                XCTAssertEqual(toolbar.identifier, name, "the toolbar took the stale list's name")
+                XCTAssertEqual(toolbar.items.map(\.itemIdentifier.rawValue), panes, "over \(list)")
+                XCTAssertEqual(toolbar.items.map(\.label), SettingsWindowController.panes.map(\.label), "over \(list)")
+                XCTAssertEqual(toolbar.selectedItemIdentifier?.rawValue, "general", "over \(list)")
+                for (index, pane) in panes.enumerated().reversed() {
+                    let item = try XCTUnwrap(toolbar.items.first { $0.itemIdentifier.rawValue == pane })
+                    XCTAssertTrue(NSApp.sendAction(try XCTUnwrap(item.action), to: item.target, from: item))
+                    XCTAssertEqual(tabs.selectedTabViewItemIndex, index, "\(pane) over \(list)")
+                    XCTAssertEqual(toolbar.selectedItemIdentifier?.rawValue, pane, "over \(list)")
+                }
+                controller.close()
+            }
+            try await waitUntil("freed over \(list)") { closed.controller == nil && closed.model == nil }
+        }
+    }
+
+    /// Settings opened and closed again and again, as the menu and Close
+    /// open and close it, frees each closed window's controller and model,
+    /// and every window but the last (AppKit keeps a closed key window
+    /// until another becomes key, ADR 0044), and keeps every pane in the
+    /// toolbar. It does not catch a stale toolbar list: AppKit seldom
+    /// reuses the address its name comes from, so a toolbar without the
+    /// fix (#742) passes here; the forced test above guards that. Not an
+    /// async test, for the reason
+    /// `testSettingsClosedBeforeItsFirstDisplayPassFreesItsModel` gives:
+    /// the run loop runs a pass at a time in a pool of its own.
+    func testReopeningSettingsAgainAndAgainFreesEachWindowAndKeepsEveryPane() throws {
+        let budget = ChildStartBudget.budget(
+            atLoadPerCore: ChildStartBudget.loadPerCore(), base: .seconds(5), cap: .seconds(30))
+        try autoreleasepool { _ = try openSettings(config: "") }
+        autoreleasepool { appDelegate.settingsWindowController?.close() }
+        let panes = Self.paneIdentifiers
+        var windows: [WeakWindow] = []
+        for round in 0..<20 {
+            let closed = try autoreleasepool {
+                MainMenu.run(command: "settings")
+                let controller = try XCTUnwrap(appDelegate.settingsWindowController)
+                let window = try XCTUnwrap(controller.window)
+                let toolbar = try XCTUnwrap(window.toolbar)
+                XCTAssertEqual(toolbar.items.map(\.itemIdentifier.rawValue), panes, "round \(round)")
+                windows.append(WeakWindow(window: window))
+                return Opened(controller: controller, model: controller.model, window: nil)
+            }
+            XCTAssertFalse(runLoop(for: .milliseconds(20)) { false })
+            autoreleasepool { closed.controller?.window?.performClose(nil) }
+            XCTAssertNil(appDelegate.settingsWindowController, "closed in round \(round)")
+            guard runLoop(for: budget, until: { closed.controller == nil && closed.model == nil }) else {
+                return XCTFail("the controller and model are freed in round \(round)")
+            }
+        }
+        XCTAssertTrue(
+            runLoop(for: budget) { windows.dropLast().allSatisfy { $0.window == nil } },
+            "the closed windows but the last are freed: \(windows.dropLast().filter { $0.window != nil }.count) kept")
+    }
+
+    /// Names a toolbar after which AppKit gives the next toolbar of that
+    /// name the item list `list` (pane identifiers), the way a closing
+    /// Settings window's toolbar leaves its name's list cut down: a toolbar
+    /// of that name offered the panes shows them, loses them and then shows
+    /// `list`. (AppKit adds to a name's list only the items its delegate
+    /// newly offers, so the panes must be offered first.)
+    private static func staleToolbarName(_ list: [String]) -> String {
+        let name = "tessera-tests-stale-\(UUID().uuidString)"
+        autoreleasepool {
+            let offer = StaleToolbarDelegate(items: paneIdentifiers)
+            let toolbar = NSToolbar(identifier: name)
+            toolbar.delegate = offer
+            let window = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 200, height: 100), styleMask: [.titled], backing: .buffered,
+                defer: true)
+            window.isReleasedWhenClosed = false
+            window.toolbar = toolbar
+            XCTAssertEqual(toolbar.items.map(\.itemIdentifier.rawValue), paneIdentifiers, "the panes offered")
+            while !toolbar.items.isEmpty { toolbar.removeItem(at: 0) }
+            for (index, item) in list.enumerated() {
+                toolbar.insertItem(withItemIdentifier: NSToolbarItem.Identifier(item), at: index)
+            }
+            XCTAssertEqual(toolbar.items.map(\.itemIdentifier.rawValue), list, "the stale list")
+            window.toolbar = nil
+        }
+        return name
+    }
+
     /// ⌘, and then ⌘W typed ahead close Settings before its first display
     /// pass (#604): opened as the menu opens it, nothing posted, and closed
     /// as Close Tab closes the key window, in the same pass of the run
@@ -6264,5 +6373,33 @@ struct SplitMix {
         mixed = (mixed ^ (mixed >> 30)) &* 0xBF58_476D_1CE4_E5B9
         mixed = (mixed ^ (mixed >> 27)) &* 0x94D0_49BB_1331_11EB
         return mixed ^ (mixed >> 31)
+    }
+}
+
+/// A window held weakly.
+private struct WeakWindow {
+    weak var window: NSWindow?
+}
+
+/// Offers a toolbar the items `items`, labelled with their identifiers.
+@MainActor
+private final class StaleToolbarDelegate: NSObject, NSToolbarDelegate {
+    let items: [NSToolbarItem.Identifier]
+
+    init(items: [String]) {
+        self.items = items.map { NSToolbarItem.Identifier($0) }
+    }
+
+    func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] { items }
+
+    func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] { items }
+
+    func toolbar(
+        _ toolbar: NSToolbar, itemForItemIdentifier itemIdentifier: NSToolbarItem.Identifier,
+        willBeInsertedIntoToolbar flag: Bool
+    ) -> NSToolbarItem? {
+        let item = NSToolbarItem(itemIdentifier: itemIdentifier)
+        item.label = itemIdentifier.rawValue
+        return item
     }
 }

@@ -72,6 +72,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             tabs.addTabViewItem(item)
         }
         let window = NSWindow(contentViewController: tabs)
+        if let toolbar = window.toolbar { Self.showEveryPane(of: tabs, in: toolbar) }
         window.styleMask = [.titled, .closable, .miniaturizable]
         window.toolbarStyle = .preference
         window.isReleasedWhenClosed = false
@@ -93,6 +94,27 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     @available(*, unavailable)
     required init?(coder: NSCoder) {
         fatalError("init(coder:) is not used")
+    }
+
+    /// Puts the panes' items back into `toolbar`, in order, when it shows
+    /// any other list (#742).
+    ///
+    /// The tab view controller installs its toolbar as the window takes its
+    /// view, named after the address of an object of AppKit's own. AppKit
+    /// keeps the item list of every toolbar name for the life of the
+    /// process, a freed toolbar's too (toolbars of one name are kept in
+    /// step), and a closing window's list is cut down as its panes go. A
+    /// window whose object lands at the address of an earlier, freed one
+    /// takes that list: no panes, or some missing. A name of the app's own
+    /// is not an option: the toolbar is the tab view controller's, and one
+    /// put in its place gets no items from it. The items put back are the
+    /// tab view controller's own, made by it: they select their pane, and
+    /// the selected pane's shows selected.
+    private static func showEveryPane(of tabs: NSTabViewController, in toolbar: NSToolbar) {
+        let panes = tabs.tabViewItems.compactMap { ($0.identifier as? String).map { NSToolbarItem.Identifier($0) } }
+        guard toolbar.items.map(\.itemIdentifier) != panes else { return }
+        while !toolbar.items.isEmpty { toolbar.removeItem(at: 0) }
+        for (index, pane) in panes.enumerated() { toolbar.insertItem(withItemIdentifier: pane, at: index) }
     }
 
     /// The tab view controller of the panes.
