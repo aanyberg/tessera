@@ -761,7 +761,7 @@ array is still left to bash.
 
 - **Design.** On bash 5.1 and later an array `PROMPT_COMMAND` gets one
   element of ours, `_tessera_si_element && builtin eval "$_tessera_si_go"
-  && _tessera_si_nop`. It is appended at index max(1, last index + 1), so it
+  && _tessera_si_nop` (`&& _tessera_si_xon` since #752). It is appended at index max(1, last index + 1), so it
   is never at index 0, where a scalar assignment (`PROMPT_COMMAND=f`, or
   starship's wrapping) would overwrite it. It is found by its exact text,
   never by its index, and it never moves (lead decisions D1, D3).
@@ -1098,3 +1098,67 @@ head's other first commands (P17).
   not read). E36 to E38 run on 3.2 and 5.3, E39 and E40 on 5.3 (5.1 where
   `TESSERA_TEST_BASH51` names one).
 - `SCRIPTS_VERSION` is 19.
+
+### Amendment (#752): our prompt work runs with `set -x` off
+
+Under `set -x` our head, tail, DEBUG trap and their functions traced
+about 300 lines per prompt on 3.2 and 365 on 5.3, each a PS4 expansion:
+a PS4 with a command substitution forked for every one, and a prompt took
+seconds. All of that work now runs with `set -x` off and puts the user's
+state back exactly (`$-` as bash alone leaves it). The first commands
+turn it off: `_tessera_si_precmd` (string head), `_tessera_si_element`
+(array) and `_tessera_si_prompt` keep the user's `$-` in
+`_tessera_si_xoff` (an expansion in their first statement that sets it
+unless it is set and expands to nothing) and run `builtin set +x`; the
+DEBUG trap does the same in its first two statements. `_tessera_si_xon`
+puts `set -x` back as the last command run (so it adds no trace line):
+the trap calls it before a command of the user's (an entry, the user's
+DEBUG trap, the command line) and not before ours (`_tessera_si_*`, the
+head's `builtin eval "$_tessera_si_..."` and `case $_tessera_si_...`),
+and the tail and the array element end with it. The head's read of the
+trap (`builtin trap -p DEBUG 1>&3`, also in its fork under `set -T`) and
+its install (`builtin trap -- "$_tessera_si_trap" DEBUG`, run while our
+trap is still set after an empty line or a Ctrl-C at the prompt) are
+ours too. The trap keeps the flag's length from before its first
+statement in `_tessera_si_xf`; under `set -T` it also runs inside our
+functions after `_tessera_si_xon` (its `builtin set -x`, or the
+`builtin return` after it in `_tessera_si_ret`): with the flag fresh (0)
+`set -x` is the user's there, so the trap puts it back and clears the
+flag (its `x` case) instead of turning it off for the rest of the
+prompt. `_tessera_si_h_x` and
+its separate switches around the read (#740) are gone: the read runs
+with `set -x` already off. A Ctrl-C that stops our work leaves the flag
+set, so the next prompt keeps the user's state from before (bash runs
+PROMPT_COMMAND again right after it).
+
+The user sees five trace lines per prompt with no entries (the head's
+call, two of `_tessera_si_precmd`, two of the trap for the command line),
+two more per command of the entries and two for our tail after them, and
+one more (`builtin return 1`) after a command that failed. Measured over
+one command and the prompt after it with no entries (bash alone, before
+the fix, with it; the same on 3.2 and 5.3): `:` 2, 12, 12; `false` 2, 13,
+13 (12, 15 under `set -T`); an empty line 1, 11, 8; a Ctrl-C at the
+prompt 1, 12, 9 (11, 8 under `set -T`). With the user's own DEBUG trap
+the restore before it adds a few more when that trap runs. With
+bash-preexec 0.7 `_tessera_si_preexec` runs with `set -x` off as well,
+and our own lines are about nine per command and prompt; most of what we
+add is bash-preexec's own trap and sanitizer running for our entry's two
+commands: `:` 212, 322, 286 on 3.2 and 108, 186, 150 on 5.3 (an empty
+line 179, 256, 237 and 91, 143, 124).
+
+- Rows `rcexit` E41 (no entries: at most bash alone's 1 line plus our 5)
+  and E42 (one entry, `:`: 2 plus 7) count the lines with a PS4 counter
+  and check `$-`, on 3.2 and 5.3 (5.1 where `TESSERA_TEST_BASH51` names
+  one). Both failed before the fix (309 and 365 lines per prompt).
+  `a_ctrl_c_before_the_heads_restore_keeps_set_x` now stops the head
+  before the install of our trap, the last head command run with
+  `set -x` off.
+- Rows E43 and E44 (`set -T`; E44 failed before the fix, PS1 expanded
+  with `set -x` off after `false`) check `$-` in PS1 after a failing command;
+  E45 and E46 (`set -T`) check that after an empty line the trace holds
+  neither the trap text nor the read, and
+  `a_ctrl_c_at_the_prompt_traces_none_of_ours` the same after a Ctrl-C
+  at the prompt; E47 that a DEBUG trap of the user's ending non-zero
+  still has its command traced. `bash_preexec_adds_few_trace_lines`
+  bounds what we add with bash-preexec (3.2 +80, 5.x +48).
+- `SCRIPTS_VERSION` is 20.

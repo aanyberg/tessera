@@ -320,3 +320,33 @@ rcexit | E37 | 3.2 5.1 5.3 | PROMPT_COMMAND='f=$-; set +x; exec 2>&7 >&6'\nexec 
 rcexit | E38 | 3.2 5.1 5.3 | PROMPT_COMMAND='f=$-; set +x; exec 2>&7 >&6'\nexec 6>&1 7>&2 >/dev/null 2>/dev/null\nBASH_XTRACEFD=2\nset -x | trap 'case $BASH_COMMAND in "echo a") echo D;; esac' DEBUG; exec >/dev/null 2>/dev/null; set -x\necho a; echo "f=${f//s/}" | lines: D / a / f=himxBH
 rcexit | E39 | 5.1 5.3 | PROMPT_COMMAND=(:)\nexec 3>/dev/null\nBASH_XTRACEFD=3\nset -x | trap 'case $BASH_COMMAND in "echo a") echo D;; esac' DEBUG\necho a; echo "f=${-//s/}" | lines: D / a / f=himxBH
 rcexit | E40 | 5.1 5.3 | PROMPT_COMMAND='set +x'\nexec 5>xt\nBASH_XTRACEFD=5\nset -x | trap ': dbg' DEBUG; set -x\necho "n=$(grep -cE '^[+]+ builtin (trap -p|set -x)' xt) u=$(grep -cE '^[+]+ set [+]x$' xt)" | lines: n=0 u=2
+# #752: under `set -x` our prompt work traced about 300 lines per prompt
+# (3.2; 365 on 5.3), each a PS4 expansion (seconds per prompt with a PS4
+# that forks). It now runs with `set -x` off, turned off by its first
+# commands: the head's call and two lines of _tessera_si_precmd, and two
+# lines of the DEBUG trap each time it fires with `set -x` on (for the
+# command line; with entries also for their commands and for our tail).
+# PS4 counts the lines (`zq`); its `\r`s hide them from the transcript
+# on 3.2 (no BASH_XTRACEFD) without a `P> ` for the harness to count. E41
+# allows bash alone's 1 line plus our 5, E42 (one entry, `:`) bash's 2
+# plus our 7; both check that `$-` is as bash alone leaves it. (Measured
+# before the fix: 309 and 365 lines with no entry.)
+rcexit | E41 | 3.2 5.1 5.3 | PS4=$'\rP\r> $((zq+=1)) ' | set -x\n:\nm=$zq\necho "le=$(( zq - m <= 6 )) x=${-//[^x]/}" | lines: le=1 x=x
+rcexit | E42 | 3.2 5.1 5.3 | PROMPT_COMMAND=':'\nPS4=$'\rP\r> $((zq+=1)) ' | set -x\n:\nm=$zq\necho "le=$(( zq - m <= 9 )) x=${-//[^x]/}" | lines: le=1 x=x
+# #752 round 2. E43 and E44 (`set -T`): `set -x` is back when PS1 is
+# expanded after a failing command (the tail's `builtin return` hands on
+# its status after _tessera_si_xon; under `set -T` the trap fires on it
+# and kept `set -x` off). PS1 counts the prompts expanded without x in
+# `zx` (in an expansion that is always empty). (Measured before the fix: E44 failed on 3.2 and 5.3, `nx=2`.)
+# E45 and E46 (`set -T`): after an empty line our trap is still set when
+# PROMPT_COMMAND runs; no trace line shows the head's trap install (its
+# whole text) or, under `set -T`, the read's `trap -p` in the fork (5.x
+# traces into `xt`; on 3.2 the install's text lines would show in the
+# transcript). (Measured before the fix: both failed on 3.2 and 5.3.)
+# E47: a DEBUG trap of the user's that ends non-zero still has its
+# command run with `set -x` on (_tessera_si_kx).
+rcexit | E43 | 3.2 5.1 5.3 | PS4=$'\rP\r> '\nPS1='${-##*"${-#"$((zx${-//[^x]/}+=1))"}"}P> ' | set -x\nzx=0\nfalse\nfalse\necho "nx=$zx" | lines: nx=0
+rcexit | E44 | 3.2 5.1 5.3 | set -T\nPS4=$'\rP\r> '\nPS1='${-##*"${-#"$((zx${-//[^x]/}+=1))"}"}P> ' | set -x\nzx=0\nfalse\nfalse\necho "nx=$zx" | lines: nx=0
+rcexit | E45 | 3.2 5.1 5.3 | exec 5>xt\nBASH_XTRACEFD=5\nPS4=$'\rP\r> ' | set -x\n:\n\n\nset +x\necho "n=$(grep -cE 'trap -- |trap -p DEBUG' xt)" | lines: n=0
+rcexit | E46 | 3.2 5.1 5.3 | set -T\nexec 5>xt\nBASH_XTRACEFD=5\nPS4=$'\rP\r> ' | set -x\n:\n\n\nset +x\necho "n=$(grep -cE 'trap -- |trap -p DEBUG' xt)" | lines: n=0
+rcexit | E47 | 3.2 5.1 5.3 | trap '[[ $BASH_COMMAND == zzz ]] && echo hi' DEBUG\nPS4=$'\rP\r> ' | set -x\necho "c=${-//[^x]/}"\necho "c=${-//[^x]/}" | lines: c=x / c=x
