@@ -436,3 +436,47 @@ installed-font build compare the two). A panic in a face's walk is
 caught: the face is left out, with one warning naming its index, and the index lands from the others. The lookups after the index still
 use swash's `Charmap::map`, whose format-12 arithmetic can overflow in a
 debug build for such a font (release wraps).
+
+## Amendment: a whole-build budget for the coverage index (#716, 2026-11-26)
+
+#689 bounded the walk per face, but a collection may hold any number of
+faces (fontdb sets no cap). A 609 KB collection of 20 000 faces that
+share one table directory and one 40-byte `cmap` reaching `u32::MAX`
+walked the code space once per face: 8.9 s in release (11.2 s on the
+machine measured here), on the index thread. Three changes:
+
+- A face whose `cmap` is the file range the face before it in the same
+  file read is not walked again. It comes later in database order, so it
+  can take no code point the earlier face did not already take; the
+  index does not change. A face whose table directory is the one the
+  face before it used reads only its offset in the collection header,
+  and `pread(2)` reads each piece in one call. The file above indexes in
+  about 20 ms in release (at a load of 150), one walk in all.
+- The whole build walks at most `MAX_INDEX_STEPS`, 64 walks of the code
+  space (a code point visited or a group or segment read is one step),
+  and reads at most `MAX_INDEX_CMAP_READ`, 64 tables at the 2 MiB cap
+  (128 MiB) of `cmap` tables. The face that runs out of either is cut
+  there and every later face is left out of the index, with one warning.
+  The installed fonts (1 016 faces on macOS 26) take about 2.8 million
+  steps (4 %) and 13 MiB of reads (10 %), well inside both, and index
+  exactly as before. A hostile file that spends the budget leaves the
+  faces after it in database order out of the
+  index until the next build: a character that only they cover draws
+  from the primary family or the fallback chain when one of those covers
+  it, else as `.notdef`. The build no longer stalls.
+- `covers`, `nominal_glyph` and the cell-advance lookup in `metrics` read
+  the character map with Tessera's own lookup (`cmap::map`), not swash's
+  `Charmap::map`. It picks the same subtable and gives the same glyph
+  for a well-formed table (a property test compares the two), with
+  swash's quirks (a format compared by its low byte, format 4 never
+  mapping U+FFFF, a symbol subtable retrying U+0000 to U+00FF at U+F000
+  to U+F0FF), but its glyph arithmetic wraps like the index's walk, so a
+  face with a format-12 glyph offset near `u32::MAX`, which the index can
+  now offer, no longer panics a debug build in the lookups or in
+  `classify` and `first_uncovered` on the render path. The full fix was
+  chosen over skipping code points whose glyph arithmetic overflows: it
+  is a binary search of about 60 lines, and the index and the lookups
+  then agree on every face. It reads a subtable only up to the `cmap`
+  table's stated length, where swash read it up to the end of the file,
+  and a `cmap` record at offset 0 is no table, as it is to swash and to
+  the index. Shaping (harfrust, through read-fonts) already wrapped.
