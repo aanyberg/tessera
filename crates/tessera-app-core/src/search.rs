@@ -456,9 +456,10 @@ struct Active {
     /// once the piece has run (at most one per byte of a piece:
     /// [`MAX_HAYSTACK_BYTES`]).
     found: Vec<Match>,
-    /// How long each piece's regex run took, its longest single regex run
-    /// (a gap between two matches) and the time its deadline allowed from
-    /// the step's start, for the step-deadline tests.
+    /// The CPU time each piece took (its haystack and its regex runs; time
+    /// spent preempted does not count, #631), its longest single regex run
+    /// (a gap between two matches, wall-clock time) and the time its
+    /// deadline allowed from the step's start, for the step-deadline tests.
     #[cfg(test)]
     pieces: Vec<(Duration, Duration, Duration)>,
     /// Pieces skipped as too slow at the smallest limit, for the tests.
@@ -929,7 +930,7 @@ impl Active {
             self.found.clear();
             let found = &mut self.found;
             #[cfg(test)]
-            let started = Instant::now();
+            let (started, started_cpu) = (Instant::now(), crate::thread_cpu_time());
             // The last match's time and the longest gap between two: with a
             // pattern that matches every cell, its longest regex run.
             #[cfg(test)]
@@ -954,7 +955,7 @@ impl Active {
             );
             #[cfg(test)]
             self.pieces.push((
-                started.elapsed(),
+                crate::thread_cpu_time().saturating_sub(started_cpu),
                 run.1.max(run.0.elapsed()),
                 deadline.duration_since(clock.started),
             ));
@@ -1736,9 +1737,9 @@ impl SearchState {
         std::mem::take(&mut self.holds)
     }
 
-    /// The pieces' regex run times recorded so far, each with its longest
-    /// single regex run and the time its deadline allowed from the step's
-    /// start, for the step-deadline test.
+    /// The pieces' CPU times recorded so far, each with its longest single
+    /// regex run (wall-clock time) and the time its deadline allowed from
+    /// the step's start, for the step-deadline test.
     #[cfg(test)]
     pub(crate) fn take_pieces(&mut self) -> Vec<(Duration, Duration, Duration)> {
         self.active
@@ -2344,9 +2345,10 @@ mod tests {
     /// run, such a piece was never late, never halved and never skipped.
     const NO_MATCH: &str = r"(?:\w{1,40}){1,5}\b\d";
 
-    /// What a step may take beyond its deadline and its longest regex run in
-    /// the step-deadline tests: the terminal lock, the copy of up to a
-    /// haystack of cells and the filing of its matches, on a loaded machine.
+    /// The CPU time a step may take beyond its deadline and its longest
+    /// regex run in the step-deadline tests: the terminal lock, the copy of
+    /// up to a haystack of cells and the filing of its matches, on a loaded
+    /// machine (where a slow core can run them).
     const STEP_SLACK: Duration = Duration::from_millis(25);
 
     /// The adversarial run's pathological pattern (F9c): one run takes
@@ -2372,6 +2374,13 @@ mod tests {
     /// before the clock was read after a last run without a match, both
     /// searched every piece to its end).
     ///
+    /// A step and a piece are timed in the thread's CPU time
+    /// (`crate::thread_cpu_time`), the deadline and a run in wall-clock
+    /// time: the deadline is wall-clock, so the CPU time up to it is never
+    /// more, and a step preempted under load is not late for it (#631: a
+    /// wall-clock step took 67.9 ms of a 41 ms bar at load 97). Without the
+    /// piece deadline a first step runs a whole 64 KiB piece, seconds of CPU.
+    ///
     /// Timing-based: release only, with the other timing bars.
     #[test]
     #[cfg_attr(debug_assertions, ignore = "timing bar; run in release")]
@@ -2395,13 +2404,17 @@ mod tests {
                 let mut longest_run = Duration::ZERO;
                 // The most a step took over its deadline and longest run.
                 let mut longest_over = Duration::ZERO;
+                // The same on the wall clock, only reported: load stretches
+                // it (#631).
+                let mut wall_over = Duration::ZERO;
                 let mut steps = 0;
                 let mut pieces_run = 0;
                 let started = Instant::now();
                 let status = loop {
-                    let step = Instant::now();
+                    let (step, wall) = (crate::thread_cpu_time(), Instant::now());
                     let status = search.step(&shared, budget);
-                    let took = step.elapsed();
+                    let took = crate::thread_cpu_time().saturating_sub(step);
+                    let took_wall = wall.elapsed();
                     steps += 1;
                     let pieces = search.take_pieces();
                     pieces_run += pieces.len();
@@ -2439,6 +2452,7 @@ mod tests {
                     }
                     longest_run = longest_run.max(run);
                     longest_over = longest_over.max(took.saturating_sub(allowed + run));
+                    wall_over = wall_over.max(took_wall.saturating_sub(allowed + run));
                     assert!(
                         took <= allowed + run + STEP_SLACK,
                         "{name}, {pattern}, budget {budget:?}: step {steps} took {took:?}, over \
@@ -2452,9 +2466,9 @@ mod tests {
                 let (limit, skips) = (active.limit, active.skips);
                 eprintln!(
                     "{name}, {pattern}, budget {budget:?}: {steps} steps in {:?}, longest \
-                     {longest:?}, longest piece {longest_piece:?}, longest run \
-                     {longest_run:?}, over by {longest_over:?}, limit {limit:?}, {skips} \
-                     skipped, {status:?}",
+                     {longest:?} CPU, longest piece {longest_piece:?} CPU, longest run \
+                     {longest_run:?}, over by {longest_over:?} CPU and {wall_over:?} wall, \
+                     limit {limit:?}, {skips} skipped, {status:?}",
                     started.elapsed()
                 );
                 assert!(
@@ -2500,9 +2514,9 @@ mod tests {
         search.active.as_mut().unwrap().limit = limit;
         let mut longest = Duration::ZERO;
         let status = loop {
-            let step = Instant::now();
+            let step = crate::thread_cpu_time();
             let status = search.step(&shared, budget);
-            let took = step.elapsed();
+            let took = crate::thread_cpu_time().saturating_sub(step);
             let run = search
                 .take_pieces()
                 .into_iter()
@@ -2520,7 +2534,7 @@ mod tests {
         };
         let skips = search.active.as_ref().unwrap().skips;
         eprintln!(
-            "floor, {NO_MATCH_PER_KIB}: longest step {longest:?}, {skips} skipped, {status:?}"
+            "floor, {NO_MATCH_PER_KIB}: longest step {longest:?} CPU, {skips} skipped, {status:?}"
         );
         assert!(skips > 0, "floor: no row skipped, {status:?}");
         assert!(status.lines_skipped, "floor: {status:?}");

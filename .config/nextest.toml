@@ -145,6 +145,13 @@ slow-timeout = { period = "60s", terminate-after = 10 }
 filter = '(package(tessera-app-core) & kind(lib) & test(a_loss_inside_the_frame_detaches_at_once)) | (package(tessera-render) & binary(device_loss))'
 slow-timeout = { period = "60s", terminate-after = 10 }
 
+# The search step bound under a slow pattern (#331) holds a core for about 27 s in release and bounds its steps in the
+# thread's CPU time (#631), so load does not fail its bars; at load 121 its wall-clock run outlasted the default 300 s,
+# so it gets 600 s.
+[[profile.default.overrides]]
+filter = 'package(tessera-app-core) & kind(lib) & test(=search::tests::no_step_outlasts_four_budgets_and_a_quarter_second)'
+slow-timeout = { period = "60s", terminate-after = 10 }
+
 # The FFI surface tests bring up a GPU device per attach and wait on a shell (each reply up to 60 s, #316). With eight
 # runs at once on a loaded machine a passing run took up to 248 s, close to the default 300 s limit, so they get 600 s
 # (#321). An unloaded run takes under a second.
