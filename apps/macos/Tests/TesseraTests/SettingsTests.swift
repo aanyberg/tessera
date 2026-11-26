@@ -2124,9 +2124,30 @@ extension SettingsTests {
     }
 
     /// The toolbar item labelled `label`, pressed as a click on it does.
+    /// The panes' items are put back first (in order, by the tab view
+    /// controller, as it makes them) if the toolbar shows any other list:
+    /// AppKit names the tab view controller's toolbar after the address of
+    /// an object of its own and keeps each name's item list for the whole
+    /// process, a freed toolbar's too (toolbars of one name are kept in
+    /// step). A Settings window whose object lands at the address of an
+    /// earlier, freed one takes that toolbar's last list, cut down as the
+    /// earlier window went, so a pane's item could be missing (#703).
     private static func pressToolbarItem(_ label: String, in window: NSWindow) throws {
-        let item = try XCTUnwrap(window.toolbar?.items.first { $0.label == label }, "\(label) in the toolbar")
+        let toolbar = try XCTUnwrap(window.toolbar, "the Settings toolbar")
+        let tabs = try XCTUnwrap(window.contentViewController as? NSTabViewController)
+        showEveryPane(of: tabs, in: toolbar)
+        let item = try XCTUnwrap(
+            toolbar.items.first { $0.label == label }, "\(label) in the toolbar: \(toolbar.items.map(\.label))")
         XCTAssertTrue(NSApp.sendAction(try XCTUnwrap(item.action), to: item.target, from: item))
+    }
+
+    /// Puts the toolbar items of `tabs`' panes back into `toolbar`, in
+    /// order, when it shows any other list (#703).
+    private static func showEveryPane(of tabs: NSTabViewController, in toolbar: NSToolbar) {
+        let panes = tabs.tabViewItems.compactMap { ($0.identifier as? String).map { NSToolbarItem.Identifier($0) } }
+        guard toolbar.items.map(\.itemIdentifier) != panes else { return }
+        while !toolbar.items.isEmpty { toolbar.removeItem(at: 0) }
+        for (index, pane) in panes.enumerated() { toolbar.insertItem(withItemIdentifier: pane, at: index) }
     }
 
     /// Selects `row` of the Profiles pane's list in `window` and types
