@@ -296,25 +296,62 @@ if [[ ${#BASH_SOURCE[@]} == "${_tessera_si_rc_depth-}" ]]; then
     if [[ -o errexit ]]; then _tessera_si_rc_e=1; builtin set +e; fi
     builtin trap - RETURN
 fi' RETURN
+        # A Ctrl-C while the file runs (#713): bash alone drops the rest of
+        # its startup, which here would leave the trap above, our
+        # _tessera_si_rc* state and no integration. Our INT trap instead
+        # returns from the file (it ran inside a function the file called:
+        # from that function, and the file goes on, as it would if that
+        # function returned), so the rest of this script runs as after any
+        # other file; the first prompt sees 130. It acts only while the
+        # file runs (deeper than here): a Ctrl-C in the rest of this script
+        # is dropped. It is removed by the route's end, our last command
+        # (no DEBUG trap runs after that), unless the file set its own:
+        # bash 3.2 runs startup files as a non-interactive shell, and there
+        # `trap - INT` makes SIGINT end the shell until bash, after the
+        # startup files, puts its interactive handler back; so the trap
+        # stays until no more of this script runs (a Ctrl-C after that,
+        # before bash's reader loop starts, still ends a 3.2 shell; at the
+        # first prompt PROMPT_COMMAND runs non-interactive too, and the
+        # first command would keep that handler).
+        builtin trap 'if [[ -n ${_tessera_si_rc_depth-} && ${#BASH_SOURCE[@]} -gt $_tessera_si_rc_depth ]]; then
+    _tessera_si_rc_int=${#BASH_SOURCE[@]}
+    builtin return 130
+fi' INT
         builtin source "$_tessera_si_rc"
         _tessera_si_rc_status=$?
+        if [[ "$(builtin trap -p INT)" == "trap -- 'if [[ -n \${_tessera_si_rc_depth-} && "* ]]; then
+            _tessera_si_rc_trap=1
+        fi
         # (Above 255 the trap saw bash's internal status for a syntax error,
         # 257 or 258, where bash alone shows source's 2 on 5.x.)
         if [[ -n "${_tessera_si_rc_seen+x}" && "$_tessera_si_rc_seen" -lt 256 ]]; then
             _tessera_si_rc_status=$_tessera_si_rc_seen
         fi
+        if [[ "${_tessera_si_rc_int-}" == $((_tessera_si_rc_depth + 1)) ]]; then
+            _tessera_si_rc_status=130
+        fi
         if [[ -n "${_tessera_si_rc_e-}" ]]; then
             builtin set -e
         fi
-        builtin unset _tessera_si_rc_depth _tessera_si_rc_q _tessera_si_rc_seen _tessera_si_rc_e
+        builtin unset _tessera_si_rc_depth _tessera_si_rc_q _tessera_si_rc_seen _tessera_si_rc_e _tessera_si_rc_int
     else
         _tessera_si_rc_status=0
     fi
-    # The --rcfile route's last command: returns the startup file's status.
+    # The --rcfile route's last command: removes our INT trap (see above)
+    # and returns the startup file's status. It runs with `set -T` off
+    # (by the caller, put back here before the trap goes), so no DEBUG
+    # or RETURN trap of the file's runs inside it: the last one runs
+    # before the call, with our trap still in place.
     _tessera_si_rc_end() {
-        builtin local status=${_tessera_si_rc_status-0}
-        builtin unset _tessera_si_rc_status
+        builtin local status=${_tessera_si_rc_status-0} ours=${_tessera_si_rc_trap-}
+        if [[ -n "${_tessera_si_rc_t-}" ]]; then
+            builtin set -T
+        fi
+        builtin unset _tessera_si_rc_status _tessera_si_rc_trap _tessera_si_rc_t
         builtin unset -f _tessera_si_rc_end
+        if [[ -n "$ours" ]]; then
+            builtin trap - INT
+        fi
         builtin return "$status"
     }
     builtin unset _tessera_si_rc
@@ -1457,14 +1494,30 @@ case ${FUNCNAME[0]-} in _tessera_si_*) _tessera_si_now= ;; esac'
     elif [[ -n "${_tessera_si_rc_status+x}" ]]; then
         # The --rcfile route: the last command leaves the startup file's $?
         # and PIPESTATUS (a failing status in an && list does not trip
-        # `set -e`).
-        _tessera_si_rc_end && _tessera_si_nop
+        # `set -e`; on 0 nothing follows the call, see _tessera_si_rc_end).
+        if [[ -o functrace ]]; then
+            _tessera_si_rc_t=1
+            builtin set +T
+        fi
+        if [[ "${_tessera_si_rc_status-0}" == 0 ]]; then
+            _tessera_si_rc_end
+        else
+            _tessera_si_rc_end && _tessera_si_nop
+        fi
     fi
     # (Nothing more: the trap may be armed.)
 else
     builtin unset _tessera_si_late _tessera_si_late_elements _tessera_si_can_arm
     # The --rcfile route left to bash: the startup file's status, as above.
     if [[ -n "${_tessera_si_rc_status+x}" ]]; then
-        _tessera_si_rc_end && builtin :
+        if [[ -o functrace ]]; then
+            _tessera_si_rc_t=1
+            builtin set +T
+        fi
+        if [[ "${_tessera_si_rc_status-0}" == 0 ]]; then
+            _tessera_si_rc_end
+        else
+            _tessera_si_rc_end && builtin :
+        fi
     fi
 fi

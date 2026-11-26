@@ -232,3 +232,34 @@ rcexit | E15 | 3.2 5.1 5.3 | PROMPT_COMMAND='echo "pc=$?"'\nset -e\nTESSERA_SHEL
 rcexit | E16 | 3.2 5.1 5.3 | PROMPT_COMMAND='echo "pc=$?"'\nset -e\n. "$HOME"/../scripts/*/bash/tessera.bash\nfalse && true | echo "st=$? e=${-//[^e]/}"\necho "rt=[$(trap -p RETURN)] v=[$(compgen -v _tessera_si_rc_)] f=[$(compgen -A function _tessera_si_rc_)]" | lines: pc=1 / st=1 e=e / pc=0 / rt=[] v=[] f=[] / pc=0
 rcexit | E17 | 3.2 5.1 5.3 | PROMPT_COMMAND='echo "pc=$?"'\nset -e\nTESSERA_SHELL_INTEGRATION=enabled . "$HOME"/../scripts/*/bash/tessera.bash\nfalse && true | echo "st=$? e=${-//[^e]/}" | lines: pc=1 / st=1 e=e / pc=0
 rcexit | E18 | 3.2 5.1 5.3 | PROMPT_COMMAND='echo "pc=$?"'\nset -e\nTESSERA_SHELL_INTEGRATION=enabled . "$HOME"/../scripts/*/bash/tessera.bash | echo "st=$? e=${-//[^e]/}" | lines: pc=0 / st=0 e=e / pc=0
+# A Ctrl-C while the `.bashrc` runs (#713): bash alone drops the rest of
+# its startup; the injected shell returns from the file instead, so the
+# rest of tessera.bash runs: neither our RETURN or INT trap nor a
+# `_tessera_si_rc` variable or function is left (E19), and the first
+# prompt sees 130 (E20). `^C <text>` in the commands is a Ctrl-C once the
+# shell printed the text, which comes from where the Ctrl-C is to land.
+# No row kills a child: bash 3.2 gives it the terminal late, and a Ctrl-C
+# before that reaches only the shell (bash alone then waits for the
+# child). ACCEPTED LIMITS: inside a function the file called, the Ctrl-C
+# returns from that function and the file goes on, where bash alone drops
+# the rest (E21); after a loop bash 3.2 alone shows 128, not 130 (E22).
+rcexit | E19 | 3.2 5.1 5.3 | echo READY\nwhile (( SECONDS < 20 )); do :; done\necho after | ^C READY\necho "rt=[$(trap -p RETURN)] it=[$(trap -p INT)] v=[$(compgen -v _tessera_si_rc)] f=[$(compgen -A function _tessera_si_rc)]" | lines: READY / rt=[] it=[] v=[] f=[]
+rcexit | E20 | 5.1 5.3 | PROMPT_COMMAND='echo "pc=$?"'\necho READY\nwhile (( SECONDS < 20 )); do :; done\necho after | ^C READY\necho "st=$?" | lines: READY / pc=130 / st=130 / pc=0
+rcexit | E21 | 3.2 5.1 5.3 | f() { echo READY; while (( SECONDS < 20 )); do :; done; }\nf\necho after-f | ^C READY | limit: READY / after-f
+rcexit | E22 | 3.2 | PROMPT_COMMAND='echo "pc=$?"'\necho READY\nwhile (( SECONDS < 20 )); do :; done\necho after | ^C READY\necho "st=$?" | limit: READY / pc=130 / st=130 / pc=0
+# A Ctrl-C after the file returned, while the rest of tessera.bash runs
+# (E23): bash 3.2 runs startup files as a non-interactive shell, where
+# `trap - INT` makes SIGINT end the shell until its interactive handler
+# is back after the startup files, so our INT trap stays (a no-op once the
+# file returned) until the route's last command. The file's DEBUG trap
+# holds the rest of the script at a command run after the file returned
+# (bash alone: at the file's last command).
+rcexit | E23 | 3.2 5.1 5.3 | trap 'if [[ $BASH_COMMAND == "builtin unset _tessera_si_rc_depth"* || ( $BASH_COMMAND == : && -z ${_tessera_si_rc_depth+x} ) ]]; then trap - DEBUG; echo READY; s=$SECONDS; while (( SECONDS - s < 4 )); do :; done; fi' DEBUG\n: | ^C READY\necho "it=[$(trap -p INT)]" | lines: READY / it=[]
+# A Ctrl-C in a DEBUG trap of the file's that runs after our INT trap is
+# gone (E24, E25): none does, the route's end is our last command and
+# runs with `set -T` off (put back inside it). The trap holds at the
+# first command it sees with no INT trap after the file returned: here
+# and with bash alone, the first prompt's PROMPT_COMMAND. E24 ends with
+# status 0 (no command after the end), E25 with 1 under `set -T`.
+rcexit | E24 | 3.2 5.1 5.3 | PROMPT_COMMAND=:\ntrap 'if [[ -z ${_tessera_si_rc_depth+x} && -z $(trap -p INT) ]]; then trap - DEBUG; echo READY; s=$SECONDS; while (( SECONDS - s < 4 )); do :; done; fi' DEBUG | ^C READY\necho "it=[$(trap -p INT)]" | lines: READY / it=[]
+rcexit | E25 | 3.2 5.1 5.3 | PROMPT_COMMAND=:\nset -T\ntrap 'if [[ -z ${_tessera_si_rc_depth+x} && -z $(trap -p INT) ]]; then trap - DEBUG; echo READY; s=$SECONDS; while (( SECONDS - s < 4 )); do :; done; fi' DEBUG\nfalse | ^C READY\necho "it=[$(trap -p INT)] t=${-//[^T]/}" | lines: READY / it=[] t=T

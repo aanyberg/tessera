@@ -247,7 +247,19 @@ impl Run<'_> {
             }
             true
         };
-        for (n, line) in lines.iter().chain(&["exit"]).enumerate() {
+        let mut n = 0;
+        for line in lines.iter().chain(&["exit"]) {
+            // `^C <text>`: a Ctrl-C once the shell printed the text (before
+            // any prompt, while a startup file runs), not a typed line.
+            if let Some(text) = line.strip_prefix("^C ") {
+                let shown = |output: &[u8]| count(output, text.as_bytes()) > 0;
+                if !read_until(&mut output, &shown) {
+                    exited = true;
+                    break;
+                }
+                pty.write(b"\x03").expect("type a Ctrl-C");
+                continue;
+            }
             // Typed ahead: the M10 launches may not show `PROMPT`.
             let prompts = |output: &[u8]| self.ahead || count(output, PROMPT.as_bytes()) > n;
             if !read_until(&mut output, &prompts) {
@@ -256,6 +268,7 @@ impl Run<'_> {
             }
             pty.write(line.as_bytes()).expect("type a line");
             pty.write(b"\r").expect("type a line");
+            n += 1;
         }
         if !exited {
             read_until(&mut output, &|_| false);
@@ -296,6 +309,8 @@ fn transcript(text: &str) -> Vec<String> {
             _ => plain.push(c),
         }
     }
+    // The terminal's echo of a Ctrl-C row's `^C`.
+    let plain = plain.replace("^C", "");
     plain
         .lines()
         .filter(|line| !line.starts_with(PROMPT) && !line.trim().is_empty())
@@ -573,12 +588,13 @@ mod rcexit {
     use super::*;
     pub(super) const TESTED: &[&str] = &[
         "E1", "E2", "E3", "E4", "E5", "E6", "E7", "E8", "E9", "E10", "E11", "E12", "E13", "E14",
-        "E15", "E16", "E17", "E18",
+        "E15", "E16", "E17", "E18", "E19", "E20", "E21", "E22", "E23", "E24", "E25",
     ];
     row_tests!(rcexit_row:
         e1 => "E1", e2 => "E2", e3 => "E3", e4 => "E4", e5 => "E5", e6 => "E6", e7 => "E7",
         e8 => "E8", e9 => "E9", e10 => "E10", e11 => "E11", e12 => "E12", e13 => "E13",
-        e14 => "E14", e15 => "E15", e16 => "E16", e17 => "E17", e18 => "E18",
+        e14 => "E14", e15 => "E15", e16 => "E16", e17 => "E17", e18 => "E18", e19 => "E19",
+        e20 => "E20", e21 => "E21", e22 => "E22", e23 => "E23", e24 => "E24", e25 => "E25",
     );
 }
 
@@ -1333,6 +1349,38 @@ fn a_bashrc_that_sources_the_script_keeps_the_marks() {
         }
     }
     report("#676 marks", &failures);
+}
+
+/// #713: a Ctrl-C while the `.bashrc` runs still leaves the shell
+/// integrated (rows E19-E22 check what is left and the status): one
+/// handshake, a C for every command and each command's D status.
+#[test]
+fn a_ctrl_c_in_the_bashrc_keeps_the_marks() {
+    let mut failures = Vec::new();
+    for program in bashes("3.2 5.3", "#713 marks") {
+        let output = Run {
+            program: &program,
+            route: Route::Rcfile,
+            injected: true,
+            startup: "echo READY\nwhile (( SECONDS < 20 )); do :; done\necho after",
+            args: None,
+            env: &[],
+            ahead: false,
+        }
+        .lines(&["^C READY", "false", "true"]);
+        let text = &output.text;
+        let handshakes = text.matches("\x1b]1337;ShellIntegrationVersion=").count();
+        let c = text.matches("\x1b]133;C").count();
+        let d = d_marks(text);
+        let got = transcript(text);
+        if !output.injected || handshakes != 1 || c != 3 || d != ["1", "0"] || got != ["READY"] {
+            failures.push(format!(
+                "{}: {handshakes} handshakes, {c} C, D {d:?}, got {got:?}: {text:?}",
+                program.display()
+            ));
+        }
+    }
+    report("#713 marks", &failures);
 }
 
 /// #676: the --rcfile route's end runs also when there is no startup file
