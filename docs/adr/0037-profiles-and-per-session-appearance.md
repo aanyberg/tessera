@@ -331,10 +331,13 @@ same date.
   five such fallbacks take up to 3 s in turn, which a 1 s floor would cut
   short (adversarial cycle 2 of #661). Such a tab waits at most 5 s for a
   helper and 5 s on its fallback, about 10 s, the two-stall limit below.
-  The spawn runs on the caller, the app's main thread
-  (`tessera_session_spawn`), so this is how long the app is held: the
-  worst case of these bounds, accepted because the tab now opens where
-  it failed, until spawning moves off the main thread (#722). Skipping the
+  The spawn runs on its caller, which since #722 is the app's spawn
+  queue, not its main thread (`TesseraApp.spawnInBackground`, one spawn
+  at a time): this is how long the tab shows its placeholder before its
+  session or its failure, the worst case of these bounds, accepted
+  because the tab now opens where it failed; the app stays responsive
+  meanwhile, and its main thread waits for a spawn only when the core is
+  shut down during one (a quit while a terminal opens). Skipping the
   fallback after every refusal was rejected: it would fail the tabs the
   reserved helper exists to start. Not bounded by this: a profile whose
   working directory and the `$SHELL` both stall waits 5 s on each (the
@@ -353,3 +356,30 @@ same date.
   reserved helper behind a slow `$SHELL` was counted stuck when its 1 s
   floor ran out, and the next tab was refused although no lookup had
   stalled.
+
+## Amendment (#722): spawns run off the main thread
+
+`tessera_session_spawn` may be called from any thread (concurrently with
+every call but `tessera_app_free`), and the app calls it on one serial
+background queue (`TesseraApp.spawnInBackground`). A new window or tab
+opens at once in its place, showing a placeholder (a spinner on the
+window background), and becomes the session's terminal when the spawn
+returns, or closes and shows the error; a window closed meanwhile gets
+nothing, and its session is closed when it arrives. A split, and a
+restored tab's further panes, appear once their sessions run. The serial
+queue starts the sessions asked for together (a restore) in the order
+asked, so their ids follow the tabs' order; the placeholders keep the
+tabs' order whatever the spawns do. The cost: with several tabs behind
+one stalled lookup they open one after the other, each within the bounds
+above (and refused at once once the helpers are all stuck). A core free
+(quit, a core replaced) waits for a spawn in flight, at most those
+bounds, and the free closes the session it started; a window that was
+still waiting is not saved at that quit. Events a session emits before
+its spawn returns are held for it in the callback bridge while a spawn
+is in flight and delivered once it registers. Keys typed at the
+placeholder are kept (256 at the most, docs/security.md) and given to the
+session's view in order once it runs, before what is typed after; they
+are dropped if the tab closes or its spawn fails. The spawn's completion
+runs from a main run loop block rather than a main-queue job, so an error
+alert it shows leaves the main queue (session deliveries, the termination
+signal sources of #441) running.

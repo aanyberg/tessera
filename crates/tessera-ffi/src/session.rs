@@ -185,6 +185,14 @@ unsafe fn os_str<'a>(ptr: *const c_char) -> &'a OsStr {
 /// are never reused by the same application, so 0 never names a session.
 /// Callbacks for the new session may fire before this returns.
 ///
+/// **Safe to call from any thread**, concurrently with every other call
+/// except `tessera_app_free` (which must not start before this returns).
+/// It waits for the program lookup, the `#!` check, the PTY open and, after
+/// a profile's failure, the built-in profile's start, about 10 s at the
+/// most (docs/security.md S5), so a host calls it off its UI thread (#722).
+/// A session it starts after the host stopped wanting it is closed with
+/// `tessera_session_close` like any other.
+///
 /// Returns `TESSERA_ERROR_NULL_POINTER` if `app`, `options` or `out_id` is
 /// `NULL` (or an argument string is), `TESSERA_ERROR_INVALID_ARGUMENT` for
 /// zero rows or columns, more than `TESSERA_MAX_ROWS` (1024) rows or

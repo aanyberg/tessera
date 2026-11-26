@@ -1982,14 +1982,18 @@ private final class PaneHostProxy: TerminalWindowControllerDelegate {
         app.terminalWindowControllerWantsNewTab(controller)
     }
 
-    func terminalWindowControllerSpawnSession(_ controller: TerminalWindowController) throws -> TesseraSession {
+    func terminalWindowControllerSpawnSession(
+        _ controller: TerminalWindowController,
+        completion: @escaping @MainActor (Result<TesseraSession, any Error>) -> Void
+    ) {
         if let left = spawnsLeft {
-            guard left > 0 else { throw SpawnRefused() }
+            guard left > 0 else { return completion(.failure(SpawnRefused())) }
             spawnsLeft = left - 1
         }
-        let session = try app.terminalWindowControllerSpawnSession(controller)
-        spawned.append(session)
-        return session
+        app.terminalWindowControllerSpawnSession(controller) { [weak self] result in
+            if case .success(let session) = result { self?.spawned.append(session) }
+            completion(result)
+        }
     }
 
     func terminalWindowController(_ controller: TerminalWindowController, didClosePaneWith session: TesseraSession) {

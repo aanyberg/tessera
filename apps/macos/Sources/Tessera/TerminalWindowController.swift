@@ -25,9 +25,15 @@ protocol TerminalContentView: NSView {
 protocol TerminalWindowControllerDelegate: AnyObject {
     /// The tab bar's "+" button: open a new tab in `window`'s tab group.
     func terminalWindowControllerWantsNewTab(_ controller: TerminalWindowController)
-    /// A new pane of `controller`'s tab needs a session: spawn one and route
-    /// its events to `controller` before the main actor runs again.
-    func terminalWindowControllerSpawnSession(_ controller: TerminalWindowController) throws -> TesseraSession
+    /// A new pane of `controller`'s tab needs a session: spawn one, off the
+    /// main thread (#722), and call `completion` on the main actor with it,
+    /// its events routed to `controller` before the main actor runs again,
+    /// or with the error. If `controller`'s window closed meanwhile, the
+    /// session is closed and `completion` gets a `CancellationError`.
+    func terminalWindowControllerSpawnSession(
+        _ controller: TerminalWindowController,
+        completion: @escaping @MainActor (Result<TesseraSession, any Error>) -> Void
+    )
     /// A pane of `controller`'s tab closed with its session; stop routing
     /// the session's events. The tab stays open.
     func terminalWindowController(_ controller: TerminalWindowController, didClosePaneWith session: TesseraSession)
@@ -133,19 +139,16 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, NSMe
     /// Follows the selection of this window's tab (no notification says).
     private var tabSelectionObservation: NSKeyValueObservation?
 
-    /// - Parameters:
-    ///   - session: The first pane's session.
-    ///   - title: The initial window title, until the session sets one.
-    init(session: TesseraSession, title: String) {
-        let pane = Pane(session: session)
-        focusedPane = pane
+    /// A terminal window with no content yet: what ``init(session:title:window:)``
+    /// makes, and what a tab whose session starts off the main thread shows
+    /// until then (``SpawnPlaceholderView``, #722).
+    static func makeWindow() -> TerminalWindow {
         let window = TerminalWindow(
             contentRect: NSRect(x: 0, y: 0, width: 480, height: 200),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
-        paneContainer = PaneContainerView(pane: pane, frame: NSRect(x: 0, y: 0, width: 480, height: 200))
         // The controller owns the window; AppKit must not release it again.
         window.isReleasedWhenClosed = false
         window.tabbingMode = .preferred
@@ -153,6 +156,23 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, NSMe
         // The window state store restores windows, not AppKit: AppKit's restoration work takes a lock that a session
         // spawn's fork waits for under TSan (#278, #443).
         window.isRestorable = false
+        window.title = Self.defaultTitle
+        return window
+    }
+
+    /// - Parameters:
+    ///   - session: The first pane's session.
+    ///   - title: The initial window title, until the session sets one.
+    ///   - window: The window to take over, from ``makeWindow()``: a tab
+    ///     that showed its placeholder while the session started (#722),
+    ///     where it already is in its tab bar. `nil` makes one.
+    init(session: TesseraSession, title: String, window: TerminalWindow? = nil) {
+        let pane = Pane(session: session)
+        focusedPane = pane
+        let window = window ?? Self.makeWindow()
+        let size = window.contentView?.bounds.size ?? .zero
+        let frame = NSRect(origin: .zero, size: size == .zero ? NSSize(width: 480, height: 200) : size)
+        paneContainer = PaneContainerView(pane: pane, frame: frame)
         window.title = title.isEmpty ? Self.defaultTitle : title
         TerminalWindowContentView(paneContainer: paneContainer, frame: paneContainer.frame).install(in: window)
         super.init(window: window)
@@ -263,22 +283,60 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, NSMe
     /// ``PaneContainerView/minimumRows`` cells).
     ///
     /// - Throws: The core's error if the session cannot be started.
+    ///
+    /// The new session starts off the main thread (#722), so the split
+    /// happens once it runs: `completion` gets the new pane, `nil` for a
+    /// refused split (also when the pane to split closed, or no longer has
+    /// room, while the session started; it is closed then), or the core's
+    /// error. ``splitFocusedPane(_:)`` is the same, returning what
+    /// `completion` got by then.
+    func beginSplit(
+        _ direction: PaneSplitDirection,
+        completion: @escaping @MainActor (Result<Pane?, any Error>) -> Void
+    ) {
+        unzoom()
+        guard let delegate, paneContainer.canSplit(focusedPane, direction) else {
+            completion(.success(nil))
+            return
+        }
+        let target = focusedPane
+        delegate.terminalWindowControllerSpawnSession(self) { [weak self] result in
+            let session: TesseraSession
+            switch result {
+            case .success(let started): session = started
+            case .failure(let error):
+                completion(.failure(error))
+                return
+            }
+            let pane = Pane(session: session)
+            guard let self else {
+                // Not reached: the delegate closes a session whose tab closed.
+                try? session.close()
+                completion(.success(nil))
+                return
+            }
+            guard panes.contains(target), paneContainer.split(target, direction, adding: pane) else {
+                closeSession(of: pane)
+                delegate.terminalWindowController(self, didClosePaneWith: session)
+                completion(.success(nil))
+                return
+            }
+            watchFocus(of: pane)
+            updateMinimumSize()
+            focus(pane)
+            paneLayoutDidChange()
+            completion(.success(pane))
+        }
+    }
+
+    /// ``beginSplit(_:completion:)``, returning the new pane if its session
+    /// started before this returns (a delegate that spawns on the calling
+    /// thread, as tests do), `nil` otherwise.
     @discardableResult
     func splitFocusedPane(_ direction: PaneSplitDirection) throws -> Pane? {
-        unzoom()
-        guard let delegate, paneContainer.canSplit(focusedPane, direction) else { return nil }
-        let session = try delegate.terminalWindowControllerSpawnSession(self)
-        let pane = Pane(session: session)
-        guard paneContainer.split(focusedPane, direction, adding: pane) else {
-            // Not reached: `canSplit` said yes and nothing ran since.
-            closeSession(of: pane)
-            return nil
-        }
-        watchFocus(of: pane)
-        updateMinimumSize()
-        focus(pane)
-        paneLayoutDidChange()
-        return pane
+        let outcome = SpawnOutcome<Pane?>()
+        beginSplit(direction) { outcome.value = $0 }
+        return try outcome.value?.get() ?? nil
     }
 
     /// Moves the focus to the pane next to the focused one toward
@@ -359,12 +417,20 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, NSMe
     /// whose panes at their smallest size do not fit the window, or once
     /// the tab has been split.
     ///
-    /// - Throws: The core's error if a session cannot be started; the tab
-    ///   then keeps its one pane and every session started for it is closed.
-    func restoreLayout(_ layout: PaneLayout) throws {
-        guard let delegate, panes.count == 1, layout.leafCount > 1 else { return }
+    /// The sessions start off the main thread (#722), one after the other;
+    /// the tab is laid out once all run, if it still has its one pane, and
+    /// `completion` gets `nil`, or the core's error if a session cannot be
+    /// started: the tab then keeps its one pane and every session started
+    /// for it is closed. ``restoreLayout(_:)`` is the same, throwing what
+    /// `completion` got by then.
+    func beginRestoringLayout(_ layout: PaneLayout, completion: @escaping @MainActor ((any Error)?) -> Void) {
+        guard delegate != nil, panes.count == 1, layout.leafCount > 1 else {
+            completion(nil)
+            return
+        }
         guard layout.isRestorable, let shape = layout.tree(leaves: Array(0..<layout.leafCount)) else {
             Self.log.error("a saved pane layout is not usable; the tab opens with one pane")
+            completion(nil)
             return
         }
         let first = focusedPane
@@ -373,26 +439,46 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, NSMe
         let space = paneContainer.bounds.size
         guard minimum.width <= space.width, minimum.height <= space.height else {
             Self.log.info("a saved pane layout does not fit its window; the tab opens with one pane")
+            completion(nil)
             return
         }
-        var added: [Pane] = []
-        do {
-            for _ in 1..<layout.leafCount {
-                added.append(Pane(session: try delegate.terminalWindowControllerSpawnSession(self)))
+        spawnRestoredPanes(layout, first: first, added: [], completion: completion)
+    }
+
+    /// The next of `layout`'s new panes, or the layout once all are there.
+    private func spawnRestoredPanes(
+        _ layout: PaneLayout,
+        first: Pane,
+        added: [Pane],
+        completion: @escaping @MainActor ((any Error)?) -> Void
+    ) {
+        guard added.count + 1 == layout.leafCount else {
+            guard let delegate else {
+                discardRestored(added)
+                completion(nil)
+                return
             }
-        } catch {
-            for pane in added {
-                closeSession(of: pane)
-                delegate.terminalWindowController(self, didClosePaneWith: pane.session)
+            delegate.terminalWindowControllerSpawnSession(self) { [weak self] result in
+                switch result {
+                case .success(let session):
+                    guard let self else {
+                        // Not reached: the delegate closes a session whose tab closed.
+                        try? session.close()
+                        completion(nil)
+                        return
+                    }
+                    spawnRestoredPanes(layout, first: first, added: added + [Pane(session: session)], completion: completion)
+                case .failure(let error):
+                    self.map { $0.discardRestored(added) }
+                    completion(error)
+                }
             }
-            throw error
+            return
         }
-        guard let tree = layout.tree(leaves: [first] + added), paneContainer.restore(tree) else {
-            // Not reached: the layout was checked above.
-            for pane in added {
-                closeSession(of: pane)
-                delegate.terminalWindowController(self, didClosePaneWith: pane.session)
-            }
+        // The tab may have been split, or its pane closed, meanwhile.
+        guard panes == [first], let tree = layout.tree(leaves: [first] + added), paneContainer.restore(tree) else {
+            discardRestored(added)
+            completion(nil)
             return
         }
         for pane in added {
@@ -401,6 +487,22 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, NSMe
         updateMinimumSize()
         focus(first)
         paneLayoutDidChange()
+        completion(nil)
+    }
+
+    private func discardRestored(_ panes: [Pane]) {
+        for pane in panes {
+            closeSession(of: pane)
+            delegate?.terminalWindowController(self, didClosePaneWith: pane.session)
+        }
+    }
+
+    /// ``beginRestoringLayout(_:completion:)``, throwing its error if every
+    /// session started (or one failed) before this returns.
+    func restoreLayout(_ layout: PaneLayout) throws {
+        let outcome = SpawnOutcome<Void>()
+        beginRestoringLayout(layout) { error in outcome.value = error.map { .failure($0) } ?? .success(()) }
+        try outcome.value?.get()
     }
 
     /// The panes' shape or a divider changed: the window state is saved.
@@ -543,12 +645,13 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, NSMe
     }
 
     private func split(_ direction: PaneSplitDirection) {
-        do {
-            if try splitFocusedPane(direction) == nil {
-                NSSound.beep()
+        beginSplit(direction) { [weak self] result in
+            switch result {
+            case .success(.some): break
+            case .success(.none): NSSound.beep()
+            case .failure(is CancellationError): break
+            case .failure(let error): self?.delegate?.presentOpenError(error)
             }
-        } catch {
-            delegate?.presentOpenError(error)
         }
     }
 
@@ -858,4 +961,11 @@ final class TerminalWindow: NSWindow {
         guard tabs.count > 1, let index = tabs.firstIndex(where: { $0 === selected }) else { return }
         selectTab(at: (index + offset + tabs.count) % tabs.count)
     }
+}
+
+/// What a completion handler got, for the calls that return it at once
+/// when it ran before they return (a spawn on the calling thread).
+@MainActor
+final class SpawnOutcome<Value> {
+    var value: Result<Value, any Error>?
 }

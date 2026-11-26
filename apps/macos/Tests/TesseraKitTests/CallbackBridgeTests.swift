@@ -117,6 +117,55 @@ final class CallbackBridgeTests: XCTestCase {
             events, (0..<5).flatMap { [Recorder.Event.title("t\($0)"), .bell] } + [.exit(code: 3, signal: 0)])
     }
 
+    /// #722: while a spawn runs in the background, the events of a session
+    /// not yet registered (its spawn has not returned) are held, and
+    /// delivered once it registers; with no spawn running they are dropped.
+    func testEventsOfASessionWhoseSpawnRunsAreHeldUntilItRegisters() async throws {
+        bridge.spawnsInFlight = 1
+        onReaderThread { callbacks in
+            callbacks.on_session_bell!(callbacks.user_data, 9)
+            callbacks.on_session_exit!(callbacks.user_data, 9, 3, 0)
+        }
+        try await until { bridge.parkedCount == 1 }
+        let spawned = TesseraSession(id: 9, core: core, bridge: bridge)
+        bridge.register(spawned)
+        bridge.spawnsInFlight = 0
+        try await until { recorder.events[9]?.count == 2 }
+        XCTAssertEqual(recorder.events[9], [.bell, .exit(code: 3, signal: 0)])
+        XCTAssertEqual(bridge.parkedCount, 0)
+
+        // No spawn runs: a stray id's events are dropped, as before.
+        onReaderThread { callbacks in callbacks.on_session_bell!(callbacks.user_data, 11) }
+        _ = try await drained()
+        XCTAssertEqual(bridge.parkedCount, 0)
+        XCTAssertNil(recorder.events[11])
+    }
+
+    /// #722: a flood from a session whose spawn has not returned is held as
+    /// one coalesced record, however many deliveries it spans, and comes as
+    /// one delivery with the latest values once the session registers.
+    func testAFloodFromASessionWhoseSpawnRunsIsHeldAsOneRecord() async throws {
+        bridge.spawnsInFlight = 1
+        for round in 0..<20 {
+            onReaderThread { callbacks in
+                for _ in 0..<1000 { callbacks.on_session_output!(callbacks.user_data, 9) }
+                Array("t\(round)".utf8CString).withUnsafeBufferPointer {
+                    callbacks.on_session_title!(callbacks.user_data, 9, $0.baseAddress)
+                }
+                callbacks.on_session_bell!(callbacks.user_data, 9)
+            }
+            try await until { bridge.parkedCount == 1 }
+            _ = try await drained()
+            XCTAssertEqual(bridge.parkedCount, 1, "round \(round)")
+        }
+        XCTAssertNil(recorder.events[9])
+        bridge.register(TesseraSession(id: 9, core: core, bridge: bridge))
+        bridge.spawnsInFlight = 0
+        try await until { recorder.events[9] != nil }
+        _ = try await drained()
+        XCTAssertEqual(recorder.events[9], [.output, .title("t19"), .bell])
+    }
+
     /// #205: the host is copied before the callback returns, a burst of
     /// changes is one delivery with the latest, after the title.
     func testRemoteStatesAreCopiedAndCoalescedAfterTheTitle() async throws {

@@ -20,9 +20,11 @@ use crate::panic::ffi_guard;
 ///
 /// * Every `tessera_app_*`, `tessera_session_*` and `tessera_surface_*`
 ///   function is called from one thread, the host's UI (main) thread, with
-///   the single exception of `tessera_session_write`, which may be called
-///   from any thread, concurrently with any other call except
-///   `tessera_app_free`. The surface functions create, configure and
+///   two exceptions, which may be called from any thread, concurrently with
+///   any other call except `tessera_app_free`: `tessera_session_write`, and
+///   `tessera_session_spawn`, whose program lookup, `#!` check and PTY open
+///   can wait for seconds (docs/security.md S5), so the host runs it on a
+///   background thread (#722). The surface functions create, configure and
 ///   present Metal surfaces, which must happen on the main thread.
 /// * Callbacks (see `TesseraCallbacks`) fire on internal threads (session
 ///   readers, the configuration watch), except `on_appearance_changed`
@@ -32,7 +34,8 @@ use crate::panic::ffi_guard;
 ///   must not block on the UI thread; the host marshals their work to its
 ///   main thread asynchronously.
 /// * `tessera_app_free` must not race with any other call on the same
-///   handle, including `tessera_session_write` from another thread.
+///   handle, including `tessera_session_write` or `tessera_session_spawn`
+///   from another thread.
 #[derive(Debug)]
 pub struct App {
     pub(crate) core: CoreApp,

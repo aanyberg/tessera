@@ -84,7 +84,36 @@ final class CallbackBridge {
     func register(_ session: TesseraSession) {
         guard !isShutDown else { return }
         sessions[session.id] = session
+        guard let events = parked.removeValue(forKey: session.id) else { return }
+        let schedule = pending.withLock { pending in
+            let isNew = pending[session.id] == nil
+            pending[session.id] = events.merged(with: pending[session.id])
+            return isNew
+        }
+        guard schedule else { return }
+        Task { @MainActor in
+            self.deliver(session.id)
+        }
     }
+
+    /// Spawns running in the background (``TesseraApp/spawnInBackground(_:completion:)``),
+    /// not yet returned: while any does, a delivery for a session not yet
+    /// registered is held (``parked``) for its registration, since the
+    /// session's first events may come before its spawn returns (#722).
+    var spawnsInFlight = 0 {
+        didSet {
+            // A held delivery left once no spawn runs belongs to no session
+            // that will register (a closed one's last events).
+            if spawnsInFlight == 0 { parked.removeAll() }
+        }
+    }
+    /// Deliveries held for sessions whose spawn has not returned, by id: at
+    /// most one record per session that a spawn in flight started, plus a
+    /// closed session's last events, until no spawn runs.
+    private var parked: [UInt64: Pending] = [:]
+
+    /// How many deliveries are held for unregistered sessions (tests).
+    var parkedCount: Int { parked.count }
 
     /// Forgets a closed session. Its own held clipboard write, the last one
     /// its program made, is written now rather than lost (a clean exit closes
@@ -103,6 +132,7 @@ final class CallbackBridge {
     func shutDown() {
         isShutDown = true
         sessions.removeAll()
+        parked.removeAll()
         clipboardRelease?.cancel()
         clipboardRelease = nil
         clipboardThrottle.dropHeld()
@@ -195,6 +225,27 @@ final class CallbackBridge {
         var bell = false
         var commandFinished: TesseraCommandFinish?
         var exit: (code: Int32, signal: Int32)?
+
+        /// These events, then `later`'s on top of them: a flag set in either
+        /// stays set, a value is the later one's if it has one, a finished
+        /// command the longer one's.
+        func merged(with later: Pending?) -> Pending {
+            guard let later else { return self }
+            var merged = self
+            merged.output = output || later.output
+            merged.title = later.title ?? title
+            merged.remote = later.remote ?? remote
+            merged.clipboard = later.clipboard ?? clipboard
+            merged.bell = bell || later.bell
+            // The longest finish, as ``receive(for:_:)`` keeps it (ADR 0048).
+            if let finish = later.commandFinished,
+                commandFinished.map({ $0.durationMilliseconds <= finish.durationMilliseconds }) ?? true
+            {
+                merged.commandFinished = finish
+            }
+            merged.exit = later.exit ?? exit
+            return merged
+        }
     }
 
     private nonisolated func receive(for id: UInt64, _ record: (inout Pending) -> Void) {
@@ -302,6 +353,10 @@ final class CallbackBridge {
         // Taken before the delegate runs, so events arriving meanwhile
         // schedule the next delivery.
         guard let events = pending.withLock({ $0.removeValue(forKey: id) }) else { return }
+        if !isShutDown, sessions[id] == nil, spawnsInFlight > 0 {
+            parked[id] = parked[id]?.merged(with: events) ?? events
+            return
+        }
         // The delegate may close the session, shut the app down or replace
         // itself in any call, so look both up again before each one.
         func target() -> (any TesseraAppDelegate, TesseraSession)? {

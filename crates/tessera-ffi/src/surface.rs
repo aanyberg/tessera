@@ -573,6 +573,41 @@ pub unsafe extern "C" fn tessera_test_hold_font_index(app: *mut App, hold: bool)
     })
 }
 
+/// Makes every program lookup's stat of the path at `path` (a
+/// NUL-terminated string) take `delay_ms` milliseconds longer and then
+/// answer, as on a slow but healthy volume, process-wide; 0 takes the
+/// delay away. For the app's test that its main thread is not held while a
+/// spawn waits on the lookup (#722).
+///
+/// Test-only (feature `test-hooks`): exported to C only by a core built
+/// with that feature, and absent from the header (a test declares it).
+/// Returns `TESSERA_ERROR_NULL_POINTER` if `path` is `NULL`.
+///
+/// # Safety
+///
+/// `path` must be `NULL` or a NUL-terminated string.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tessera_test_delay_program_lookup(
+    path: *const std::ffi::c_char,
+    delay_ms: u64,
+) -> Error {
+    use std::os::unix::ffi::OsStrExt;
+    ffi_guard!("tessera_test_delay_program_lookup", {
+        if path.is_null() {
+            return Error::NullPointer;
+        }
+        // SAFETY: non-null and NUL-terminated per the contract.
+        let bytes = unsafe { std::ffi::CStr::from_ptr(path) }.to_bytes();
+        tessera_app_core::pty_test_hooks::delay_program_lookup(
+            std::path::Path::new(std::ffi::OsStr::from_bytes(bytes)),
+            std::time::Duration::from_millis(delay_ms),
+        );
+        Error::Ok
+    })
+}
+
 /// Writes to `*out` whether session `session_id`'s surface shows a row
 /// shaped with a provisional face that the font fallback index may change
 /// (#594).
