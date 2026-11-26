@@ -6342,6 +6342,93 @@ mod tests {
         });
     }
 
+    /// #754: a click whose thread is descheduled past the smart-rule
+    /// budget right after its clock starts (the test hook's wall-clock
+    /// stall, no sleep) still selects by one set of rules, never the plain
+    /// word: on the engines in effect, on engines a reload's click rebuilt
+    /// (cold, their first match before the click), in flight on the old
+    /// engines while a reload lands and another click rebuilds them, and
+    /// by the default rules after the first (a path, a URL).
+    #[test]
+    fn a_click_stalled_past_the_budget_selects_by_the_rules() {
+        let stalled = |click: &dyn Fn() -> Option<String>| {
+            selection::WALL_STALL.with(|stall| stall.set(selection::SMART_RULE_BUDGET * 10));
+            let text = click();
+            selection::WALL_STALL.with(|stall| stall.set(Duration::ZERO));
+            text
+        };
+        let theme = tessera_config::Theme::default();
+        let app = app();
+        let first = app.spawn_test_session(PtySize::new(2, 20)).unwrap();
+        let second = app.spawn_test_session(PtySize::new(2, 20)).unwrap();
+        for id in [first, second] {
+            app.feed_for_test(id, b"ab-cd-ef").unwrap();
+        }
+        let double_click = |id| {
+            app.select_begin(id, Point::new(0, 4), Granularity::Word, false)
+                .unwrap();
+            app.selection_text(id).unwrap()
+        };
+        app.apply_config(&smart_rule("ab-cd"), &theme);
+        // Rebuilt by this click, then in effect.
+        assert_eq!(stalled(&|| double_click(first)).as_deref(), Some("ab-cd"));
+        assert_eq!(stalled(&|| double_click(first)).as_deref(), Some("ab-cd"));
+
+        let (in_flight, rebuilt) = thread::scope(|scope| {
+            let (paused_tx, paused) = mpsc::channel();
+            // Dropped on every way out of this scope, so the paused click
+            // always returns.
+            let (resume, resume_rx) = mpsc::channel::<()>();
+            let (double_click, stalled) = (&double_click, &stalled);
+            let in_flight = scope.spawn(move || {
+                IN_CLICK.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move || {
+                        let _ = paused_tx.send(());
+                        // An error is a dropped sender: go on all the same.
+                        let _ = resume_rx.recv();
+                    }));
+                });
+                stalled(&|| double_click(first))
+            });
+            let paused = paused.recv_timeout(TIMEOUT);
+            let rebuilt = paused.is_ok().then(|| {
+                app.apply_config(&smart_rule("cd-ef"), &theme);
+                scope.spawn(move || stalled(&|| double_click(second)))
+            });
+            drop(resume);
+            let in_flight = in_flight.join().unwrap();
+            assert!(paused.is_ok(), "the click never paused");
+            (in_flight, rebuilt.map(|handle| handle.join().unwrap()))
+        });
+        assert_eq!(in_flight.as_deref(), Some("ab-cd"), "the old rules");
+        assert_eq!(rebuilt.flatten().as_deref(), Some("cd-ef"), "the new rules");
+        assert_eq!(stalled(&|| double_click(first)).as_deref(), Some("cd-ef"));
+
+        // A reload's cold engines, their first match before the click.
+        let line = app.spawn_test_session(PtySize::new(2, 40)).unwrap();
+        app.feed_for_test(line, b"ab-cd-ef ab-cd-ef").unwrap();
+        let click_at = |id, col| {
+            app.select_begin(id, Point::new(0, col), Granularity::Word, false)
+                .unwrap();
+            app.selection_text(id).unwrap()
+        };
+        app.apply_config(&smart_rule("ab-cd"), &theme);
+        assert_eq!(click_at(line, 13).as_deref(), Some("ab-cd"));
+        app.apply_config(&smart_rule("cd-ef"), &theme);
+        assert_eq!(stalled(&|| click_at(line, 13)).as_deref(), Some("cd-ef"));
+
+        // The default rules: paths and URLs are not the first.
+        app.apply_config(&Config::default(), &theme);
+        let text = app.spawn_test_session(PtySize::new(2, 60)).unwrap();
+        app.feed_for_test(text, b"see /tmp/xyz or https://example.com/a ok")
+            .unwrap();
+        assert_eq!(stalled(&|| click_at(text, 6)).as_deref(), Some("/tmp/xyz"));
+        assert_eq!(
+            stalled(&|| click_at(text, 22)).as_deref(),
+            Some("https://example.com/a")
+        );
+    }
+
     /// ADR 0041: `accessible_text` reads the rows the view shows, at its
     /// scroll offset, with the cursor and the selection; an unknown
     /// session is an error.

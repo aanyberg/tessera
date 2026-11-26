@@ -79,7 +79,9 @@
 
 use std::cmp::Reverse;
 use std::ops::{ControlFlow, Range};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(test)]
+use std::time::Instant;
 
 use tessera_config::{CompiledRule, RuleCheck};
 pub use tessera_grid::Point;
@@ -663,19 +665,24 @@ fn trim_url(text: &str, span: Range<usize>) -> Range<usize> {
     span.start..span.start + end
 }
 
-/// The wall time one double-click gives its smart-selection rules (#351
-/// m1, #433): checked before each rule, the first rule included, and after
+/// The time one double-click gives its smart-selection rules (#351 m1,
+/// #433), on the clicking thread's CPU clock (`CLOCK_THREAD_CPUTIME_ID`,
+/// #754): checked before each rule after the first, and after
 /// a match a rule finds when its search may have been costly (the first on
 /// a cold DFA cache, one that reset its cache, or the fallback's) or it is
 /// the click's [`SMART_CLOCK_STRIDE`]th, 2 x [`SMART_CLOCK_STRIDE`]th, ...
-/// match. A rule not started within it is skipped, and one that has spent
-/// it stops at the match where it reads that. Rules are bounded in count and size
-/// (S5); this bounds them in time: a click costs at most the budget plus
-/// one match attempt, at most [`SMART_RULE_ATTEMPT_BOUND`] (#518), plus
-/// fewer than [`SMART_CLOCK_STRIDE`] searches on cached DFA states (a pass
-/// over the window each, microseconds): the terminal and selection locks
-/// are held at most rules x (budget + attempt bound) per click, in practice
-/// the budget plus one attempt.
+/// match, the first rule's included. A rule not started within it is
+/// skipped, and one that has spent it stops at the match where it reads
+/// that. The first rule always runs, and a click whose thread is
+/// descheduled spends none of it, so it selects by its rules under load as
+/// when idle (#754). Rules are bounded in count and size (S5); this bounds
+/// their work: a click costs at most the budget plus one match attempt, at most
+/// [`SMART_RULE_ATTEMPT_BOUND`] (#518), plus fewer than
+/// [`SMART_CLOCK_STRIDE`] searches on cached DFA states (a pass over the
+/// window each, microseconds): the terminal and selection locks are held
+/// at most rules x (budget + attempt bound) of the clicking thread's CPU
+/// time per click, in practice the budget plus one attempt; load stretches
+/// that in wall time.
 pub const SMART_RULE_BUDGET: Duration = Duration::from_millis(50);
 
 /// How many matches of a click's smart-selection rules may pass between
@@ -688,14 +695,15 @@ pub const SMART_CLOCK_STRIDE: usize = 16;
 
 #[cfg(test)]
 thread_local! {
-    /// Test hook: wall time charged to the budget per rule run, so a test
+    /// Test hook: CPU time charged to the budget per rule run, so a test
     /// can spend the budget without slow rules.
     static RULE_COST: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
-    /// Test hook: wall time charged to the budget per match a rule finds.
+    /// Test hook: CPU time charged to the budget per match a rule finds.
     static MATCH_COST: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
-    /// Test hook: whether wall time counts toward the budget; off, only
-    /// the charged costs do, so a stall of the test thread cannot spend it.
-    static WALL_CLOCK: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    /// Test hook: whether the clock ([`RuleClock`]) counts toward the
+    /// budget; off, only the charged costs do, so tests that expect exact
+    /// counts do not depend on the machine's speed.
+    static REAL_CLOCK: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
     /// Test hook: how many rules the last [`smart_at`] on this thread
     /// started.
     static RULES_RUN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -704,21 +712,81 @@ thread_local! {
     static MATCHES_SEEN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Test hook: how many times [`rules_time`] ran on this thread.
     static CLOCK_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Test hook: wall time this thread is taken to have been descheduled
+    /// since a click's clock started (#754): a wall clock counts it
+    /// ([`RuleClock::wall_elapsed`]), the budget's CPU clock must not. A
+    /// test stalls a click this way without sleeping.
+    pub(crate) static WALL_STALL: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
+    /// Test hook: CPU time this thread is taken to have spent since a
+    /// click's clock started: both clocks count it.
+    pub(crate) static CPU_SPENT: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
 }
 
-/// The time the rules of a click have taken: since `started`, plus in tests
-/// the charged cost of the `ran` rules finished and the `found` matches.
-fn rules_time(started: Instant, ran: usize, found: usize) -> Duration {
+/// The clock of a click's [`SMART_RULE_BUDGET`]: the CPU time of the
+/// clicking thread since the rules started (#754). The budget bounds the
+/// work the rules do (#433), so time the thread spends descheduled or
+/// waiting for a rule's cache lock does not count: a click stalled past
+/// the budget still selects by its rules, under load as when idle.
+struct RuleClock {
+    started: Duration,
+    /// When the rules started on the wall clock, for the test model of a
+    /// stall ([`RuleClock::wall_elapsed`]).
+    #[cfg(test)]
+    wall: Instant,
+}
+
+impl RuleClock {
+    /// A clock started now.
+    fn start() -> Self {
+        Self {
+            started: thread_cpu_time(),
+            #[cfg(test)]
+            wall: Instant::now(),
+        }
+    }
+
+    /// The CPU time this thread has spent since the clock started.
+    fn elapsed(&self) -> Duration {
+        let spent = thread_cpu_time().saturating_sub(self.started);
+        #[cfg(test)]
+        let spent = spent.saturating_add(CPU_SPENT.with(std::cell::Cell::get));
+        spent
+    }
+
+    /// The wall time since the clock started, a stall of this thread
+    /// included ([`WALL_STALL`]): what the budget measured before #754.
+    #[cfg(test)]
+    fn wall_elapsed(&self) -> Duration {
+        self.wall
+            .elapsed()
+            .saturating_add(WALL_STALL.with(std::cell::Cell::get))
+            .saturating_add(CPU_SPENT.with(std::cell::Cell::get))
+    }
+}
+
+/// The CPU time the calling thread has used so far. The thread's own clock
+/// does not fail on the platforms Tessera runs on (macOS, and Linux for
+/// tests); a failure would read as no time spent, which leaves a click
+/// bounded by its rules' count and attempt bound alone
+/// ([`SMART_RULE_ATTEMPT_BOUND`]).
+fn thread_cpu_time() -> Duration {
+    nix::time::clock_gettime(nix::time::ClockId::CLOCK_THREAD_CPUTIME_ID)
+        .map_or(Duration::ZERO, Duration::from)
+}
+
+/// The time the rules of a click have taken on `clock`, plus in tests the
+/// charged cost of the `ran` rules finished and the `found` matches.
+fn rules_time(clock: &RuleClock, ran: usize, found: usize) -> Duration {
     #[cfg(test)]
     CLOCK_READS.with(|reads| reads.set(reads.get() + 1));
     #[cfg(test)]
-    let elapsed = if WALL_CLOCK.with(std::cell::Cell::get) {
-        started.elapsed()
+    let elapsed = if REAL_CLOCK.with(std::cell::Cell::get) {
+        clock.elapsed()
     } else {
         Duration::ZERO
     };
     #[cfg(not(test))]
-    let elapsed = started.elapsed();
+    let elapsed = clock.elapsed();
     #[cfg(test)]
     let charged = {
         let times = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
@@ -744,9 +812,10 @@ fn rules_time(started: Instant, ran: usize, found: usize) -> Duration {
 /// rule matches there, or `pos` is past the end of its line's text or on
 /// padding.
 ///
-/// The rules share [`SMART_RULE_BUDGET`], its clock read every
-/// [`SMART_CLOCK_STRIDE`] matches and after each costly search: once it is
-/// spent, the rule running stops and the rules not yet started are skipped
+/// The rules share [`SMART_RULE_BUDGET`], its clock read before each rule
+/// after the first, every [`SMART_CLOCK_STRIDE`] matches and after each
+/// costly search: once it is spent, the rule running stops and the rules
+/// not yet started are skipped
 /// (one debug log with the counts, S8), and the best match found so far
 /// wins; with none the word is selected. Each rule's attempt is bounded on its own
 /// ([`SMART_RULE_ATTEMPT_BOUND`], #518): a rule that gives up or is over
@@ -763,12 +832,14 @@ fn smart_at(lines: &Lines<'_>, pos: Pos, engines: &SmartEngines) -> Option<(Pos,
     let click = window.bytes(window.click);
     let ascii = window.text.is_ascii();
     let mut best: Option<(Key, Range<usize>)> = None;
-    let started = Instant::now();
+    let budget = RuleClock::start();
     // Rules finished, and matches found.
     let (mut ran, mut found) = (0usize, 0usize);
     let mut spent = false;
     for (index, rule) in rules.rules().iter().enumerate() {
-        if rules_time(started, ran, found) >= SMART_RULE_BUDGET {
+        // The first rule always runs (#351): before it the clock has
+        // counted nothing of the rules' work.
+        if index > 0 && rules_time(&budget, ran, found) >= SMART_RULE_BUDGET {
             spent = true;
             break;
         }
@@ -787,7 +858,7 @@ fn smart_at(lines: &Lines<'_>, pos: Pos, engines: &SmartEngines) -> Option<(Pos,
                 rule_best = Some(candidate);
             }
             if (cost == SearchCost::Costly || found % SMART_CLOCK_STRIDE == 0)
-                && rules_time(started, ran, found) >= SMART_RULE_BUDGET
+                && rules_time(&budget, ran, found) >= SMART_RULE_BUDGET
             {
                 spent = true;
                 return ControlFlow::Break(());
@@ -3206,23 +3277,113 @@ mod tests {
         assert_eq!(RULES_RUN.with(std::cell::Cell::get), 1);
     }
 
+    /// #754: the budget's clock counts the CPU time the clicking thread
+    /// spends, not a stall of it; the wall clock it measured before counts
+    /// both.
+    #[test]
+    fn the_rule_clock_counts_cpu_time_not_a_stall() {
+        let clock = RuleClock::start();
+        WALL_STALL.with(|stall| stall.set(SMART_RULE_BUDGET * 10));
+        let (cpu, wall) = (clock.elapsed(), clock.wall_elapsed());
+        WALL_STALL.with(|stall| stall.set(Duration::ZERO));
+        assert!(cpu < SMART_RULE_BUDGET, "a stall counted: {cpu:?}");
+        assert!(wall >= SMART_RULE_BUDGET * 10, "{wall:?}");
+        CPU_SPENT.with(|spent| spent.set(SMART_RULE_BUDGET * 10));
+        let (cpu, wall) = (clock.elapsed(), clock.wall_elapsed());
+        CPU_SPENT.with(|spent| spent.set(Duration::ZERO));
+        assert!(cpu >= SMART_RULE_BUDGET * 10, "{cpu:?}");
+        assert!(wall >= SMART_RULE_BUDGET * 10, "{wall:?}");
+    }
+
+    /// [`smart_at`] on `lines` at column `col` of its first line, its
+    /// thread stalled past [`SMART_RULE_BUDGET`] right after the click's
+    /// clock starts ([`WALL_STALL`], #754).
+    fn stalled_at(lines: &Lines<'_>, col: u16, rules: &SmartEngines) -> Option<(Pos, Pos)> {
+        WALL_STALL.with(|stall| stall.set(SMART_RULE_BUDGET * 10));
+        let found = smart_at(lines, first_line(lines, col), rules);
+        WALL_STALL.with(|stall| stall.set(Duration::ZERO));
+        found
+    }
+
+    /// Column `col` of the first line of `lines`.
+    fn first_line(lines: &Lines<'_>, col: u16) -> Pos {
+        Pos {
+            line: lines.base,
+            col,
+        }
+    }
+
+    /// #754: a stalled click on a cold cache (the first after a reload)
+    /// whose first match is before the click selects by its rule: the
+    /// clock read after that costly match does not count the stall.
+    #[test]
+    fn a_stalled_click_on_a_cold_cache_selects_by_its_rule() {
+        let mut term = Terminal::new(2, 40);
+        term.advance(b"ab-cd-ef ab-cd-ef");
+        let lines = Lines::of(term.grid());
+        let cold = smart_rules(&[("cd-ef", Precision::Normal)]);
+        let second = Some((first_line(&lines, 12), first_line(&lines, 16)));
+        assert_eq!(stalled_at(&lines, 13, &cold), second);
+    }
+
+    /// #754: a stalled click selects by a rule after the first: the clock
+    /// read before it does not count the stall. CPU time the click spends
+    /// does count: past the budget that rule is skipped.
+    #[test]
+    fn a_stalled_click_selects_by_a_later_rule() {
+        let mut term = Terminal::new(2, 40);
+        term.advance(b"see /tmp/xyz ok");
+        let lines = Lines::of(term.grid());
+        let rules = smart_rules(&[
+            ("zz", Precision::Normal),
+            ("/tmp/[a-z]+", Precision::Normal),
+        ]);
+        let path = Some((first_line(&lines, 4), first_line(&lines, 11)));
+        assert_eq!(stalled_at(&lines, 6, &rules), path);
+        assert_eq!(RULES_RUN.with(std::cell::Cell::get), 2);
+        CPU_SPENT.with(|spent| spent.set(SMART_RULE_BUDGET * 10));
+        let found = smart_at(&lines, first_line(&lines, 6), &rules);
+        CPU_SPENT.with(|spent| spent.set(Duration::ZERO));
+        assert_eq!(found, None, "CPU time spent counts");
+        assert_eq!(RULES_RUN.with(std::cell::Cell::get), 1);
+    }
+
+    /// #754: a stalled click on a warm cache past the
+    /// [`SMART_CLOCK_STRIDE`]th match selects by its rule: the clock read
+    /// at that match does not count the stall.
+    #[test]
+    fn a_stalled_click_past_the_stride_selects_by_its_rule() {
+        let mut term = Terminal::new(2, 200);
+        term.advance("ab-cd-ef ".repeat(20).as_bytes());
+        let lines = Lines::of(term.grid());
+        let warm = smart_rules(&[("cd-ef", Precision::Normal)]);
+        let col = 9 * 17 + 4;
+        let late = Some((first_line(&lines, col - 1), first_line(&lines, col + 3)));
+        assert_eq!(
+            smart_at(&lines, first_line(&lines, col), &warm),
+            late,
+            "warmed"
+        );
+        assert_eq!(stalled_at(&lines, col, &warm), late);
+        assert!(MATCHES_SEEN.with(std::cell::Cell::get) > SMART_CLOCK_STRIDE);
+    }
+
     /// Runs `f` with the rule budget counting only the charged test costs,
-    /// not wall time: a stall of the test thread past
-    /// [`SMART_RULE_BUDGET`] would skip the rules and select nothing
-    /// (#525), so tests that expect a match or exact counts run here.
+    /// not the thread's CPU time, so tests that expect exact counts do not
+    /// depend on the machine's speed (#525: the budget was wall time then,
+    /// and a stall skipped the rules).
     fn charged_only<T>(f: impl FnOnce() -> T) -> T {
-        WALL_CLOCK.with(|clock| clock.set(false));
+        REAL_CLOCK.with(|clock| clock.set(false));
         let out = f();
-        WALL_CLOCK.with(|clock| clock.set(true));
+        REAL_CLOCK.with(|clock| clock.set(true));
         out
     }
 
     /// #351 m1 in real time: 64 slow user rules (`[a-z]+X|[a-z]`, ~425 ms
     /// a click on 8192 letters in a release build before the budget) stop
-    /// near [`SMART_RULE_BUDGET`]. The budget is wall time, so load makes
-    /// fewer rules run, not more; the bound is loose (500 ms, which one
-    /// rule run late under load still meets) and the fastest of five
-    /// clicks counts, so one descheduled click does not fail it.
+    /// near [`SMART_RULE_BUDGET`]. The budget is the thread's CPU time
+    /// (#754), measured so here too, so load does not change it; the bound
+    /// is loose (500 ms) and the fastest of five clicks counts.
     #[test]
     fn sixty_four_slow_rules_stay_near_the_click_budget() {
         let slow = vec![("[a-z]+X|[a-z]", Precision::Normal); MAX_SMART_RULES];
@@ -3239,9 +3400,9 @@ mod tests {
         let mut fastest = Duration::MAX;
         let mut ran = MAX_SMART_RULES;
         for _ in 0..5 {
-            let started = Instant::now();
+            let started = crate::thread_cpu_time();
             let _ = smart_at(&lines, mid, &rules);
-            let took = started.elapsed();
+            let took = crate::thread_cpu_time().saturating_sub(started);
             if took < fastest {
                 fastest = took;
                 ran = RULES_RUN.with(std::cell::Cell::get);
@@ -3367,8 +3528,9 @@ mod tests {
     }
 
     /// #557: on cached DFA states a click reads the clock once before each
-    /// rule and once every [`SMART_CLOCK_STRIDE`] matches, not after each
-    /// match; the first search on a cold cache adds one read.
+    /// rule after the first (#754) and once every [`SMART_CLOCK_STRIDE`]
+    /// matches, not after each match; the first search on a cold cache
+    /// adds one read.
     #[test]
     fn the_budget_clock_is_read_once_every_stride_matches() {
         let mut term = Terminal::new(2, 200);
@@ -3389,8 +3551,8 @@ mod tests {
             )
         };
         let matches = SMART_SCAN_BEFORE + 2;
-        assert_eq!(reads(), (2 + matches / SMART_CLOCK_STRIDE, matches), "cold");
-        assert_eq!(reads(), (1 + matches / SMART_CLOCK_STRIDE, matches), "warm");
+        assert_eq!(reads(), (1 + matches / SMART_CLOCK_STRIDE, matches), "cold");
+        assert_eq!(reads(), (matches / SMART_CLOCK_STRIDE, matches), "warm");
     }
 
     /// #433, S5: the scan window holds at most [`SMART_SCAN_BYTES`] bytes,
