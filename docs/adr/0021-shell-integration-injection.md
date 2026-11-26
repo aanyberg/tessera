@@ -997,3 +997,26 @@ that resets SIGINT and sends it again kills the shell there.
   the rest of the file. After a loop the first prompt sees 130 where
   bash 3.2 alone shows 128 (E22).
 - `SCRIPTS_VERSION` is 16.
+
+## Amendment: a DEBUG trap in the INT trap check (#726, 2026-11-26)
+
+The `--rcfile` route's check that our INT trap is still in place after
+the `.bashrc` read `$(builtin trap -p INT)`. Under `set -T`, or extdebug
+(which turns `set -T` on), a DEBUG trap of the file's runs in that
+command substitution before `trap -p`. What it wrote to standard output
+came first in the read, so the match failed and our INT trap stayed in
+the interactive shell; reading through descriptor 3 instead (the form
+the prompt's DEBUG trap read uses) still takes what such a trap writes
+to descriptor 3, and under extdebug a trap's non-zero status skips
+`trap -p` in the fork. The check now turns `set -T` off for the read
+and back on right after it (extdebug itself stays on), so no trap of the
+user's runs in the fork. The script's only other command substitution
+of `trap -p`, the prompt's DEBUG trap read, keeps the descriptor 3 form
+(not changed here).
+
+- Rows `rcexit` E26 and E27 (a trap writing to standard output, under
+  `set -T` and extdebug), E28 and E29 (writing to descriptor 3) and E30
+  (extdebug, non-zero status), on 3.2, 5.1 and 5.3, check that no INT
+  trap is left and that the startup status, `set -T` and extdebug are as
+  bash alone leaves them.
+- `SCRIPTS_VERSION` is 17.

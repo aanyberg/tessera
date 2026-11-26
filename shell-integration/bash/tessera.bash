@@ -319,8 +319,21 @@ fi' RETURN
 fi' INT
         builtin source "$_tessera_si_rc"
         _tessera_si_rc_status=$?
+        # Is our INT trap still the one in place? Under `set -T` (which
+        # extdebug turns on) a DEBUG trap of the file's runs in the fork
+        # too, before `trap -p` (#726): what it writes, to any descriptor,
+        # could land in the read, and under extdebug a non-zero status
+        # skips `trap -p`. So `set -T` is off for the read, and back on
+        # right after (extdebug itself stays on).
+        if [[ -o functrace ]]; then
+            _tessera_si_rc_ft=1
+            builtin set +T
+        fi
         if [[ "$(builtin trap -p INT)" == "trap -- 'if [[ -n \${_tessera_si_rc_depth-} && "* ]]; then
             _tessera_si_rc_trap=1
+        fi
+        if [[ -n "${_tessera_si_rc_ft-}" ]]; then
+            builtin set -T
         fi
         # (Above 255 the trap saw bash's internal status for a syntax error,
         # 257 or 258, where bash alone shows source's 2 on 5.x.)
@@ -333,7 +346,7 @@ fi' INT
         if [[ -n "${_tessera_si_rc_e-}" ]]; then
             builtin set -e
         fi
-        builtin unset _tessera_si_rc_depth _tessera_si_rc_q _tessera_si_rc_seen _tessera_si_rc_e _tessera_si_rc_int
+        builtin unset _tessera_si_rc_depth _tessera_si_rc_q _tessera_si_rc_seen _tessera_si_rc_e _tessera_si_rc_int _tessera_si_rc_ft
     else
         _tessera_si_rc_status=0
     fi
