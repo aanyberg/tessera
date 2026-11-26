@@ -277,3 +277,21 @@ rcexit | E27 | 3.2 5.1 5.3 | PROMPT_COMMAND='echo "pc=$?"'\nshopt -s extdebug\nt
 rcexit | E28 | 3.2 5.1 5.3 | PROMPT_COMMAND='echo "pc=$?"'\nexec 3>/dev/null\nset -T\ntrap '[[ $BASH_SUBSHELL == 0 ]] || echo sub >&3' DEBUG\nfalse | echo "it=[$(trap -p INT)] t=${-//[^T]/}" | lines: pc=1 / it=[] t=T / pc=0
 rcexit | E29 | 3.2 5.1 5.3 | PROMPT_COMMAND='echo "pc=$?"'\nexec 3>/dev/null\nshopt -s extdebug\ntrap '[[ $BASH_SUBSHELL == 0 ]] || echo sub >&3' DEBUG\nfalse | shopt -q extdebug; x=$?; echo "it=[$(trap -p INT)] t=${-//[^T]/} x=$x" | lines: pc=1 / it=[] t=T x=0 / pc=0
 rcexit | E30 | 3.2 5.1 5.3 | PROMPT_COMMAND='echo "pc=$?"'\nshopt -s extdebug\ntrap '[[ $BASH_SUBSHELL == 0 ]]' DEBUG\nfalse | shopt -q extdebug; x=$?; trap -p INT > it; read -r l < it; echo "it=[$l] t=${-//[^T]/} x=$x" | lines: pc=1 / it=[] t=T x=0 / pc=0
+# Under `set -x` with BASH_XTRACEFD=1 (bash 4.1 and later; 3.2 always
+# traces to standard error) the trace of the route's `trap -p INT` went
+# into the read (#733), so our INT trap stayed: E31, and E33 with `set -T`
+# and a DEBUG trap as in E26. E32 (the trace on standard error) and E34 (on
+# descriptor 5, a file) passed before the fix too: they, like E31 and E33,
+# check that `set -x` is back on after the check ($- as bash alone leaves
+# it, but for `s`, which 5.x adds) and that no `_tessera_si_rc_` variable
+# is left. The trace goes to /dev/null until the first PROMPT_COMMAND
+# entry has saved $- and turned `set -x` off. (Measured before the fix:
+# E31 and E33 left the trap on 5.3.) E35 traces to a file under `set -T`
+# with a DEBUG trap: from the route's status after the file to the check's
+# end, the trace has no `set -T`, `set +T` or `trap -p` line (`set -x` goes
+# off before `set -T` and comes back after it).
+rcexit | E31 | 3.2 5.1 5.3 | PROMPT_COMMAND='s=$? f=$-; set +x; exec 2>&7 >&6; echo "pc=$s f=${f//s/}"'\nexec 6>&1 7>&2 >/dev/null 2>/dev/null\nBASH_XTRACEFD=1\nset -x\nfalse | echo "it=[$(trap -p INT)] v=[$(compgen -v _tessera_si_rc_)]" | lines: pc=1 f=himxBH / it=[] v=[] / pc=0 f=himBH
+rcexit | E32 | 3.2 5.1 5.3 | PROMPT_COMMAND='s=$? f=$-; set +x; exec 2>&7 >&6; echo "pc=$s f=${f//s/}"'\nexec 6>&1 7>&2 >/dev/null 2>/dev/null\nset -x\nfalse | echo "it=[$(trap -p INT)] v=[$(compgen -v _tessera_si_rc_)]" | lines: pc=1 f=himxBH / it=[] v=[] / pc=0 f=himBH
+rcexit | E33 | 3.2 5.1 5.3 | PROMPT_COMMAND='s=$? f=$-; set +x; exec 2>&7 >&6; echo "pc=$s f=${f//s/}"'\nexec 6>&1 7>&2 >/dev/null 2>/dev/null\nBASH_XTRACEFD=1\nset -T\ntrap '[[ $BASH_SUBSHELL == 0 ]] || echo sub' DEBUG\nset -x\nfalse | echo "it=[$(trap -p INT)] f=${-//s/} v=[$(compgen -v _tessera_si_rc_)]" | lines: pc=1 f=himxBHT / it=[sub] f=himBHT v=[sub] / pc=0 f=himBHT
+rcexit | E34 | 3.2 5.1 5.3 | PROMPT_COMMAND='s=$? f=$-; set +x; exec 2>&7 >&6; echo "pc=$s f=${f//s/}"'\nexec 6>&1 7>&2 >/dev/null 2>/dev/null 5>xt\nBASH_XTRACEFD=5\nset -x\nfalse | echo "it=[$(trap -p INT)] v=[$(compgen -v _tessera_si_rc_)]" | lines: pc=1 f=himxBH / it=[] v=[] / pc=0 f=himBH
+rcexit | E35 | 3.2 5.1 5.3 | PROMPT_COMMAND='s=$? f=$-; set +x; exec 2>&7 >&6; echo "pc=$s f=${f//s/}"'\nexec 6>&1 7>&2 >/dev/null 2>/dev/null 5>xt\nBASH_XTRACEFD=5\nset -T\ntrap ': dbg' DEBUG\nset -x\nfalse | awk '/_tessera_si_rc_status=/ { a = 1 } a && /-lt 256/ { exit } a' xt > ck; echo "n=$(grep -cE 'set [-+]T|trap -p' ck) it=[$(trap -p INT)] v=[$(compgen -v _tessera_si_rc_)]" | lines: pc=1 f=himxBHT / n=0 it=[] v=[] / pc=0 f=himBHT

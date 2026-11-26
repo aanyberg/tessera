@@ -1020,3 +1020,32 @@ of `trap -p`, the prompt's DEBUG trap read, keeps the descriptor 3 form
   trap is left and that the startup status, `set -T` and extdebug are as
   bash alone leaves them.
 - `SCRIPTS_VERSION` is 17.
+
+## Amendment: `set -x` in the INT trap check (#733, 2026-11-26)
+
+Under `set -x` with `BASH_XTRACEFD=1` (bash 4.1 and later; 3.2 always
+traces to standard error) the fork of the same check traced
+`builtin trap -p INT` to its standard output, the read, so the match
+failed and our INT trap stayed in the interactive shell, as in #726. The
+check now also turns `set -x` off for the read, first, and back on last,
+after `set -T`: neither the `set -T` switch nor the restore adds a trace
+line (the user sees the trace of `[[ -o xtrace ]]`, `_tessera_si_rc_x=1`
+and `builtin set +x` in place of the check's own). With the trace on standard error or another
+descriptor nothing reached the read; the rows check that `set -x` comes
+back there too.
+
+The prompt's DEBUG trap read (`{ builtin trap -p DEBUG >&3; } 3>&1`)
+takes the trace when `BASH_XTRACEFD` is 3: a DEBUG trap the user sets at
+a prompt under `set -x` is then lost (bash alone runs it). It is not
+changed here (a per-prompt path, recorded on #733); `BASH_XTRACEFD=1`
+is safe there, as standard output is /dev/null for that read.
+
+- Rows `rcexit` E31 (`BASH_XTRACEFD=1`), E32 (standard error), E33
+  (`BASH_XTRACEFD=1` with `set -T` and a DEBUG trap) and E34
+  (`BASH_XTRACEFD=5`, a file) check that no INT trap and no
+  `_tessera_si_rc_` variable is left and that `$-` is as bash alone
+  leaves it. E35 (`BASH_XTRACEFD=5` with `set -T` and a DEBUG trap)
+  checks that the check's trace has no `set -T`, `set +T` or `trap -p`
+  line. The rows run on 3.2 and 5.3; 5.1 only where
+  `TESSERA_TEST_BASH51` names one, which CI does not set.
+- `SCRIPTS_VERSION` is 18.
