@@ -952,3 +952,48 @@ words load it after the file.
   `a_missing_startup_file_leaves_nothing_of_the_rc_end` the route without
   a startup file.
 - `SCRIPTS_VERSION` is 15.
+
+## Amendment: a Ctrl-C while the `.bashrc` runs (#713, 2026-11-26)
+
+On the `--rcfile` route a Ctrl-C while the startup file ran ended the
+rest of bash's startup, which here is the rest of `tessera.bash`: our
+RETURN trap and `_tessera_si_rc*` state stayed (the trap then fired at
+the user's next `source` and could turn `set -e` off), and the shell got
+no integration. The script now sets an INT trap for the file's `source`
+only. On a Ctrl-C it returns from the file with 130, so the rest of the
+script runs as after any other file: the route's end cleans up and the
+integration loads; the first prompt sees 130. The trap acts only while
+the file runs (a Ctrl-C in the rest of the script is dropped), and the
+route's last command removes it unless the file set its own (bash alone
+keeps that one too). It is not removed right after the file: bash 3.2
+runs startup files as a non-interactive shell, and `trap - INT` there
+makes SIGINT end the shell until bash puts its interactive handler back
+after the startup files, so a Ctrl-C in the rest of the script closed
+the tab. Removing it at the first prompt instead does not help on 3.2:
+`PROMPT_COMMAND` and traps run non-interactive too, and the handler then
+stays the terminating one through the first command. Nothing of the
+user's runs after the removal: the route's last command is a call with
+`set -T` off (put back inside it before the trap goes), so a DEBUG or
+RETURN trap of the file's runs before the call, with our trap still in
+place, and not inside it, and with status 0 no command follows the call
+(with any other status the `&&` list that keeps `set -e` off ends
+there). What is left is the time between that call's removal and bash's
+own reader loop (bash internals and loading the history, no shell code),
+where a Ctrl-C still ends a 3.2 shell.
+A trap was chosen over aborting the startup from inside the handler:
+bash 3.2 runs trap handlers as a non-interactive shell, so a handler
+that resets SIGINT and sends it again kills the shell there.
+
+- Rows `rcexit` E19 (no trap, variable or function left; 3.2, 5.1, 5.3),
+  E20 (the first prompt's entry and the first command see 130, as
+  bash alone; 5.1, 5.3), E23 (a Ctrl-C after the file returned keeps
+  the shell; 3.2, 5.1, 5.3) and E24, E25 (a Ctrl-C in the file's DEBUG
+  trap at the first command it sees without our trap, the first prompt;
+  status 0, and 1 under `set -T`; 3.2, 5.1, 5.3) cover it.
+  `a_ctrl_c_in_the_bashrc_keeps_the_marks` checks the handshake and the
+  marks after it.
+- ACCEPTED LIMIT (E21): inside a function the file called, the Ctrl-C
+  returns from that function and the file goes on, where bash alone drops
+  the rest of the file. After a loop the first prompt sees 130 where
+  bash 3.2 alone shows 128 (E22).
+- `SCRIPTS_VERSION` is 16.
