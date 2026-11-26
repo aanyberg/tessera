@@ -681,9 +681,10 @@ prefilter was rejected: a small one is cheap and its speed is real.
 The bar is for the steady state. When the rules change, the app builds
 the new engines while it still holds the old ones, so a reload peaks at
 both sets: 277.8 MiB over the baseline as measured for 64 rules, about
-twice the ceiling at worst. Dropping the old engines first is #688.
+twice the ceiling at worst. Dropping the old engines first is #688 (see
+its amendment below).
 
-Every cache is one per rule whatever thread clicks: the app holds one `SmartEngines`, an `Arc` that every session and thread shares and that is rebuilt only when the rules change; each rule's DFA cache and PikeVM cache sit behind that rule's own `Mutex`; and no engine keeps a per-thread pool (the regex crate's pool is searched only by tessera-config's load-time empty-match check, on the loading thread, and dropped with its `Regex`). So a further clicking thread waits for the rule's lock and adds 0 MiB; a reload while another thread clicks keeps the old engines until that click returns (only the main thread clicks today). The program term follows from the size limit: it bounds the compiler's count of each program (32 bytes a state plus its transitions), and the finished NFA is smaller than that count (regex-automata boxes the compiler's vectors). The
+Every cache is one per rule whatever thread clicks: the app holds one `SmartEngines`, an `Arc` that every session and thread shares and that is rebuilt only when the rules change; each rule's DFA cache and PikeVM cache sit behind that rule's own `Mutex`; and no engine keeps a per-thread pool (the regex crate's pool is searched only by tessera-config's load-time empty-match check, on the loading thread, and dropped with its `Regex`). So a further clicking thread waits for the rule's lock and adds 0 MiB; a reload while another thread clicks keeps the old engines until that click returns (only the main thread clicks today). (Superseded by the #688 amendment below: the engines sit behind an `RwLock` each click holds while it searches, and a rebuild drops the old engines before it builds the new ones.) The program term follows from the size limit: it bounds the compiler's count of each program (32 bytes a state plus its transitions), and the finished NFA is smaller than that count (regex-automata boxes the compiler's vectors). The
 largest pair of programs measured over families of patterns at their
 largest size that loads allocated 1.86 MiB, 0.93 MiB an NFA (a class of
 64 one-byte members repeated 1820 times, found by the adversarial run;
@@ -768,7 +769,7 @@ So 2 + 1.25 + 1.75 = 5 MiB per rule and 64 x 5 = 320 MiB, under the
 384 MiB bar. A program whose minimum raises the capacity has (as measured) more than
 16 384 states, so it never falls back and has no PikeVM cache; its caches
 allocate at most their sparse sets (allocated exactly) plus twice the
-rest, 2 x (0.5 + 2 x 0.34) = 2.38 MiB, under 2 + 1.25 MiB. Every cache is one per rule whatever thread clicks: the app holds one `SmartEngines`, an `Arc` that every session and thread shares and that is rebuilt only when the rules change; each rule's DFA cache and PikeVM cache sit behind that rule's own `Mutex`; and no engine keeps a per-thread pool (the regex crate's pool is searched only by tessera-config's load-time empty-match check, on the loading thread, and dropped with its `Regex`). So a further clicking thread waits for the rule's lock and adds 0 MiB; a reload while another thread clicks keeps the old engines until that click returns (only the main thread clicks today). The program term is measured, not a limit: the
+rest, 2 x (0.5 + 2 x 0.34) = 2.38 MiB, under 2 + 1.25 MiB. Every cache is one per rule whatever thread clicks: the app holds one `SmartEngines`, an `Arc` that every session and thread shares and that is rebuilt only when the rules change; each rule's DFA cache and PikeVM cache sit behind that rule's own `Mutex`; and no engine keeps a per-thread pool (the regex crate's pool is searched only by tessera-config's load-time empty-match check, on the loading thread, and dropped with its `Regex`). So a further clicking thread waits for the rule's lock and adds 0 MiB; a reload while another thread clicks keeps the old engines until that click returns (only the main thread clicks today). (Superseded by the #688 amendment below: the engines sit behind an `RwLock` each click holds while it searches, and a rebuild drops the old engines before it builds the new ones.) The program term is measured, not a limit: the
 largest pair of programs over families of patterns at their largest size
 within `SMART_RULE_SIZE_LIMIT` allocated 1.73 MiB
 (`\b(?-u:[cegikmoqsuwyCEGIKMOQSUWY02468]){3541}`; `\b(?-u:a){32760}`
@@ -851,3 +852,44 @@ states, and an eighth for one of 64-member classes. No built-in rule is
 affected. The largest, the compressed IPv6 rule (131 states, 146 units),
 needs 4.78 M on the widest 32 KiB window (tested). The count adds one word
 to what each rule keeps about its program, and no allocation.
+
+## Amendment: a reload drops the old engines before it builds the new ones (#688, 2026-11-26)
+
+**Why.** The #649 bar held for the steady state only. A click after a
+rules change built the new `SmartEngines` while the app still held the
+old, filled ones, so a reload peaked at both sets, up to about twice the
+384 MiB ceiling (277.8 MiB over the baseline as the #649 adversarial run
+measured for 64 rules). A click on another thread could also keep the old
+engines alive through a rebuild, since each click took its own `Arc`.
+
+**The change.** The app keeps its engines behind an `RwLock`, no longer an
+`Arc` behind a `Mutex`. Each double-click holds the lock while it
+searches: read for the engines in effect, so clicks still run side by
+side, and written by the click that finds the rules changed. That click
+waits for the clicks on the old engines to return, drops the old engines,
+filled caches and all, and only then builds the new ones
+(`SmartEngines::update`). A reload that changed no rule keeps the engines
+and their caches, as before. The lock is taken before the session's
+selection and terminal locks, and never under them.
+
+**Bound.** A reload now peaks at the larger set, the old one kept or the
+new one built, plus what building one rule holds for a moment (1.1 MB at
+most as measured), so the 384 MiB ceiling holds through a reload too. A
+click racing a reload searches either the old rules with the old engines
+or the new rules with the new ones: the rules and their engines are one
+value, read under one lock.
+
+**Measured** (debug build, regex crates at opt-level 3; tessera-ffi's
+`smart_selection_heap`, the 64 filling rules on their lines, then the
+rules moved up one place): the rebuild peaked at the old set's 97.5 MB
+kept (it held both, 180.5 MB, before), the new set built unfilled kept
+82.1 MB, and the clicks that filled it peaked at 105.4 MB, the same as the
+first set's first clicks. The test process's maximum resident set size
+came to 137 MB, against 211 to 215 MB before; the steady-state 64-rule
+test reaches 131 MB.
+
+**Cost.** A click that waits for another thread's click before it rebuilds
+waits for that click to return: its rules' budget plus one attempt, and
+its wait for its own session's locks (S6). Only the main thread clicks
+today. A click's cost is otherwise the same: one read lock
+replaces a mutex lock and an `Arc` clone.

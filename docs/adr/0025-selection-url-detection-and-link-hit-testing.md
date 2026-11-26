@@ -382,7 +382,10 @@ The selection and hover live in the session under their own mutex, taken
 the other way round: views → selection → input → terminal (ADR 0014).
 Every selection call takes selection, then resolves the viewport (input,
 terminal, input). Nothing takes the view table or the selection lock while
-holding the terminal.
+holding the terminal. A double-click holds the app's smart-selection
+engines lock (ADR 0042, #688) while it searches, so that lock comes before
+the selection lock: engines → selection → input → terminal. Nothing takes
+the engines lock under the session's locks.
 
 ### FFI
 

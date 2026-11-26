@@ -288,9 +288,12 @@ pub struct App {
     notify_limiter: Mutex<NotifyLimiter>,
     /// The bounded engines of the smart-selection rules in effect (#518),
     /// built by the first double-click after the rules change, with their
-    /// DFA caches kept across clicks. A leaf lock: held only to look the
-    /// engines up or rebuild them.
-    smart_engines: Mutex<Arc<smart_engine::SmartEngines>>,
+    /// DFA caches kept across clicks. Each double-click holds the lock while
+    /// it searches, read; the click that rebuilds the engines holds it
+    /// written, so the rebuild waits for the clicks on the old engines and
+    /// drops them before it builds the new ones (#688). Taken before the
+    /// session's selection and terminal locks, never under them.
+    smart_engines: RwLock<smart_engine::SmartEngines>,
 }
 
 impl App {
@@ -369,7 +372,7 @@ impl App {
             observers: Arc::new(RwLock::new(Some(tee))),
             bindings,
             views: Arc::new(Mutex::new(HashMap::new())),
-            smart_engines: Mutex::default(),
+            smart_engines: RwLock::default(),
             gpu: Mutex::new(None),
             fonts: Mutex::new(None),
             theme,
@@ -1783,26 +1786,49 @@ impl App {
         granularity: Granularity,
         block: bool,
     ) -> Result<()> {
-        // Compiled when the configuration was loaded; their bounded engines
-        // built at the first click after that, outside the session's locks.
-        let rules = self.smart_engines();
-        self.session(id)?.with_selection(|selection, term, offset| {
-            selection.begin(term.grid(), offset, at, granularity, block, &rules);
+        let session = self.session(id)?;
+        self.with_smart_engines(|rules| {
+            #[cfg(test)]
+            tests::in_click();
+            session.with_selection(|selection, term, offset| {
+                selection.begin(term.grid(), offset, at, granularity, block, rules);
+            });
         });
         Ok(())
     }
 
-    /// The engines of the smart-selection rules in effect, built once per
-    /// set of rules (at the first click after the configuration loads a
-    /// changed one; a reload that changed no rule keeps them).
-    fn smart_engines(&self) -> Arc<smart_engine::SmartEngines> {
+    /// Runs `click` with the engines of the smart-selection rules in
+    /// effect, holding them for the whole call (the `smart_engines` lock,
+    /// before the session's locks). They are built once per set of rules,
+    /// at the first click after the configuration loads a changed one, and
+    /// outside the session's locks; a reload that changed no rule keeps
+    /// them. A click that rebuilds them waits for the clicks on the old
+    /// ones and drops them first (#688), so a click racing a reload
+    /// searches either the old rules or the new ones.
+    fn with_smart_engines<R>(&self, click: impl FnOnce(&smart_engine::SmartEngines) -> R) -> R {
+        // Compiled when the configuration was loaded.
         let rules = self.config().selection.compiled_rules();
+        {
+            let held = self
+                .smart_engines
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
+            if held.are_for(&rules) {
+                return click(&held);
+            }
+        }
         let mut held = self
             .smart_engines
-            .lock()
+            .write()
             .unwrap_or_else(PoisonError::into_inner);
-        *held = held.for_rules(rules);
-        Arc::clone(&held)
+        held.update(rules);
+        click(&held)
+    }
+
+    /// Another handle to the engines in effect, after a click's rebuild.
+    #[cfg(test)]
+    fn smart_engines(&self) -> smart_engine::SmartEngines {
+        self.with_smart_engines(smart_engine::SmartEngines::shared)
     }
 
     /// Extends session `id`'s selection to view-relative cell `at` (a
@@ -3119,6 +3145,21 @@ mod tests {
     mod mouse_routing;
 
     const TIMEOUT: Duration = Duration::from_secs(5);
+
+    thread_local! {
+        /// Test hook: runs once, on this thread, inside the next
+        /// double-click while it holds the smart-selection engines, before
+        /// it takes the session's locks (#688).
+        static IN_CLICK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            std::cell::RefCell::new(None);
+    }
+
+    /// Runs this thread's [`IN_CLICK`] hook, if any.
+    pub(super) fn in_click() {
+        if let Some(hook) = IN_CLICK.with(std::cell::RefCell::take) {
+            hook();
+        }
+    }
 
     /// A PTY whose "child" is the test: output is injected through the
     /// event sender, and hanging up or killing ends the stream unless the
@@ -6096,6 +6137,142 @@ mod tests {
             !app.smart_engines().shares_engines_with(&first),
             "a changed set"
         );
+    }
+
+    /// The configuration of one smart rule, `pattern`.
+    fn smart_rule(pattern: &str) -> Config {
+        let text = format!("[[selection.smart_rules]]\nregex = '{pattern}'\n");
+        Config::from_toml_lenient(&text).unwrap().config
+    }
+
+    /// #688: a click that rebuilds the engines for changed rules waits for
+    /// a click still searching the old ones, so the old engines are dropped
+    /// before the new ones are built even with a click in flight; each
+    /// click searches one set of rules, the old or the new. The click in
+    /// flight pauses while it holds the engines, before the session's
+    /// locks: once on engines it found built, once on engines it rebuilt.
+    #[test]
+    fn a_rebuild_waits_for_a_click_on_the_old_engines() {
+        for paused_rebuilt in [false, true] {
+            a_rebuild_waits_for_a_paused_click(paused_rebuilt);
+        }
+    }
+
+    /// [`a_rebuild_waits_for_a_click_on_the_old_engines`], the paused click
+    /// rebuilding the engines if `paused_rebuilt`.
+    fn a_rebuild_waits_for_a_paused_click(paused_rebuilt: bool) {
+        let theme = tessera_config::Theme::default();
+        let app = app();
+        let first = app.spawn_test_session(PtySize::new(2, 20)).unwrap();
+        let second = app.spawn_test_session(PtySize::new(2, 20)).unwrap();
+        for id in [first, second] {
+            app.feed_for_test(id, b"ab-cd-ef").unwrap();
+        }
+        let double_click = |id| {
+            app.select_begin(id, Point::new(0, 4), Granularity::Word, false)
+                .unwrap();
+            app.selection_text(id).unwrap()
+        };
+        app.apply_config(&smart_rule("ab-cd"), &theme);
+        if !paused_rebuilt {
+            assert_eq!(double_click(first).as_deref(), Some("ab-cd"));
+        }
+
+        let (in_flight, ran_early, rebuilding) = thread::scope(|scope| {
+            let (paused_tx, paused) = mpsc::channel();
+            // Dropped on every way out of this scope, a failed assert
+            // included, so the paused click always returns.
+            let (resume, resume_rx) = mpsc::channel::<()>();
+            let double_click = &double_click;
+            let in_flight = scope.spawn(move || {
+                IN_CLICK.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move || {
+                        let _ = paused_tx.send(());
+                        // An error is a dropped sender: go on all the same.
+                        let _ = resume_rx.recv();
+                    }));
+                });
+                double_click(first)
+            });
+            let paused = paused.recv_timeout(TIMEOUT);
+            let (ran_early, rebuilding) = if paused.is_ok() {
+                app.apply_config(&smart_rule("cd-ef"), &theme);
+                let (done_tx, done) = mpsc::channel();
+                let rebuilding = scope.spawn(move || {
+                    let text = double_click(second);
+                    let _ = done_tx.send(());
+                    text
+                });
+                let ran_early = done.recv_timeout(Duration::from_millis(500)).is_ok();
+                (ran_early, Some(rebuilding))
+            } else {
+                (false, None)
+            };
+            drop(resume);
+            let in_flight = in_flight.join().unwrap();
+            assert!(paused.is_ok(), "the click never paused");
+            let rebuilding = rebuilding.map(|handle| handle.join().unwrap());
+            (in_flight, ran_early, rebuilding)
+        });
+        assert!(
+            !ran_early,
+            "the rebuild ran while a click held the old engines (paused click rebuilt: {paused_rebuilt})"
+        );
+        assert_eq!(in_flight.as_deref(), Some("ab-cd"));
+        assert_eq!(rebuilding.flatten().as_deref(), Some("cd-ef"));
+        assert_eq!(double_click(first).as_deref(), Some("cd-ef"));
+    }
+
+    /// #688: clicks on two threads racing reloads that swap the rules on a
+    /// third each select by one set of rules, the old or the new, never by
+    /// none (the plain word) and without a panic.
+    #[test]
+    fn clicks_racing_reloads_select_by_one_set_of_rules() {
+        let theme = tessera_config::Theme::default();
+        let app = app();
+        let sets = [smart_rule("ab-cd"), smart_rule("cd-ef")];
+        let ids = [
+            app.spawn_test_session(PtySize::new(2, 20)).unwrap(),
+            app.spawn_test_session(PtySize::new(2, 20)).unwrap(),
+        ];
+        for id in ids {
+            app.feed_for_test(id, b"ab-cd-ef").unwrap();
+        }
+        app.apply_config(&sets[1], &theme);
+        let stop = AtomicBool::new(false);
+        let clicks = [AtomicUsize::new(0), AtomicUsize::new(0)];
+        thread::scope(|scope| {
+            let clickers = [0, 1].map(|clicker| {
+                let (app, stop, clicks, id) = (&app, &stop, &clicks[clicker], ids[clicker]);
+                scope.spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        app.select_begin(id, Point::new(0, 4), Granularity::Word, false)
+                            .unwrap();
+                        let text = app.selection_text(id).unwrap();
+                        assert!(
+                            matches!(text.as_deref(), Some("ab-cd" | "cd-ef")),
+                            "a click selected {text:?}"
+                        );
+                        clicks.fetch_add(1, Ordering::Relaxed);
+                    }
+                })
+            });
+            // Until both threads have clicked through reloads (nextest's
+            // timeout ends a run whose threads never get to).
+            let mut reload = 0;
+            while reload < 200 || clicks.iter().any(|n| n.load(Ordering::Relaxed) < 50) {
+                if clickers.iter().any(thread::ScopedJoinHandle::is_finished) {
+                    break;
+                }
+                app.apply_config(&sets[reload % 2], &theme);
+                reload += 1;
+                thread::yield_now();
+            }
+            stop.store(true, Ordering::Relaxed);
+            for clicker in clickers {
+                clicker.join().unwrap();
+            }
+        });
     }
 
     /// ADR 0041: `accessible_text` reads the rows the view shows, at its
