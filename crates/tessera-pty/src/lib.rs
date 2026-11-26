@@ -81,6 +81,13 @@ pub mod test_hooks {
         slow_read::release(path, Stage::Lookup);
     }
 
+    /// Makes every program lookup's stat of `path` take `delay` longer
+    /// and then answer, as on a slow but healthy volume (#661 F1), until a
+    /// [`hold_program_lookup`] of `path` replaces it.
+    pub fn delay_program_lookup(path: &Path, delay: Duration) {
+        slow_read::delay(path, Stage::Lookup, delay);
+    }
+
     /// The names of the threads that started a lookup stat of `path` while
     /// it was held, and how many of those stats have returned.
     #[must_use]
@@ -255,6 +262,33 @@ pub enum PtyEvent {
 /// Receiving end of the event stream produced by a spawned PTY.
 pub type PtyEvents = Receiver<PtyEvent>;
 
+/// A step of the program lookup [`NativePty::spawn`] makes before the
+/// fork, in the order it makes them, each asking the file system about one
+/// path; the one [`PtyError::ProgramTimedOut`] names got no answer (#661).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum LookupStep {
+    /// The requested working directory stated (`SpawnOptions::cwd`).
+    WorkingDirectory,
+    /// `$SHELL` checked for execute permission (or, when it is not
+    /// executable, the password database's shell), which `portable-pty`
+    /// does whatever it runs.
+    LoginShell,
+    /// The program's path, or each `PATH` candidate, stated and checked
+    /// for execute permission.
+    Program,
+}
+
+impl std::fmt::Display for LookupStep {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::WorkingDirectory => "working directory",
+            Self::LoginShell => "login shell ($SHELL)",
+            Self::Program => "program",
+        })
+    }
+}
+
 /// Errors from spawning or driving a PTY.
 #[derive(Debug, thiserror::Error)]
 pub enum PtyError {
@@ -281,30 +315,40 @@ pub enum PtyError {
         reason: String,
     },
     /// The file system gave no answer within 5 s while the program was
-    /// looked up (its path, each `PATH` candidate, or the login shell
-    /// stated or checked for execute permission), as on a stalled network
-    /// volume. Nothing was opened or forked. The program's path is left
-    /// out of the error and the logs (docs/security.md S8); `path_bytes`
-    /// is its length as given (`$SHELL` for the login shell).
+    /// looked up (the working directory stated, `$SHELL` checked for
+    /// execute permission, then the program's path or each `PATH`
+    /// candidate), as on a stalled network volume. Nothing was opened or
+    /// forked. `stalled` is the step the lookup was waiting on when its
+    /// time ran out (#661). The path is left out of the error and the logs
+    /// (docs/security.md S8); `path_bytes` is the length of that step's
+    /// path as given: the working directory, `$SHELL`, or the program
+    /// (`$SHELL` for the login shell).
     #[error(
-        "the program ({path_bytes}-byte path) could not be looked up: the file system gave no answer in time"
+        "the {stalled} ({path_bytes}-byte path) could not be looked up: the file system gave no answer in time"
     )]
     ProgramTimedOut {
-        /// Bytes in the program's path as given.
+        /// Bytes in the stalled step's path as given.
         path_bytes: usize,
+        /// The step of the lookup that got no answer.
+        stalled: LookupStep,
     },
     /// The program was not looked up: four earlier lookups or `#!` checks
     /// are still waiting for the file system (or every helper stayed busy
     /// with earlier ones for 5 s), so no helper was free to ask it (#602).
-    /// Nothing was opened or forked. As for
+    /// Nothing was opened or forked. `stalled` is the step the helpers it
+    /// found taken were waiting on (#661 F2): the login shell when any of
+    /// them was checking `$SHELL`, else the working directory when any was
+    /// stating one, else the program (also for `#!` checks). As for
     /// [`PtyError::ProgramTimedOut`], the path is left out and `path_bytes`
-    /// is its length as given.
+    /// is the length of that step's path in this spawn, as given.
     #[error(
-        "the program ({path_bytes}-byte path) could not be looked up: too many earlier program checks are still waiting"
+        "the {stalled} ({path_bytes}-byte path) could not be looked up: too many earlier program checks are still waiting"
     )]
     ProgramLookupBusy {
-        /// Bytes in the program's path as given.
+        /// Bytes in the step's path as given.
         path_bytes: usize,
+        /// The step the taken helpers were waiting on.
+        stalled: LookupStep,
     },
     /// Opening the PTY pair gave no answer within 5 s, or four earlier
     /// opens are still without one (#568): on macOS `grantpt(3)` can, very

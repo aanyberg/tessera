@@ -146,11 +146,17 @@ mod tests {
                 Error::SpawnFailed,
             ),
             (
-                CoreError::Pty(PtyError::ProgramTimedOut { path_bytes: 1 }),
+                CoreError::Pty(PtyError::ProgramTimedOut {
+                    path_bytes: 1,
+                    stalled: tessera_app_core::LookupStep::Program,
+                }),
                 Error::SpawnFailed,
             ),
             (
-                CoreError::Pty(PtyError::ProgramLookupBusy { path_bytes: 1 }),
+                CoreError::Pty(PtyError::ProgramLookupBusy {
+                    path_bytes: 1,
+                    stalled: tessera_app_core::LookupStep::Program,
+                }),
                 Error::SpawnFailed,
             ),
             (CoreError::Pty(PtyError::OpenTimedOut), Error::SpawnFailed),

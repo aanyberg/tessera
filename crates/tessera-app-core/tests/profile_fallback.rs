@@ -20,7 +20,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use tessera_app_core::{
-    App, Config, ConfigPaths, Error, PtyError, PtySize, SessionId, SpawnOptions,
+    App, Config, ConfigPaths, Error, LookupStep, PtyError, PtySize, SessionId, SpawnOptions,
 };
 use tessera_pty::test_hooks;
 
@@ -604,4 +604,639 @@ fn a_command_whose_lookup_thread_cannot_start_starts_the_default_shell() {
             && line.contains(&format!("errno=Some({eagain})"))),
         "{logged:?}"
     );
+}
+
+/// The `strerror` text of `errno`, without its `(os error N)`.
+fn errno_text(errno: nix::errno::Errno) -> String {
+    let text = std::io::Error::from_raw_os_error(errno as i32).to_string();
+    text.split(" (os error").next().unwrap().to_owned()
+}
+
+/// Waits until the held lookups of `path` have all returned.
+fn wait_for_lookups_to_return(path: &Path) {
+    for _ in 0..OUTPUT_ATTEMPTS {
+        let (callers, finished) = test_hooks::program_lookup_calls(path);
+        if finished == callers.len() {
+            return;
+        }
+        thread::sleep(POLL);
+    }
+    panic!("the held lookups did not return on release");
+}
+
+/// #661 E1: four tabs of a profile whose command is on a stalled volume,
+/// opened at once, fill the shared lookup helpers with stuck lookups; each
+/// still starts the default shell (on the helper kept for the built-in
+/// start) instead of failing with "too many earlier program checks". So
+/// do a fifth tab of that profile (refused at once, `EAGAIN`) and a tab of
+/// the built-in profile. Fills the process's helpers, so it runs only
+/// alone in its process (as under nextest).
+#[test]
+fn four_stalled_profile_tabs_at_once_each_start_the_default_shell() {
+    if std::env::var_os("NEXTEST").is_none() {
+        eprintln!("skipped: fills the process-wide helper pool; run under nextest");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let tool = script(root.path());
+    let app = app(
+        &root,
+        config(
+            &[("stalled", Some(tool.to_str().unwrap()), None)],
+            "Default",
+        ),
+    );
+    let held = HeldLookup::new(&tool);
+    let started = Instant::now();
+    let ids: Vec<SessionId> = thread::scope(|scope| {
+        let tabs: Vec<_> = (0..4)
+            .map(|_| {
+                scope
+                    .spawn(|| app.spawn_session_with_profile(options(home.path()), Some("stalled")))
+            })
+            .collect();
+        tabs.into_iter()
+            .map(|tab| {
+                tab.join()
+                    .unwrap()
+                    .expect("the fallback starts at the helper cap")
+            })
+            .collect()
+    });
+    let waited = started.elapsed();
+    assert!(
+        waited < test_hooks::PROGRAM_LOOKUP_TIMEOUT + Duration::from_secs(4),
+        "the four tabs took {waited:?}"
+    );
+    let (callers, finished) = test_hooks::program_lookup_calls(&tool);
+    assert_eq!(callers.len(), 4, "{callers:?}");
+    assert_eq!(finished, 0, "a held lookup returned");
+    let timed_out = notice("stalled", &errno_text(nix::errno::Errno::ETIMEDOUT));
+    for &id in &ids {
+        let rows = wait_for_row(&app, id, &timed_out);
+        assert_eq!(rows[0], timed_out, "{rows:?}");
+        assert_a_shell_in(&app, id, home.path());
+    }
+
+    // Every shared helper is stuck now: a fifth tab is refused at once and
+    // falls back too, as does a tab that changes nothing.
+    let fifth = app
+        .spawn_session_with_profile(options(home.path()), Some("stalled"))
+        .expect("a fifth tab starts the default shell");
+    let busy = notice("stalled", &errno_text(nix::errno::Errno::EAGAIN));
+    let rows = wait_for_row(&app, fifth, &busy);
+    assert_eq!(rows[0], busy, "{rows:?}");
+    assert_a_shell_in(&app, fifth, home.path());
+    let plain = app
+        .spawn_session(options(home.path()))
+        .expect("a built-in tab starts");
+    assert_a_shell_in(&app, plain, home.path());
+    assert_eq!(test_hooks::program_lookup_calls(&tool).0.len(), 4);
+
+    for id in ids.into_iter().chain([fifth, plain]) {
+        app.close_session(id).unwrap();
+    }
+    drop(held);
+    wait_for_lookups_to_return(&tool);
+}
+
+/// #661 M1: with `$SHELL` on a stalled volume, a profile whose command is
+/// a local `/bin/sh` times out on the `$SHELL` check that every start
+/// makes. The built-in start would wait on the same check, so it is not
+/// tried: the tab fails once the one lookup's time is up (not after a
+/// second 5 s wait on a second helper), with an error that names the
+/// login shell and `$SHELL`'s length, not `/bin/sh`.
+#[test]
+fn a_local_command_under_a_stalled_login_shell_fails_after_one_lookup() {
+    let root = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let shell = root.path().join("stalled-login-shell");
+    std::os::unix::fs::symlink("/bin/sh", &shell).unwrap();
+    let app = app(
+        &root,
+        config(&[("local", Some("/bin/sh"), None)], "Default"),
+    );
+    let held = HeldLookup::new(&shell);
+    let started = Instant::now();
+    let (result, logged) = warnings(|| {
+        app.spawn_session_with_profile(options(home.path()).env("SHELL", &shell), Some("local"))
+    });
+    let waited = started.elapsed();
+    let (callers, finished) = test_hooks::program_lookup_calls(&shell);
+    assert_eq!(callers, ["pty-spawn-program"], "a second lookup was made");
+    assert_eq!(finished, 0, "the held lookup returned");
+    let err = match result {
+        Err(Error::Pty(
+            err @ PtyError::ProgramTimedOut {
+                stalled: LookupStep::LoginShell,
+                ..
+            },
+        )) => err,
+        other => panic!("a timed-out login shell check, got {other:?}"),
+    };
+    assert!(
+        matches!(err, PtyError::ProgramTimedOut { path_bytes, .. }
+            if path_bytes == shell.as_os_str().len()),
+        "{err:?}"
+    );
+    let shown = err.to_string();
+    assert!(shown.starts_with("the login shell ($SHELL) ("), "{shown}");
+    assert!(!shown.contains("(7-byte path)"), "blames /bin/sh: {shown}");
+    assert!(
+        waited >= test_hooks::PROGRAM_LOOKUP_TIMEOUT,
+        "failed after {waited:?}"
+    );
+    assert!(
+        waited < test_hooks::PROGRAM_LOOKUP_TIMEOUT + Duration::from_secs(2),
+        "failed after {waited:?}"
+    );
+    assert!(
+        !logged
+            .iter()
+            .any(|line| line.contains("trying the built-in")),
+        "{logged:?}"
+    );
+    assert!(
+        logged
+            .iter()
+            .any(|line| line.contains("would wait on the same lookup")),
+        "{logged:?}"
+    );
+    for line in &logged {
+        assert!(!line.contains("stalled-login-shell"), "{logged:?}");
+    }
+    assert_eq!(app.session_ids(), Vec::new());
+    drop(held);
+    wait_for_lookups_to_return(&shell);
+}
+
+/// #661 M1: the second start is skipped only when it would repeat the
+/// stalled step. A profile whose working directory stalls (the built-in
+/// start does not ask about it) still starts the default shell at home.
+#[test]
+fn a_working_directory_whose_lookup_never_answers_starts_the_default_shell_at_home() {
+    let root = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let dir = root.path().join("stalled-dir");
+    std::fs::create_dir(&dir).unwrap();
+    let app = app(
+        &root,
+        config(&[("far", None, Some(dir.to_str().unwrap()))], "Default"),
+    );
+    let held = HeldLookup::new(&dir);
+    let started = Instant::now();
+    let id = app
+        .spawn_session_with_profile(options(home.path()), Some("far"))
+        .expect("the fallback starts");
+    let waited = started.elapsed();
+    assert!(
+        waited < test_hooks::PROGRAM_LOOKUP_TIMEOUT + Duration::from_secs(2),
+        "fell back after {waited:?}"
+    );
+    assert_eq!(
+        test_hooks::program_lookup_calls(&dir).0,
+        ["pty-spawn-program"],
+        "the directory's lookup was not held"
+    );
+    let timed_out = notice("far", &errno_text(nix::errno::Errno::ETIMEDOUT));
+    let rows = wait_for_row(&app, id, &timed_out);
+    assert_eq!(rows[0], timed_out, "{rows:?}");
+    assert_a_shell_in(&app, id, home.path());
+    app.close_session(id).unwrap();
+    drop(held);
+    wait_for_lookups_to_return(&dir);
+}
+
+/// How long after four stalled tabs the fifth of
+/// [`five_tabs_on_one_stall`] starts in the `shell5`/`prog5` tests: well
+/// inside the four's 5 s, so the fifth's wait for a helper is a long one.
+const GAP: Duration = Duration::from_millis(300);
+
+/// How long the fifth tab's healthy but slow login shell takes to answer
+/// in #661 round 2's test: well within a lookup timeout and under the 1 s
+/// floor, but longer than the milliseconds a refusal for want of a helper
+/// leaves of the 5 s.
+const SLOW_SHELL: Duration = Duration::from_millis(400);
+
+/// The longest a tab refused for want of a helper may take with its
+/// fallback (#661 B1): the 5 s lookup timeout, the fallback's 1 s floor,
+/// and 1 s of slack, against 10 s for a second full wait.
+const ONE_WAIT: Duration = Duration::from_secs(7);
+
+/// Waits until `n` lookups of `path` are held.
+fn wait_for_held_lookups(path: &Path, n: usize) {
+    for _ in 0..OUTPUT_ATTEMPTS {
+        if test_hooks::program_lookup_calls(path).0.len() >= n {
+            return;
+        }
+        thread::sleep(POLL);
+    }
+    panic!("fewer than {n} lookups of the path were held");
+}
+
+/// Starts four tabs of `profile` with `tab()`'s options at once, whose
+/// lookups all stall on `held`, and a fifth `gap` after they are all
+/// waiting; the fifth, waiting for a shared helper, is refused only once
+/// the four time out. Returns the four results and the fifth's, with how
+/// long the fifth took.
+fn five_tabs_on_one_stall(
+    app: &App,
+    held: &Path,
+    profile: &str,
+    gap: Duration,
+    tab: impl Fn() -> SpawnOptions + Sync,
+) -> (
+    Vec<Result<SessionId, Error>>,
+    Result<SessionId, Error>,
+    Duration,
+) {
+    thread::scope(|scope| {
+        let four: Vec<_> = (0..4)
+            .map(|_| scope.spawn(|| app.spawn_session_with_profile(tab(), Some(profile))))
+            .collect();
+        wait_for_held_lookups(held, 4);
+        thread::sleep(gap);
+        let started = Instant::now();
+        let fifth = app.spawn_session_with_profile(tab(), Some(profile));
+        let took = started.elapsed();
+        let four = four.into_iter().map(|tab| tab.join().unwrap()).collect();
+        (four, fifth, took)
+    })
+}
+
+/// #661 B1 (adversarial `shell5`): with `$SHELL` on a stalled volume and
+/// four tabs of a profile with a local `command = "/bin/sh"` stuck on its
+/// check, a fifth tab is refused for want of a helper only after waiting
+/// for one. Its fallback runs within that same wait's 5 s (or its 1 s
+/// floor), so the tab fails after about one lookup timeout (not two),
+/// with the error of the
+/// fallback's own lookup: the login shell and `$SHELL`'s length, not the
+/// profile's `/bin/sh`. Fills the process's helpers, so it runs only alone
+/// in its process (as under nextest).
+#[test]
+fn a_fifth_tab_under_a_stalled_login_shell_fails_within_one_lookup_timeout() {
+    if std::env::var_os("NEXTEST").is_none() {
+        eprintln!("skipped: fills the process-wide helper pool; run under nextest");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let shell = root.path().join("stalled-login-shell");
+    std::os::unix::fs::symlink("/bin/sh", &shell).unwrap();
+    let app = app(
+        &root,
+        config(&[("local", Some("/bin/sh"), None)], "Default"),
+    );
+    let held = HeldLookup::new(&shell);
+    let (four, fifth, waited) = five_tabs_on_one_stall(&app, &shell, "local", GAP, || {
+        options(home.path()).env("SHELL", &shell)
+    });
+    let stalled_shell = |result: &Result<SessionId, Error>| {
+        matches!(result, Err(Error::Pty(PtyError::ProgramTimedOut {
+            stalled: LookupStep::LoginShell,
+            path_bytes,
+        })) if *path_bytes == shell.as_os_str().len())
+    };
+    assert!(four.iter().all(stalled_shell), "{four:?}");
+    assert!(stalled_shell(&fifth), "{fifth:?}");
+    let shown = fifth.unwrap_err().to_string();
+    assert!(shown.starts_with("the login shell ($SHELL) ("), "{shown}");
+    assert!(waited < ONE_WAIT, "the fifth tab failed after {waited:?}");
+    // The four shared helpers and the reserved one: the 4 + 1 bound.
+    assert_eq!(test_hooks::program_lookup_calls(&shell).0.len(), 5);
+    assert_eq!(app.session_ids(), Vec::new());
+    drop(held);
+    wait_for_lookups_to_return(&shell);
+}
+
+/// #661 B1 (adversarial `prog5`): the caller's own command on a stalled
+/// volume, under a profile that changes only the working directory. Four
+/// tabs time out on the program and are not retried (the built-in start
+/// would run the same one); a fifth, refused after waiting for a helper,
+/// falls back within that wait's 5 s (or its 1 s floor) and fails after
+/// about one lookup timeout, naming the program. Runs only alone in its
+/// process.
+#[test]
+fn a_fifth_tab_of_a_stalled_command_fails_within_one_lookup_timeout() {
+    if std::env::var_os("NEXTEST").is_none() {
+        eprintln!("skipped: fills the process-wide helper pool; run under nextest");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let tool = script(root.path());
+    let dir = tempfile::tempdir().unwrap();
+    let app = app(
+        &root,
+        config(
+            &[("far", None, Some(dir.path().to_str().unwrap()))],
+            "Default",
+        ),
+    );
+    let held = HeldLookup::new(&tool);
+    let (four, fifth, waited) = five_tabs_on_one_stall(&app, &tool, "far", GAP, || {
+        SpawnOptions::command(&tool, "")
+            .size(PtySize::new(24, 400))
+            .env("SHELL", "/bin/sh")
+            .env("HOME", home.path())
+    });
+    let stalled_tool = |result: &Result<SessionId, Error>| {
+        matches!(result, Err(Error::Pty(PtyError::ProgramTimedOut {
+            stalled: LookupStep::Program,
+            path_bytes,
+        })) if *path_bytes == tool.as_os_str().len())
+    };
+    assert!(four.iter().all(stalled_tool), "{four:?}");
+    assert!(stalled_tool(&fifth), "{fifth:?}");
+    assert!(waited < ONE_WAIT, "the fifth tab failed after {waited:?}");
+    assert_eq!(test_hooks::program_lookup_calls(&tool).0.len(), 5);
+    assert_eq!(app.session_ids(), Vec::new());
+    drop(held);
+    wait_for_lookups_to_return(&tool);
+}
+
+/// #661 B2 (adversarial `pinwait`): four tabs whose lookups are slow (held
+/// for a while, then released) fill the shared helpers, and a built-in
+/// tab whose lookup stalls holds the reserved one. A healthy login shell
+/// opened then waits for whichever helper frees first: it starts once the
+/// slow lookups return, not refused after waiting on the stalled reserved
+/// helper alone. Runs only alone in its process.
+#[test]
+fn a_builtin_tab_behind_a_stalled_reserved_lookup_takes_the_first_free_helper() {
+    if std::env::var_os("NEXTEST").is_none() {
+        eprintln!("skipped: fills the process-wide helper pool; run under nextest");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let slow_dir = tempfile::tempdir().unwrap();
+    let stalled_dir = tempfile::tempdir().unwrap();
+    let slow = script(slow_dir.path());
+    let stalled = script(stalled_dir.path());
+    let app = app(&root, config(&[], "Default"));
+    let slow_held = HeldLookup::new(&slow);
+    let stalled_held = HeldLookup::new(&stalled);
+    let command = |path: &Path| {
+        SpawnOptions::command(path, "")
+            .size(PtySize::new(24, 400))
+            .env("SHELL", "/bin/sh")
+            .env("HOME", home.path())
+    };
+    thread::scope(|scope| {
+        let four: Vec<_> = (0..4)
+            .map(|_| scope.spawn(|| app.spawn_session(command(&slow))))
+            .collect();
+        wait_for_held_lookups(&slow, 4);
+        let pinned = scope.spawn(|| app.spawn_session(command(&stalled)));
+        wait_for_held_lookups(&stalled, 1);
+        let started = Instant::now();
+        let healthy = scope.spawn(|| app.spawn_session(options(home.path())));
+        // The healthy tab waits for a helper by now; the slow lookups then
+        // return and free the shared ones.
+        thread::sleep(Duration::from_millis(500));
+        drop(slow_held);
+        let healthy = healthy.join().unwrap();
+        let took = started.elapsed();
+        let id = healthy.expect("the healthy tab starts on a freed shared helper");
+        assert!(
+            took + Duration::from_secs(1) < test_hooks::PROGRAM_LOOKUP_TIMEOUT,
+            "the healthy tab started after {took:?}"
+        );
+        assert_a_shell_in(&app, id, home.path());
+        for tab in four {
+            app.close_session(tab.join().unwrap().expect("a slow tab starts"))
+                .unwrap();
+        }
+        app.close_session(id).unwrap();
+        // The stalled tab is refused once its own 5 s are up; at most one
+        // lookup of it was made, on the reserved helper.
+        let pinned = pinned.join().unwrap();
+        assert!(
+            matches!(
+                pinned,
+                Err(Error::Pty(PtyError::ProgramTimedOut {
+                    stalled: LookupStep::Program,
+                    ..
+                }))
+            ),
+            "{pinned:?}"
+        );
+    });
+    assert_eq!(test_hooks::program_lookup_calls(&stalled).0.len(), 1);
+    drop(stalled_held);
+    wait_for_lookups_to_return(&stalled);
+}
+
+/// #661 round 2: a profile whose command is on a stalled volume, `$SHELL`
+/// healthy, five tabs opened together. Four take the shared helpers; the
+/// fifth, waiting for one, is refused just as their lookups time out, with
+/// only milliseconds of its own 5 s left. Its fallback still gets the 1 s
+/// floor, enough for a login shell that answers in [`SLOW_SHELL`] (well
+/// within a lookup timeout, but slower than the milliseconds left), so it
+/// starts the default shell like the other four (with the `EAGAIN` notice)
+/// instead of failing with no time left or naming `$SHELL`. Runs only
+/// alone in its process.
+#[test]
+fn a_fifth_tab_refused_as_the_four_time_out_still_starts_the_default_shell() {
+    if std::env::var_os("NEXTEST").is_none() {
+        eprintln!("skipped: fills the process-wide helper pool; run under nextest");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let tool = script(root.path());
+    let app = app(
+        &root,
+        config(
+            &[("stalled", Some(tool.to_str().unwrap()), None)],
+            "Default",
+        ),
+    );
+    let held = HeldLookup::new(&tool);
+    let shell = root.path().join("slow-login-shell");
+    std::os::unix::fs::symlink("/bin/sh", &shell).unwrap();
+    let slow = HeldLookup::new(&shell);
+    let tabs = std::sync::atomic::AtomicUsize::new(0);
+    let (four, fifth, waited) = thread::scope(|scope| {
+        scope.spawn(|| {
+            wait_for_held_lookups(&shell, 1);
+            thread::sleep(SLOW_SHELL);
+            test_hooks::release_program_lookup(&shell);
+        });
+        five_tabs_on_one_stall(&app, &tool, "stalled", Duration::ZERO, || {
+            let tab = tabs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let options = options(home.path());
+            if tab < 4 {
+                options
+            } else {
+                options.env("SHELL", &shell)
+            }
+        })
+    });
+    let fifth = fifth
+        .unwrap_or_else(|err| panic!("the fifth tab failed after {waited:?}: {err:?} / {err}"));
+    assert!(waited < ONE_WAIT, "the fifth tab started after {waited:?}");
+    let busy = notice("stalled", &errno_text(nix::errno::Errno::EAGAIN));
+    let rows = wait_for_row(&app, fifth, &busy);
+    assert_eq!(rows[0], busy, "{rows:?}");
+    assert_a_shell_in(&app, fifth, home.path());
+    let timed_out = notice("stalled", &errno_text(nix::errno::Errno::ETIMEDOUT));
+    for tab in four {
+        let id = tab.expect("each of the four starts the default shell");
+        let rows = wait_for_row(&app, id, &timed_out);
+        assert_eq!(rows[0], timed_out, "{rows:?}");
+        app.close_session(id).unwrap();
+    }
+    app.close_session(fifth).unwrap();
+    assert_eq!(test_hooks::program_lookup_calls(&tool).0.len(), 4);
+    assert_eq!(test_hooks::program_lookup_calls(&shell).0.len(), 1);
+    drop(held);
+    drop(slow);
+    wait_for_lookups_to_return(&tool);
+    wait_for_lookups_to_return(&shell);
+}
+
+/// How long each lookup of the slow but healthy login shell in the #661 F1
+/// test takes: well within a lookup timeout, but five of them queued on the
+/// one helper kept for the built-in start take 3 s, far past the 1 s floor.
+const SLOWER_SHELL: Duration = Duration::from_millis(600);
+
+/// How far apart the four stalled tabs of the #661 F1 test start, so the
+/// first of them times out (and takes the reserved helper for its
+/// fallback) well before the fifth tab is refused.
+const STAGGER: Duration = Duration::from_millis(50);
+
+/// #661 F1 (adversarial cycle 2 `fifth`): a profile whose command is on a
+/// stalled volume, `$SHELL` healthy but slow ([`SLOWER_SHELL`] per
+/// lookup), and five tabs. Four take the shared helpers and time out on
+/// the command; the fifth waits for a shared helper and is refused as they
+/// do. All five fallbacks then queue on the one reserved helper, and each
+/// starts the default shell: the fifth's fallback gets its own 5 s (the
+/// taken helpers waited on the profile's command, which the fallback does
+/// not ask about), not the 1 s floor that slow queue would outlast. Runs
+/// only alone in its process.
+#[test]
+fn five_tabs_of_a_stalled_command_under_a_slow_login_shell_all_start_the_default_shell() {
+    if std::env::var_os("NEXTEST").is_none() {
+        eprintln!("skipped: fills the process-wide helper pool; run under nextest");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let tool = script(root.path());
+    let shell = root.path().join("slow-login-shell");
+    std::os::unix::fs::symlink("/bin/sh", &shell).unwrap();
+    let app = app(
+        &root,
+        config(
+            &[("stalled", Some(tool.to_str().unwrap()), None)],
+            "Default",
+        ),
+    );
+    let held = HeldLookup::new(&tool);
+    test_hooks::delay_program_lookup(&shell, SLOWER_SHELL);
+    let tab = || options(home.path()).env("SHELL", &shell);
+    let (four, fifth, waited) = thread::scope(|scope| {
+        let four: Vec<_> = (0..4_u32)
+            .map(|n| {
+                let (app, tab) = (&app, &tab);
+                scope.spawn(move || {
+                    thread::sleep(STAGGER * n);
+                    app.spawn_session_with_profile(tab(), Some("stalled"))
+                })
+            })
+            .collect();
+        wait_for_held_lookups(&tool, 4);
+        let started = Instant::now();
+        let fifth = app.spawn_session_with_profile(tab(), Some("stalled"));
+        let fifth_waited = started.elapsed();
+        let four: Vec<_> = four.into_iter().map(|tab| tab.join().unwrap()).collect();
+        (four, fifth, fifth_waited)
+    });
+    let fifth = fifth
+        .unwrap_or_else(|err| panic!("the fifth tab failed after {waited:?}: {err:?} / {err}"));
+    assert!(
+        waited < test_hooks::PROGRAM_LOOKUP_TIMEOUT * 2,
+        "the fifth tab started after {waited:?}"
+    );
+    let busy = notice("stalled", &errno_text(nix::errno::Errno::EAGAIN));
+    let rows = wait_for_row(&app, fifth, &busy);
+    assert_eq!(rows[0], busy, "{rows:?}");
+    let timed_out = notice("stalled", &errno_text(nix::errno::Errno::ETIMEDOUT));
+    let ids: Vec<SessionId> = four
+        .into_iter()
+        .map(|tab| tab.unwrap_or_else(|err| panic!("one of the four failed: {err:?} / {err}")))
+        .collect();
+    for &id in &ids {
+        let rows = wait_for_row(&app, id, &timed_out);
+        assert_eq!(rows[0], timed_out, "{rows:?}");
+    }
+    for id in ids.into_iter().chain([fifth]) {
+        app.close_session(id).unwrap();
+    }
+    assert_eq!(test_hooks::program_lookup_calls(&tool).0.len(), 4);
+    drop(held);
+    wait_for_lookups_to_return(&tool);
+}
+
+/// #661 F2 (adversarial cycle 2 `b1shell` with extra tabs): with `$SHELL`
+/// on a stalled volume and four tabs of a profile with a local `command =
+/// "/bin/sh"` stuck on its check, two more tabs are refused for want of a
+/// helper. One takes the reserved helper for its fallback and times out
+/// on `$SHELL`; the other, refused again, fails with the first refusal,
+/// which names what the taken helpers wait on: the login shell and
+/// `$SHELL`'s length, not the profile's 7-byte `/bin/sh`. Runs only alone
+/// in its process.
+#[test]
+fn tabs_refused_under_a_stalled_login_shell_name_the_login_shell() {
+    if std::env::var_os("NEXTEST").is_none() {
+        eprintln!("skipped: fills the process-wide helper pool; run under nextest");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let shell = root.path().join("stalled-login-shell");
+    std::os::unix::fs::symlink("/bin/sh", &shell).unwrap();
+    let app = app(
+        &root,
+        config(&[("local", Some("/bin/sh"), None)], "Default"),
+    );
+    let held = HeldLookup::new(&shell);
+    let tab = || options(home.path()).env("SHELL", &shell);
+    let (four, extra) = thread::scope(|scope| {
+        let four: Vec<_> = (0..4)
+            .map(|_| scope.spawn(|| app.spawn_session_with_profile(tab(), Some("local"))))
+            .collect();
+        wait_for_held_lookups(&shell, 4);
+        let extra: Vec<_> = (0..2)
+            .map(|_| scope.spawn(|| app.spawn_session_with_profile(tab(), Some("local"))))
+            .collect();
+        let four: Vec<_> = four.into_iter().map(|tab| tab.join().unwrap()).collect();
+        let extra: Vec<_> = extra.into_iter().map(|tab| tab.join().unwrap()).collect();
+        (four, extra)
+    });
+    assert_eq!(four.len(), 4);
+    let names_the_shell = format!(
+        "the login shell ($SHELL) ({}-byte path) could not be looked up: ",
+        shell.as_os_str().len()
+    );
+    for result in four.iter().chain(&extra) {
+        let shown = match result {
+            Err(err) => err.to_string(),
+            Ok(id) => panic!("a tab started: {id:?}"),
+        };
+        assert!(shown.starts_with(&names_the_shell), "{shown}");
+    }
+    assert!(
+        extra
+            .iter()
+            .any(|result| matches!(result, Err(Error::Pty(PtyError::ProgramLookupBusy { .. })))),
+        "{extra:?}"
+    );
+    // The four shared helpers and the reserved one: the 4 + 1 bound.
+    assert_eq!(test_hooks::program_lookup_calls(&shell).0.len(), 5);
+    assert_eq!(app.session_ids(), Vec::new());
+    drop(held);
+    wait_for_lookups_to_return(&shell);
 }

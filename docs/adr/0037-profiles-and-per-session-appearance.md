@@ -260,7 +260,8 @@ same date.
   `ProgramLookupBusy` error ("too many earlier program checks are still
   waiting"). The fallback on `ProgramLookupBusy` stays, since it works as
   soon as one stuck lookup ends. Keeping a helper free for the built-in
-  start (or exempting its lookup) is #661.
+  start (or exempting its lookup) is #661. *Lifted by the #661 amendment
+  below.*
 - **Known limit: `$HOME` on a stalled volume.** A session that starts in
   `$HOME` (no working directory given, or one that is not a directory)
   whose home is on a volume that gives no answer still holds the caller,
@@ -268,3 +269,87 @@ same date.
   `chdir(2)` into `$HOME` blocks before its `exec`, and the spawn waits for
   the `exec`. This predates #554 and is not bounded; neither the lookup's
   5 s nor the fallback applies to it.
+
+## Amendment: a helper for the built-in start, and no second wait on the same stall (#661, 2026-11-25)
+
+- **A reserved lookup helper.** The built-in profile's start (a tab with
+  no profile, a profile that changes neither the program nor the
+  directory, and the fallback start) looks its program up through
+  `NativePty::spawn_builtin`: on a shared helper when one is free at once,
+  otherwise on one helper kept for these starts (`RESERVED_HELPERS` = 1),
+  and with neither free waiting within the 5 s for whichever frees first
+  (a shared one or the reserved one). So
+  four tabs of a profile whose command is on a stalled volume, which fill
+  the shared helpers with stuck lookups, each still start the default
+  shell, and so do later tabs (their profile lookup refused at once with
+  `ProgramLookupBusy`, the notice naming `EAGAIN`). The bound stays finite:
+  the reserved helper can itself get stuck (a built-in start whose own
+  lookup stalls), and with it and every shared helper stuck, built-in
+  starts are refused at once too, so at most 4 + 1 lookup and `#!` check
+  helpers are ever stuck
+  (docs/security.md S5). The built-in start's `#!` check stays on the
+  shared helpers and is skipped while none is free, as for any spawn. A
+  reservation was chosen over exempting the login-shell lookup from the
+  cap because an exempt lookup would either run on the caller (the app's
+  main thread, held by a stalled `$SHELL`) or leave a thread per tab
+  behind on a volume that never answers.
+- **No second wait on the same stall.** A timed-out lookup names the step
+  that got no answer (`PtyError::ProgramTimedOut { stalled }`: the working
+  directory, `$SHELL`, or the program; `LookupStep`), with that path's
+  length. The fallback is not tried when the built-in start would ask
+  about the same path: `$SHELL` (every start checks it, so a profile with
+  a local `command = "/bin/sh"`, or one that changes only the working
+  directory, under a `$SHELL` on a stalled volume), the same working
+  directory, or the same program. The tab then fails after the one 5 s
+  wait, with one stuck helper instead of two, and its error names the
+  login shell (`the login shell ($SHELL) (<n>-byte path) could not be
+  looked up`) rather than the profile's command. A profile whose own
+  command or working directory stalled still falls back.
+- **One wait after a refusal for want of a helper.** A profile's start
+  refused with `ProgramLookupBusy` names the step the helpers it found
+  taken were on when the refusal came (`ProgramLookupBusy { stalled }`,
+  from a progress mark each lookup helper keeps; `$SHELL` before the
+  working directory before the program when they differ), with that
+  path's length. When the fallback would ask about that same step (a
+  stalled `$SHELL` under a profile with a local `command = "/bin/sh"`, the
+  same working directory, the same program), a tab that waited the whole
+  5 s for a helper would wait 5 s more on the same stall, so the
+  fallback's lookup ends when the first start's would have
+  (`NativePty::spawn_builtin(options, since)`, `since` the start of the
+  tab's spawn), but never less than 1 s (`SPAWN_PROGRAM_FLOOR`): refused
+  at once, the fallback gets nearly the whole 5 s; refused after waiting,
+  it gets what is left or the 1 s floor, whichever is longer, so the tab
+  takes at most about 6 s in all, and when that lookup times out the tab
+  fails with its error, which names `$SHELL` (say) rather than the
+  profile's command. The floor is for a tab refused just as the stuck
+  lookups time out, whose fallback would otherwise have no time at all.
+  When the taken helpers were on a step the fallback does not ask about
+  (the profile's own command or working directory on a stalled volume),
+  the fallback gets its own 5 s, as after that step's own timeout: its
+  lookup may queue behind other tabs' fallbacks on the one reserved
+  helper, and with a slow but healthy `$SHELL` (300 or 600 ms a lookup)
+  five such fallbacks take up to 3 s in turn, which a 1 s floor would cut
+  short (adversarial cycle 2 of #661). Such a tab waits at most 5 s for a
+  helper and 5 s on its fallback, about 10 s, the two-stall limit below.
+  The spawn runs on the caller, the app's main thread
+  (`tessera_session_spawn`), so this is how long the app is held: the
+  worst case of these bounds, accepted because the tab now opens where
+  it failed, until spawning moves off the main thread (#722). Skipping the
+  fallback after every refusal was rejected: it would fail the tabs the
+  reserved helper exists to start. Not bounded by this: a profile whose
+  working directory and the `$SHELL` both stall waits 5 s on each (the
+  fallback is tried after the directory's timeout and stalls on `$SHELL`),
+  10 s in all, as before #661 (#630).
+- **Late helpers are not stuck.** A helper counts toward the cap of 4
+  stuck ones only once it has run its own 5 s without an answer. A
+  caller that waited for a free helper and then gave up at its deadline
+  leaves a helper that has run less than that: it is late, keeps its
+  place (so at most 4 + 1 helper threads exist all the same), and is
+  counted stuck from the caller's deadline plus the time the caller
+  queued. A caller waiting for a helper is refused at once only while
+  every place holds a stuck helper, and a waiting caller wakes when a
+  late helper turns stuck, so it is refused then rather than at its own
+  deadline. Before this, the fifth of five fallbacks queued on the
+  reserved helper behind a slow `$SHELL` was counted stuck when its 1 s
+  floor ran out, and the next tab was refused although no lookup had
+  stalled.

@@ -5,7 +5,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use tessera_config::ResolvedProfile;
-use tessera_pty::{Program, SpawnOptions};
+use tessera_pty::{LookupStep, Program, SpawnOptions};
 
 /// `options` with `resolved`'s command and working directory, each only
 /// where the caller left the choice open: the command when
@@ -24,6 +24,40 @@ pub(crate) fn apply(mut options: SpawnOptions, resolved: &ResolvedProfile) -> Sp
         options.cwd = Some(directory_for(dir, home.as_deref()));
     }
     options
+}
+
+/// Whether the built-in profile's start (`builtin`, the caller's options)
+/// would ask the file system about the path that `stalled`, a step of
+/// `profiled`'s program lookup, got no answer for
+/// ([`tessera_pty::PtyError::ProgramTimedOut`], #661), so that starting it
+/// would only wait on the stalled volume again: `$SHELL` when both see the
+/// same one (every start checks it), the working directory when both ask
+/// for the same one, the program when both run the same one. Compares the
+/// options only, never the file system.
+pub(crate) fn repeats_stalled_step(
+    stalled: LookupStep,
+    profiled: &SpawnOptions,
+    builtin: &SpawnOptions,
+) -> bool {
+    match stalled {
+        LookupStep::WorkingDirectory => profiled.cwd.is_some() && profiled.cwd == builtin.cwd,
+        LookupStep::LoginShell => shell(profiled) == shell(builtin),
+        LookupStep::Program => profiled.program == builtin.program,
+        // A step this version does not know: the start is tried.
+        _ => false,
+    }
+}
+
+/// The `$SHELL` the child of `options` gets: the last `SHELL` among its
+/// variables (they are applied last), else this process's.
+fn shell(options: &SpawnOptions) -> Option<OsString> {
+    options
+        .env
+        .iter()
+        .rev()
+        .find(|(key, _)| key == "SHELL")
+        .map(|(_, value)| value.clone())
+        .or_else(|| std::env::var_os("SHELL"))
 }
 
 /// The `errno` behind a [`tessera_pty::PtyError::Spawn`] reason, when it
@@ -257,6 +291,41 @@ mod tests {
             appearance: tessera_config::Appearance::default(),
             warning: None,
         }
+    }
+
+    /// #661 M1: the built-in start is not tried when it would ask about
+    /// the path that stalled: the same `$SHELL` (any profile), the same
+    /// working directory or the same program. A profile's own directory
+    /// or command that stalled leaves the built-in start to try.
+    #[test]
+    fn the_builtin_start_is_skipped_only_when_it_repeats_the_stalled_step() {
+        let builtin = SpawnOptions::login_shell("1").env("SHELL", "/Volumes/v/zsh");
+        let local_sh = apply(builtin.clone(), &resolved(Some("/bin/sh"), None));
+        let in_dir = apply(builtin.clone(), &resolved(None, Some("/Volumes/v/dir")));
+        let at = |step, profiled: &SpawnOptions| repeats_stalled_step(step, profiled, &builtin);
+        assert!(at(LookupStep::LoginShell, &local_sh));
+        assert!(at(LookupStep::LoginShell, &in_dir));
+        assert!(!at(LookupStep::Program, &local_sh));
+        assert!(!at(LookupStep::WorkingDirectory, &in_dir));
+        // The caller's own directory, kept by the profile: the same stat.
+        let caller_dir = builtin.clone().cwd("/Volumes/v/dir");
+        let kept = apply(caller_dir.clone(), &resolved(Some("/bin/sh"), None));
+        assert!(repeats_stalled_step(
+            LookupStep::WorkingDirectory,
+            &kept,
+            &caller_dir
+        ));
+        // The caller's own program, run in the profile's directory.
+        let caller_tool = SpawnOptions::command("/Volumes/v/tool", "1");
+        let moved = apply(caller_tool.clone(), &resolved(None, Some("/tmp")));
+        assert!(repeats_stalled_step(
+            LookupStep::Program,
+            &moved,
+            &caller_tool
+        ));
+        // A profile whose variables name another `$SHELL`.
+        let other = builtin.clone().env("SHELL", "/bin/sh");
+        assert!(!at(LookupStep::LoginShell, &other));
     }
 
     #[test]
