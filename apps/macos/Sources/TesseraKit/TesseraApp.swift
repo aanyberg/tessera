@@ -224,16 +224,75 @@ public final class TesseraApp {
     ///   ``TesseraCoreError/spawnFailed`` if the program cannot be started,
     ///   including when its arguments and the environment together exceed
     ///   the system's `ARG_MAX` (1 MiB on macOS, less a tenth).
+    ///
+    /// Waits on the calling thread, the main one, for as long as the core's
+    /// spawn waits (about 10 s at the most, docs/security.md S5): the app
+    /// opens its terminals with ``spawnInBackground(_:completion:)`` (#722).
     public func spawn(_ options: TesseraSession.SpawnOptions = .init()) throws -> TesseraSession {
-        let app = core.pointer
-        var id: UInt64 = 0
-        let status = try options.withCOptions { cOptions in
-            tessera_session_spawn(app, &cOptions, &id)
-        }
-        try TesseraCoreError.check(status)
+        let id = try Self.spawnSession(core, options)
         let session = TesseraSession(id: id, core: core, bridge: bridge)
         bridge.register(session)
         return session
+    }
+
+    /// Starts a session as ``spawn(_:)`` does, on a background queue, and
+    /// gives it to `completion` on the main thread once it runs, or the
+    /// error; the main thread is free meanwhile (#722).
+    ///
+    /// `completion` runs from a main run loop block, not a main-queue job,
+    /// so what it runs modally (an error alert) leaves the main queue free
+    /// to drain (session deliveries, the app's signal sources). The session
+    /// is registered in that same block, just before, so no delivery of
+    /// its events runs before `completion` has it.
+    ///
+    /// Spawns run one at a time, in the order they were asked for, so
+    /// sessions asked for together start (and get their ids) in that order.
+    /// Events the session emits before it is registered are held for it and
+    /// delivered afterwards, as for ``spawn(_:)``. ``shutdown()`` during the
+    /// spawn waits for it to return, and the free closes the session;
+    /// `completion` then gets ``TesseraCoreError/nullPointer``. An error is
+    /// what ``spawn(_:)`` throws.
+    public func spawnInBackground(
+        _ options: TesseraSession.SpawnOptions = .init(),
+        completion: @escaping @MainActor (Result<TesseraSession, any Error>) -> Void
+    ) {
+        let core = core
+        bridge.spawnsInFlight += 1
+        Self.spawnQueue.async {
+            let outcome = Result { try Self.spawnSession(core, options) }
+            RunLoop.main.perform(inModes: [.common]) {
+                MainActor.assumeIsolated {
+                    // After the session is registered, so its held events reach it.
+                    defer { self.bridge.spawnsInFlight -= 1 }
+                    completion(
+                        outcome.flatMap { id in
+                            // Freed meanwhile: the free waited for the spawn and closed the session.
+                            guard !core.isFreed else { return .failure(TesseraCoreError.nullPointer) }
+                            let session = TesseraSession(id: id, core: core, bridge: self.bridge)
+                            self.bridge.register(session)
+                            return .success(session)
+                        })
+                }
+            }
+        }
+    }
+
+    /// Where ``spawnInBackground(_:completion:)`` runs `tessera_session_spawn`: one at a
+    /// time, at the priority of the work the user waits for.
+    private nonisolated static let spawnQueue = DispatchQueue(
+        label: "com.aanyberg.tessera.spawn", qos: .userInitiated)
+
+    /// `tessera_session_spawn` on the calling thread, through
+    /// ``CoreHandle/call(_:)``, so a free waits for it to return.
+    private nonisolated static func spawnSession(
+        _ core: CoreHandle, _ options: TesseraSession.SpawnOptions
+    ) throws -> UInt64 {
+        var id: UInt64 = 0
+        let status = try options.withCOptions { cOptions in
+            core.call { app in tessera_session_spawn(app, &cOptions, &id) }
+        }
+        try TesseraCoreError.check(status)
+        return id
     }
 
     /// Creates the configuration directory and a commented `config.toml` with

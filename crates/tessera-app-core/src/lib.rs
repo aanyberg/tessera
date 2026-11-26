@@ -89,6 +89,11 @@ pub use tessera_config::{
     AppAppearance, Config, ConfigPaths, ConfigStore, MAX_PROFILE_NAME_LEN, ShellIntegration,
     WatchOptions,
 };
+/// The PTY crate's test hooks (a stalled or slow program lookup), for the
+/// FFI's test-only exports (#722).
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub use tessera_pty::test_hooks as pty_test_hooks;
 pub use tessera_pty::{
     ExitStatus, ForegroundProcess, LookupStep, MAX_FOREGROUND_NAME_BYTES, Program, PtyError,
     PtySize, SpawnOptions,

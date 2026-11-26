@@ -35,6 +35,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private(set) var windowControllers: [TerminalWindowController] = []
     /// What new windows and tabs run. Tests replace the login shell here.
     var spawnOptions = TesseraSession.SpawnOptions()
+    /// Whether sessions start off the main thread (#722,
+    /// ``TesseraApp/spawnInBackground(_:completion:)``): a new window or tab shows its
+    /// placeholder until its session runs. Tests that need a terminal open
+    /// when the call returns turn it off; the sessions then start on the
+    /// main thread, as ``newWindow(frame:profile:)`` and
+    /// ``newTab(in:profile:)`` always start theirs.
+    var spawnsInBackground = true
+    /// Windows and tabs whose first session is starting in the background,
+    /// in the order they opened (#722). Each shows ``SpawnPlaceholderView``
+    /// and becomes a ``TerminalWindowController``'s once its session runs.
+    private(set) var pendingTerminals: [PendingTerminal] = []
+    /// Sessions starting in the background (tests).
+    private(set) var spawnsInFlight = 0
     /// Opens the configuration file and the help page. Tests record instead,
     /// so no editor or browser starts.
     var opener: any ExternalOpener = WorkspaceOpener()
@@ -106,6 +119,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var cascadePoint = NSPoint.zero
     /// A coalesced save of the window state is queued.
     private var windowStateSavePending = false
+    /// The saved layouts of restored tabs whose other panes' sessions are
+    /// still starting (``TerminalWindowController/beginRestoringLayout(_:completion:)``),
+    /// by controller: the window state saves these, not the one pane such a
+    /// tab has meanwhile.
+    private var restoringLayouts: [ObjectIdentifier: PaneLayout] = [:]
     /// `[appearance] dim_inactive_panes` as last read from the core, given to
     /// every tab (internal so tests can set it).
     var paneDimming: CGFloat = 0 {
@@ -342,7 +360,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Clicking the Dock icon with no window open opens one. With windows
     /// open (minimized ones included) AppKit's default applies.
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        guard windowControllers.isEmpty else { return true }
+        guard windowControllers.isEmpty, pendingTerminals.isEmpty else { return true }
         openNewWindow(nil)
         return false
     }
@@ -350,7 +368,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: Windows and tabs
 
     /// Opens a standalone window with a new session and returns its
-    /// controller.
+    /// controller, the session started on the main thread (tests; the app
+    /// opens its windows with ``openWindow(frame:profile:completion:)``).
     ///
     /// - Parameter frame: Where the window goes, as restored at launch;
     ///   `nil` cascades it from the previous standalone window.
@@ -359,56 +378,181 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     ///   `[general] default_profile`.
     @discardableResult
     func newWindow(frame: NSRect? = nil, profile: String? = nil) throws -> TerminalWindowController {
-        let controller = try makeController(profile: profile)
-        guard let window = controller.window else { return controller }
-        // `.preferred` would put a window that is ordered front into the
-        // key window's tab bar; a new window must stand alone.
-        window.tabbingMode = .disallowed
-        if let frame {
-            window.setFrame(frame, display: false)
-            // From the zero point the window stays put; the next new window
-            // cascades from it.
-            cascadePoint = window.cascadeTopLeft(from: .zero)
-        } else {
-            if windowControllers.count == 1 {
-                window.center()
-                cascadePoint = .zero
-            }
-            // Each standalone window opens down and to the right of the
-            // previous.
-            cascadePoint = window.cascadeTopLeft(from: cascadePoint)
-        }
-        controller.showWindow(nil)
-        window.tabbingMode = .preferred
-        return controller
+        try onMainThread { openWindow(frame: frame, profile: profile, completion: $0) }
     }
 
     /// Opens a new tab with a new session right after `window` in its tab
-    /// bar (for ⌘T, the selected tab), or a standalone window if `window` is
-    /// `nil` or not a terminal window, and returns its controller.
+    /// bar, as ``openTab(in:profile:completion:)``, and returns its
+    /// controller, the session started on the main thread (tests).
     ///
     /// - Parameter profile: The profile the session starts with; `nil` for
     ///   `[general] default_profile`.
     /// - Throws: The core's error if it or the session cannot be started.
     @discardableResult
     func newTab(in window: NSWindow?, profile: String? = nil) throws -> TerminalWindowController {
-        guard let window, windowControllers.contains(where: { $0.window === window }) else {
-            return try newWindow(profile: profile)
+        try onMainThread { openTab(in: window, profile: profile, completion: $0) }
+    }
+
+    /// Runs `open` with ``spawnsInBackground`` off and returns the
+    /// controller its completion got.
+    private func onMainThread(
+        _ open: (@escaping @MainActor (Result<TerminalWindowController, any Error>) -> Void) -> Void
+    ) throws -> TerminalWindowController {
+        let background = spawnsInBackground
+        spawnsInBackground = false
+        defer { spawnsInBackground = background }
+        let outcome = SpawnOutcome<TerminalWindowController>()
+        open { outcome.value = $0 }
+        guard let result = outcome.value else {
+            // Not reached: a spawn on the main thread completes at once.
+            throw TesseraCoreError.spawnFailed
         }
-        let controller = try makeController(profile: profile)
-        guard let tab = controller.window else { return controller }
-        window.addTabbedWindow(tab, ordered: .above)
-        tab.makeKeyAndOrderFront(nil)
-        return controller
+        return try result.get()
+    }
+
+    /// Opens a standalone window with a new session. The session starts off
+    /// the main thread (``spawnsInBackground``): the window shows its
+    /// placeholder until then, and `completion` gets its controller, or the
+    /// error once the window has closed again (`CancellationError` if it was
+    /// closed first, its session closed too). Returns the window, or `nil`
+    /// if it never opened (a main-thread spawn that failed).
+    ///
+    /// - Parameter frame: Where the window goes, as restored at launch;
+    ///   `nil` cascades it from the previous standalone window.
+    /// - Parameter profile: The profile the session starts with; `nil` for
+    ///   `[general] default_profile`.
+    @discardableResult
+    func openWindow(
+        frame: NSRect? = nil,
+        profile: String? = nil,
+        completion: @escaping @MainActor (Result<TerminalWindowController, any Error>) -> Void = { _ in }
+    ) -> TerminalWindow? {
+        openTerminal(profile: profile, completion: completion) { [weak self] window in
+            guard let self else { return }
+            // `.preferred` would put a window that is ordered front into the
+            // key window's tab bar; a new window must stand alone.
+            window.tabbingMode = .disallowed
+            if let frame {
+                window.setFrame(frame, display: false)
+                // From the zero point the window stays put; the next new window
+                // cascades from it.
+                cascadePoint = window.cascadeTopLeft(from: .zero)
+            } else {
+                if windowControllers.count + pendingTerminals.count == 1 {
+                    window.center()
+                    cascadePoint = .zero
+                }
+                // Each standalone window opens down and to the right of the
+                // previous.
+                cascadePoint = window.cascadeTopLeft(from: cascadePoint)
+            }
+            window.makeKeyAndOrderFront(nil)
+            window.tabbingMode = .preferred
+        }
+    }
+
+    /// Opens a new tab with a new session right after `window` in its tab
+    /// bar (for ⌘T, the selected tab), or a standalone window if `window` is
+    /// `nil` or not a terminal window, as
+    /// ``openWindow(frame:profile:completion:)`` does: the tab shows its
+    /// placeholder until its session runs.
+    ///
+    /// - Parameter profile: The profile the session starts with; `nil` for
+    ///   `[general] default_profile`.
+    @discardableResult
+    func openTab(
+        in window: NSWindow?,
+        profile: String? = nil,
+        completion: @escaping @MainActor (Result<TerminalWindowController, any Error>) -> Void = { _ in }
+    ) -> TerminalWindow? {
+        guard let window, isTerminalWindow(window) else {
+            return openWindow(profile: profile, completion: completion)
+        }
+        return openTerminal(profile: profile, completion: completion) { [weak window] tab in
+            guard let window else { return }
+            window.addTabbedWindow(tab, ordered: .above)
+            tab.makeKeyAndOrderFront(nil)
+        }
+    }
+
+    /// Whether `window` is a terminal tab: one with its session, or one
+    /// whose session is starting.
+    func isTerminalWindow(_ window: NSWindow) -> Bool {
+        windowControllers.contains { $0.window === window } || pendingTerminals.contains { $0.window === window }
+    }
+
+    /// A terminal window whose first session starts with `profile`: placed
+    /// (`place`) at once, showing its placeholder, when the session starts
+    /// in the background, or once the session runs when it starts on the
+    /// main thread, so a failure there shows nothing.
+    private func openTerminal(
+        profile: String?,
+        completion: @escaping @MainActor (Result<TerminalWindowController, any Error>) -> Void,
+        place: @escaping @MainActor (TerminalWindow) -> Void
+    ) -> TerminalWindow? {
+        let pending = PendingTerminal(window: TerminalWindowController.makeWindow())
+        pending.onClose = { [weak self, weak pending] in
+            self?.pendingTerminals.removeAll { $0 === pending }
+            // The saved state lists the tab while its session starts.
+            self?.scheduleWindowStateSave()
+        }
+        pendingTerminals.append(pending)
+        spawn(profile: profile) { [weak self] result in
+            pending.isSettled = true
+            guard let self else { return }
+            pendingTerminals.removeAll { $0 === pending }
+            let window = pending.window
+            switch result {
+            case .failure(let error):
+                pending.dropTyped()
+                if pending.isPlaced, !pending.isClosed {
+                    window.delegate = nil
+                    window.close()
+                    scheduleWindowStateSave()
+                }
+                completion(.failure(error))
+            case .success(let session):
+                guard !pending.isClosed else {
+                    // Closed while its session started: nothing attaches.
+                    profileBySession[session.id] = nil
+                    try? session.close()
+                    completion(.failure(CancellationError()))
+                    return
+                }
+                let controller = makeController(session: session, window: window)
+                if pending.isPlaced {
+                    let typed = pending.takeTyped()
+                    if let view = controller.panes.first?.view {
+                        window.makeFirstResponder(view)
+                        // What was typed at the placeholder, as if typed now.
+                        for event in typed {
+                            view.keyDown(with: event)
+                        }
+                    }
+                    if pending.droppedKeys > 0 {
+                        Self.log.info("\(pending.droppedKeys) keys typed while a terminal started were dropped")
+                    }
+                } else {
+                    place(window)
+                }
+                completion(.success(controller))
+            }
+        }
+        guard !pending.isSettled else { return liveWindow(pending) }
+        pending.showPlaceholder()
+        place(pending.window)
+        pending.isPlaced = true
+        return pending.window
+    }
+
+    /// `pending`'s window if a controller took it over.
+    private func liveWindow(_ pending: PendingTerminal) -> TerminalWindow? {
+        windowControllers.contains { $0.window === pending.window } ? pending.window : nil
     }
 
     /// ⌘N.
     @objc func openNewWindow(_ sender: Any?) {
-        do {
-            try newWindow()
-        } catch {
-            presentOpenError(error)
-        }
+        openWindow(completion: presentOpenFailure)
     }
 
     /// ⌘T: a tab in the key window's tab bar, or in the main window's while a
@@ -420,11 +564,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Shell > New Window with Profile > a profile: the item's
     /// `representedObject` is the profile's name (``MainMenu/setProfiles(_:in:)``).
     @objc func openNewWindowWithProfile(_ sender: Any?) {
-        do {
-            try newWindow(profile: Self.profileName(of: sender))
-        } catch {
-            presentOpenError(error)
-        }
+        openWindow(profile: Self.profileName(of: sender), completion: presentOpenFailure)
     }
 
     /// Shell > New Tab with Profile > a profile, as ⌘T with that profile.
@@ -434,13 +574,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func openTab(profile: String?) {
         let terminal = [NSApp.keyWindow, NSApp.mainWindow].lazy.compactMap { $0 }.first { window in
-            self.windowControllers.contains { $0.window === window }
+            self.isTerminalWindow(window)
         }
-        do {
-            try newTab(in: terminal, profile: profile)
-        } catch {
-            presentOpenError(error)
-        }
+        openTab(in: terminal, profile: profile, completion: presentOpenFailure)
+    }
+
+    /// Shows a new window's or tab's failure to open, unless it was closed
+    /// while its session started.
+    private func presentOpenFailure(_ result: Result<TerminalWindowController, any Error>) {
+        guard case .failure(let error) = result, !(error is CancellationError) else { return }
+        presentOpenError(error)
     }
 
     /// Close All (⌥⌘W, Close Tab's alternate, which takes the place of
@@ -469,7 +612,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         // `close()`, not `performClose(_:)`: the user has been asked once
         // for all of them, or nothing in them runs.
-        for window in windowControllers.compactMap(\.window) {
+        for window in windowControllers.compactMap(\.window) + pendingTerminals.map(\.window) {
             window.close()
         }
         closeSettingsWindow()
@@ -664,31 +807,65 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// back one opens first and the front one last, which leaves it in front
     /// and key (#414). Returns whether any window opened; `false` for no
     /// state or no window in it, so the caller opens the usual one.
+    ///
+    /// Each tab opens at once, showing its placeholder while its session
+    /// starts in the background (#722), so the tabs keep their order
+    /// whatever order the sessions start in; a tab whose session fails
+    /// closes, and only the first failure is shown. With sessions started
+    /// on the main thread the first failure ends the restore.
     @discardableResult
     func restoreWindows(from state: WindowState?, screens: [NSRect] = NSScreen.screens.map(\.visibleFrame)) -> Bool {
         guard let state else { return false }
-        var opened = false
-        do {
-            for saved in state.restorePlan(screens: screens).reversed() {
-                let first = try newWindow(frame: saved.frame)
-                opened = true
-                if let layout = saved.layout(ofTab: 0) {
-                    try first.restoreLayout(layout)
-                }
-                guard let window = first.window as? TerminalWindow else { continue }
-                for index in 1..<saved.tabCount {
-                    let tab = try newTab(in: window.tabGroup?.windows.last ?? window)
-                    if let layout = saved.layout(ofTab: index) {
-                        try tab.restoreLayout(layout)
+        let run = RestoreRun()
+        let report: @MainActor (any Error) -> Void = { [weak self] error in
+            guard !run.failed, !(error is CancellationError) else { return }
+            run.failed = true
+            self?.presentOpenError(error)
+        }
+        func restore(_ layout: PaneLayout?) -> @MainActor (Result<TerminalWindowController, any Error>) -> Void {
+            { [weak self] result in
+                switch result {
+                case .success(let controller):
+                    guard let layout, let self else { return }
+                    // Saved as the tab's layout until its panes are there
+                    // (or one fails); a save meanwhile keeps it.
+                    let id = ObjectIdentifier(controller)
+                    restoringLayouts[id] = layout
+                    controller.beginRestoringLayout(layout) { [weak self] error in
+                        self?.restoringLayouts[id] = nil
+                        self?.scheduleWindowStateSave()
+                        error.map(report)
                     }
-                }
-                // Each new tab was selected as it opened, so the last one is.
-                if let selected = saved.selectedTab {
-                    window.selectTab(at: selected)
+                case .failure(let error):
+                    report(error)
                 }
             }
-        } catch {
-            presentOpenError(error)
+        }
+        /// `window`, opened for a tab of `layout`, carries it while its
+        /// session starts, so a save meanwhile keeps the tab's layout.
+        func opening(_ window: TerminalWindow?, with layout: PaneLayout?) -> TerminalWindow? {
+            pendingTerminals.last { $0.window === window }?.layout = layout
+            return window
+        }
+        var opened = false
+        for saved in state.restorePlan(screens: screens).reversed() {
+            guard !run.failed,
+                let window = opening(
+                    openWindow(frame: saved.frame, completion: restore(saved.layout(ofTab: 0))),
+                    with: saved.layout(ofTab: 0))
+            else { break }
+            opened = true
+            for index in 1..<saved.tabCount {
+                let layout = saved.layout(ofTab: index)
+                guard !run.failed,
+                    opening(openTab(in: window.tabGroup?.windows.last ?? window, completion: restore(layout)), with: layout)
+                        != nil
+                else { break }
+            }
+            // Each new tab was selected as it opened, so the last one is.
+            if let selected = saved.selectedTab {
+                window.selectTab(at: selected)
+            }
         }
         return opened
     }
@@ -700,19 +877,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// selected tab is not among them (ordered out, or opened while the
     /// application was hidden) comes after those that are, in the order the
     /// windows opened. Every tab of a window counts once, whichever is
-    /// selected.
+    /// selected. A tab whose session is starting (``pendingTerminals``)
+    /// counts with the layout it opens with, as does a restored tab whose
+    /// other panes' sessions are starting, so a save during a restore keeps
+    /// every tab of it.
     func currentWindowState(orderedWindows: [NSWindow]? = nil) -> WindowState {
         let orderedWindows = orderedWindows ?? windowsFrontToBack()
-        var groups: [(front: NSWindow, tabs: [TerminalWindowController])] = []
+        let terminals: [(window: NSWindow, layout: PaneLayout?)] =
+            windowControllers.compactMap { controller in
+                controller.window.map { window in
+                    let restoring = controller.panes.count == 1 ? restoringLayouts[ObjectIdentifier(controller)] : nil
+                    return (window, restoring ?? controller.paneLayout)
+                }
+            } + pendingTerminals.filter(\.isPlaced).map { ($0.window, $0.layout) }
+        var groups: [(front: NSWindow, tabs: [(window: NSWindow, layout: PaneLayout?)])] = []
         var indexByGroup: [ObjectIdentifier: Int] = [:]
-        for controller in windowControllers {
-            guard let window = controller.window else { continue }
+        for terminal in terminals {
+            let window = terminal.window
             let group = window.tabGroup.map(ObjectIdentifier.init) ?? ObjectIdentifier(window)
             if let index = indexByGroup[group] {
-                groups[index].tabs.append(controller)
+                groups[index].tabs.append(terminal)
             } else {
                 indexByGroup[group] = groups.count
-                groups.append((window.tabGroup?.selectedWindow ?? window, [controller]))
+                groups.append((window.tabGroup?.selectedWindow ?? window, [terminal]))
             }
         }
         var depth: [ObjectIdentifier: Int] = [:]
@@ -727,7 +914,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let windows = stacked.map(\.element).map { group in
             // Tab bar order, which a drag may have changed; a tab not (yet)
             // in the bar keeps its opening place.
-            let order = group.tabs.first?.window?.tabGroup?.windows ?? []
+            let order = group.tabs.first?.window.tabGroup?.windows ?? []
             let tabs = group.tabs.enumerated().sorted { lhs, rhs in
                 let left = order.firstIndex { $0 === lhs.element.window } ?? Int.max
                 let right = order.firstIndex { $0 === rhs.element.window } ?? Int.max
@@ -735,7 +922,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             return WindowState.Window(
                 frame: group.front.frame, tabCount: tabs.count,
-                tabs: tabs.map { WindowState.Tab(tree: $0.element.paneLayout) },
+                tabs: tabs.map { WindowState.Tab(tree: $0.element.layout) },
                 selectedTab: tabs.firstIndex { $0.element.window === group.front })
         }
         return WindowState(windows: windows)
@@ -787,9 +974,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func makeController(profile: String?) throws -> TerminalWindowController {
-        let session = try spawn(profile: profile)
-        let controller = TerminalWindowController(session: session, title: TerminalWindowController.defaultTitle)
+    private func makeController(session: TesseraSession, window: TerminalWindow) -> TerminalWindowController {
+        let controller = TerminalWindowController(
+            session: session, title: TerminalWindowController.defaultTitle, window: window)
         controller.delegate = self
         controller.paneContainer.inactivePaneDimming = paneDimming
         controller.showsRemoteHost = showsRemoteHost
@@ -802,13 +989,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return controller
     }
 
-    /// Starts a session of ``spawnOptions`` with `profile` and records its
-    /// profile.
-    private func spawn(profile: String?) throws -> TesseraSession {
-        let core = try self.core ?? startCore()
+    /// Starts a session of ``spawnOptions`` with `profile`, records its
+    /// profile and gives it to `completion` on the main actor, or the error:
+    /// off the main thread while ``spawnsInBackground`` (#722), before this
+    /// returns otherwise.
+    private func spawn(
+        profile: String?,
+        completion: @escaping @MainActor (Result<TesseraSession, any Error>) -> Void
+    ) {
+        let core: TesseraApp
+        do {
+            core = try self.core ?? startCore()
+        } catch {
+            completion(.failure(error))
+            return
+        }
         var options = spawnOptions
         options.profile = profile
-        let session = try core.spawn(options)
+        guard spawnsInBackground else {
+            completion(Result { try core.spawn(options) }.map { record(profile, of: $0) })
+            return
+        }
+        spawnsInFlight += 1
+        core.spawnInBackground(options) { [weak self] result in
+            guard let self else {
+                if case .success(let session) = result { try? session.close() }
+                return
+            }
+            spawnsInFlight -= 1
+            completion(result.map { record(profile, of: $0) })
+        }
+    }
+
+    private func record(_ profile: String?, of session: TesseraSession) -> TesseraSession {
         if let profile {
             profileBySession[session.id] = profile
         }
@@ -1117,20 +1330,31 @@ extension AppDelegate: NSMenuItemValidation {
 
 extension AppDelegate: TerminalWindowControllerDelegate {
     func terminalWindowControllerWantsNewTab(_ controller: TerminalWindowController) {
-        do {
-            try newTab(in: controller.window)
-        } catch {
-            presentOpenError(error)
-        }
+        openTab(in: controller.window, completion: presentOpenFailure)
     }
 
-    /// A split's session, of the focused pane's profile.
-    func terminalWindowControllerSpawnSession(_ controller: TerminalWindowController) throws -> TesseraSession {
-        let session = try spawn(profile: profile(of: controller.focusedPane.session))
-        // Registered before the main actor can run the session's first
-        // delivery, so no event is dropped.
-        router.register(controller, session: session)
-        return session
+    /// A split's session, of the focused pane's profile; closed if the tab
+    /// closed while it started.
+    func terminalWindowControllerSpawnSession(
+        _ controller: TerminalWindowController,
+        completion: @escaping @MainActor (Result<TesseraSession, any Error>) -> Void
+    ) {
+        spawn(profile: profile(of: controller.focusedPane.session)) { [weak self, weak controller] result in
+            guard case .success(let session) = result else {
+                completion(result)
+                return
+            }
+            guard let self, let controller, windowControllers.contains(where: { $0 === controller }) else {
+                self?.profileBySession[session.id] = nil
+                try? session.close()
+                completion(.failure(CancellationError()))
+                return
+            }
+            // Registered before the main actor can run the session's first
+            // delivery, so no event is dropped.
+            router.register(controller, session: session)
+            completion(.success(session))
+        }
     }
 
     func terminalWindowController(_ controller: TerminalWindowController, didClosePaneWith session: TesseraSession) {

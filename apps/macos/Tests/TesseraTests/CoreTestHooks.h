@@ -33,7 +33,12 @@ int32_t tessera_test_hold_font_index(struct TesseraApp *_Nullable app, bool hold
 int32_t tessera_test_surface_shows_provisional_faces(
     struct TesseraApp *_Nullable app, uint64_t session_id, bool *_Nullable out) __attribute__((weak_import));
 
-/// Whether the host exports both hooks above.
+/// Makes every program lookup's stat of `path` take `delay_ms` longer,
+/// process-wide; 0 takes the delay away (#722).
+int32_t tessera_test_delay_program_lookup(const char *_Nullable path, uint64_t delay_ms) __attribute__((weak_import));
+
+/// Whether the host exports the hooks above.
 static inline bool TesseraTestsCoreTestHooksLinked(void) {
-    return &tessera_test_hold_font_index != NULL && &tessera_test_surface_shows_provisional_faces != NULL;
+    return &tessera_test_hold_font_index != NULL && &tessera_test_surface_shows_provisional_faces != NULL
+        && &tessera_test_delay_program_lookup != NULL;
 }

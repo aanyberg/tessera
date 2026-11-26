@@ -22,7 +22,7 @@ use tessera_ffi::{
     App, Callbacks, Error, SpawnOptions, tessera_app_config_path, tessera_app_free,
     tessera_app_new, tessera_app_set_callbacks, tessera_session_clear_scrollback,
     tessera_session_close, tessera_session_resize, tessera_session_spawn, tessera_session_write,
-    tessera_test_panic,
+    tessera_test_delay_program_lookup, tessera_test_panic,
 };
 
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -218,8 +218,9 @@ impl Drop for Handle {
 /// `tessera_session_write`, which the contract allows from any thread.
 #[derive(Clone, Copy)]
 struct SendPtr(*mut App);
-// SAFETY: only used for `tessera_session_write`, documented as callable
-// from any thread, while the owning test keeps the handle alive.
+// SAFETY: only used for `tessera_session_write` and
+// `tessera_session_spawn`, documented as callable from any thread, while the
+// owning test keeps the handle alive.
 unsafe impl Send for SendPtr {}
 
 fn default_options() -> SpawnOptions {
@@ -316,6 +317,77 @@ fn write_is_allowed_from_another_thread() {
     });
     assert_eq!(writer.join().unwrap(), Error::Ok);
     assert_eq!(recorder.wait_exit(id), (5, 0));
+}
+
+/// A spawn may run on another thread (#722): one whose program lookup is
+/// slow there holds neither this thread's own spawn and close nor the
+/// session it starts.
+#[test]
+fn spawn_is_allowed_from_another_thread() {
+    use std::os::unix::ffi::OsStrExt;
+    const SLOW: Duration = Duration::from_millis(1500);
+    let recorder = Recorder::default();
+    let app = Handle::observed(&recorder);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sh");
+    std::os::unix::fs::symlink("/bin/sh", &path).unwrap();
+    let program = CString::new(path.as_os_str().as_bytes()).unwrap();
+    let delay = u64::try_from(SLOW.as_millis()).unwrap();
+    // SAFETY: a NUL-terminated path.
+    assert_eq!(
+        unsafe { tessera_test_delay_program_lookup(program.as_ptr(), delay) },
+        Error::Ok
+    );
+    let shared = SendPtr(app.0);
+    let started = Instant::now();
+    let spawner = thread::spawn({
+        let program = program.clone();
+        move || {
+            let shared = shared;
+            let options = SpawnOptions {
+                program: program.as_ptr(),
+                ..default_options()
+            };
+            let mut id = 0;
+            // SAFETY: the handle outlives the thread (joined below), the
+            // options are valid, and spawn may be called from any thread.
+            let code = unsafe { tessera_session_spawn(shared.0, &raw const options, &raw mut id) };
+            (code, id, started.elapsed())
+        }
+    });
+    // Only once the other thread's spawn is in its lookup, so this one
+    // meets it there rather than running first.
+    let deadline = Instant::now() + SLOW;
+    while tessera_app_core::pty_test_hooks::program_lookup_calls(&path)
+        .0
+        .is_empty()
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the other thread's lookup did not start"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    let here = app.spawn("/bin/sh", &[]).unwrap();
+    assert_eq!(app.close(here), Error::Ok);
+    let quick = started.elapsed();
+    let (code, id, waited) = spawner.join().unwrap();
+    // SAFETY: as above.
+    assert_eq!(
+        unsafe { tessera_test_delay_program_lookup(program.as_ptr(), 0) },
+        Error::Ok
+    );
+    assert_eq!(code, Error::Ok);
+    assert!(
+        waited >= SLOW,
+        "the other thread's spawn waited on its lookup ({waited:?})"
+    );
+    assert!(
+        quick < SLOW,
+        "this thread's spawn and close waited for the other's ({quick:?})"
+    );
+    assert_eq!(app.write(id, b"exit 3\n"), Error::Ok);
+    assert_eq!(recorder.wait_exit(id), (3, 0));
 }
 
 #[test]

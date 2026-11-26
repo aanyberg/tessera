@@ -32,6 +32,9 @@ final class HostDisplaySettings: NSObject, XCTestObservation {
             LiveWindows.install()
             if let appDelegate = NSApp.delegate as? AppDelegate {
                 Self.pin(appDelegate)
+                // Most tests need the terminal they open there when the
+                // call returns; SpawnOffMainTests turn this back on (#722).
+                appDelegate.spawnsInBackground = false
             }
         }
     }

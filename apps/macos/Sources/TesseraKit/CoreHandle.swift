@@ -17,6 +17,11 @@ internal import TesseraCore
 /// through ``call(_:)``, which ``free()`` waits for in the same way. They
 /// never block for long: each reads and writes one small file.
 ///
+/// A session's spawn (`tessera_session_spawn`, #722) runs on a background
+/// queue through ``call(_:)`` too, so ``free()`` waits for it: as long as
+/// the core's spawn waits, about 10 s at the most (docs/security.md S5),
+/// and only at a free during a spawn (a quit while a terminal opens).
+///
 /// Every other `tessera_*` call is made on the main thread, which is also
 /// where ``free()`` runs, so those calls never race with it; they read
 /// ``pointer`` and pass `NULL` after the free, which the core rejects.

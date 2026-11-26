@@ -40,10 +40,13 @@ final class TransparencyHost: TerminalWindowControllerDelegate {
 
     func terminalWindowControllerWantsNewTab(_ controller: TerminalWindowController) {}
 
-    func terminalWindowControllerSpawnSession(_ controller: TerminalWindowController) throws -> TesseraSession {
-        let session = try spawn(nextProfile)
-        router.register(controller, session: session)
-        return session
+    func terminalWindowControllerSpawnSession(
+        _ controller: TerminalWindowController,
+        completion: @escaping @MainActor (Result<TesseraSession, any Error>) -> Void
+    ) {
+        let result = Result { try spawn(nextProfile) }
+        if case .success(let session) = result { router.register(controller, session: session) }
+        completion(result)
     }
 
     func terminalWindowController(_ controller: TerminalWindowController, didClosePaneWith session: TesseraSession) {
