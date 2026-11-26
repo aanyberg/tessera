@@ -38,6 +38,7 @@ mod config_watch;
 pub mod input;
 mod mouse;
 pub mod notify;
+pub mod paste;
 pub mod plugins;
 mod profile;
 pub mod remote;
@@ -72,6 +73,10 @@ pub use commands::{
 pub use input::{InputEvent, InputOutcome};
 pub use notify::{
     MAX_NOTIFICATION_TEXT_BYTES, MAX_NOTIFICATIONS_PER_MINUTE, NotifyDecision, NotifyLimiter,
+};
+pub use paste::{
+    PREVIEW_MAX_BYTES, PREVIEW_MAX_LINE_CHARS, PREVIEW_MAX_LINES, PasteCheck, PasteDecision,
+    PastePreview, paste_decision, paste_preview,
 };
 pub use plugins::{PluginInfo, PluginState};
 pub use remote::{MAX_REMOTE_HOST_BYTES, Remote, SSH_PROBE_INTERVAL};
@@ -1444,6 +1449,25 @@ impl App {
         self.session(id)?
             .check_input_room(len)
             .map_err(|source| Error::Write { id, source })
+    }
+
+    /// Whether pasting `text` into session `id` asks first (#471): the
+    /// pure [`paste_decision`] on `[terminal] paste_guard` of the
+    /// configuration in effect and the session's bracketed-paste mode
+    /// (DECSET 2004), read once under the terminal lock. A paste confirmed
+    /// later reads the mode again ([`App::paste`]).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SessionNotFound`] if `id` is not a live session.
+    pub fn paste_check(&self, id: SessionId, text: &str) -> Result<PasteCheck> {
+        let session = self.session(id)?;
+        let bracketed = session.with_terminal(|term| term.modes().bracketed_paste);
+        let guard = self.config().terminal.paste_guard;
+        Ok(PasteCheck {
+            decision: paste_decision(guard, bracketed, text),
+            bracketed,
+        })
     }
 
     fn queue_paste(session: &Session, id: SessionId, text: &str) -> Result<InputOutcome> {
@@ -5712,6 +5736,44 @@ mod tests {
         feed_child(&events, &fake, id, b"\x1b[?2004l");
         assert_eq!(app.paste(id, "d\ne").unwrap(), InputOutcome::Consumed);
         written_eventually(&fake, b"\x1b[200~a\nb[201~c\x1b[201~d\re");
+    }
+
+    /// The paste guard reads the session's DECSET 2004 and the live
+    /// `[terminal] paste_guard` at each check (#471).
+    #[test]
+    fn the_paste_check_follows_the_mode_and_the_live_guard() {
+        let app = app();
+        let events = observe(&app);
+        let (id, fake) = attach_fake(&app, false);
+        let check = |text| app.paste_check(id, text).unwrap();
+        let ask = |bracketed| PasteCheck {
+            decision: PasteDecision::Ask,
+            bracketed,
+        };
+        let paste = |bracketed| PasteCheck {
+            decision: PasteDecision::Paste,
+            bracketed,
+        };
+        assert_eq!(check("a\nb"), ask(false), "the default asks without 2004");
+        assert_eq!(check("ab"), paste(false));
+        feed_child(&events, &fake, id, b"\x1b[?2004h");
+        assert_eq!(check("a\nb"), paste(true));
+        assert_eq!(check("a\x1b[201~b"), ask(true));
+        let theme = tessera_config::Theme::default();
+        let mut config = Config::default();
+        config.terminal.paste_guard = tessera_config::PasteGuard::Always;
+        app.apply_config(&config, &theme);
+        assert_eq!(check("ab"), ask(true));
+        config.terminal.paste_guard = tessera_config::PasteGuard::Off;
+        app.apply_config(&config, &theme);
+        assert_eq!(check("a\x1b[201~b"), paste(true));
+        feed_child(&events, &fake, id, b"\x1b[?2004l");
+        assert_eq!(check("a\nb"), paste(false));
+        assert!(matches!(
+            app.paste_check(SessionId::from_raw(9999), "a"),
+            Err(Error::SessionNotFound(_))
+        ));
+        assert!(lock(&fake.written).is_empty(), "a check sends nothing");
     }
 
     /// In 8-bit mode (S8C1T) every sequence the host builds starts with a

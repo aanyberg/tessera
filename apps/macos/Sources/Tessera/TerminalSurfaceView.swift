@@ -209,6 +209,14 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
     var pasteboard: NSPasteboard = .general
     /// Pastes handed to the session (tests).
     private(set) var pasteCount = 0
+    /// Asks before a paste the core guards (`[terminal] paste_guard`, #471).
+    /// Tests record instead of showing the sheet.
+    var pasteConfirmationPresenter: any PasteConfirmationPresenter = SheetPasteConfirmationPresenter()
+    /// Whether a paste confirmation is waiting for its answer: another
+    /// guarded paste meanwhile is refused with a beep.
+    private(set) var isConfirmingPaste = false
+    /// The notice of a program's clipboard write (OSC 52, #471).
+    let clipboardNotice = PaneClipboardNotice()
 
     // Selection and link state (#30).
 
@@ -278,6 +286,9 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
             statusLabel.centerXAnchor.constraint(equalTo: centerXAnchor),
             statusLabel.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -8),
         ])
+
+        clipboardNotice.host = self
+        clipboardNotice.reducesMotion = { [weak self] in self?.scroller.reducesMotion ?? true }
 
         scroller.onScroll = { [weak self] target in self?.scrollerMoved(to: target) }
         scroller.onStyleChange = { [weak self] in self?.scrollerStyleChanged() }
@@ -352,6 +363,10 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
         super.viewWillMove(toWindow: newWindow)
         guard window !== newWindow, window != nil else { return }
         tearDown()
+        // Leaving the window (the pane closed): its paste question goes too.
+        if isConfirmingPaste {
+            pasteConfirmationPresenter.dismiss()
+        }
     }
 
     override func viewDidMoveToWindow() {
@@ -851,6 +866,13 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
     /// The search started or stopped having work for the display link.
     func searchNeedsStepChanged() {
         updateDisplayLinkPause()
+    }
+
+    /// The program wrote the clipboard (OSC 52): the notice at the top of
+    /// the pane names the size, at most once a second (ADR 0022
+    /// D-NOTICE52). The user's own Copy never comes here.
+    func showClipboardNotice(_ write: TesseraClipboardWrite) {
+        clipboardNotice.offer(write)
     }
 
     func sessionDidExit(code: Int32, signal: Int32) {
@@ -2057,13 +2079,51 @@ extension TerminalSurfaceView: NSMenuItemValidation {
     /// what a paste must not carry and brackets it when the terminal asked
     /// for bracketed paste (D5). No text on the pasteboard sends nothing.
     /// A composition in progress is kept, and the paste goes ahead of it.
+    ///
+    /// The core decides whether the paste asks first (`[terminal]
+    /// paste_guard`, ADR 0022 D-PASTE): by default a paste with a line break
+    /// while the program has not turned on bracketed paste, or with control
+    /// characters. Then a sheet shows the core's escaped preview, and only
+    /// Paste sends it.
     @objc func paste(_ sender: Any?) {
-        guard let text = pasteboard.string(forType: .string), !text.isEmpty else { return }
+        guard var text = pasteboard.string(forType: .string), !text.isEmpty else { return }
         guard Self.fitsPasteLimit(text) else {
             Self.log.error("paste not sent: \(text.utf16.count) UTF-16 units is more than the core takes")
             NSSound.beep()
             return
         }
+        // The check, the preview and the paste read one UTF-8 copy.
+        text.makeContiguousUTF8()
+        let check: TesseraSession.PasteCheck
+        do {
+            check = try session.pasteCheck(text)
+        } catch {
+            Self.log.error("paste not sent: \(String(describing: error), privacy: .public)")
+            NSSound.beep()
+            return
+        }
+        guard check.ask else {
+            send(paste: text)
+            return
+        }
+        guard !isConfirmingPaste, let window, window.attachedSheet == nil else {
+            Self.log.info("paste not sent: a sheet is open, or the view has no window to ask in")
+            NSSound.beep()
+            return
+        }
+        let confirmation = PasteConfirmation(preview: TesseraSession.pastePreview(text), bracketed: check.bracketed)
+        isConfirmingPaste = true
+        pasteConfirmationPresenter.confirm(confirmation, sheetFor: window) { [weak self] paste in
+            guard let self else { return }
+            self.isConfirmingPaste = false
+            if paste {
+                self.send(paste: text)
+            }
+        }
+    }
+
+    /// Hands a paste to the session, which strips and brackets it.
+    private func send(paste text: String) {
         pasteCount += 1
         do {
             try session.paste(text)

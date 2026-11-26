@@ -75,6 +75,13 @@ public protocol TesseraAppDelegate: AnyObject {
     /// database the core loads. Not sent after ``TesseraApp/shutdown()``.
     /// The default does nothing.
     func fontIndexDidLand()
+    /// The session's program wrote the clipboard (OSC 52) and the write
+    /// goes to the pasteboard (#471): show the pane's notice. Several writes
+    /// between two deliveries are reported once, with their count and the
+    /// latest one's size; the text itself is never handed over. Not sent for
+    /// the user's own Copy, which never passes through the core. The default
+    /// does nothing.
+    func session(_ session: TesseraSession, didWriteClipboard write: TesseraClipboardWrite)
 }
 
 extension TesseraAppDelegate {
@@ -83,6 +90,22 @@ extension TesseraAppDelegate {
     public func configurationDidNotLoad() {}
     public func session(_ session: TesseraSession, didChangeRemote remote: TesseraRemote) {}
     public func session(_ session: TesseraSession, didFinishCommand finish: TesseraCommandFinish) {}
+    public func session(_ session: TesseraSession, didWriteClipboard write: TesseraClipboardWrite) {}
+}
+
+/// A program's clipboard write as the delegate learns of it
+/// (``TesseraAppDelegate/session(_:didWriteClipboard:)``): sizes, never
+/// the text.
+public struct TesseraClipboardWrite: Sendable, Hashable {
+    /// The UTF-8 bytes of the latest write (at most 1 MiB, ADR 0022).
+    public var bytes: Int
+    /// The writes this report folds, at least 1.
+    public var writes: Int
+
+    public init(bytes: Int, writes: Int) {
+        self.bytes = bytes
+        self.writes = writes
+    }
 }
 
 /// A finished command, as the core reports it
@@ -151,7 +174,9 @@ public final class TesseraApp {
 
     /// Where programs' clipboard writes (OSC 52) go: the general pasteboard.
     /// Written for an open session whether or not a ``delegate`` is set.
-    var pasteboard: NSPasteboard {
+    /// Tests set a named pasteboard, so the user's clipboard is never
+    /// changed.
+    public var pasteboard: NSPasteboard {
         get { bridge.pasteboard }
         set { bridge.pasteboard = newValue }
     }

@@ -56,7 +56,8 @@ a low-risk change.
 - **S4. Paste is sanitised.** Every C0 control except TAB, CR and LF, plus DEL and the C1 range, is removed before
   brackets are added, so a paste cannot end bracketed paste early (`crates/tessera-app-core/src/input.rs`).
   Without bracketed paste, line breaks become CR. Only `tessera_session_write` is raw, by design, and the app never
-  feeds it clipboard text.
+  feeds it clipboard text. Before that, `[terminal] paste_guard` (default `"unbracketed"`) asks on a sheet when a
+  paste holds a line break while bracketed paste is off, or holds one of those controls (ADR 0022 D-PASTE).
 - **S5. Every buffer filled from untrusted input has a named cap.** A new queue, buffer, stack, table or cache fed
   by the child, a file or a client states its cap as a constant, and a test floods it past the cap. Unbounded
   growth is a BLOCKER even when "nobody would send that".
@@ -83,7 +84,8 @@ a low-risk change.
 | OSC string in the parser | **none** (#213) | `crates/tessera-vt/src/lib.rs` |
 | OSC parameters | 16 | `crates/tessera-term/src/osc.rs` |
 | Title | 1024 bytes, dropped whole when longer; stack depth 10; last title per chunk | `crates/tessera-term/src/osc.rs`, `crates/tessera-term/src/reports.rs`, `crates/tessera-app-core/src/session.rs` |
-| OSC 52 write | 1 MiB decoded, strict base64, UTF-8; last write per chunk; 10 pasteboard writes per second app-wide, latest held | `crates/tessera-term/src/osc.rs`, `crates/tessera-app-core/src/session.rs`, `apps/macos/Sources/TesseraKit/CallbackBridge.swift` |
+| OSC 52 write | 1 MiB decoded, strict base64, UTF-8; last write per chunk; 10 pasteboard writes per second app-wide, latest held; the pane's notice (#471, ADR 0022 D-NOTICE52) at most once a second per pane, later writes counted into one held notice (two saturating integers and at most one timer per pane), its text fixed words and numbers, never the written text (S3, S8) | `crates/tessera-term/src/osc.rs`, `crates/tessera-app-core/src/session.rs`, `apps/macos/Sources/TesseraKit/CallbackBridge.swift` |
+| Paste confirmation (#471, ADR 0022 D-PASTE) | the paste itself 16 MiB (`maxPasteBytes`, before the core); the decision and the preview one pass each over the text, no copy kept; the preview at most 20 lines (`PREVIEW_MAX_LINES`), 200 characters a line (`PREVIEW_MAX_LINE_CHARS`) and 16 079 bytes (`PREVIEW_MAX_BYTES`, `TESSERA_PASTE_PREVIEW_MAX_BYTES`), the rest counted; C0, DEL and C1 shown escaped (`^[`, `^?`, `<U+009B>`), bidi, zero-width, separator and other invisible characters as `<U+XXXX>` (S3); one sheet per pane at a time, another paste meanwhile refused | `crates/tessera-app-core/src/paste.rs`, `crates/tessera-ffi/src/input.rs`, `apps/macos/Sources/Tessera/PasteConfirmation.swift`, `apps/macos/Sources/Tessera/TerminalSurfaceView.swift` |
 | OSC 7 / OSC 1337 | 4096 bytes | `crates/tessera-term/src/lib.rs` |
 | Rectangle operations (DECERA, DECFRA, DECCRA, DECSERA; ADR 0046) | work per sequence at most the clamped rectangle (the screen); DECCRA's only buffers scratch of at most one row (its cells; for a copy that carries clusters or links, also their entries and the destination row's own while merged in column order, so each row costs linear work; taking a row's entries out moves its entry list out too, so each touched row regrows it, about log n allocations for n entries), at most the screen's width (2048 cells), none sized from a parameter; plain text costs one allocation per copy, a copied cluster one more for its text; an exact self copy costs and allocates nothing; no reply, no per-cell event; DECFRA never writes a C0, C1 or DEL cell | `crates/tessera-term/src/rect.rs`, `crates/tessera-grid/src/rect.rs` |
 | Remote host in the title (#205, ADR 0022) | host 253 bytes (`MAX_REMOTE_HOST_BYTES`, `TESSERA_MAX_REMOTE_HOST_LEN`), dropped whole when longer (shown `⇢ ssh`); control, bidi-control and line-separator characters (the title filter, `tessera_term::shown_in_title`) and default-ignorable characters removed, and a host with nothing visible left (only invisible characters, combining marks or white space) shown `⇢ ssh` (S3); one decision per chunk, `SessionEvent::Remote` only on change (S6), one pending state per session in the bridge; the `ssh` probe (foreground job, else session leader; names at most 64 bytes, compared, never shown) at most once per second per session, on output only; at most 4 local host names remembered per session (`MAX_LOCAL_HOST_NAMES`, the first kept); logs carry the host's length only (S8) | `crates/tessera-app-core/src/remote.rs`, `crates/tessera-app-core/src/session.rs`, `crates/tessera-ffi/src/callbacks.rs`, `apps/macos/Sources/TesseraKit/CallbackBridge.swift` |
@@ -159,10 +161,12 @@ Tracked: churn and leak checks for Rust, FFI and the app (#214); FFI fuzzing, AS
 ## Known gaps and open decisions
 
 - The OSC buffer in the parser is unbounded (#213).
-- OSC 52 writes are on by default with no notice (only a `config.toml` that exists but does not load at launch, or
-  sits behind a configuration directory symlink whose target is missing, turns them off until it loads: the store
-  fails closed, `crates/tessera-config/src/store.rs`), multi-line paste without
-  bracketed paste runs every line (#217).
+- OSC 52 writes are on by default (only a `config.toml` that exists but does not load at launch, or sits behind a
+  configuration directory symlink whose target is missing, turns them off until it loads: the store fails closed,
+  `crates/tessera-config/src/store.rs`); each write shows a notice in its pane, at most one a second, after the fact
+  (#471). A multi-line paste without bracketed paste asks first unless `paste_guard = "off"` (#471). The guard trusts
+  the program's DECSET 2004 state: output that leaves 2004 on (a `cat` of `ESC[?2004h`, a remote tmux that died)
+  lets a multi-line paste into a shell that reads no bracketed paste through without asking.
 - Link opening (ADR 0027, #437): a local file whose default handler is a regular third-party app opens with it,
   whatever that app does with it (a `.torrent`, a `.skill`); only system apps that run, install or import, and agent
   apps, are judged risky by name. Also trusted by that rule, so not named: Excel for macro add-ins (`.xlam`, `.xla`,

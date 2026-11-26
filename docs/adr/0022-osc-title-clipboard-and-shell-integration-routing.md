@@ -356,6 +356,64 @@ shell runs on another machine, as `⇢ <host>: <title>`.
     child's own claim either way. The indicator is a display hint, never a
     security decision.
 
+### Amendment 2026-11-26: paste guard and OSC 52 write notice (#471, #217)
+
+The #217 decisions ship: a paste that would run lines the user did not
+read asks first, and OSC 52 stays on by default but every write is seen.
+
+- **D-PASTE** (lead decision, #217): `[terminal] paste_guard =
+  "unbracketed" | "always" | "off"` (default `"unbracketed"`; any other
+  value or type is a type error, so the configuration does not load, like
+  any strict enum key). The decision is a pure core function,
+  `tessera_app_core::paste_decision(guard, bracketed, text)` (paste or
+  ask), reached through `App::paste_check`, which reads the program's
+  DECSET 2004 state and the configuration in effect now
+  (`tessera_session_paste_check`). An empty paste never asks; `"off"`
+  never asks; `"always"` asks before every paste; `"unbracketed"` asks when
+  the text holds a line break (LF, CR, CRLF: each would run what comes
+  before it) while bracketed paste is off, or holds a control character
+  whatever the mode. Control characters are what S4 removes: C0 but TAB,
+  LF and CR, plus DEL and C1, so `ESC[201~` inside the text, which would
+  end a bracketed paste early, always asks. The paste itself is unchanged:
+  confirmed text goes through `tessera_session_paste` and S4.
+- **D-PASTE-SHEET**: the question is a document-modal sheet on the tab's
+  window with the line count, why it asks, a preview and Paste / Cancel.
+  Cancel is the default button for every guard mode (not only `"always"`):
+  Return answers Cancel, Escape and ⌘. answer Cancel whatever has the
+  focus (the sheet reads them itself, since a focused button does not pass
+  Escape on), and Paste takes a click, so a Return typed right after ⌘V
+  cannot run the lines. The preview comes from
+  the core (`tessera_paste_preview`, one pass over the text): the first 20
+  lines (`PREVIEW_MAX_LINES`), each cut at 200 characters with `…`, C0 in
+  caret notation (`^[`), DEL as `^?`, C1, the line and paragraph
+  separators, the interlinear annotation controls and every
+  default-ignorable code point (bidi controls, zero-width characters, BOM,
+  soft hyphen, tags, CGJ, the Hangul fillers, the Mongolian variation
+  selectors; VS15 and VS16 stay, so emoji show as they paste) as
+  `<U+XXXX>`, at
+  most 16 079 bytes (`TESSERA_PASTE_PREVIEW_MAX_BYTES`) whatever the
+  paste's size (16 MiB at most); the sheet adds "… n more lines". A second
+  paste while the sheet is up, or into a window that already shows a sheet,
+  beeps and sends nothing; a pane that leaves its window (closed) ends its
+  sheet as Cancel, and closing the tab ends it with the tab's other sheets.
+- **D-NOTICE52** (lead decision, #217): each OSC 52 write the bridge hands
+  the pasteboard is reported to the session's delegate as a size and a
+  count, never its text (`TesseraAppDelegate.session(_:didWriteClipboard:)`,
+  `TesseraClipboardWrite`); the pane shows a non-modal notice over its top
+  edge ("A program copied 5 bytes to the clipboard") that takes no clicks
+  or keys, fades after 2.5 s (no fade under Reduce Motion) and is
+  announced to VoiceOver. At most one notice per pane per second
+  (`ClipboardNoticeThrottle.minimumInterval`); a write within the second is
+  not dropped but counted into one held notice ("… at least 4 times, last
+  3 bytes") that shows when the second has passed. Pending state is one held
+  notice (two saturating integers) and at most one timer per pane, so a
+  flood costs a constant. The user's own Copy writes the pasteboard
+  directly and never passes the core, so it shows no notice; with
+  `clipboard_write = false` the core delivers nothing and nothing shows.
+  The count is of the writes the core delivers: it keeps the last write of
+  each output chunk, so writes within one chunk count as one, and the
+  notice says "at least".
+
 ## Consequences
 
 - The C callback table grows by `on_session_clipboard(user_data,
@@ -364,7 +422,8 @@ shell runs on another machine, as `⇢ <host>: <title>`.
 - `SessionEvent` gains `Clipboard(String)`; matches over it (the dev
   window's mailbox) gain an arm.
 - A program can still replace the clipboard without asking, which is what
-  OSC 52 is for; `clipboard_write = false` is the opt-out. Reading is not
+  OSC 52 is for; `clipboard_write = false` is the opt-out, and since #471
+  each write shows a notice in its pane (D-NOTICE52). Reading is not
   possible at all.
 - Divergences from xterm worth knowing: CAN/SUB/ESC apply a partial OSC
   (D-CAN), empty OSC 52 data does not clear (D-EMPTY52), unknown `Pc`

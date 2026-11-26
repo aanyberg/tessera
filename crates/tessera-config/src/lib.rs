@@ -509,7 +509,38 @@ pub struct Terminal {
     /// once when changed.
     #[serde(deserialize_with = "load::lenient_clipboard_write")]
     pub clipboard_write: bool,
+    /// When a paste asks first, on a sheet that shows the text with its
+    /// control characters escaped and its line count: `"unbracketed"` asks
+    /// when the text holds a line break and the program has not turned on
+    /// bracketed paste (DECSET 2004), so each line would run as a command,
+    /// or when it holds control characters (C0 other than tab, line feed
+    /// and carriage return, DEL or C1, which the paste removes); `"always"`
+    /// asks before every paste; `"off"` never asks. Cancel is the default
+    /// button, so a Return typed after ⌘V does not paste. Applies to the
+    /// next paste when changed.
+    #[cfg_attr(feature = "schema", schemars(schema_with = "PasteGuard::schema"))]
+    pub paste_guard: PasteGuard,
 }
+
+/// When a paste asks before it is sent (`[terminal] paste_guard`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PasteGuard {
+    /// Ask for text with a line break while bracketed paste is off, or
+    /// with control characters.
+    #[default]
+    Unbracketed,
+    /// Ask before every paste.
+    Always,
+    /// Never ask.
+    Off,
+}
+
+load::named_values!(PasteGuard {
+    Unbracketed => "unbracketed",
+    Always => "always",
+    Off => "off",
+});
 
 /// Whether Tessera injects its shell integration scripts into the shells it
 /// starts (`[terminal] shell_integration`).
@@ -540,6 +571,7 @@ impl Default for Terminal {
             scrollback_lines: 10_000,
             shell_integration: ShellIntegration::Auto,
             clipboard_write: true,
+            paste_guard: PasteGuard::Unbracketed,
         }
     }
 }
@@ -699,6 +731,26 @@ mod tests {
         // Any other value is a type mismatch, like a mistyped number.
         for bad in ["\"on\"", "\"Auto\"", "true", "1"] {
             let text = format!("[terminal]\nshell_integration = {bad}\n");
+            assert!(Config::from_toml_lenient(&text).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn paste_guard_is_unbracketed_unless_changed() {
+        assert_eq!(
+            Config::default().terminal.paste_guard,
+            PasteGuard::Unbracketed
+        );
+        for value in PasteGuard::ALL {
+            let text = format!("[terminal]\npaste_guard = \"{}\"\n", value.as_str());
+            let loaded = Config::from_toml_lenient(&text).unwrap();
+            assert_eq!(loaded.config.terminal.paste_guard, value);
+            assert_eq!(loaded.warnings, []);
+            assert!(loaded.config.to_toml().unwrap().contains(&text[11..]));
+        }
+        // Any other value is the standard type-mismatch error.
+        for bad in ["\"on\"", "\"Always\"", "\"never\"", "true", "1", "\"\""] {
+            let text = format!("[terminal]\npaste_guard = {bad}\n");
             assert!(Config::from_toml_lenient(&text).is_err(), "{bad}");
         }
     }

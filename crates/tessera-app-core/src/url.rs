@@ -242,7 +242,7 @@ fn url_around(line: &[char], at: usize) -> Option<Range<usize>> {
 /// selectors, BOM, U+FFF0-U+FFF8, the shorthand format controls, the
 /// musical beam and slur controls, and the tags and supplementary
 /// variation selectors (U+E0000-U+E0FFF, reserved code points included).
-const DEFAULT_IGNORABLE: [(u32, u32); 17] = [
+pub(crate) const DEFAULT_IGNORABLE: [(u32, u32); 17] = [
     (0x00AD, 0x00AD),
     (0x034F, 0x034F),
     (0x061C, 0x061C),
