@@ -569,8 +569,7 @@ impl Fonts {
     /// second (more in debug builds), so create one `Fonts` per process and
     /// share it.
     pub fn new(config: &FontConfig) -> Result<Self, RenderError> {
-        let (system, owned) = font_scan::installed_font_system();
-        Self::with_fonts(system, owned, config, IndexBuild::Background(None))
+        Self::installed(config, None)
     }
 
     /// [`Self::new`], calling `notice` once the background coverage index
@@ -587,13 +586,25 @@ impl Fonts {
         config: &FontConfig,
         notice: impl FnOnce() + Send + 'static,
     ) -> Result<Self, RenderError> {
+        Self::installed(config, Some(Box::new(notice)))
+    }
+
+    /// The installed fonts and their coverage index, `notice` called once
+    /// it lands: the process's shared ones while a test shares them
+    /// (`share_installed_fonts`, feature `test-hooks`), else loaded and
+    /// built for these fonts.
+    fn installed(config: &FontConfig, notice: Option<IndexNotice>) -> Result<Self, RenderError> {
+        #[cfg(feature = "test-hooks")]
+        if let Some((db, owned, coverage)) = shared_fonts::get() {
+            return Self::with_fonts(
+                font_scan::font_system(db),
+                owned,
+                config,
+                IndexBuild::Shared(coverage, notice),
+            );
+        }
         let (system, owned) = font_scan::installed_font_system();
-        Self::with_fonts(
-            system,
-            owned,
-            config,
-            IndexBuild::Background(Some(Box::new(notice))),
-        )
+        Self::with_fonts(system, owned, config, IndexBuild::Background(notice))
     }
 
     /// [`Self::with_fonts`] over `system` with no lazily read user fonts.
@@ -669,6 +680,7 @@ impl Fonts {
             }
         }
 
+        let coverage = index.slot();
         let mut inner = Inner {
             system,
             owned,
@@ -678,7 +690,7 @@ impl Fonts {
             used_default_family,
             styled_faces: HashMap::new(),
             char_faces: HashMap::new(),
-            coverage: Arc::new(OnceLock::new()),
+            coverage,
             color_faces: HashMap::new(),
             ink: HashMap::new(),
             provisional: 0,
@@ -695,13 +707,7 @@ impl Fonts {
                 inner.families[0]
             )));
         }
-        match index {
-            IndexBuild::Background(notice) => {
-                spawn_coverage_build(inner.system.db().clone(), &inner.coverage, notice);
-            }
-            #[cfg(test)]
-            IndexBuild::Never => {}
-        }
+        index.start(inner.system.db(), &inner.coverage);
         let coverage = Arc::clone(&inner.coverage);
         Ok(Self {
             inner: Arc::new(Mutex::new(inner)),
@@ -1334,6 +1340,38 @@ enum IndexBuild {
     /// Leave it unset (tests fill it by hand).
     #[cfg(test)]
     Never,
+    /// Use the process's shared index in this slot, built or building, and
+    /// call the notice, if any, once it lands (#660).
+    #[cfg(feature = "test-hooks")]
+    Shared(Arc<OnceLock<Coverage>>, Option<IndexNotice>),
+}
+
+impl IndexBuild {
+    /// The slot the index lands in: the shared one, or a new one.
+    fn slot(&self) -> Arc<OnceLock<Coverage>> {
+        match self {
+            Self::Background(_) => Arc::new(OnceLock::new()),
+            #[cfg(test)]
+            Self::Never => Arc::new(OnceLock::new()),
+            #[cfg(feature = "test-hooks")]
+            Self::Shared(slot, _) => Arc::clone(slot),
+        }
+    }
+
+    /// Starts the index of `db` landing in `slot` (from [`Self::slot`]).
+    fn start(self, db: &fontdb::Database, slot: &Arc<OnceLock<Coverage>>) {
+        match self {
+            Self::Background(notice) => spawn_coverage_build(db.clone(), slot, notice),
+            #[cfg(test)]
+            Self::Never => {}
+            #[cfg(feature = "test-hooks")]
+            Self::Shared(_, notice) => {
+                if let Some(notice) = notice {
+                    shared_fonts::notice_on_landing(slot, notice);
+                }
+            }
+        }
+    }
 }
 
 /// Builds the coverage index of `db` off the render path, stores it in
@@ -1396,6 +1434,11 @@ mod test_hold {
         }
     }
 
+    /// Whether the hold is on.
+    pub(super) fn held() -> bool {
+        *HELD.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Waits while the hold is on.
     pub(super) fn wait() {
         let mut held = HELD.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1412,6 +1455,102 @@ mod test_hold {
 #[doc(hidden)]
 pub fn hold_fallback_index(hold: bool) {
     test_hold::set(hold);
+}
+
+/// One scan of the installed fonts and one coverage index for every
+/// [`Fonts`] loaded while a test shares them (feature `test-hooks`, #660):
+/// a test host that replaces its core many times builds the index once,
+/// where each core would build its own, and Thread Sanitizer's `munmap`
+/// interceptor faulted under that churn (docs/testing.md).
+#[cfg(feature = "test-hooks")]
+mod shared_fonts {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+
+    use cosmic_text::fontdb;
+
+    use super::{Coverage, IndexNotice, font_scan, spawn_coverage_build, test_hold};
+
+    /// The scan and the index slot every shared load clones.
+    type Shared = (
+        fontdb::Database,
+        font_scan::OwnedFaces,
+        Arc<OnceLock<Coverage>>,
+    );
+
+    static SHARE: AtomicBool = AtomicBool::new(false);
+    static SHARED: Mutex<Option<Shared>> = Mutex::new(None);
+    /// Coverage index builds this process started.
+    pub(super) static BUILDS: AtomicU64 = AtomicU64::new(0);
+
+    /// Shares (`true`) from the next load on, or stops sharing and forgets
+    /// the shared fonts (`false`).
+    pub(super) fn set(share: bool) {
+        SHARE.store(share, Ordering::SeqCst);
+        if !share {
+            *SHARED.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        }
+    }
+
+    /// The shared scan, the first call scanning and starting the index,
+    /// or `None` when nothing is shared or the indexes are held: a held
+    /// load wants an index of its own that waits for the release (#594).
+    pub(super) fn get() -> Option<Shared> {
+        if !SHARE.load(Ordering::SeqCst) || test_hold::held() {
+            return None;
+        }
+        let mut shared = SHARED.lock().unwrap_or_else(PoisonError::into_inner);
+        let (db, owned, slot) = shared.get_or_insert_with(|| {
+            let (db, owned) = font_scan::installed_fonts();
+            let slot = Arc::new(OnceLock::new());
+            spawn_coverage_build(db.clone(), &slot, None);
+            (db, owned, slot)
+        });
+        Some((db.clone(), owned.clone(), Arc::clone(slot)))
+    }
+
+    /// Calls `notice` once the index lands in `slot`, on a thread of its
+    /// own as an unshared index's notice is called, or on this one, after
+    /// the landing, if no thread can be spawned.
+    pub(super) fn notice_on_landing(slot: &Arc<OnceLock<Coverage>>, notice: IndexNotice) {
+        let notice = Arc::new(Mutex::new(Some(notice)));
+        let (thread_slot, thread_notice) = (Arc::clone(slot), Arc::clone(&notice));
+        let call = |slot: &OnceLock<Coverage>, notice: &Mutex<Option<IndexNotice>>| {
+            slot.wait();
+            let notice = notice.lock().unwrap_or_else(PoisonError::into_inner).take();
+            if let Some(notice) = notice {
+                notice();
+            }
+        };
+        let spawned = std::thread::Builder::new()
+            .name("tessera-font-index".into())
+            .spawn(move || call(&thread_slot, &thread_notice));
+        if spawned.is_err() {
+            call(slot, &notice);
+        }
+    }
+}
+
+/// Makes every [`Fonts`] loaded from now on share one scan of the
+/// installed fonts and one coverage index, process-wide (`true`), so the
+/// index is built once however many fonts a test host loads; `false`
+/// stops that and forgets the shared ones. A load while the indexes are
+/// held ([`hold_fallback_index`]) builds its own. The fonts are those
+/// installed when the first shared load scans them (#660).
+/// Test-only (feature `test-hooks`).
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub fn share_installed_fonts(share: bool) {
+    shared_fonts::set(share);
+}
+
+/// How many coverage indexes this process has started building (#660).
+/// Test-only (feature `test-hooks`).
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+#[must_use]
+pub fn fallback_index_builds() -> u64 {
+    shared_fonts::BUILDS.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// Which installed face first covers each code point: sorted, disjoint,
@@ -1457,6 +1596,8 @@ impl Coverage {
     /// that runs out of either is cut there and every later face is left
     /// out, with one warning.
     fn build_with_stats(db: &fontdb::Database) -> (Self, BuildStats) {
+        #[cfg(feature = "test-hooks")]
+        shared_fonts::BUILDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let started = std::time::Instant::now();
         let mut faces: Vec<fontdb::ID> = Vec::new();
         // One entry per face: (its source, index into `faces`, face index

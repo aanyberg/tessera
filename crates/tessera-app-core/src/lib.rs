@@ -103,6 +103,12 @@ pub use tessera_pty::{
     ExitStatus, ForegroundProcess, LookupStep, MAX_FOREGROUND_NAME_BYTES, Program, PtyError,
     PtySize, SpawnOptions,
 };
+/// The render crate's process-wide font hooks (one shared scan of the
+/// installed fonts and its index, and the count of index builds), for
+/// the FFI's test-only exports (#660).
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub use tessera_render::{fallback_index_builds, share_installed_fonts};
 pub use tessera_shell_integration::Cwd;
 
 use config_watch::{Applied, ConfigWatch};

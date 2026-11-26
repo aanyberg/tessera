@@ -131,7 +131,8 @@ pub use surface::{
 #[cfg(feature = "test-hooks")]
 #[doc(hidden)]
 pub use surface::{
-    tessera_test_delay_program_lookup, tessera_test_hold_font_index, tessera_test_surface_panic,
+    tessera_test_delay_program_lookup, tessera_test_font_index_builds,
+    tessera_test_hold_font_index, tessera_test_share_font_index, tessera_test_surface_panic,
     tessera_test_surface_shows_provisional_faces,
 };
 

@@ -573,6 +573,50 @@ pub unsafe extern "C" fn tessera_test_hold_font_index(app: *mut App, hold: bool)
     })
 }
 
+/// Makes every font database loaded from now on, by any application in
+/// the process, share one scan of the installed fonts and one font
+/// fallback index (`share` true), so a test host that replaces its core
+/// builds the index once instead of once per core (#660); false stops
+/// that and forgets the shared ones. A load while the indexes are held
+/// (`tessera_test_hold_font_index`) builds its own. Production loads one
+/// per application.
+///
+/// Test-only (feature `test-hooks`): exported to C only by a core built
+/// with that feature, and absent from the header (a test declares it).
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+#[unsafe(no_mangle)]
+pub extern "C" fn tessera_test_share_font_index(share: bool) -> Error {
+    ffi_guard!("tessera_test_share_font_index", {
+        tessera_app_core::share_installed_fonts(share);
+        Error::Ok
+    })
+}
+
+/// Writes to `*out` how many font fallback indexes this process has
+/// started building (#660).
+///
+/// Test-only (feature `test-hooks`): exported to C only by a core built
+/// with that feature, and absent from the header (a test declares it).
+/// Returns `TESSERA_ERROR_NULL_POINTER` if `out` is `NULL`.
+///
+/// # Safety
+///
+/// `out` must be `NULL` or writable.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tessera_test_font_index_builds(out: *mut u64) -> Error {
+    ffi_guard!("tessera_test_font_index_builds", {
+        if out.is_null() {
+            return Error::NullPointer;
+        }
+        // SAFETY: non-null and writable per the contract.
+        unsafe { out.write(tessera_app_core::fallback_index_builds()) };
+        Error::Ok
+    })
+}
+
 /// Makes every program lookup's stat of the path at `path` (a
 /// NUL-terminated string) take `delay_ms` milliseconds longer and then
 /// answer, as on a slow but healthy volume, process-wide; 0 takes the

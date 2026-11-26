@@ -22,6 +22,8 @@ exclude = [
     "tessera_test_hold_font_index",
     "tessera_test_surface_shows_provisional_faces",
     "tessera_test_delay_program_lookup",
+    "tessera_test_share_font_index",
+    "tessera_test_font_index_builds",
 ]
 # Constants are `#define`d with C-style names instead of the type prefix.
 renaming_overrides_prefixing = true

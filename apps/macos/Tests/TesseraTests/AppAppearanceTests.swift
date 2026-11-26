@@ -70,6 +70,19 @@ final class AppAppearanceTests: XCTestCase {
         return lines.joined(separator: "\n") + "\n"
     }
 
+    /// Font fallback indexes the process has started building
+    /// (CoreTestHooks.h, #660).
+    private func fontIndexBuilds() throws -> UInt64 {
+        guard TesseraTestsCoreTestHooksLinked() else {
+            throw PollTimedOut(
+                description: "the test host does not export tessera_test_font_index_builds: its core was built "
+                    + "without tessera-ffi's test-hooks (run the tests through just app-test or just app-test-only)")
+        }
+        var builds: UInt64 = 0
+        XCTAssertEqual(tessera_test_font_index_builds(&builds), 0, "read the index builds")
+        return builds
+    }
+
     /// Waits up to 10 s for `condition`.
     private func waitUntil(_ what: String, _ condition: () -> Bool) async throws {
         let deadline = ContinuousClock.now + .seconds(10)
@@ -250,7 +263,14 @@ final class AppAppearanceTests: XCTestCase {
     /// the Settings window draw as the value says: no key and an unknown
     /// value are dark, `system` is `nil` (the system's). The previous value
     /// is another each time, so each one is a change.
+    ///
+    /// Each value replaces the core, and each core loads its fonts on its
+    /// first surface; the host shares one scan and one font fallback index
+    /// between them (#660), so the seven cores build the index at most once
+    /// (once for the run's first load, none after).
     func testEachValueReachesEveryWindowTheAppOpens() async throws {
+        let builds = try fontIndexBuilds()
+        var attached = 0
         for value in ["light", nil, "system", "light", "dark", "light", "unknown"] {
             let what = value ?? "no key"
             try write(Self.config(value, translucent: true))
@@ -289,11 +309,18 @@ final class AppAppearanceTests: XCTestCase {
             assertDraws(dark: dark, appDelegate.settingsWindowController?.window, "\(what): Settings")
             appDelegate.settingsWindowController?.close()
 
+            if appDelegate.windowControllers.allSatisfy({ $0.panes.allSatisfy(\.view.surface.isAttached) }) {
+                attached += 1
+            }
             for controller in appDelegate.windowControllers {
                 controller.window?.close()
             }
             XCTAssertTrue(appDelegate.windowControllers.isEmpty)
         }
+        // The count is a bound only if the cores loaded fonts.
+        XCTAssertEqual(attached, 7, "cores whose windows attached their surfaces")
+        let built = try fontIndexBuilds() - builds
+        XCTAssertLessThanOrEqual(built, 1, "the seven cores built \(built) font fallback indexes")
     }
 
     // MARK: Live reload

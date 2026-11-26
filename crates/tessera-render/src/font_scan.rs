@@ -102,6 +102,13 @@ const SCAN_TABLES: [([u8; 4], u32, bool); 3] = [
 /// The faces it records against a lazily read file come back with it:
 /// [`OwnedFaces::admit`] must see each before the font system loads it.
 pub(crate) fn installed_font_system() -> (FontSystem, OwnedFaces) {
+    let (db, owned) = installed_fonts();
+    (font_system(db), owned)
+}
+
+/// The font database [`installed_font_system`] builds its font system on,
+/// and its lazily read faces.
+pub(crate) fn installed_fonts() -> (fontdb::Database, OwnedFaces) {
     let mut db = fontdb::Database::new();
     #[cfg(target_os = "macos")]
     let owned = {
@@ -118,10 +125,13 @@ pub(crate) fn installed_font_system() -> (FontSystem, OwnedFaces) {
     db.set_monospace_family("Noto Sans Mono");
     db.set_sans_serif_family("Open Sans");
     db.set_serif_family("DejaVu Serif");
-    (
-        FontSystem::new_with_locale_and_db("en-US".into(), db),
-        owned,
-    )
+    (db, owned)
+}
+
+/// A cosmic-text font system over `db`, with [`installed_font_system`]'s
+/// fixed locale.
+pub(crate) fn font_system(db: fontdb::Database) -> FontSystem {
+    FontSystem::new_with_locale_and_db("en-US".into(), db)
 }
 
 /// Loads every installed font into `db`, in the order fontdb's macOS
@@ -483,8 +493,10 @@ fn table_range(
 }
 
 /// The faces of a font database recorded against an [`OwnedFontFile`],
-/// by face, until each is admitted.
-#[derive(Default)]
+/// by face, until each is admitted. A clone, which a database shared by
+/// a test's fonts takes (#660), holds the same files, so each file's read
+/// is still decided once.
+#[derive(Clone, Default)]
 pub(crate) struct OwnedFaces(HashMap<fontdb::ID, Arc<OwnedFontFile>>);
 
 impl OwnedFaces {
