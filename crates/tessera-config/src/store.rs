@@ -506,11 +506,12 @@ impl ConfigStore {
     ///
     /// Returns whether one of them changed since the sample recorded
     /// before: `true` for the first sample too. A re-read that finds the
-    /// configuration applied reports [`ConfigEvent::Unchanged`] only then
-    /// (or when `themes/` changed), so the temporary file of a stalled
-    /// rename-save, created beside `config.toml` a debounce or more before
-    /// its rename, reports nothing: the host is not told the file was
-    /// read before the save is on disk (#731). Kept in the store, as the
+    /// configuration applied reports [`ConfigEvent::Unchanged`] only then,
+    /// so the temporary file of a stalled rename-save, created beside
+    /// `config.toml` a debounce or more before its rename, reports
+    /// nothing, and a change in `themes/` alone only its
+    /// [`ConfigEvent::ThemesChanged`]: the host is not told the file was
+    /// read before the save is on disk (#731, #745). Kept in the store, as the
     /// themes state is, so of several watchers of one store the first to
     /// sample a change reports it.
     pub(crate) fn record_read(&self, read: ReadFingerprint) -> bool {

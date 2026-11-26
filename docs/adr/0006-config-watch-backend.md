@@ -404,8 +404,9 @@ until the window opened again.
 after a change on disk loads successfully and the store finds nothing new
 (`ConfigStore::apply` returns `None`): a save undone inside the debounce,
 a rewrite with the same text, a comment-only edit, a change in
-`themes/` or `profiles/` that leaves the configuration alone (then before
-its `ThemesChanged`). Until #731 the temporary file of a rename-save
+`profiles/` that leaves the configuration alone. A change in `themes/`
+alone sent one too, before its `ThemesChanged`, until #745 (see that
+amendment). Until #731 the temporary file of a rename-save
 created a debounce or more before its rename sent one too (#720); see
 the #731 amendment. Every re-read of a good file that finds changed
 files thus reports `Changed` or `Unchanged`. The catch-up when a watcher
@@ -490,7 +491,8 @@ each `*.toml` file in `profiles/` (the directory's own fingerprint left
 out). The sample is kept on the store. A re-read that finds the
 configuration applied sends `Unchanged` only when that sample differs from
 the one the previous re-read took, or when `themes/` changed (then still
-before its `ThemesChanged`). A temporary file is hidden and not a
+before its `ThemesChanged`; until #745, see that amendment). A temporary
+file is hidden and not a
 `*.toml` file (`.config.toml.<pid>.<n>.tmp` from `write_atomic`), so it
 changes no sample and its re-read sends nothing; the `Changed` at the
 rename is the save's one announcement. On a file system with fine
@@ -518,3 +520,40 @@ configuration directory on such a file system (in practice FAT) and
 another writer undoing a save within about 100 ms of it. Settings then
 shows its saved value until the next apply or until its window opens
 again.
+
+## Amendment: a change in `themes/` alone sends no `Unchanged` (#745, 2026-11-26)
+
+**Context.** Settings' Import Theme writes the theme into `themes/` and
+then saves `appearance.theme`. When the save landed a debounce or more
+after the import (a slow `fsync`, a loaded machine), the import settled on
+its own: its re-read found `config.toml` as applied and, `themes/` having
+changed, sent `Unchanged` and then `ThemesChanged`; the save's `Changed`
+came after. The `Unchanged` moved the configuration generation past the
+one Settings queued the save at (ADR 0044), so the theme field showed the
+old theme until the `Changed` was applied: #731's symptom, started by
+`themes/` instead of a temporary file.
+
+**Decision.** A re-read that finds the configuration applied sends
+`Unchanged` only when the files the load reads changed since the last
+re-read (the #731 sample); a change in `themes/` no longer counts. A change
+in `themes/` alone is reported by its `ThemesChanged` only, and the import
+then the late save is `[ThemesChanged, Changed]` on both backends. A
+change in `themes/` and an edit of a file the load reads that settle
+together and leave the configuration alone still send `Unchanged` and
+then `ThemesChanged`; a `ThemesChanged` always comes after the event of
+the re-read it settled with.
+
+Folding the import and the save into one settle was rejected: the watcher
+cannot know a save will follow (an external tool adding a theme, a theme
+imported and never selected), so it would have to hold every change in
+`themes/` for some window, delaying its `ThemesChanged`, and a save later
+than that window would split it again.
+
+**Consequences.** A host hears `on_config_applied` for a change in
+`themes/` only when app-core applies a theme from it (the theme in use, or
+the colours of a configuration changed under the lookup), not for a theme
+file added or edited that is not in use, as it did since #535. Settings
+re-lists the themes after its own import and on every apply; a theme file
+another program adds while the window is open is listed at the next apply
+or when the window opens again. Every consumer of `Unchanged` is
+unchanged.

@@ -70,8 +70,9 @@
 //! resolves the theme again ([`ConfigStore::theme`]). A re-read that finds
 //! the configuration already applied (a save undone inside the debounce,
 //! say) is reported as [`ConfigEvent::Unchanged`] (#535), when a file the
-//! load reads or `themes/` changed since the last re-read: not for the
-//! temporary file of a stalled rename-save (#731).
+//! load reads changed since the last re-read: not for the temporary file
+//! of a stalled rename-save (#731), nor for a change in `themes/` alone,
+//! which its `ThemesChanged` reports (#745).
 //!
 //! Each re-read settles in one order: `config.toml` is loaded, the theme
 //! file it names is followed (registered, or recorded as the poll
@@ -258,17 +259,18 @@ pub enum ConfigEvent {
     /// Sent at most once per settled change (debounced like `config.toml`),
     /// and independently of [`Changed`](ConfigEvent::Changed): an edit of
     /// `config.toml` alone never produces it, and an edit in `themes/`
-    /// alone never produces a `Changed`. The native backend sees an
+    /// alone never produces a `Changed`, nor an
+    /// [`Unchanged`](ConfigEvent::Unchanged) (#745). It comes after the
+    /// event of the re-read it settled with, if any. The native backend sees an
     /// in-place write only to the theme file in use (see the module
     /// documentation); the polling backend sees writes to every theme file,
     /// to one not in use within about twenty polling intervals.
     ThemesChanged,
     /// The watcher re-read `config.toml` (and the profile files) after a
-    /// change on disk to one of them or to `themes/`, and the
-    /// configuration it loaded is the one already applied: a save another
-    /// writer undid inside the debounce, a rewrite with the same text, a
-    /// change in `themes/` or to a profile file that left the
-    /// configuration alone. Sent instead of a
+    /// change on disk to one of them, and the configuration it loaded is
+    /// the one already applied: a save another writer undid inside the
+    /// debounce, a rewrite with the same text, a change to a profile file
+    /// that left the configuration alone. Sent instead of a
     /// [`Changed`](ConfigEvent::Changed), so every re-read after a write to
     /// a file the load reads reports one or the other, and an application
     /// that waits to see a value it saved can tell "read, and not there"
@@ -278,12 +280,17 @@ pub enum ConfigEvent {
     /// already reported sends nothing, and neither does the catch-up a
     /// watcher does when it starts ([`ConfigStore::watch`]) when it finds
     /// nothing new. Nor does a re-read that finds the files the load reads
-    /// as the last re-read did and `themes/` unchanged: the one the
-    /// temporary file of a rename-save starts when it is created beside
-    /// `config.toml` (or beside a linked `config.toml`'s target, or in
-    /// `profiles/`) a debounce or more before its rename. The rename's
-    /// `Changed` is then the only event, so a host does not take the read
-    /// of the old file for the read of its save (#720, #731). Several
+    /// as the last re-read did, whether or not `themes/` changed: the one
+    /// the temporary file of a rename-save starts when it is created
+    /// beside `config.toml` (or beside a linked `config.toml`'s target, or
+    /// in `profiles/`) a debounce or more before its rename, and the one a
+    /// change in `themes/` alone starts (a theme imported, which its
+    /// [`ThemesChanged`](ConfigEvent::ThemesChanged) reports). The save's
+    /// `Changed` is then the only event that reads the configuration, so a
+    /// host does not take the read of the old file for the read of its
+    /// save: Settings imports a theme and saves `appearance.theme` right
+    /// after, and sees `ThemesChanged` and then `Changed` (#720, #731,
+    /// #745). Several
     /// watchers of one store share that record: the first to see a change
     /// reports it, and a watcher may still see a `Changed` and, from
     /// another watcher's re-read, an `Unchanged` for one change.
@@ -480,8 +487,10 @@ impl Drop for WatchGuard {
 /// `reread` says whether a load that finds the configuration unchanged
 /// reports [`ConfigEvent::Unchanged`]: yes after a change on disk, no for
 /// the catch-up when the watcher starts. Even then only when the files the
-/// load reads ([`ReadFingerprint`], sampled before it) or `themes/` changed
-/// since the last re-read (#731).
+/// load reads ([`ReadFingerprint`], sampled before it) changed since the
+/// last re-read (#731): a change in `themes/` alone is reported by its
+/// [`ConfigEvent::ThemesChanged`] only (#745). Any `ThemesChanged` comes
+/// last, after the outcome's event.
 ///
 /// Returns the files the load went to, `config.toml` whether it loaded
 /// or not ([`ConfigStore::load_from_disk_identified`]).
@@ -495,28 +504,20 @@ fn settle(store: &ConfigStore, follow: impl FnOnce(&Config), reread: Reread) -> 
         Err(_) => follow(&store.config()),
     }
     match apply(store, outcome, reread) {
-        Some(ConfigEvent::Unchanged) => {
-            // Nothing new was loaded. Reported only when a file the load
-            // reads changed since the last re-read, or `themes/` did (then
-            // before its `ThemesChanged`, as for any re-read): a re-read
-            // that the temporary file of a stalled rename-save started,
-            // with `config.toml` still the old one, reports nothing, so a
-            // host waiting to see the save does not take it for the read
-            // of the file it saved (#731).
-            let themes_changed = sample_themes(store);
-            if files_changed || themes_changed {
-                store.broadcast(&ConfigEvent::Unchanged);
-            }
-            if themes_changed {
-                store.broadcast(&ConfigEvent::ThemesChanged);
-            }
-        }
-        Some(event) => {
-            store.broadcast(&event);
-            report_themes(store);
-        }
-        None => report_themes(store),
+        // Nothing new was loaded, and no file the load reads changed since
+        // the last re-read. A re-read that the temporary file of a stalled
+        // rename-save started, with `config.toml` still the old one,
+        // reports nothing, so a host waiting to see the save does not take
+        // it for the read of the file it saved (#731); nor does one that a
+        // change in `themes/` alone started, which its `ThemesChanged`
+        // announces (#745): an imported theme's re-read would otherwise
+        // tell Settings the `appearance.theme` it saves right after was
+        // read, before it is on disk.
+        Some(ConfigEvent::Unchanged) if !files_changed => {}
+        Some(event) => store.broadcast(&event),
+        None => {}
     }
+    report_themes(store);
     read
 }
 
@@ -6565,6 +6566,54 @@ mod tests {
                 }
             }
             assert_fix_is_seen(&paths, &store, &watcher, half_written, &what);
+        }
+    }
+
+    /// #745: a re-read reports a change in `themes/` after its own event.
+    /// With a comment-only edit of `config.toml` in the same settle, the
+    /// files the load reads changed and nothing new loaded: `Unchanged`,
+    /// then `ThemesChanged`. With `themes/` alone, `ThemesChanged` alone.
+    /// [`settle`] runs on this thread, so the order is deterministic and
+    /// the same for both backends, which share it.
+    #[test]
+    fn a_themes_change_is_reported_after_the_reread_it_settled_with() {
+        for comment in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let paths = ConfigPaths::new(dir.path());
+            std::fs::create_dir_all(paths.themes_dir()).unwrap();
+            std::fs::write(paths.config_file(), "[appearance]\nfont_size = 13\n").unwrap();
+            let store = ConfigStore::open(paths.clone()).unwrap();
+            let (_id, events) = store.subscribe();
+            settle(&store, |_| {}, Reread::CatchUp);
+            assert_eq!(events.try_iter().count(), 0, "comment={comment}: baseline");
+
+            std::fs::write(
+                paths.themes_dir().join("added.toml"),
+                theme_doc("Added", "#202020"),
+            )
+            .unwrap();
+            if comment {
+                std::fs::write(
+                    paths.config_file(),
+                    "[appearance]\nfont_size = 13\n# a comment\n",
+                )
+                .unwrap();
+            }
+            settle(&store, |_| {}, Reread::Changed);
+            let events: Vec<_> = events.try_iter().collect();
+            let expected: &[fn(&ConfigEvent) -> bool] = if comment {
+                &[
+                    |e| matches!(e, ConfigEvent::Unchanged),
+                    |e| matches!(e, ConfigEvent::ThemesChanged),
+                ]
+            } else {
+                &[|e| matches!(e, ConfigEvent::ThemesChanged)]
+            };
+            assert!(
+                events.len() == expected.len()
+                    && events.iter().zip(expected).all(|(event, is)| is(event)),
+                "comment={comment}: {events:?}"
+            );
         }
     }
 
