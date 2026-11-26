@@ -132,7 +132,7 @@ one is short), and a copy past the cap is `TESSERA_ERROR_REFUSED` with only
 | Rules | 64 (`MAX_SMART_RULES`), later ones dropped with one warning |
 | Pattern | 1024 bytes (`MAX_SMART_RULE_PATTERN_LEN`); compiled program 1 MiB (`SMART_RULE_SIZE_LIMIT`), each lazy DFA cache of the regex crate's 512 KiB (`SMART_RULE_REGEX_CACHE_BYTES`, #649), nesting 50 (`SMART_RULE_NEST_LIMIT`); a rule that breaks one, does not compile or matches the empty string is left out with a warning naming its index |
 | Scan | 8192 characters of the logical line around the click (`SMART_SCAN_LEN`: 4096 before it, the rest after) and 32 KiB (`SMART_SCAN_BYTES`: 16 KiB before it, 16 KiB from it on, #433) |
-| Click time | 50 ms (`SMART_RULE_BUDGET`), checked before each rule, the first rule included (#433), and after each costly search and every 16th match (`SMART_CLOCK_STRIDE`, #557) |
+| Click time | 50 ms (`SMART_RULE_BUDGET`) of the clicking thread's CPU time (#754), checked before each rule after the first and, in every rule (#433), after each costly search and every 16th match (`SMART_CLOCK_STRIDE`, #557) |
 | Formatted copy | 16 MiB of HTML and of RTF (`MAX_RICH_COPY_LEN`), counted while the runs are built; past it the formatted copy is refused and the plain copy still works |
 | RTF colour table | 4096 entries (`MAX_RTF_COLORS`); more is refused like a copy past the size cap |
 
@@ -230,7 +230,9 @@ attempt is bounded only by the scan window and the program size (about
   the DFA. The largest built-in rule (paths) compiles to ~104 KiB, and a
   test checks that every built-in rule fits half the bound.
 - **Budget per match.** `SMART_RULE_BUDGET` (50 ms) is checked before each
-  rule and after each match a rule finds, the first rule included: a rule
+  rule after the first and after each match a rule finds, the first
+  rule's included (#433 also checked it before the first rule; #754
+  dropped that check, which had nothing to count there but a stall): a rule
   that has spent it stops at the match it found, the rules after it are
   skipped, and the best match so far wins. The debug log adds the match
   count (S8: counts only).
@@ -893,3 +895,41 @@ waits for that click to return: its rules' budget plus one attempt, and
 its wait for its own session's locks (S6). Only the main thread clicks
 today. A click's cost is otherwise the same: one read lock
 replaces a mutex lock and an `Arc` clone.
+
+## Amendment: the click budget runs on the thread's CPU clock (#754, 2026-11-26)
+
+**Context.** `SMART_RULE_BUDGET` measured wall time. A click whose thread
+was descheduled for 50 ms or more spent the budget with no work done:
+before the first rule (every rule skipped), after the costly first match
+of a cold cache (the first click after a reload) when that match was
+before the click, before a rule after the first (the built-in path and
+URL rules among them), or at the 16th match on a warm cache. Each case
+selected the plain word, so a loaded machine changed what a click
+selected.
+
+**Decision.** The budget is the clicking thread's CPU time
+(`CLOCK_THREAD_CPUTIME_ID`, read through `nix::time::clock_gettime`, now a
+normal dependency of tessera-app-core, which forbids unsafe code). The
+50 ms, the read points and the 16-match stride stay. A stall, or a wait
+for a lock, costs the budget nothing, so a stalled click selects as an
+idle one does. #433's bound holds: what it
+bounds is the rules' CPU work, the hostile rules included, and a stall
+added no work. The check before the first rule stays gone (#351: the
+first rule always runs).
+
+**Cost.** A read of the thread's CPU clock is a kernel call: 0.28 to
+0.42 µs of wall time a read measured in a release build (0.12 to 0.14 µs
+of it CPU), against 24 to 64 ns for `Instant::now`. A click reads it
+once at the start, once before each rule after the first, after each
+costly search and every 16th match: a click on the 15 built-in rules
+about 20 reads, about 8 µs; the most matches a click scans (4098) add
+256 reads, about 0.1 ms, against the 50 ms budget.
+
+**Consequence.** The lock bound (S6) is in CPU time: the terminal and
+selection locks are held for at most rules x (budget + attempt bound) of
+the clicking thread's CPU time per click, in practice the budget plus one
+attempt. In wall time a loaded machine stretches a click, as it stretches
+any work; it no longer makes the click select less. Should the thread's
+clock fail to read (it does not on macOS or Linux), it reads as no time
+spent, and the click is bounded by its rules' count and attempt bound
+alone.

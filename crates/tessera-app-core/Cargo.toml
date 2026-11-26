@@ -33,11 +33,13 @@ thiserror.workspace = true
 tracing.workspace = true
 # Whether a remote host shows anything (a character that takes a cell, #358).
 unicode-width.workspace = true
+# The clicking thread's CPU clock, which a smart-selection click's time
+# budget runs on (#754); also the tests' timing bars that a loaded machine
+# must not fail.
+nix = { workspace = true, features = ["time"] }
 
 [dev-dependencies]
 tempfile = "3"
-# The calling thread's CPU clock, for the timing bars that a loaded machine must not fail.
-nix = { workspace = true, features = ["time"] }
 # Enables `test-hooks` (`App::spawn_test_session`) for the integration tests.
 tessera-app-core = { path = ".", features = ["test-hooks"] }
 # URL detection and selection properties.
