@@ -179,18 +179,20 @@ pub const SMART_FALLBACK_SLOT_BYTES: usize = 512 * 1024;
 ///   prefilters, so the term allows 128 + 32 KiB = 0.156 MiB.
 ///
 /// So 2.59 + 1.25 + 2 + 0.156 = 5.996 MiB per rule, and 64 rules keep at
-/// most 64 x 5.996 = 383.76 MiB, under the 384 MiB bar. The bar is for the steady
-/// state: when the rules change, the app builds the new engines while it
-/// still holds the old ones, so a reload peaks at both sets, up to about
-/// twice the ceiling (277.8 MiB over the baseline measured for 64 rules,
-/// #688). Every cache is one per rule whatever thread clicks: the app
-/// holds one `SmartEngines`, an `Arc` that every session and thread shares
-/// and that is rebuilt only when the rules change; each rule's DFA cache
-/// and `PikeVM` cache sit behind that rule's own `Mutex`; and no engine
-/// keeps a per-thread pool. So a further clicking thread waits for the
-/// rule's lock and adds 0 MiB; a reload while another thread clicks keeps
-/// the old engines until that click returns (only the main thread clicks
-/// today).
+/// most 64 x 5.996 = 383.76 MiB, under the 384 MiB bar. The bar holds
+/// through a reload too: when the rules change, the app drops the old
+/// engines, filled caches and all, before it builds the new ones
+/// (`SmartEngines::update`, #688; 277.8 MiB over the baseline for 64
+/// rules when it held both). Every cache is one per rule whatever thread
+/// clicks: the app holds one `SmartEngines` behind a lock that each click
+/// holds while it searches (read, so clicks run side by side) and a
+/// rebuild holds written, so every session and thread shares it, it is
+/// rebuilt only when the rules change, and a rebuild waits for the clicks
+/// on the old engines to return; each rule's DFA cache and `PikeVM` cache
+/// sit behind that rule's own `Mutex`; and no engine keeps a per-thread
+/// pool. So a further clicking thread waits for the rule's lock and adds
+/// 0 MiB, and a click racing a reload searches either the old rules with
+/// the old engines or the new rules with the new ones.
 ///
 /// Measured (release, kept heap after the clicks, programs included, #649):
 /// the critic's mix of a large program and a cache filler
@@ -263,8 +265,9 @@ thread_local! {
 #[derive(Debug, Default)]
 pub(crate) struct SmartEngines {
     rules: Arc<SmartRules>,
-    /// Shared with the engines of an equal set loaded later
-    /// ([`SmartEngines::for_rules`]).
+    /// One per rule of `rules`; [`SmartEngines::update`] keeps them, caches
+    /// and all, for a reload of equal rules, and drops them before it builds
+    /// others. Shared only by test handles ([`SmartEngines::shared`]).
     engines: Arc<[RuleEngine]>,
 }
 
@@ -314,14 +317,21 @@ impl SmartEngines {
         &self.rules
     }
 
-    /// The engines of `rules`: these when they are for that compiled set;
-    /// these rules' engines, caches and warnings kept, when `rules` holds
-    /// the same patterns with the same precisions and checks in the same
-    /// order (a reload that changed no rule compiles them again, #518);
-    /// new ones otherwise.
-    pub(crate) fn for_rules(self: &Arc<Self>, rules: Arc<SmartRules>) -> Arc<Self> {
-        if Arc::ptr_eq(&self.rules, &rules) {
-            return Arc::clone(self);
+    /// Whether these are the engines of `rules`, that compiled set.
+    pub(crate) fn are_for(&self, rules: &Arc<SmartRules>) -> bool {
+        Arc::ptr_eq(&self.rules, rules)
+    }
+
+    /// Makes these the engines of `rules`: unchanged when they are for that
+    /// compiled set; these rules' engines, caches and warnings kept, when
+    /// `rules` holds the same patterns with the same precisions and checks
+    /// in the same order (a reload that changed no rule compiles them
+    /// again, #518); new ones otherwise. The old engines, filled caches and
+    /// all, are dropped before the new ones are built, so a rules change
+    /// holds one set at a time (#688) unless another handle to them lives.
+    pub(crate) fn update(&mut self, rules: Arc<SmartRules>) {
+        if self.are_for(&rules) {
+            return;
         }
         let same = |a: &CompiledRule, b: &CompiledRule| {
             a.pattern() == b.pattern() && a.precision() == b.precision() && a.check() == b.check()
@@ -334,12 +344,21 @@ impl SmartEngines {
                 .zip(rules.rules())
                 .all(|(a, b)| same(a, b));
         if unchanged {
-            Arc::new(Self {
-                rules,
-                engines: Arc::clone(&self.engines),
-            })
+            self.rules = rules;
         } else {
-            Arc::new(Self::new(rules))
+            // The new engines are built before an assignment drops the old
+            // ones, so the old ones go first.
+            *self = Self::default();
+            *self = Self::new(rules);
+        }
+    }
+
+    /// Another handle to these engines, which keeps them while it lives.
+    #[cfg(test)]
+    pub(crate) fn shared(&self) -> Self {
+        Self {
+            rules: Arc::clone(&self.rules),
+            engines: Arc::clone(&self.engines),
         }
     }
 

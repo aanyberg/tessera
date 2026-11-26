@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use tessera_app_core::{App, Config, ConfigPaths, Granularity, Point, PtySize};
+use tessera_app_core::{App, Config, ConfigPaths, Granularity, Point, PtySize, SessionId};
 use tessera_config::{Precision, SmartRule};
 
 /// [`System`], counting the bytes currently allocated by every thread.
@@ -21,6 +21,20 @@ struct Counting;
 
 /// Bytes allocated and not yet freed, process-wide.
 static LIVE: AtomicUsize = AtomicUsize::new(0);
+
+/// The most [`LIVE`] has been since [`reset_peak`] (#688).
+static PEAK: AtomicUsize = AtomicUsize::new(0);
+
+/// Counts `bytes` more allocated, raising [`PEAK`] with them.
+fn grew(bytes: usize) {
+    let live = LIVE.fetch_add(bytes, Ordering::Relaxed) + bytes;
+    PEAK.fetch_max(live, Ordering::Relaxed);
+}
+
+/// Starts [`PEAK`] again at the live heap.
+fn reset_peak() {
+    PEAK.store(LIVE.load(Ordering::SeqCst), Ordering::SeqCst);
+}
 
 #[global_allocator]
 static ALLOCATOR: Counting = Counting;
@@ -32,7 +46,7 @@ unsafe impl GlobalAlloc for Counting {
         // SAFETY: forwarded unchanged.
         let block = unsafe { System.alloc(layout) };
         if !block.is_null() {
-            LIVE.fetch_add(layout.size(), Ordering::Relaxed);
+            grew(layout.size());
         }
         block
     }
@@ -41,7 +55,7 @@ unsafe impl GlobalAlloc for Counting {
         // SAFETY: forwarded unchanged.
         let block = unsafe { System.alloc_zeroed(layout) };
         if !block.is_null() {
-            LIVE.fetch_add(layout.size(), Ordering::Relaxed);
+            grew(layout.size());
         }
         block
     }
@@ -56,8 +70,11 @@ unsafe impl GlobalAlloc for Counting {
         // SAFETY: forwarded unchanged.
         let moved = unsafe { System.realloc(block, layout, new_size) };
         if !moved.is_null() {
-            LIVE.fetch_add(new_size, Ordering::Relaxed);
-            LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
+            if new_size >= layout.size() {
+                grew(new_size - layout.size());
+            } else {
+                LIVE.fetch_sub(layout.size() - new_size, Ordering::Relaxed);
+            }
         }
         moved
     }
@@ -106,6 +123,17 @@ const LINE_ROWS: usize = 41;
 ///
 /// Every rule must load: a rule left out would keep nothing.
 fn kept_by_clicks(rules: &[String], lines: &[String], column: u16, clicks: usize) -> usize {
+    let fed = Fed::new(rules, lines);
+    let before = settled_heap();
+    fed.click(column, clicks);
+    let kept = settled_heap().saturating_sub(before);
+    fed.close();
+    kept
+}
+
+/// The configuration of `rules`, each of which must load (a rule left out
+/// would keep nothing).
+fn config_of(rules: &[String]) -> Config {
     let mut config = Config::default();
     config.selection.smart_rules = Some(
         rules
@@ -124,31 +152,55 @@ fn kept_by_clicks(rules: &[String], lines: &[String], column: u16, clicks: usize
         rules.len(),
         "a rule did not load"
     );
-    drop(probe);
-    let app = App::new(config, ConfigPaths::new("/nonexistent/tessera-649"));
-    let id = app
-        .spawn_test_session(PtySize::new(330, 200))
-        .expect("a session");
-    let mut rows = Vec::new();
-    for (index, line) in lines.iter().enumerate() {
-        let start = LINE_ROWS * index;
-        // CUP is 1-based.
-        app.feed_for_test(id, format!("\x1b[{};1H{line}", start + 1).as_bytes())
-            .expect("fed");
-        let middle = start + line.chars().count() / COLS / 2;
-        rows.push(u16::try_from(middle).expect("within 330 rows"));
+    config
+}
+
+/// An app with smart rules and a 330 x 200 test session fed with lines,
+/// line `i` from row `41 i`.
+struct Fed {
+    app: App,
+    id: SessionId,
+    /// The middle row of each line.
+    rows: Vec<u16>,
+}
+
+impl Fed {
+    fn new(rules: &[String], lines: &[String]) -> Self {
+        let app = App::new(
+            config_of(rules),
+            ConfigPaths::new("/nonexistent/tessera-649"),
+        );
+        let id = app
+            .spawn_test_session(PtySize::new(330, 200))
+            .expect("a session");
+        let mut rows = Vec::new();
+        for (index, line) in lines.iter().enumerate() {
+            let start = LINE_ROWS * index;
+            // CUP is 1-based.
+            app.feed_for_test(id, format!("\x1b[{};1H{line}", start + 1).as_bytes())
+                .expect("fed");
+            let middle = start + line.chars().count() / COLS / 2;
+            rows.push(u16::try_from(middle).expect("within 330 rows"));
+        }
+        Self { app, id, rows }
     }
-    let before = settled_heap();
-    for click in 0..clicks {
-        for row in &rows {
-            let column = column + u16::try_from(click % 2).expect("0 or 1");
-            app.select_begin(id, Point::new(*row, column), Granularity::Word, false)
-                .expect("clicked");
+
+    /// Double-clicks each line's middle row `clicks` times, at `column` or
+    /// the next one, alternately, so every click starts a new search.
+    fn click(&self, column: u16, clicks: usize) {
+        for click in 0..clicks {
+            for row in &self.rows {
+                let column = column + u16::try_from(click % 2).expect("0 or 1");
+                self.app
+                    .select_begin(self.id, Point::new(*row, column), Granularity::Word, false)
+                    .expect("clicked");
+            }
         }
     }
-    let kept = settled_heap().saturating_sub(before);
-    app.close_session(id).expect("closed");
-    kept
+
+    fn close(self) {
+        self.app.close_session(self.id).expect("closed");
+    }
 }
 
 /// `|[cC]` for each of `chars`, `c` and its upper case.
@@ -280,14 +332,9 @@ fn a_large_literal_set_keeps_no_prefilter() {
 const MIXED_RULE: &str =
     r"\b(?:(?-u:[cegikmoqsuwyCEGIKMOQSUWY02468]){2000}|(?-u:q){12000}|[ab]*a[ab]{14})";
 
-/// The ceiling in bytes allocated (S5, #649): 64 rules, about 9 of each
-/// kind that fills a term (the largest programs, `\b\w{20}` with its raised
-/// cache, rules at the slot gate, rules filling their DFA caches, stack
-/// fillers and the critic's mix of a large program with a cache filler),
-/// each clicked on its line, keep at most 64 x 5.996 = 383.76 MiB
-/// (`SMART_RULE_CACHE_BYTES`).
-#[test]
-fn sixty_four_filling_rules_stay_under_the_ceiling() {
+/// The 64 rules of [`sixty_four_filling_rules_stay_under_the_ceiling`] and
+/// the lines that fill them.
+fn sixty_four_rules() -> (Vec<String>, [String; 3]) {
     let classes = alternatives(('q'..='z').chain('Q'..='Z').chain('0'..='9'));
     let kinds = [
         prog1820(),
@@ -298,14 +345,83 @@ fn sixty_four_filling_rules_stay_under_the_ceiling() {
         format!(r"\b(?:ab{classes})+"),
         MIXED_RULE.to_owned(),
     ];
-    let rules: Vec<String> = kinds.iter().cycle().take(64).cloned().collect();
+    let rules = kinds.iter().cycle().take(64).cloned().collect();
     let lines = [
         format!("x{}\u{e9}", "a".repeat(300)),
         random_ab(8000, 7),
         format!("{}\u{e9}", "ab".repeat(3800)),
     ];
+    (rules, lines)
+}
+
+/// The ceiling in bytes allocated (S5, #649): 64 rules, about 9 of each
+/// kind that fills a term (the largest programs, `\b\w{20}` with its raised
+/// cache, rules at the slot gate, rules filling their DFA caches, stack
+/// fillers and the critic's mix of a large program with a cache filler),
+/// each clicked on its line, keep at most 64 x 5.996 = 383.76 MiB
+/// (`SMART_RULE_CACHE_BYTES`).
+#[test]
+fn sixty_four_filling_rules_stay_under_the_ceiling() {
+    let (rules, lines) = sixty_four_rules();
     let kept = kept_by_clicks(&rules, &lines, 96, 2);
     assert!(kept > 64 << 20, "the rules filled: {kept} bytes kept");
     eprintln!("kept {kept} bytes");
     assert!(kept <= 64 * RULE_CEILING, "{kept} bytes kept");
+}
+
+/// A smart-rules reload peaks at one set of engines, not two (#688): the
+/// app drops the old engines, filled caches and all, before it builds the
+/// new ones. The 64 filling rules are clicked on their lines; the
+/// configuration then changes every rule (the list moves up by one, so
+/// each place holds another pattern, compiled before it is applied, as a
+/// load does), and a double-click on a blank row, which searches nothing,
+/// rebuilds the engines. That rebuild peaks at the larger set, the old one
+/// kept or the new one built, plus what building one rule holds for a
+/// moment (1.1 MB at most as measured), within one rule's ceiling; holding
+/// both sets peaked at the old set plus the whole new one (180.5 MB over
+/// 97.5 MB kept, as measured). Clicks on the lines then fill the new set,
+/// and the reload's peak through them stays under the ceiling. A rebuild
+/// reads no clock, so load changes only how much of each set the clicks
+/// fill (the clicks' budget), not the bound.
+#[test]
+fn a_rules_reload_peaks_at_one_set_of_engines() {
+    let (rules, lines) = sixty_four_rules();
+    let fed = Fed::new(&rules, &lines);
+    let before = settled_heap();
+    fed.click(96, 2);
+    let old = settled_heap().saturating_sub(before);
+    let changed: Vec<String> = rules.iter().cycle().skip(1).take(64).cloned().collect();
+    let changed = config_of(&changed);
+    // Compiled now, as a load does, not at the click.
+    changed.selection.compiled_rules();
+    fed.app
+        .apply_config(&changed, &tessera_config::Theme::default());
+    let applied = settled_heap();
+    reset_peak();
+    // The bottom row holds no text.
+    fed.app
+        .select_begin(fed.id, Point::new(329, 0), Granularity::Word, false)
+        .expect("clicked");
+    let built = PEAK.load(Ordering::SeqCst);
+    let rebuilt = settled_heap();
+    fed.click(96, 2);
+    let peak = PEAK.load(Ordering::SeqCst).saturating_sub(before);
+    let new = settled_heap().saturating_sub(before);
+    eprintln!(
+        "old {old} applied {} rebuild peak {} rebuilt {} reload peak {peak} new {new} bytes",
+        applied.saturating_sub(before),
+        built.saturating_sub(before),
+        rebuilt.saturating_sub(before),
+    );
+    assert!(old > 64 << 20, "the rules filled: {old} bytes kept");
+    assert!(
+        built <= applied.max(rebuilt) + RULE_CEILING,
+        "the rebuild peaked at {} bytes: {} kept by the old engines, {} by the new",
+        built.saturating_sub(before),
+        applied.saturating_sub(before),
+        rebuilt.saturating_sub(before),
+    );
+    assert!(new > 64 << 20, "the changed rules filled: {new} bytes kept");
+    assert!(peak <= 64 * RULE_CEILING, "{peak} bytes at the peak");
+    fed.close();
 }
