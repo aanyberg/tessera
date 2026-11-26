@@ -754,16 +754,18 @@ fn options(backend: WatchBackend) -> WatchOptions {
 /// The next `Changed`, within `within`, skipping `ThemesChanged` and the
 /// `Unchanged` reports that may come before it (#578, PR #586's run).
 ///
-/// With one watcher, an `Unchanged` is a re-read that ran while a save
+/// With one watcher, an `Unchanged` was a re-read that ran while a save
 /// was half done, so it found the files as already applied: the native
 /// backend sees `profiles/` change when [`write_atomic`] creates its
 /// temporary file (`.a.toml.<pid>.<n>.tmp`, which the loader skips: it
 /// is not a `*.toml` file), and if writing and syncing it takes longer than the
 /// debounce (a loaded machine) the re-read runs before the rename and
 /// finds nothing new (the files are quiet meanwhile: the temporary file
-/// itself is not watched). The `Changed` follows at the rename. Only
-/// `Changed` counts as a reload, so a save that reloads twice still fails
-/// [`more_changes`].
+/// itself is not watched). Since #731 that re-read reports nothing, as
+/// the files the load reads are as they were; the skip stays for a
+/// re-read of a save another re-read already applied. The `Changed`
+/// follows at the rename. Only `Changed` counts as a reload, so a save
+/// that reloads twice still fails [`more_changes`].
 fn next_change(watcher: &Watcher, within: Duration, what: &str) -> Arc<Config> {
     let started = Instant::now();
     loop {
@@ -1138,7 +1140,7 @@ fn a_flood_of_writes_to_a_profile_file_coalesces() {
         let mut stalls = 0_usize;
         let mut wrote = started;
         for i in 1..=WRITES {
-            std::fs::write(&file, command(&format!("/bin/{i}"))).unwrap();
+            overwrite(&file, &command(&format!("/bin/{i}")));
             if wrote.elapsed() >= stall {
                 stalls += 1;
             }
@@ -1205,7 +1207,7 @@ fn polling_follows_an_added_profile_file_before_the_full_listing() {
         let config = next_change(&watcher, EVENTUALLY * 2, name);
         assert_eq!(config.profiles.len(), i + 1, "{name}");
         let started = Instant::now();
-        std::fs::write(&file, command("/bin/x")).unwrap();
+        overwrite(&file, &command("/bin/x"));
         let config = next_change(&watcher, EVENTUALLY * 2, name);
         let elapsed = started.elapsed();
         assert_eq!(
@@ -1225,7 +1227,7 @@ fn watching_never_writes_profile_files() {
         let before = snapshot(&paths.profiles_dir());
         let store = ConfigStore::open(paths.clone()).unwrap();
         let watcher = store.watch(options(backend)).unwrap();
-        std::fs::write(paths.config_file(), "[appearance]\nfont_size = 15\n").unwrap();
+        overwrite(&paths.config_file(), "[appearance]\nfont_size = 15\n");
         let _ = next_change(&watcher, EVENTUALLY, &format!("{backend:?}"));
         drop(watcher);
         assert_eq!(snapshot(&paths.profiles_dir()), before, "{backend:?}");

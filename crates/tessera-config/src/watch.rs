@@ -69,7 +69,9 @@
 //! `themes/` as [`ConfigEvent::ThemesChanged`], after which the application
 //! resolves the theme again ([`ConfigStore::theme`]). A re-read that finds
 //! the configuration already applied (a save undone inside the debounce,
-//! say) is reported as [`ConfigEvent::Unchanged`] (#535).
+//! say) is reported as [`ConfigEvent::Unchanged`] (#535), when a file the
+//! load reads or `themes/` changed since the last re-read: not for the
+//! temporary file of a stalled rename-save (#731).
 //!
 //! Each re-read settles in one order: `config.toml` is loaded, the theme
 //! file it names is followed (registered, or recorded as the poll
@@ -107,7 +109,7 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::load::Warning;
 use crate::store::{ConfigStore, FromDisk, WentTo};
 use crate::theme::{MAX_THEME_DIR_ENTRIES, Theme, ThemeSource};
-use crate::{Config, Error};
+use crate::{Config, ConfigPaths, Error};
 
 /// Lower bound for [`WatchOptions::poll_interval`]; smaller values are
 /// raised to it so the polling backend can never spin.
@@ -262,23 +264,29 @@ pub enum ConfigEvent {
     /// to one not in use within about twenty polling intervals.
     ThemesChanged,
     /// The watcher re-read `config.toml` (and the profile files) after a
-    /// change on disk, and the configuration it loaded is the one already
-    /// applied: a save another writer undid inside the debounce, a rewrite
-    /// with the same text, a change in `themes/` or `profiles/` that left
-    /// the configuration alone, or the temporary file of a rename-save
-    /// that was created beside `config.toml` (or beside a linked
-    /// `config.toml`'s target) a debounce or more before its rename, whose
-    /// own `Changed` then follows (#720). Sent instead of a
-    /// [`Changed`](ConfigEvent::Changed), so every re-read of a successful
-    /// load reports one or the other, and an application that waits to
-    /// see a value it saved can tell "read, and not there" from "not read
-    /// yet" (#535).
+    /// change on disk to one of them or to `themes/`, and the
+    /// configuration it loaded is the one already applied: a save another
+    /// writer undid inside the debounce, a rewrite with the same text, a
+    /// change in `themes/` or to a profile file that left the
+    /// configuration alone. Sent instead of a
+    /// [`Changed`](ConfigEvent::Changed), so every re-read after a write to
+    /// a file the load reads reports one or the other, and an application
+    /// that waits to see a value it saved can tell "read, and not there"
+    /// from "not read yet" (#535).
     ///
     /// Nothing is to be applied. A re-read that fails with an error
     /// already reported sends nothing, and neither does the catch-up a
     /// watcher does when it starts ([`ConfigStore::watch`]) when it finds
-    /// nothing new. Several watchers of one store each send their own, so
-    /// each of them may see one per watcher for one change.
+    /// nothing new. Nor does a re-read that finds the files the load reads
+    /// as the last re-read did and `themes/` unchanged: the one the
+    /// temporary file of a rename-save starts when it is created beside
+    /// `config.toml` (or beside a linked `config.toml`'s target, or in
+    /// `profiles/`) a debounce or more before its rename. The rename's
+    /// `Changed` is then the only event, so a host does not take the read
+    /// of the old file for the read of its save (#720, #731). Several
+    /// watchers of one store share that record: the first to see a change
+    /// reports it, and a watcher may still see a `Changed` and, from
+    /// another watcher's re-read, an `Unchanged` for one change.
     Unchanged,
 }
 
@@ -471,20 +479,44 @@ impl Drop for WatchGuard {
 ///
 /// `reread` says whether a load that finds the configuration unchanged
 /// reports [`ConfigEvent::Unchanged`]: yes after a change on disk, no for
-/// the catch-up when the watcher starts.
+/// the catch-up when the watcher starts. Even then only when the files the
+/// load reads ([`ReadFingerprint`], sampled before it) or `themes/` changed
+/// since the last re-read (#731).
 ///
 /// Returns the files the load went to, `config.toml` whether it loaded
 /// or not ([`ConfigStore::load_from_disk_identified`]).
 fn settle(store: &ConfigStore, follow: impl FnOnce(&Config), reread: Reread) -> WentTo {
+    // Before the load: a write after this sample is either read by the
+    // load or seen as a change by the next re-read's sample.
+    let files_changed = store.record_read(ReadFingerprint::of(store.paths()));
     let (read, outcome) = store.load_from_disk_identified();
     match &outcome {
         Ok(from) => follow(&from.loaded.config),
         Err(_) => follow(&store.config()),
     }
-    if let Some(event) = apply(store, outcome, reread) {
-        store.broadcast(&event);
+    match apply(store, outcome, reread) {
+        Some(ConfigEvent::Unchanged) => {
+            // Nothing new was loaded. Reported only when a file the load
+            // reads changed since the last re-read, or `themes/` did (then
+            // before its `ThemesChanged`, as for any re-read): a re-read
+            // that the temporary file of a stalled rename-save started,
+            // with `config.toml` still the old one, reports nothing, so a
+            // host waiting to see the save does not take it for the read
+            // of the file it saved (#731).
+            let themes_changed = sample_themes(store);
+            if files_changed || themes_changed {
+                store.broadcast(&ConfigEvent::Unchanged);
+            }
+            if themes_changed {
+                store.broadcast(&ConfigEvent::ThemesChanged);
+            }
+        }
+        Some(event) => {
+            store.broadcast(&event);
+            report_themes(store);
+        }
+        None => report_themes(store),
     }
-    report_themes(store);
     read
 }
 
@@ -504,10 +536,15 @@ enum Reread {
 /// store report one change once, as with [`settle`]; the first sample of
 /// a store records a baseline and reports nothing.
 fn report_themes(store: &ConfigStore) {
-    let themes = ThemesFingerprint::of(&store.paths().themes_dir());
-    if store.record_themes(themes) {
+    if sample_themes(store) {
         store.broadcast(&ConfigEvent::ThemesChanged);
     }
+}
+
+/// Samples the themes directory and records it in the store; whether it
+/// differs from the state recorded before ([`ConfigStore::record_themes`]).
+fn sample_themes(store: &ConfigStore) -> bool {
+    store.record_themes(ThemesFingerprint::of(&store.paths().themes_dir()))
 }
 
 /// The theme file `name` resolves to in `themes`, or `None` when it
@@ -951,6 +988,32 @@ impl ProfilesFingerprint {
                 })
                 .collect(),
             more: self.more,
+        }
+    }
+}
+
+/// A cheap identity of the files a load reads: `config.toml` (followed
+/// through links, by type alone when it is no regular file,
+/// [`Fingerprint::of_file`]) and the profile files of `profiles/` (at most
+/// [`crate::MAX_PROFILE_FILES`], as the load reads, with the dangling
+/// links, whose target may appear). Not the directories: a file created
+/// beside them that the load does not read (a rename-save's temporary
+/// file, hidden or not `*.toml`) changes nothing here. [`settle`] samples
+/// it before each load and reports an unchanged configuration only when it
+/// changed ([`ConfigStore::record_read`], #731).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReadFingerprint {
+    config: Fingerprint,
+    profiles: Vec<(std::path::PathBuf, Fingerprint)>,
+}
+
+impl ReadFingerprint {
+    /// The files under `paths` as they are now.
+    fn of(paths: &ConfigPaths) -> Self {
+        Self {
+            config: Fingerprint::of_file(&paths.config_file()),
+            profiles: ProfilesFingerprint::of(&paths.profiles_dir(), crate::MAX_PROFILE_FILES)
+                .files,
         }
     }
 }

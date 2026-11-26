@@ -686,7 +686,7 @@ fn a_flood_of_unloadable_theme_files_is_followed_up_to_the_cap() {
         after <= before + 8,
         "{after} descriptors open, {before} before the switch"
     );
-    write(&keyed, &theme_doc("Keyed Theme", "#1c1c1c"));
+    save(&keyed, &theme_doc("Keyed Theme", "#1c1c1c"));
     expect_theme_applied(&watcher, &store, "#1c1c1c", "the newest of a flood");
 }
 

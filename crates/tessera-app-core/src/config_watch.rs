@@ -4744,6 +4744,66 @@ font_size = 14.0
         app.stop_config_watch();
     }
 
+    /// #731: a rename-save (Settings' own, through a temporary file beside
+    /// `config.toml`) whose writer stalls past the debounce between
+    /// creating the temporary file and renaming it is announced once, with
+    /// the new value: the re-read the temporary file starts finds the old
+    /// file and announces nothing, so the configuration generation does
+    /// not move to a configuration without the save, which a host waiting
+    /// for a newer generation would take as the save's and show the old
+    /// value until the next apply.
+    #[test]
+    fn a_stalled_rename_save_is_announced_once_with_its_value() {
+        const STALL: Duration = Duration::from_millis(500);
+        let root = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::new(root.path());
+        std::fs::create_dir_all(paths.root()).unwrap();
+        let doc = |size: u32| format!("[appearance]\nfont_size = {size}\n");
+        std::fs::write(paths.config_file(), doc(13)).unwrap();
+        let store = ConfigStore::open(paths.clone()).unwrap();
+        let app = App::new((*store.config()).clone(), paths.clone());
+        let heard = Announced::waking();
+        app.set_observer(Some(Box::new(heard.clone())));
+        app.start_config_watch(
+            store,
+            WatchOptions {
+                debounce: Duration::from_millis(50),
+                ..WatchOptions::default()
+            },
+        )
+        .unwrap();
+        // The catch-up at the start finds nothing new and announces
+        // nothing; give the apply thread time to have handled it.
+        std::thread::sleep(Duration::from_millis(200));
+        let generation = app.config_generation();
+        let announced = lock(&heard.applied).len();
+
+        let tmp = paths.root().join(".config.toml.731.tmp");
+        std::fs::write(&tmp, doc(14)).unwrap();
+        std::thread::sleep(STALL);
+        assert_eq!(
+            app.config_generation(),
+            generation,
+            "the temporary file moved the generation"
+        );
+        std::fs::rename(&tmp, paths.config_file()).unwrap();
+        assert!(
+            heard.wait_for(announced + 1, Duration::from_secs(10)),
+            "the save was never announced"
+        );
+        // Anything more would come within a debounce or two.
+        std::thread::sleep(Duration::from_millis(300));
+        let (config, now) = app.config_and_generation();
+        assert_eq!(now, generation + 1, "one generation for the save");
+        assert_eq!(
+            lock(&heard.applied)[announced..],
+            [generation + 1],
+            "one announcement"
+        );
+        assert_eq!(config.appearance.font_size, 14.0, "the saved value");
+        app.stop_config_watch();
+    }
+
     /// #535: an `Unchanged` folded into a `ThemesChanged` that applies the
     /// theme in use is covered by that apply's announcement: one, not two.
     #[test]
