@@ -3,6 +3,7 @@
 #import <Foundation/Foundation.h>
 
 #import "CoreTestHooks.h"
+#import "ToolbarNaming.h"
 
 NS_ASSUME_NONNULL_BEGIN
 
