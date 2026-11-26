@@ -70,6 +70,7 @@ extension TerminalSurfaceView {
         let hadFocus = findBar?.fieldHasFocus ?? false
         findController?.close()
         findBar?.removeFromSuperview()
+        clipboardNotice.layout()
         if hadFocus || window?.firstResponder == nil || window?.firstResponder === window {
             window?.makeFirstResponder(self)
         }
@@ -87,7 +88,8 @@ extension TerminalSurfaceView {
     }
 
     /// The bar, added if it is not shown: below a dimmed pane's shade,
-    /// which stays the pane's top subview.
+    /// which stays the pane's top subview, and below the clipboard notice,
+    /// which a pane too short for both shows over the bar (#747).
     @discardableResult
     private func showBar() -> FindBarView {
         if let bar = findBar { return bar }
@@ -96,8 +98,8 @@ extension TerminalSurfaceView {
         bar.onOlder = { [weak self] in self?.findController?.older() }
         bar.onNewer = { [weak self] in self?.findController?.newer() }
         bar.field.onFocus = { [weak self] in self?.didBecomeFirstResponder?() }
-        if let shade = subviews.last(where: { $0 is PaneDimView }) {
-            addSubview(bar, positioned: .below, relativeTo: shade)
+        if let above = subviews.first(where: { $0 is PaneDimView || $0 is ClipboardNoticeView }) {
+            addSubview(bar, positioned: .below, relativeTo: above)
         } else {
             addSubview(bar)
         }
@@ -106,8 +108,10 @@ extension TerminalSurfaceView {
     }
 
     /// Places the bar in the top trailing corner, clear of the scroll bar,
-    /// as wide as fits. Never resizes the grid.
+    /// as wide as fits, and the clipboard notice clear of the bar. Never
+    /// resizes the grid.
     func layoutFindBar() {
+        defer { clipboardNotice.layout() }
         guard let bar = findBar else { return }
         let margin = FindBarView.margin
         let trailing = margin + TerminalScroller.width(for: scroller.effectiveStyle)
