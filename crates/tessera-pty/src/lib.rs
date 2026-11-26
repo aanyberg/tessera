@@ -45,9 +45,11 @@ use std::sync::mpsc::Receiver;
 compile_error!("tessera-pty supports Unix platforms only");
 
 mod bounded;
+mod child_env;
 mod foreground;
 mod native;
 
+pub use child_env::{CHILD_ENV_FILTER, EnvAction, EnvName, EnvRule, inherits};
 pub use foreground::{ForegroundProcess, MAX_FOREGROUND_NAME_BYTES};
 pub use native::{IoThreads, NativePty, WRITE_QUEUE_BYTES, set_thread_start_hook};
 
@@ -409,17 +411,23 @@ pub enum Program {
 
 /// Everything needed to start a child in a fresh PTY.
 ///
-/// The child inherits this process's environment, then receives the Tessera
-/// identification variables ([`TERM`], [`COLORTERM`], [`TERM_PROGRAM`],
-/// [`TERM_PROGRAM_VERSION`], [`SESSION_ID_VAR`]), and finally any entries
-/// from [`SpawnOptions::env`], which win over both.
+/// The child inherits this process's environment except the variables
+/// [`CHILD_ENV_FILTER`] strips (Tessera's own, such as
+/// `TESSERA_CONFIG_DIR`, every `DYLD_*` and what Xcode and `XCTest` add;
+/// see [`inherits`]), then
+/// receives the Tessera identification variables ([`TERM`], [`COLORTERM`],
+/// [`TERM_PROGRAM`], [`TERM_PROGRAM_VERSION`], [`SESSION_ID_VAR`]), and
+/// finally any entries from [`SpawnOptions::env`], which win over both.
+/// The filter applies to the inherited variables only: the injected ones
+/// and the entries of [`SpawnOptions::env`] always reach the child.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpawnOptions {
     /// Program to run.
     pub program: Program,
     /// Working directory; the home directory when `None`.
     pub cwd: Option<PathBuf>,
-    /// Extra environment variables, applied last.
+    /// Extra environment variables, applied last and never filtered
+    /// ([`CHILD_ENV_FILTER`] applies to inherited variables only).
     pub env: Vec<(OsString, OsString)>,
     /// Initial window size.
     pub size: PtySize,

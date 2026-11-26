@@ -635,7 +635,9 @@ fn render_document(sections: &[Section]) -> String {
         out,
         "Tessera reads its settings from `~/Library/Application Support/{APP_SUPPORT_DIR_NAME}/{CONFIG_FILE_NAME}`, \
          or from `{CONFIG_FILE_NAME}` in the directory the `TESSERA_CONFIG_DIR` environment \
-         variable names (unset by default; for tests and side-by-side installs). Starting Tessera \
+         variable names (unset by default; for tests and side-by-side installs; it is not passed \
+         on to the shells Tessera starts, so a Tessera started from one of them reads the \
+         default directory unless it is set again). Starting Tessera \
          writes no configuration there: without the file the defaults apply, and the file is \
          written, with every default commented, only when the app is asked to open it for \
          editing or a change is saved in the Settings window (a file you create yourself is picked up within a few seconds and never \
