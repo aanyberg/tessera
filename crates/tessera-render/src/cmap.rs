@@ -9,17 +9,21 @@
 //! killed the index thread. [`enumerate`] reads the same subtable swash
 //! picks and yields the same pairs for a well-formed table, but never
 //! walks a code point at or past the code space, and never walks one
-//! twice: each group or segment starts after the highest code point an
-//! earlier one reached, as the format's sorted, non-overlapping order
-//! requires of a valid font. A face therefore costs at most one step per
-//! code point of the code space plus one per group or segment, and a walk
-//! stops early at the step budget its caller gives it (#716: the coverage
-//! index shares one budget across every face it walks).
+//! twice. It walks the binary search [`map`] runs as a tree, so it claims
+//! a code point exactly where that lookup finds a glyph for it, even for
+//! the unsorted or overlapping groups or segments a valid font never has
+//! (#725: a walk of them in turn claimed code points the search misses,
+//! which then drew as `.notdef`). A face therefore costs at most one step
+//! per code point of the code space plus one per group or segment, and a
+//! walk stops early at the step budget its caller gives it (#716: the
+//! coverage index shares one budget across every face it walks).
 //!
 //! [`map`] looks one code point up as swash's `Charmap::map` does, with
 //! the same wrapping glyph arithmetic as [`enumerate`] (#716: swash's
 //! overflowed in debug builds for a glyph offset near `u32::MAX`), so the
 //! lookups after the index agree with it and never panic.
+
+use std::ops::ControlFlow;
 
 /// Format 4 (segment mapping to delta values, BMP only).
 const FORMAT_SEGMENTS: u16 = 4;
@@ -65,22 +69,29 @@ impl Walk {
 }
 
 /// Calls `f(code_point, glyph)` for each code point below `limit` that
-/// `cmap` maps, in at most `budget` steps ([`Walk::steps`]), through
-/// the subtable swash's character map uses (a symbol subtable first,
-/// else a Unicode format-12 one, else the first Unicode format-4 one). `cmap` holds the `cmap` table from its first byte. A
-/// subtable is read up to the end of `cmap`, not of the table's stated
-/// length (swash reads to the end of the font data); the index passes
-/// the table alone.
+/// `cmap` maps, in rising order and in at most `budget` steps
+/// ([`Walk::steps`]), through the subtable swash's character map uses (a
+/// symbol subtable first, else a Unicode format-12 one, else the first
+/// Unicode format-4 one). `cmap` holds the `cmap` table from its first
+/// byte. A subtable is read up to the end of `cmap`, not of the table's
+/// stated length (swash reads to the end of the font data); the index
+/// passes the table alone.
 ///
 /// For a well-formed table the pairs are swash's `Charmap::enumerate`
 /// pairs below `limit`, glyph 0 included where swash passes it (a
 /// format-4 `idRangeOffset` glyph that `idDelta` takes to 0). Glyph
-/// arithmetic wraps, as swash's does in release builds. A group or
-/// segment is walked only above the highest code point an earlier one
-/// reached, so overlapping or unsorted records (which a valid font never
-/// has) are cut, not walked again. When the budget runs out the walk
-/// stops there, [`Walk::cut`] set: the pairs are a prefix of the whole
-/// walk's.
+/// arithmetic wraps, as swash's does in release builds. For any table,
+/// sorted or not (#725), a pair with a non-zero glyph is one [`map`]
+/// gives: the walk follows `map`'s binary search, each group or segment
+/// read at most once and only for the code points that search takes to
+/// it. The walk and `map` differ in three cases, only the first of them
+/// a pair `map` does not give: format 4 yields U+FFFF where a segment
+/// maps it, which `map` never does (swash's quirk); a format whose high
+/// byte is set is walked as nothing, where `map` reads it by its low
+/// byte; and a symbol subtable's U+0000 to U+00FF, which `map` also looks
+/// up at U+F000 to U+F0FF, are not yielded for those. When the budget runs
+/// out the walk stops there, [`Walk::cut`] set: the pairs are a prefix of
+/// the whole walk's.
 pub(crate) fn enumerate(cmap: &[u8], limit: u32, budget: u64, mut f: impl FnMut(u32, u16)) -> Walk {
     let Some(subtable) = subtable(cmap).and_then(|(offset, _)| cmap.get(offset..)) else {
         return Walk::default();
@@ -221,25 +232,23 @@ fn groups(table: &[u8], limit: u32, budget: u64, f: &mut impl FnMut(u32, u16)) -
     if !check_range(table, 16, count.saturating_mul(12)) {
         return walk;
     }
-    // The lowest code point no earlier group reached.
-    let mut next = 0_u32;
-    for group in table[16..].as_chunks::<12>().0.iter().take(count) {
-        if walk.steps() >= budget {
-            walk.cut = true;
-            break;
-        }
-        walk.records += 1;
-        let start = u32_at(group, 0);
-        let end = u32_at(group, 4);
-        let glyph = u32_at(group, 8);
-        let first = start.max(next);
-        let last = end.min(limit.saturating_sub(1));
-        if first > last {
-            continue;
-        }
-        let Some(last) = walk.clip(budget, first, last) else {
-            break;
+    let (Some(groups), Some(last)) = (
+        table[16..].as_chunks::<12>().0.get(..count),
+        limit.checked_sub(1),
+    ) else {
+        return walk;
+    };
+    let range = |i: usize| {
+        groups
+            .get(i)
+            .map(|group| (u32_at(group, 0), u32_at(group, 4)))
+    };
+    let mut hit = |i: usize, first: u32, last: u32| {
+        let Some(group) = groups.get(i) else {
+            return;
         };
+        let start = u32_at(group, 0);
+        let glyph = u32_at(group, 8);
         for cp in first..=last {
             #[expect(
                 clippy::cast_possible_truncation,
@@ -250,12 +259,8 @@ fn groups(table: &[u8], limit: u32, budget: u64, f: &mut impl FnMut(u32, u16)) -
                 f(cp, id);
             }
         }
-        walk.code_points += u64::from(last - first) + 1;
-        next = last + 1;
-        if walk.cut {
-            break;
-        }
-    }
+    };
+    let _ = search(&mut walk, budget, (0, count), (0, last), &range, &mut hit);
     walk
 }
 
@@ -267,37 +272,31 @@ fn segments(table: &[u8], limit: u32, budget: u64, f: &mut impl FnMut(u32, u16))
     if !check_range(table, 0, 16 + seg_x2 * 4) {
         return walk;
     }
+    let Some(last) = limit.checked_sub(1) else {
+        return walk;
+    };
     let ends = 14;
     let starts = ends + seg_x2 + 2;
     let deltas = starts + seg_x2;
     let ranges = deltas + seg_x2;
-    let mut next = 0_u32;
-    for segment in 0..count {
-        if walk.steps() >= budget {
-            walk.cut = true;
-            break;
-        }
-        walk.records += 1;
-        let (Some(start), Some(end), Some(delta), Some(range)) = (
-            read_u16(table, starts + segment * 2),
-            read_u16(table, ends + segment * 2),
-            read_u16(table, deltas + segment * 2),
-            read_u16(table, ranges + segment * 2),
+    // Inside the subtable, which `check_range` checked: never `None`.
+    let range = |i: usize| {
+        let start = read_u16(table, starts + i * 2)?;
+        let end = read_u16(table, ends + i * 2)?;
+        Some((u32::from(start), u32::from(end)))
+    };
+    let mut hit = |i: usize, first: u32, last: u32| {
+        let (Some(start), Some(delta), Some(range)) = (
+            read_u16(table, starts + i * 2),
+            read_u16(table, deltas + i * 2),
+            read_u16(table, ranges + i * 2),
         ) else {
-            continue;
+            return;
         };
-        let first = u32::from(start).max(next);
-        let last = u32::from(end).min(limit.saturating_sub(1));
-        if first > last {
-            continue;
-        }
-        let Some(last) = walk.clip(budget, first, last) else {
-            break;
-        };
-        let range_base = ranges + segment * 2 + usize::from(range);
+        let range_base = ranges + i * 2 + usize::from(range);
         for cp in first..=last {
             if range == 0 {
-                // `cp` is at most `end`, a `u16`.
+                // `cp` is at most the segment's end, a `u16`.
                 let id = u16::try_from(cp).unwrap_or(u16::MAX).wrapping_add(delta);
                 if id != 0 {
                     f(cp, id);
@@ -309,13 +308,89 @@ fn segments(table: &[u8], limit: u32, budget: u64, f: &mut impl FnMut(u32, u16))
                 f(cp, id.wrapping_add(delta));
             }
         }
-        walk.code_points += u64::from(last - first) + 1;
-        next = last + 1;
+    };
+    let _ = search(
+        &mut walk,
+        budget,
+        (0, count),
+        (0, last.min(0xFFFF)),
+        &range,
+        &mut hit,
+    );
+    walk
+}
+
+/// Walks the binary search [`map`] runs over the records `low..high` (a
+/// subtable's groups or segments, `range(i)` giving record `i`'s first
+/// and last code point as the subtable states them) for the code points
+/// `first..=last` (`first <= last`), all of which that search takes to
+/// these records, as a tree: record `mid` (the midpoint) sends the code
+/// points below its first to the records below it, maps those from its
+/// first to its last with `hit(mid, from, to)`, and sends those above
+/// both to the records above it. The walk then claims a code point
+/// exactly where the lookup finds a record for it, in whatever order the
+/// records lie (#725: unsorted or overlapping records, which a valid font
+/// never has, made a walk of them in turn claim code points the search
+/// misses), and in rising order. A record whose range cannot be read
+/// sends nothing on, as the lookup gives up there.
+///
+/// Each record is read at most once and only when a code point reaches
+/// it, a step each, and the code point ranges are disjoint, a step per
+/// code point: at most one walk of `first..=last` plus one step per
+/// record. [`ControlFlow::Break`] once the budget runs out, the walk cut.
+/// The recursion halves `high - low` at each level, so it is at most 64
+/// deep.
+fn search(
+    walk: &mut Walk,
+    budget: u64,
+    (low, high): (usize, usize),
+    (first, last): (u32, u32),
+    range: &impl Fn(usize) -> Option<(u32, u32)>,
+    hit: &mut impl FnMut(usize, u32, u32),
+) -> ControlFlow<()> {
+    if low >= high {
+        return ControlFlow::Continue(());
+    }
+    if walk.steps() >= budget {
+        walk.cut = true;
+        return ControlFlow::Break(());
+    }
+    walk.records += 1;
+    let mid = usize::midpoint(low, high);
+    // Unreachable today: both callers' `range` reads only records inside
+    // the subtable `check_range` checked. Defensive, as `map` gives up on
+    // a record it cannot read.
+    let Some((start, end)) = range(mid) else {
+        return ControlFlow::Continue(());
+    };
+    if first < start {
+        search(
+            walk,
+            budget,
+            (low, mid),
+            (first, last.min(start - 1)),
+            range,
+            hit,
+        )?;
+    }
+    let (from, to) = (first.max(start), last.min(end));
+    if from <= to {
+        let Some(to) = walk.clip(budget, from, to) else {
+            return ControlFlow::Break(());
+        };
+        hit(mid, from, to);
+        walk.code_points += u64::from(to - from) + 1;
         if walk.cut {
-            break;
+            return ControlFlow::Break(());
         }
     }
-    walk
+    // Above its last and not below its first.
+    match end.checked_add(1).map(|after| after.max(start).max(first)) {
+        Some(from) if from <= last => {
+            search(walk, budget, (mid + 1, high), (from, last), range, hit)
+        }
+        _ => ControlFlow::Continue(()),
+    }
 }
 
 /// swash's `Bytes::check_range`: `offset` lies inside `data` and `len`
@@ -541,7 +616,8 @@ mod tests {
 
     /// #716: a walk stops at its step budget, a code point or a record
     /// read each one step: the pairs so far are the whole walk's first
-    /// ones.
+    /// ones. The walk reads the records as the lookup's binary search
+    /// does (#725): the second of two first, then the first.
     #[test]
     fn a_walk_stops_at_its_budget() {
         let cmap = cmap_of(&[(3, 10, groups_table(12, &[(0x41, 0x43, 1), (0x45, 0x46, 9)]))]);
@@ -555,8 +631,9 @@ mod tests {
         assert_eq!(walk_with(u64::MAX), (all.clone(), 7, false));
         assert_eq!(walk_with(6), (all[..4].to_vec(), 6, true));
         assert_eq!(walk_with(5), (all[..3].to_vec(), 5, true));
-        assert_eq!(walk_with(4), (all[..3].to_vec(), 4, true));
-        assert_eq!(walk_with(2), (all[..1].to_vec(), 2, true));
+        assert_eq!(walk_with(4), (all[..2].to_vec(), 4, true));
+        assert_eq!(walk_with(3), (all[..1].to_vec(), 3, true));
+        assert_eq!(walk_with(2), (Vec::new(), 2, true));
         assert_eq!(walk_with(1), (Vec::new(), 1, true));
         assert_eq!(walk_with(0), (Vec::new(), 0, true));
         let bmp = cmap_of(&[(
@@ -565,16 +642,86 @@ mod tests {
             segments_table(&[(0x41, 0x43, 0, 0), (0x45, 0x45, 0, 0)], &[]),
         )]);
         let mut pairs = Vec::new();
-        let walk = enumerate(&bmp, LIMIT, 3, |cp, glyph| pairs.push((cp, glyph)));
+        let walk = enumerate(&bmp, LIMIT, 4, |cp, glyph| pairs.push((cp, glyph)));
         assert_eq!(
             (pairs, walk.steps(), walk.cut),
-            (vec![(0x41, 0x41), (0x42, 0x42)], 3, true)
+            (vec![(0x41, 0x41), (0x42, 0x42)], 4, true)
         );
+    }
+
+    /// #725: the walk took unsorted groups in turn, so it gave this face
+    /// U+0050 to U+0060, but the lookup's binary search reads the middle
+    /// group (U+0010 to U+0020) first, goes above it and never reaches
+    /// the first group: U+0055 maps to nothing, and `resolve` drew it as
+    /// `.notdef` from this face. The walk follows that search, so it
+    /// claims exactly what the lookup (and swash's) finds. So it does for
+    /// format-4 segments.
+    #[test]
+    fn unsorted_records_claim_only_what_the_lookup_finds() {
+        let groups = cmap_of(&[(
+            3,
+            10,
+            groups_table(
+                12,
+                &[(0x50, 0x60, 1), (0x10, 0x20, 0x20), (0x30, 0x40, 0x40)],
+            ),
+        )]);
+        let segments = cmap_of(&[(
+            3,
+            1,
+            segments_table(
+                &[
+                    (0x50, 0x60, 0, 0),
+                    (0x10, 0x20, 0x10, 0),
+                    (0x30, 0x40, 0x10, 0),
+                ],
+                &[],
+            ),
+        )]);
+        for cmap in [groups, segments] {
+            let (pairs, walk) = ours(&cmap);
+            let expected: Vec<(u32, u16)> = (0x10..=0x20)
+                .chain(0x30..=0x40)
+                .map(|cp| (cp, u16::try_from(cp + 0x10).expect("small")))
+                .collect();
+            assert_eq!(pairs, expected);
+            assert_eq!(walk.records, 3);
+            assert_eq!(our_map(&cmap, &[0x50, 0x55, 0x60]), [0, 0, 0]);
+            assert_eq!(swash_map(&cmap, &[0x50, 0x55, 0x60]), [0, 0, 0]);
+            let walked: Vec<u32> = pairs.iter().map(|&(cp, _)| cp).collect();
+            let glyphs: Vec<u16> = pairs.iter().map(|&(_, glyph)| glyph).collect();
+            assert_eq!(our_map(&cmap, &walked), glyphs);
+        }
+    }
+
+    /// #725: a group that ends before it starts sends the code points
+    /// below its start to the records below it and those at or above its
+    /// start (not merely above its end) to the records above: the last
+    /// group, U+0040 to U+0045, lies below the reversed group's start
+    /// (U+0050), so the lookup never reaches it, and the walk must not
+    /// claim it either.
+    #[test]
+    fn a_reversed_group_sends_only_code_points_from_its_start_above_it() {
+        let cmap = cmap_of(&[(
+            3,
+            10,
+            groups_table(12, &[(0x10, 0x20, 1), (0x50, 0x30, 9), (0x40, 0x45, 0x100)]),
+        )]);
+        let (pairs, walk) = ours(&cmap);
+        let expected: Vec<(u32, u16)> = (0x10..=0x20)
+            .map(|cp| (cp, u16::try_from(cp - 0xF).expect("small")))
+            .collect();
+        assert_eq!(pairs, expected, "U+0040 to U+0045 must not be claimed");
+        assert_eq!(walk.records, 3);
+        let probes = [0x3F, 0x40, 0x42, 0x45, 0x50];
+        assert_eq!(our_map(&cmap, &probes), [0; 5]);
+        assert_eq!(swash_map(&cmap, &probes), [0; 5]);
     }
 
     /// #689: a group reaching `u32::MAX` is cut at the code space, and the
     /// most groups a 2 MiB `cmap` holds, all overlapping, cost one walk of
-    /// the code space plus one step per group.
+    /// the code space: the lookup's first group (#725: the walk follows
+    /// its binary search) takes every code point, so no other is read.
     #[test]
     fn overlapping_groups_reaching_u32_max_cost_one_walk_of_the_code_space() {
         let count = (2 << 20) / 12;
@@ -590,7 +737,7 @@ mod tests {
             walk,
             Walk {
                 code_points: u64::from(LIMIT),
-                records: count as u64,
+                records: 1,
                 cut: false,
             }
         );
@@ -600,7 +747,7 @@ mod tests {
     }
 
     /// #689: so do the most format-4 segments, all overlapping: one walk
-    /// of the BMP plus one step per segment.
+    /// of the BMP, from the lookup's first segment.
     #[test]
     fn overlapping_format4_segments_cost_one_walk_of_the_bmp() {
         let count = 0x7FFF;
@@ -610,7 +757,7 @@ mod tests {
             walk,
             Walk {
                 code_points: 0x1_0000,
-                records: count as u64,
+                records: 1,
                 cut: false,
             }
         );
@@ -721,6 +868,124 @@ mod tests {
             })
     }
 
+    /// A hostile `cmap` of one subtable, and code points to probe it at.
+    #[derive(Debug, Clone)]
+    struct Hostile {
+        cmap: Vec<u8>,
+        /// At and around each record's edges, and in U+0000 to U+00FF for
+        /// those in U+F000 to U+F0FF.
+        probes: Vec<u32>,
+        format12: bool,
+        /// The format's high byte.
+        high: u8,
+        /// A (3, 0) symbol record.
+        symbol: bool,
+    }
+
+    /// Hostile tables: format-12 groups or format-4 segments unsorted and
+    /// overlapping, some ending before they start, a record count past
+    /// the data, the format's high byte set, a Unicode or a symbol
+    /// record; the glyph offsets kept where swash's debug arithmetic does
+    /// not overflow.
+    fn hostile() -> impl Strategy<Value = Hostile> {
+        (
+            prop::collection::vec(
+                (
+                    prop_oneof![
+                        0_u32..0x200,
+                        0xF000_u32..0xF100,
+                        0xFF00_u32..0x1_0100,
+                        any::<u32>()
+                    ],
+                    prop_oneof![0_u32..0x100, any::<u32>()],
+                    any::<bool>(),
+                    any::<u32>(),
+                )
+                    .prop_map(|(start, len, back, glyph)| {
+                        let end = if back {
+                            start.saturating_sub(len)
+                        } else {
+                            start.saturating_add(len)
+                        };
+                        (start, end, glyph.min(u32::MAX - end.saturating_sub(start)))
+                    }),
+                0..12,
+            ),
+            prop::collection::vec(
+                (
+                    prop_oneof![
+                        0_u16..0x200,
+                        0xF000_u16..0xF100,
+                        0xFF00_u16..=0xFFFF,
+                        any::<u16>()
+                    ],
+                    prop_oneof![0_u16..0x40, any::<u16>()],
+                    any::<bool>(),
+                    any::<u16>(),
+                    prop_oneof![Just(0_u16), 0_u16..200, any::<u16>()],
+                )
+                    .prop_map(|(start, len, back, delta, range)| {
+                        let end = if back {
+                            start.saturating_sub(len)
+                        } else {
+                            start.saturating_add(len)
+                        };
+                        (start, end, delta, range)
+                    }),
+                0..12,
+            ),
+            prop::collection::vec(any::<u16>(), 0..32),
+            any::<bool>(),
+            prop_oneof![Just(0_u8), any::<u8>()],
+            0_u16..3,
+            prop::sample::select(vec![(3_u16, 0_u16), (3, 1), (3, 10), (0, 4)]),
+        )
+            .prop_map(
+                |(groups, segments, glyphs, format12, high, extra, record)| {
+                    let mut table = if format12 {
+                        let mut table = groups_table(12, &groups);
+                        let count = u32::try_from(groups.len()).expect("small") + u32::from(extra);
+                        table[12..16].copy_from_slice(&count.to_be_bytes());
+                        table
+                    } else {
+                        let mut table = segments_table(&segments, &glyphs);
+                        let seg_x2 = u16::try_from(segments.len() * 2).expect("small") + 2 * extra;
+                        table[6..8].copy_from_slice(&seg_x2.to_be_bytes());
+                        table
+                    };
+                    table[0] = high;
+                    let cmap = cmap_of(&[(record.0, record.1, table)]);
+                    let edges: Vec<(u32, u32)> = if format12 {
+                        groups
+                            .iter()
+                            .map(|&(start, end, _)| (start, end.max(start)))
+                            .collect()
+                    } else {
+                        segments
+                            .iter()
+                            .map(|&(start, end, _, _)| {
+                                (u32::from(start), u32::from(end.max(start)))
+                            })
+                            .collect()
+                    };
+                    let mut probes = probes(edges);
+                    let symbol: Vec<u32> = probes
+                        .iter()
+                        .filter(|cp| (0xF000..=0xF0FF).contains(*cp))
+                        .map(|cp| cp - 0xF000)
+                        .collect();
+                    probes.extend(symbol);
+                    Hostile {
+                        cmap,
+                        probes,
+                        format12,
+                        high,
+                        symbol: record == (3, 0),
+                    }
+                },
+            )
+    }
+
     proptest! {
         /// For a well-formed format-12 table the walk yields swash's pairs
         /// below the code space.
@@ -758,77 +1023,52 @@ mod tests {
             prop_assert_eq!(our_map(&cmap, &probes), swash_map(&cmap, &probes));
         }
 
-        /// #716: for hostile tables (groups or segments unsorted and
-        /// overlapping, a record count past the data, the format's high
-        /// byte set, a Unicode or a symbol record), [`map`] gives what
-        /// swash's `map` gives, the glyph offsets kept where swash's debug
-        /// arithmetic does not overflow.
+        /// #716: for hostile tables ([`hostile`]), [`map`] gives what
+        /// swash's `map` gives.
         #[test]
-        fn hostile_map_matches_swash(
-            groups in prop::collection::vec(
-                (
-                    prop_oneof![0_u32..0x200, 0xF000_u32..0xF100, 0xFF00_u32..0x1_0100, any::<u32>()],
-                    prop_oneof![0_u32..0x100, any::<u32>()],
-                    any::<bool>(),
-                    any::<u32>(),
-                )
-                    .prop_map(|(start, len, back, glyph)| {
-                        let end = if back { start.saturating_sub(len) } else { start.saturating_add(len) };
-                        (start, end, glyph.min(u32::MAX - end.saturating_sub(start)))
-                    }),
-                0..12,
-            ),
-            segments in prop::collection::vec(
-                (
-                    prop_oneof![0_u16..0x200, 0xF000_u16..0xF100, 0xFF00_u16..=0xFFFF, any::<u16>()],
-                    prop_oneof![0_u16..0x40, any::<u16>()],
-                    any::<bool>(),
-                    any::<u16>(),
-                    prop_oneof![Just(0_u16), 0_u16..200, any::<u16>()],
-                )
-                    .prop_map(|(start, len, back, delta, range)| {
-                        let end = if back { start.saturating_sub(len) } else { start.saturating_add(len) };
-                        (start, end, delta, range)
-                    }),
-                0..12,
-            ),
-            glyphs in prop::collection::vec(any::<u16>(), 0..32),
-            format12 in any::<bool>(),
-            high in prop_oneof![Just(0_u8), any::<u8>()],
-            extra in 0_u16..3,
-            record in prop::sample::select(vec![(3_u16, 0_u16), (3, 1), (3, 10), (0, 4)]),
-            code_point in any::<u32>(),
-        ) {
-            let mut table = if format12 {
-                let mut table = groups_table(12, &groups);
-                let count = u32::try_from(groups.len()).expect("small") + u32::from(extra);
-                table[12..16].copy_from_slice(&count.to_be_bytes());
-                table
-            } else {
-                let mut table = segments_table(&segments, &glyphs);
-                let seg_x2 = u16::try_from(segments.len() * 2).expect("small") + 2 * extra;
-                table[6..8].copy_from_slice(&seg_x2.to_be_bytes());
-                table
-            };
-            table[0] = high;
-            let cmap = cmap_of(&[(record.0, record.1, table)]);
-            let edges: Vec<(u32, u32)> = if format12 {
-                groups.iter().map(|&(start, end, _)| (start, end.max(start))).collect()
-            } else {
-                segments
-                    .iter()
-                    .map(|&(start, end, _, _)| (u32::from(start), u32::from(end.max(start))))
-                    .collect()
-            };
-            let mut probes = probes(edges);
-            let symbol: Vec<u32> = probes
-                .iter()
-                .filter(|cp| (0xF000..=0xF0FF).contains(*cp))
-                .map(|cp| cp - 0xF000)
-                .collect();
-            probes.extend(symbol);
+        fn hostile_map_matches_swash(hostile in hostile(), code_point in any::<u32>()) {
+            let mut probes = hostile.probes;
             probes.push(code_point);
-            prop_assert_eq!(our_map(&cmap, &probes), swash_map(&cmap, &probes));
+            prop_assert_eq!(our_map(&hostile.cmap, &probes), swash_map(&hostile.cmap, &probes));
+        }
+
+        /// #725: for hostile tables ([`hostile`]), the walk yields a
+        /// non-zero glyph for a code point exactly where [`map`] gives
+        /// that glyph, in rising order, at and around each record's edges
+        /// and at every walked code point (a sample of them when there
+        /// are many), but for [`enumerate`]'s documented exceptions:
+        /// format 4 at U+FFFF, which `map` never maps; a format with its
+        /// high byte set, which the walk reads as nothing; and a symbol
+        /// subtable's retry of U+0000 to U+00FF at U+F000 to U+F0FF.
+        #[test]
+        fn hostile_walk_matches_map(hostile in hostile(), code_point in 0_u32..LIMIT) {
+            let cmap = &hostile.cmap;
+            let pairs = ours(cmap).0;
+            prop_assert!(pairs.windows(2).all(|w| w[0].0 < w[1].0), "rising: {:?}", pairs);
+            if hostile.high != 0 {
+                prop_assert_eq!(pairs, Vec::new());
+                return Ok(());
+            }
+            let walked = |cp: u32| {
+                pairs
+                    .binary_search_by_key(&cp, |&(cp, _)| cp)
+                    .map_or(0, |i| pairs[i].1)
+            };
+            let stride = pairs.len() / 1024 + 1;
+            let mut probes: Vec<u32> = pairs.iter().step_by(stride).map(|&(cp, _)| cp).collect();
+            probes.extend(hostile.probes.iter().filter(|&&cp| cp < LIMIT));
+            probes.push(code_point);
+            for cp in probes {
+                let ours = walked(cp);
+                let theirs = map(cmap, cp);
+                if !hostile.format12 && cp == 0xFFFF {
+                    prop_assert_eq!(theirs, 0, "format 4 never maps U+FFFF");
+                } else if hostile.symbol && cp <= 0xFF && ours == 0 {
+                    prop_assert_eq!(theirs, walked(cp + 0xF000), "U+{:04X} retried", cp);
+                } else {
+                    prop_assert_eq!(theirs, ours, "U+{:04X}", cp);
+                }
+            }
         }
 
         /// #716: a walk with a step budget takes exactly the budget's steps
@@ -869,7 +1109,7 @@ mod tests {
                 last = Some(cp);
             });
             prop_assert!(walk.code_points <= u64::from(LIMIT));
-            prop_assert_eq!(walk.records, groups.len() as u64);
+            prop_assert!(walk.records <= groups.len() as u64);
         }
 
         /// Any bytes: no panic, and at most one walk of the code space;
