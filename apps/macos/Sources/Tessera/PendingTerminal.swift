@@ -31,6 +31,10 @@ final class PendingTerminal: NSObject, NSWindowDelegate {
     /// fast typist enters in the longest spawn wait (about 10 s, S5); keys
     /// past it are dropped, newest first, and counted.
     static let maxTypedKeys = 256
+    /// Clipboard writes a closed tab left unseen while this tab was the one
+    /// its tab bar selected (#763): its pane gets them once its session
+    /// runs. One notice, however many tabs close.
+    private(set) var clipboardNotice: ClipboardNoticeThrottle.Notice?
 
     init(window: TerminalWindow) {
         self.window = window
@@ -61,6 +65,17 @@ final class PendingTerminal: NSObject, NSWindowDelegate {
     func takeTyped() -> [NSEvent] {
         defer { dropTyped() }
         return typed
+    }
+
+    /// Counts a closed tab's unseen clipboard writes into ``clipboardNotice``.
+    func holdClipboardNotice(_ notice: ClipboardNoticeThrottle.Notice) {
+        clipboardNotice = clipboardNotice?.adding(notice) ?? notice
+    }
+
+    /// Takes ``clipboardNotice``.
+    func takeClipboardNotice() -> ClipboardNoticeThrottle.Notice? {
+        defer { clipboardNotice = nil }
+        return clipboardNotice
     }
 
     /// Forgets the typed keys (the window closed or its session failed).

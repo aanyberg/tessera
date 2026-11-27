@@ -436,8 +436,10 @@ not).
   those writes to the pane the user is left with (#763): within the tab,
   the pane the focus moves to; with the tab's last pane, the tab its tab
   bar selects next, else the selected tab of the frontmost window that is
-  not minimised, else of any terminal window. There the writes count
-  into that pane's notice under the same rules (one a second, held while
+  not minimised, else of any terminal window. A tab whose session is
+  still starting (its placeholder) keeps them for its pane, or passes
+  them on by the same rules if it closes or fails to start first. There
+  the writes count into that pane's notice under the same rules (one a second, held while
   hidden) and say where they came from ("A program in a closed pane
   copied 5 bytes to the clipboard"; "Programs here and in a closed pane
   …" when that pane wrote too). When no terminal window is left (the last

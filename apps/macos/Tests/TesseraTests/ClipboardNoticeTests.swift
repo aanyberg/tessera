@@ -439,6 +439,82 @@ final class ClipboardNoticeTests: XCTestCase {
         XCTAssertEqual(kept.clipboardNotice.shownCount, 1, "shown as the window is")
     }
 
+    /// A tab of `window` opened as ⌘T opens it, whose session starts in
+    /// the background and, through `program` (a symlink of this test's),
+    /// only after `delay`: it shows its placeholder meanwhile.
+    private func openStartingTab(
+        in window: NSWindow?, program: URL, delay: UInt64, completion: @escaping @MainActor (Bool) -> Void
+    ) throws -> NSWindow {
+        guard TesseraTestsCoreTestHooksLinked() else {
+            throw XCTSkip("the test host does not export the core's test hooks (a core built without test-hooks)")
+        }
+        XCTAssertEqual(tessera_test_delay_program_lookup(program.path, delay), 0)
+        appDelegate.spawnOptions = .init(program: program.path, arguments: ["-c", "echo kept; exec cat"])
+        let background = appDelegate.spawnsInBackground
+        appDelegate.spawnsInBackground = true
+        defer { appDelegate.spawnsInBackground = background }
+        let tab = try XCTUnwrap(appDelegate.openTab(in: window) { completion((try? $0.get()) != nil) })
+        XCTAssertEqual(appDelegate.pendingTerminals.count, 1, "starting")
+        return tab
+    }
+
+    private func symlink(to target: String) throws -> URL {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("tessera-osc52-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let link = dir.appendingPathComponent("sh")
+        try FileManager.default.createSymbolicLink(atPath: link.path, withDestinationPath: target)
+        addTeardownBlock {
+            _ = tessera_test_delay_program_lookup(link.path, 0)
+            try? FileManager.default.removeItem(at: dir)
+        }
+        return link
+    }
+
+    func testAWriteFromATabThatExitsWaitsForTheStartingTabItsTabBarSelects() async throws {
+        appDelegate.spawnOptions = .init(program: "/bin/sh", arguments: ["-c", "echo ready; read go; \(Self.hello)"])
+        let writer = try appDelegate.newWindow()
+        let writing = onScreen(writer.focusedPane.view)
+        try await waitUntil("the child is ready") { try writing.session.accessibleText().string.contains("ready") }
+        var started: Bool?
+        let tab = try openStartingTab(in: writer.window, program: try symlink(to: "/bin/sh"), delay: 3000) {
+            started = $0
+        }
+        try await waitUntil("the starting tab is selected") { writer.window?.tabGroup?.selectedWindow === tab }
+        try writing.session.write(Array("\n".utf8))
+        try await waitUntil("the writing tab closes") { !appDelegate.windowControllers.contains { $0 === writer } }
+        XCTAssertEqual(pasteboard.string(forType: .string), "hello")
+        try await waitUntil("the starting tab runs", seconds: 15) { started != nil }
+        XCTAssertEqual(started, true)
+        let controller = try XCTUnwrap(appDelegate.windowControllers.first)
+        XCTAssertIdentical(controller.window, tab)
+        let view = controller.focusedPane.view
+        XCTAssertEqual(view.clipboardNotice.throttle.held, .init(writes: 1, bytes: 5, closedWrites: 1), "held until shown")
+        onScreen(view)
+        XCTAssertEqual(view.clipboardNotice.shownCount, 1, "shown on the tab the user is left with")
+        XCTAssertEqual(view.clipboardNotice.view?.text, "A program in a closed pane copied 5 bytes to the clipboard")
+    }
+
+    func testAStartingSuccessorThatFailsToStartPassesTheWritesOn() async throws {
+        let other = try openTab("echo kept")
+        appDelegate.spawnOptions = .init(program: "/bin/sh", arguments: ["-c", "echo ready; read go; \(Self.hello)"])
+        let writer = try appDelegate.newWindow()
+        let writing = onScreen(writer.focusedPane.view)
+        try await waitUntil("the child is ready") { try writing.session.accessibleText().string.contains("ready") }
+        // Its program is missing: its session never runs.
+        let missing = try symlink(to: "/nonexistent-\(UUID().uuidString)")
+        var started: Bool?
+        let tab = try openStartingTab(in: writer.window, program: missing, delay: 2000) { started = $0 }
+        try await waitUntil("the starting tab is selected") { writer.window?.tabGroup?.selectedWindow === tab }
+        try writing.session.write(Array("\n".utf8))
+        try await waitUntil("the writing tab closes") { !appDelegate.windowControllers.contains { $0 === writer } }
+        try await Task.sleep(for: .milliseconds(200))
+        XCTAssertEqual(other.clipboardNotice.shownCount, 0, "kept for the starting tab")
+        try await waitUntil("the starting tab fails", seconds: 15) { started != nil }
+        XCTAssertEqual(started, false)
+        try await waitUntil("the writes go on to the window left") { other.clipboardNotice.shownCount == 1 }
+        XCTAssertEqual(other.clipboardNotice.lastShown, .init(writes: 1, bytes: 5, closedWrites: 1))
+    }
+
     func testANoticeSeenInFullDoesNotMoveWhenItsPaneCloses() async throws {
         let remaining = try openTab("echo kept")
         let controller = try XCTUnwrap(appDelegate.windowControllers.first)
