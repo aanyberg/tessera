@@ -18,7 +18,9 @@ fn state(term: &Terminal) -> (String, Vec<tessera_grid::Line>, bool, bool, bool)
     let grid = term.grid();
     (
         format!("{grid:?}"),
-        grid.logical_lines().cloned().collect(),
+        grid.logical_lines()
+            .map(tessera_grid::LineRef::into_owned)
+            .collect(),
         term.auto_wrap(),
         term.insert_mode(),
         term.c1_8bit_replies(),

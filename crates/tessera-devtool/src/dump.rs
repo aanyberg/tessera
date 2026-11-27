@@ -30,7 +30,7 @@
 
 use std::fmt::Write as _;
 
-use tessera_grid::{Cell, CellFlags, Color, Grid, Line, Style, UnderlineStyle};
+use tessera_grid::{Cell, CellFlags, Color, Grid, Line, LineRef, Style, UnderlineStyle};
 
 /// How a dump is rendered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -111,7 +111,7 @@ pub fn ansi_with(grid: &Grid, options: DumpOptions) -> String {
                 push_sgr(&mut out, style);
                 current = style;
             }
-            out.push_str(&cell_text(line, col, cell));
+            out.push_str(&cell_text(&line, col, cell));
         }
         out.push_str("\x1b[0m\n");
     }
@@ -140,7 +140,7 @@ pub fn text_with(grid: &Grid, options: DumpOptions) -> String {
             .cells
             .iter()
             .enumerate()
-            .map(|(col, cell)| cell_text(line, col, cell))
+            .map(|(col, cell)| cell_text(&line, col, cell))
             .collect();
         if options.cursor && row == Row::Screen(cursor.row) {
             let at = (usize::from(cursor.col) + 1).min(pieces.len());
@@ -186,7 +186,7 @@ pub fn cells_with(grid: &Grid, options: DumpOptions) -> String {
     for (row, line) in rows(grid, options) {
         let label = row.label();
         for (col, cell) in line.cells.iter().enumerate() {
-            let text = cell_text(line, col, cell);
+            let text = cell_text(&line, col, cell);
             let text = if text.is_empty() { " " } else { &text };
             // Writing to a `String` cannot fail.
             let _ = write!(
@@ -229,7 +229,7 @@ impl Row {
 
 /// The lines a dump covers, top to bottom: the scrollback (oldest first)
 /// when asked for, then the visible rows.
-fn rows(grid: &Grid, options: DumpOptions) -> impl Iterator<Item = (Row, &Line)> {
+fn rows(grid: &Grid, options: DumpOptions) -> impl Iterator<Item = (Row, LineRef<'_>)> {
     let history_len = if options.scrollback {
         grid.scrollback_len()
     } else {
@@ -241,7 +241,7 @@ fn rows(grid: &Grid, options: DumpOptions) -> impl Iterator<Item = (Row, &Line)>
     });
     let screen = (0..grid.rows())
         .zip(grid.visible_lines())
-        .map(|(row, line)| (Row::Screen(row), line));
+        .map(|(row, line)| (Row::Screen(row), LineRef::borrowed(line)));
     history.chain(screen)
 }
 

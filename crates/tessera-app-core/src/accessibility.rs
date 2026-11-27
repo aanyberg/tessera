@@ -36,7 +36,7 @@
 //!
 //! [`App::accessible_text`]: crate::App::accessible_text
 
-use std::ops::Range;
+use std::ops::{Deref, Range};
 
 use tessera_grid::{Cell, GraphemeTable, Line, Point};
 use tessera_render::{Selection as Highlight, SelectionKind};
@@ -130,7 +130,7 @@ impl Capture {
         capture
     }
 
-    fn copy<'a>(&mut self, lines: impl Iterator<Item = &'a Line>) {
+    fn copy<L: Deref<Target = Line>>(&mut self, lines: impl Iterator<Item = L>) {
         let cols = self.cols;
         for line in lines {
             let src = &line.cells[..line.cells.len().min(cols)];

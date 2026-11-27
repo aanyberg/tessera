@@ -48,7 +48,7 @@ fn only_cells_written_while_a_link_is_open_carry_it() {
     assert_eq!((link.uri(), link.id()), ("https://a.bc/", Some("k")));
     assert!(link.same_link(grid.line(0).unwrap().hyperlink(3).unwrap()));
     assert!(grid.hyperlink().is_none());
-    assert_eq!(grid.hyperlink_at(0, 2), Some(link));
+    assert_eq!(grid.hyperlink_at(0, 2).as_ref(), Some(link));
     assert_eq!(grid.hyperlink_at(0, 4), None);
     grid.check_invariants();
 }
@@ -247,7 +247,7 @@ fn links_scroll_into_history_and_are_freed_when_it_evicts_them() {
     }
     assert_eq!(grid.scrollback_len(), 1);
     assert_eq!(
-        grid.hyperlink_at(0, 1).map(Hyperlink::uri),
+        grid.hyperlink_at(0, 1).as_ref().map(Hyperlink::uri),
         Some("https://a.bc/")
     );
     assert_eq!(grid.live_hyperlinks(), 1);
@@ -541,7 +541,7 @@ fn a_trailing_linked_space_does_not_add_a_row_when_narrowing() {
         grid.check_invariants();
         // `ab` stays one row: its trailing spaces are dropped, linked or
         // not, so `cd` is the next row.
-        let rows: Vec<String> = grid.logical_lines().map(tessera_grid::Line::text).collect();
+        let rows: Vec<String> = grid.logical_lines().map(|line| line.text()).collect();
         assert_eq!(rows[..2], ["ab", "cd"], "linked spaces: {linked_space}");
         assert_eq!(logical_text(&grid)[..2], ["ab", "cd"]);
     }

@@ -85,7 +85,7 @@ use std::time::Instant;
 
 use tessera_config::{CompiledRule, RuleCheck};
 pub use tessera_grid::Point;
-use tessera_grid::{Cell, Color, DamageRows, Grid, Line};
+use tessera_grid::{Cell, Color, DamageRows, Grid, Line, LineRef};
 use tessera_render::{Overlay, OverlayKind, Selection as Highlight};
 use tessera_term::ThemeColors;
 
@@ -178,7 +178,7 @@ impl<'a> Lines<'a> {
     }
 
     /// Line `n`, if it is selectable.
-    fn line(&self, n: i64) -> Option<&'a Line> {
+    fn line(&self, n: i64) -> Option<LineRef<'a>> {
         if n < self.first || n > self.last() {
             return None;
         }
@@ -186,8 +186,11 @@ impl<'a> Lines<'a> {
     }
 
     /// The cell at `pos`.
-    fn cell(&self, pos: Pos) -> Option<&'a Cell> {
-        self.line(pos.line)?.cells.get(usize::from(pos.col))
+    fn cell(&self, pos: Pos) -> Option<Cell> {
+        self.line(pos.line)?
+            .cells
+            .get(usize::from(pos.col))
+            .copied()
     }
 
     /// The number of the view's top row at scroll `offset` (clamped as the
@@ -386,11 +389,11 @@ fn word_at(lines: &Lines<'_>, pos: Pos) -> Option<(Pos, Pos)> {
     if last.is_none_or(|last| at > last) {
         return None;
     }
-    let class = class_of(lines.cell(at)?);
+    let class = class_of(&lines.cell(at)?);
     if class == Class::Other {
         return Some((at, lines.char_end(at)));
     }
-    let same = |p: &Pos| lines.cell(*p).is_some_and(|c| class_of(c) == class);
+    let same = |p: &Pos| lines.cell(*p).is_some_and(|c| class_of(&c) == class);
     let mut start = at;
     while let Some(p) = lines.prev_char(start).filter(same) {
         start = p;
@@ -999,8 +1002,8 @@ impl Guard {
         for (i, n) in (self.first..=last).enumerate() {
             let Some(line) = lines.line(n) else { break };
             match self.lines.get_mut(i) {
-                Some(kept) => kept.clone_from(line),
-                None => self.lines.push(line.clone()),
+                Some(kept) => kept.clone_from(&line),
+                None => self.lines.push(line.into_owned()),
             }
         }
     }
@@ -1060,7 +1063,7 @@ impl Guard {
             || self.lines.iter().zip(self.first..).all(|(kept, n)| {
                 n < lines.first
                     || n >= lines.top
-                    || lines.line(n).is_some_and(|line| same(line, kept))
+                    || lines.line(n).is_some_and(|line| same(&line, kept))
             });
         let holds = history_holds
             && (0..lines.rows).all(|row| {
@@ -1521,7 +1524,7 @@ enum Piece<'a> {
 /// the rows up to the last one the trimmed text has a cell on (text
 /// follows the row's first selected cell on its logical line), and none
 /// after it (`trim_trailing_whitespace = false`, ADR 0042).
-fn walk<'a>(lines: &Lines<'a>, sel: &Sel, trim: bool, mut emit: impl FnMut(Piece<'a>) -> bool) {
+fn walk(lines: &Lines<'_>, sel: &Sel, trim: bool, mut emit: impl FnMut(Piece<'_>) -> bool) {
     let columns = |n: i64| {
         if sel.block {
             (sel.start.col, sel.end.col)
@@ -1734,17 +1737,16 @@ fn hidden_url_end(text: &str) -> Option<char> {
 /// Whether a cell of `cells` hides a URL end ([`url_char`] differs from
 /// its base scalar).
 fn hides_url_end(lines: &Lines<'_>, cells: &[Pos]) -> bool {
-    let mut row: Option<(i64, &Line)> = None;
+    let mut row: Option<(i64, LineRef<'_>)> = None;
     cells.iter().any(|&p| {
-        let line = match row {
-            Some((n, line)) if n == p.line => line,
-            _ => match lines.line(p.line) {
-                Some(line) => {
-                    row = Some((p.line, line));
-                    line
-                }
+        if row.as_ref().is_none_or(|(n, _)| *n != p.line) {
+            match lines.line(p.line) {
+                Some(line) => row = Some((p.line, line)),
                 None => return false,
-            },
+            }
+        }
+        let Some((_, line)) = &row else {
+            return false;
         };
         line.cells.get(usize::from(p.col)).is_some_and(|cell| {
             cell.is_cluster()
@@ -1806,7 +1808,7 @@ fn hidden_end_can_link(lines: &Lines<'_>, chars: &[char], cells: &[Pos], index: 
 /// character (a cell that hides a URL end is found later, see
 /// [`link_with_reach`]). `row` is the line of `pos` and moves along with
 /// it, so the walk looks a line up once per row, not once per cell.
-fn prev_url_char<'a>(lines: &Lines<'a>, row: &mut &'a Line, pos: Pos) -> Option<(Pos, char)> {
+fn prev_url_char<'a>(lines: &Lines<'a>, row: &mut LineRef<'a>, pos: Pos) -> Option<(Pos, char)> {
     let mut pos = pos;
     loop {
         if pos.col == 0 {
@@ -1830,7 +1832,7 @@ fn prev_url_char<'a>(lines: &Lines<'a>, row: &mut &'a Line, pos: Pos) -> Option<
 
 /// The character after `pos`, as [`Lines::next_char`] finds it; otherwise
 /// as [`prev_url_char`].
-fn next_url_char<'a>(lines: &Lines<'a>, row: &mut &'a Line, pos: Pos) -> Option<(Pos, char)> {
+fn next_url_char<'a>(lines: &Lines<'a>, row: &mut LineRef<'a>, pos: Pos) -> Option<(Pos, char)> {
     let mut pos = Pos {
         col: pos.col + 1,
         ..pos
@@ -1869,13 +1871,13 @@ fn next_url_char<'a>(lines: &Lines<'a>, row: &mut &'a Line, pos: Pos) -> Option<
 fn window(lines: &Lines<'_>, at: Pos, reach: usize) -> Option<(Vec<char>, Vec<Pos>, usize)> {
     let at = lines.char_at(at)?;
     let line = lines.line(at.line)?;
-    let here = url_char(line, at.col, lines.cell(at)?);
+    let here = url_char(&line, at.col, &lines.cell(at)?);
     if !url::is_url_char(here) {
         return None;
     }
     // Back to the run's start, noting a `:`.
     let (mut cells, mut chars) = (Vec::new(), Vec::new());
-    let (mut pos, mut row, mut colon) = (at, line, here == ':');
+    let (mut pos, mut row, mut colon) = (at, line.clone(), here == ':');
     while cells.len() < reach {
         let Some((prev, c)) = prev_url_char(lines, &mut row, pos) else {
             break;
@@ -1887,7 +1889,7 @@ fn window(lines: &Lines<'_>, at: Pos, reach: usize) -> Option<(Vec<char>, Vec<Po
     }
     let back = cells.len();
     if !colon {
-        let (mut pos, mut row) = (at, line);
+        let (mut pos, mut row) = (at, line.clone());
         let found = (0..url::COLON_REACH).any(|_| match next_url_char(lines, &mut row, pos) {
             Some((next, c)) => {
                 pos = next;
@@ -1928,7 +1930,8 @@ pub(crate) fn link_at(grid: &Grid, offset: usize, at: Point) -> Option<Link> {
 fn osc8_link(grid: &Grid, offset: usize, at: Point) -> Option<Link> {
     let lines = Lines::of(grid);
     let pos = lines.exact(offset, at)?;
-    let link = lines.line(pos.line)?.hyperlink(usize::from(pos.col))?;
+    let row = lines.line(pos.line)?;
+    let link = row.hyperlink(usize::from(pos.col))?;
     let top = lines.view_top(offset);
     let mut span: Vec<(u16, Range<u16>)> = Vec::new();
     for row in 0..lines.rows {
@@ -1994,7 +1997,7 @@ fn link_with_reach(grid: &Grid, offset: usize, at: Point, reach: usize) -> Optio
         if let Some(line) = lines.line(p.line)
             && let Some(cell) = line.cells.get(usize::from(p.col))
         {
-            *c = url_char(line, p.col, cell);
+            *c = url_char(&line, p.col, cell);
         }
     }
     let span = url::url_at(&chars, index)?;
@@ -2024,7 +2027,9 @@ fn link_of(lines: &Lines<'_>, offset: usize, cells: &[Pos]) -> Option<(Link, boo
     for &p in cells {
         let line = lines.line(p.line)?;
         match line.cluster(usize::from(p.col)) {
-            Some(cluster) if lines.cell(p).is_some_and(Cell::is_cluster) => text.push_str(cluster),
+            Some(cluster) if lines.cell(p).is_some_and(|c| c.is_cluster()) => {
+                text.push_str(cluster);
+            }
             _ => text.push(lines.cell(p)?.ch),
         }
         let row = p.line - top;
@@ -2279,7 +2284,7 @@ mod tests {
             .iter()
             .map(|&p| {
                 let line = lines.line(p.line).expect("a line");
-                url_char(line, p.col, lines.cell(p).expect("a cell"))
+                url_char(&line, p.col, &lines.cell(p).expect("a cell"))
             })
             .collect();
         let span = url::url_at(&chars, index)?;
@@ -3013,7 +3018,7 @@ mod tests {
                 let open = last == lines.last() && lines.line(last).is_some_and(|l| l.wrapped);
                 let rows = (sel.start.line..=last)
                     .filter(|&n| n >= lines.top - 1)
-                    .filter_map(|n| Some((n, lines.line(n)?.clone())))
+                    .filter_map(|n| Some((n, lines.line(n)?.into_owned())))
                     .collect();
                 (rows, last, open)
             };

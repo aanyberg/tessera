@@ -413,7 +413,11 @@ fn logical_texts(grid: &Grid) -> Vec<String> {
 /// Each logical line as its glyphs (one per non-spacer cell), each with
 /// whether it is a default blank.
 fn logical_units(grid: &Grid) -> Vec<Vec<(String, bool)>> {
-    let lines: Vec<&Line> = grid.logical_lines().collect();
+    let owned: Vec<Line> = grid
+        .logical_lines()
+        .map(tessera_grid::LineRef::into_owned)
+        .collect();
+    let lines: Vec<&Line> = owned.iter().collect();
     logical_units_of(&lines)
 }
 
@@ -455,7 +459,11 @@ fn row_units(line: &Line, next: Option<&Line>) -> Vec<(String, bool)> {
 /// index of the glyph under it (a spacer counts as its wide character),
 /// plus one while a wrap is pending (the place after that glyph).
 fn cursor_position(grid: &Grid) -> (usize, usize) {
-    let lines: Vec<&Line> = grid.logical_lines().collect();
+    let owned: Vec<Line> = grid
+        .logical_lines()
+        .map(tessera_grid::LineRef::into_owned)
+        .collect();
+    let lines: Vec<&Line> = owned.iter().collect();
     let target = grid.scrollback_len() + usize::from(grid.cursor().row);
     let (mut index, mut offset) = (0, 0);
     for (i, line) in lines.iter().enumerate() {
@@ -481,7 +489,11 @@ fn cursor_position(grid: &Grid) -> (usize, usize) {
 /// then clears the wrap flag of the row above (lead decision after round
 /// 1, spec step 1), so the last row kept is shown without its flag.
 fn rows_without_trailing_blanks(grid: &Grid) -> Vec<String> {
-    let lines: Vec<&Line> = grid.logical_lines().collect();
+    let owned: Vec<Line> = grid
+        .logical_lines()
+        .map(tessera_grid::LineRef::into_owned)
+        .collect();
+    let lines: Vec<&Line> = owned.iter().collect();
     let keep = lines
         .iter()
         .rposition(|line| !line.marks.is_empty() || line.cells.iter().any(|c| *c != Cell::BLANK))
@@ -944,8 +956,13 @@ fn texts_of<'a>(lines: impl IntoIterator<Item = &'a Line>) -> Vec<String> {
 
 /// The logical lines of the scrollback alone and of the screen alone.
 fn split_texts(grid: &Grid) -> (Vec<String>, Vec<String>) {
-    let history = (0..grid.scrollback_len()).filter_map(|i| grid.scrollback_line(i));
-    (texts_of(history), texts_of(grid.visible_lines()))
+    let history: Vec<Line> = (0..grid.scrollback_len())
+        .filter_map(|i| {
+            grid.scrollback_line(i)
+                .map(tessera_grid::LineRef::into_owned)
+        })
+        .collect();
+    (texts_of(&history), texts_of(grid.visible_lines()))
 }
 
 /// True when the top screen row continues a wrapped line from history.
@@ -1140,7 +1157,11 @@ proptest! {
 /// wide cell that starts the following row, as `(pad, wide)` pairs, and
 /// whether every padding cell has one.
 fn pads_and_their_wide_cells(grid: &Grid) -> (Vec<(Cell, Cell)>, bool) {
-    let lines: Vec<&Line> = grid.logical_lines().collect();
+    let owned: Vec<Line> = grid
+        .logical_lines()
+        .map(tessera_grid::LineRef::into_owned)
+        .collect();
+    let lines: Vec<&Line> = owned.iter().collect();
     let mut pairs = Vec::new();
     let mut all = true;
     for (i, line) in lines.iter().enumerate() {
@@ -1262,7 +1283,10 @@ fn grid_reads_stay_consistent_after_resize() {
     assert_eq!(grid.cursor(), Point::new(1, 4));
     // Writing continues after the text.
     grid.put_str("kl");
-    assert_eq!(grid.line(1).map(Line::text).as_deref(), Some("ghijkl"));
+    assert_eq!(
+        grid.line(1).map(tessera_grid::Line::text).as_deref(),
+        Some("ghijkl")
+    );
     assert!(grid.pending_wrap());
 }
 
@@ -1278,7 +1302,11 @@ fn a_full_history_reflows_and_keeps_its_newest_lines() {
     grid.resize(4, 5);
     check_invariants("10 -> 5", &grid);
     assert_eq!(grid.scrollback_len(), 20, "the cap still holds");
-    let screen: Vec<String> = grid.visible_lines().iter().map(Line::text).collect();
+    let screen: Vec<String> = grid
+        .visible_lines()
+        .iter()
+        .map(tessera_grid::Line::text)
+        .collect();
     assert_eq!(
         screen,
         ["38 xx", "line", "39 xx", ""],
@@ -1286,7 +1314,7 @@ fn a_full_history_reflows_and_keeps_its_newest_lines() {
     );
     grid.resize(4, 10);
     check_invariants("5 -> 10", &grid);
-    let texts: Vec<String> = grid.logical_lines().map(Line::text).collect();
+    let texts: Vec<String> = grid.logical_lines().map(|line| line.text()).collect();
     assert!(texts.contains(&"line 39 xx".to_owned()), "{texts:?}");
 }
 
@@ -1299,7 +1327,7 @@ fn spacer_cells_never_appear_without_their_wide_cell() {
         check_invariants(&format!("{cols} columns"), &grid);
         for line in grid.logical_lines() {
             if let Some(first) = line.cells.first() {
-                assert!(!first.is_spacer(), "{}", render_row(line));
+                assert!(!first.is_spacer(), "{}", render_row(&line));
             }
         }
     }
@@ -1317,7 +1345,10 @@ fn an_empty_continuation_row_goes_before_the_prompt() {
     assert!(grid.line(0).is_some_and(|l| l.wrapped));
     grid.resize(1, 10);
     assert_eq!(grid.scrollback_len(), 0);
-    assert_eq!(grid.line(0).map(Line::text).as_deref(), Some("$ echo hel"));
+    assert_eq!(
+        grid.line(0).map(tessera_grid::Line::text).as_deref(),
+        Some("$ echo hel")
+    );
     assert!(
         !grid.line(0).is_some_and(|l| l.wrapped),
         "nothing continues it"
@@ -1337,8 +1368,14 @@ fn a_cursor_past_a_full_last_row_arms_pending_wrap() {
     assert_eq!(grid.cursor(), Point::new(0, 3));
     assert!(grid.pending_wrap());
     grid.put_char('x');
-    assert_eq!(grid.line(0).map(Line::text).as_deref(), Some("abcd"));
-    assert_eq!(grid.line(1).map(Line::text).as_deref(), Some("x"));
+    assert_eq!(
+        grid.line(0).map(tessera_grid::Line::text).as_deref(),
+        Some("abcd")
+    );
+    assert_eq!(
+        grid.line(1).map(tessera_grid::Line::text).as_deref(),
+        Some("x")
+    );
     // A wide character filling the row: the cursor waits on its spacer
     // column, as after `put_wide`, with the wrap pending.
     let mut grid = Grid::new(3, 8);
@@ -1364,7 +1401,11 @@ fn a_cursor_row_pushed_into_history_stays_on_row_zero() {
     grid.resize(2, 2);
     assert_eq!(grid.cursor(), Point::new(0, 1));
     assert!(!grid.pending_wrap());
-    let screen: Vec<String> = grid.visible_lines().iter().map(Line::text).collect();
+    let screen: Vec<String> = grid
+        .visible_lines()
+        .iter()
+        .map(tessera_grid::Line::text)
+        .collect();
     assert_eq!(screen, ["ef", "gh"]);
     assert_eq!(grid.scrollback_len(), 2);
 }
@@ -1385,7 +1426,7 @@ fn styled_trailing_spaces_survive_a_reflow() {
         grid.line_feed();
         let styled = |grid: &Grid| {
             grid.logical_lines()
-                .flat_map(|line| line.cells.iter())
+                .flat_map(|line| line.cells.clone())
                 .filter(|cell| cell.ch == ' ' && cell.style == style)
                 .count()
         };
@@ -1415,7 +1456,10 @@ fn a_pruned_empty_row_does_not_leave_its_line_wrapped() {
     grid.goto(0, 0);
     grid.resize(1, 1);
     check_invariants("1x1", &grid);
-    assert_eq!(grid.line(0).map(Line::text).as_deref(), Some("a"));
+    assert_eq!(
+        grid.line(0).map(tessera_grid::Line::text).as_deref(),
+        Some("a")
+    );
     assert!(
         !grid.line(0).is_some_and(|l| l.wrapped),
         "nothing continues it"
@@ -1443,7 +1487,7 @@ fn the_prune_counts_blank_rows_after_the_rewrap() {
     grid.goto(0, 2);
     grid.resize(2, 4);
     check_invariants("2x4", &grid);
-    let texts: Vec<String> = grid.logical_lines().map(Line::text).collect();
+    let texts: Vec<String> = grid.logical_lines().map(|line| line.text()).collect();
     assert_eq!(texts, ["$ ec", "ho h", "el"]);
 }
 
@@ -1459,8 +1503,8 @@ fn padded() -> Grid {
 
 fn pads(grid: &Grid) -> usize {
     grid.logical_lines()
-        .flat_map(|line| line.cells.iter())
-        .filter(|cell| cell.is_pad())
+        .flat_map(|line| line.cells.clone())
+        .filter(tessera_grid::Cell::is_pad)
         .count()
 }
 
@@ -1524,8 +1568,8 @@ fn writing_or_erasing_padding_clears_it() {
     let visible = grid
         .visible_lines()
         .iter()
-        .flat_map(|line| line.cells.iter())
-        .filter(|cell| cell.is_pad())
+        .flat_map(|line| line.cells.clone())
+        .filter(tessera_grid::Cell::is_pad)
         .count();
     assert_eq!((visible, pads(&grid)), (0, 1));
     // A wide character written into the last column again pads it again.
@@ -1551,7 +1595,10 @@ fn padding_takes_the_pen_background_and_is_dropped_by_a_join() {
     assert_eq!(cell.style.bg, Color::Indexed(4));
     assert!(cell.is_blank(), "padding is blank to everyone else");
     grid.resize(3, 8);
-    assert_eq!(grid.line(0).map(Line::text).as_deref(), Some("abcd中"));
+    assert_eq!(
+        grid.line(0).map(tessera_grid::Line::text).as_deref(),
+        Some("abcd中")
+    );
     assert_eq!(pads(&grid), 0);
 }
 
@@ -1791,8 +1838,10 @@ fn a_bounded_rewrap_matches_an_unbounded_one() {
         let offset = large.scrollback_len() - 50;
         for i in 0..50 {
             assert_eq!(
-                small.scrollback_line(i).map(render_row),
-                large.scrollback_line(offset + i).map(render_row),
+                small.scrollback_line(i).map(|line| render_row(&line)),
+                large
+                    .scrollback_line(offset + i)
+                    .map(|line| render_row(&line)),
                 "{case}: history line {i}"
             );
         }
@@ -1836,8 +1885,10 @@ fn a_drop_on_the_last_row_still_leaves_a_full_history() {
     let offset = large.scrollback_len() - 50;
     for i in 0..50 {
         assert_eq!(
-            small.scrollback_line(i).map(render_row),
-            large.scrollback_line(offset + i).map(render_row),
+            small.scrollback_line(i).map(|line| render_row(&line)),
+            large
+                .scrollback_line(offset + i)
+                .map(|line| render_row(&line)),
             "history line {i}"
         );
     }
@@ -1885,8 +1936,10 @@ fn a_bounded_rewrap_keeps_marks_and_a_cursor_past_the_text() {
         for i in 0..50 {
             let kept = small.scrollback_line(i);
             assert_eq!(
-                kept.map(render_row),
-                large.scrollback_line(offset + i).map(render_row),
+                kept.as_deref().map(render_row),
+                large
+                    .scrollback_line(offset + i)
+                    .map(|line| render_row(&line)),
                 "{lines}: history line {i}"
             );
             marked += usize::from(kept.is_some_and(|l| !l.marks.is_empty()));

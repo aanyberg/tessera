@@ -15,7 +15,7 @@
 
 use std::time::Instant;
 
-use tessera_grid::{Line, Mark};
+use tessera_grid::Mark;
 use tessera_term::{MAX_MARK_REQUESTS, Request, Terminal};
 
 const FIXTURE: &str = include_str!("../../tessera-app-core/tests/fixtures/prompts_spec.txt");
@@ -85,9 +85,8 @@ fn fed(rows: u16, cols: u16, bytes: &[u8]) -> (Terminal, Vec<(Mark, u64)>) {
 fn grid_marks(term: &Terminal) -> Vec<Vec<Mark>> {
     let grid = term.grid();
     (0..grid.scrollback_len())
-        .filter_map(|i| grid.scrollback_line(i))
-        .chain(grid.visible_lines())
-        .map(|line: &Line| line.marks.clone())
+        .filter_map(|i| grid.scrollback_line(i).map(|line| line.marks.clone()))
+        .chain(grid.visible_lines().iter().map(|line| line.marks.clone()))
         .collect()
 }
 

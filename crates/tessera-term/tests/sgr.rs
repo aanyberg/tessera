@@ -347,7 +347,7 @@ fn check_cell_case(case: &CellCase, chunking: Chunking) -> Vec<String> {
                 grid.scrollback_len()
             ));
         }
-        let got = grid.scrollback_line(0).map(tessera_grid::Line::text);
+        let got = grid.scrollback_line(0).map(|line| line.text());
         if got.as_deref() != Some(first.as_str()) {
             fail(format!("scrollback[0] {got:?}, expected {first:?}"));
         }

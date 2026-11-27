@@ -86,7 +86,7 @@ use std::collections::VecDeque;
 use std::ops::ControlFlow;
 use std::time::{Duration, Instant};
 
-use tessera_grid::{DamageRows, Grid, Line};
+use tessera_grid::{DamageRows, Grid, Line, LineRef};
 use tessera_render::{Overlay, OverlayKind};
 use tessera_search::{
     Haystack, MAX_HAYSTACK_BYTES, MAX_SEGMENT_ROWS, MIN_PIECE_BYTES, Match, Piece, PieceLimit,
@@ -1396,7 +1396,7 @@ impl<'a> Lines<'a> {
     }
 }
 
-fn line_at(grid: &Grid, base: u64, line: u64) -> Option<&Line> {
+fn line_at(grid: &Grid, base: u64, line: u64) -> Option<LineRef<'_>> {
     let index = usize::try_from(line.checked_sub(base)?).ok()?;
     grid.logical_line(index)
 }
@@ -1457,7 +1457,7 @@ fn copy_lines(
         }
         let kept = scanned
             .as_mut()
-            .and_then(|(scanned, _)| scanned.take_same(line, source, untouched.as_ref()));
+            .and_then(|(scanned, _)| scanned.take_same(line, &source, untouched.as_ref()));
         unchanged.push(kept.is_some());
         match kept {
             Some(kept) => {
@@ -1466,7 +1466,7 @@ fn copy_lines(
                     spare.push(old);
                 }
             }
-            None => copy_line(&mut pool[count], source),
+            None => copy_line(&mut pool[count], &source),
         }
         count += 1;
     }

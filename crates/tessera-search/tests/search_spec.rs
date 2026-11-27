@@ -360,7 +360,10 @@ fn g01_nested_quantifier_is_linear() {
     .unwrap()
     .unwrap();
     let grid = terminal.grid();
-    let rows: Vec<_> = grid.logical_lines().cloned().collect();
+    let rows: Vec<_> = grid
+        .logical_lines()
+        .map(tessera_grid::LineRef::into_owned)
+        .collect();
     assert_eq!(rows.len(), 977, "one line wrapped over 977 rows");
     assert!(rows[..976].iter().all(|row| row.wrapped));
     let mut found = 0;

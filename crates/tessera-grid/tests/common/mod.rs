@@ -199,7 +199,7 @@ pub fn invariant_errors(grid: &Grid) -> Vec<String> {
     }
     for i in 0..grid.scrollback_len() {
         if let Some(line) = grid.scrollback_line(i) {
-            line_errors(&format!("scrollback {i}"), line, &mut errors);
+            line_errors(&format!("scrollback {i}"), &line, &mut errors);
         }
     }
     let cursor = grid.cursor();

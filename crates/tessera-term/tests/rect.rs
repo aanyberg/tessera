@@ -522,7 +522,10 @@ fn untouched(term: &Terminal) -> Untouched {
         alt: grid.is_alt_screen(),
         tabs: grid.tabs().clone(),
         history: (0..grid.scrollback_len())
-            .filter_map(|i| grid.scrollback_line(i).cloned())
+            .filter_map(|i| {
+                grid.scrollback_line(i)
+                    .map(tessera_grid::LineRef::into_owned)
+            })
             .collect(),
         wrapped_and_marks: grid
             .visible_lines()

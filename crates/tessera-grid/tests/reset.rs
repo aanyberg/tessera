@@ -8,6 +8,10 @@
 //! character costs the runs' room and no more, and ICH/DCH and scrolls
 //! between margins over linked rows do not grow it.
 //!
+//! It also bars the heap a scrollback line costs once history is packed
+//! (#51, ADR 0051): full 80-column lines of plain ASCII and of a coloured,
+//! wide-character mix.
+//!
 //! Allocations and live bytes are counted per thread, so the test
 //! harness's own threads do not disturb the count.
 
@@ -417,4 +421,117 @@ fn a_span_copy_grows_a_link_table_as_writing_its_runs_one_by_one_would() {
     assert!(written <= 0, "the 32nd run left {written} more bytes");
     grid.end_hyperlink();
     grid.check_invariants();
+}
+
+/// Lines of history the heap-per-line bars measure.
+const HISTORY_LINES: usize = 10_000;
+
+/// A small deterministic generator (xorshift), so the corpus is fixed.
+struct Rng(u64);
+
+impl Rng {
+    fn below(&mut self, n: u64) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0 % n
+    }
+}
+
+/// Writes one full 80-column line and its CR LF: printable ASCII with
+/// some spaces (`plain`), or coloured words, wide characters, a combining
+/// sequence and an emoji, padded with spaces, as the `heap_lines_*`
+/// cases of `scripts/perf-cases.rs` do.
+fn history_line(grid: &mut Grid, rng: &mut Rng, plain: bool) {
+    if plain {
+        let line: String = (0..80u64)
+            .map(|col| {
+                if col < 79 && rng.below(6) == 0 {
+                    ' '
+                } else {
+                    char::from(b'!' + u8::try_from(rng.below(94)).unwrap())
+                }
+            })
+            .collect();
+        grid.put_str(&line);
+    } else {
+        let words: [(&str, usize); 8] = [
+            ("alpha", 5),
+            ("needle42", 8),
+            ("\u{4e2d}\u{6587}", 4),
+            ("\u{65e5}\u{672c}\u{8a9e}", 6),
+            ("e\u{301}te\u{301}", 4),
+            ("\u{1f600}", 2),
+            ("tessera", 7),
+            ("0123456789", 10),
+        ];
+        let mut col = 0;
+        loop {
+            let (word, width) = words[usize::try_from(rng.below(8)).unwrap()];
+            if col + width + 1 > 80 {
+                break;
+            }
+            match rng.below(4) {
+                0 => grid.set_pen(Style {
+                    fg: tessera_grid::Color::Indexed(u8::try_from(1 + rng.below(7)).unwrap()),
+                    ..Style::DEFAULT
+                }),
+                1 => grid.set_pen(
+                    Style {
+                        fg: tessera_grid::Color::Indexed(u8::try_from(rng.below(256)).unwrap()),
+                        ..Style::DEFAULT
+                    }
+                    .with(Style::BOLD),
+                ),
+                2 => grid.set_pen(Style::DEFAULT),
+                _ => {}
+            }
+            grid.put_str(word);
+            grid.put_str(" ");
+            col += width + 1;
+        }
+        grid.set_pen(Style::DEFAULT);
+        while col < 80 {
+            grid.put_str(" ");
+            col += 1;
+        }
+    }
+    grid.carriage_return();
+    grid.line_feed();
+}
+
+/// Heap bytes per history line: a grid keeping [`HISTORY_LINES`] lines
+/// against one keeping none, fed the same lines.
+fn heap_per_line(plain: bool) -> isize {
+    let fill = |cap: usize| {
+        let before = live_bytes();
+        let mut rng = Rng(0x5103);
+        let mut grid = Grid::with_scrollback(24, 80, cap);
+        for _ in 0..HISTORY_LINES + 24 {
+            history_line(&mut grid, &mut rng, plain);
+        }
+        assert_eq!(grid.scrollback_len(), cap, "the corpus fills the history");
+        // Measured while the grid is alive, then released.
+        let live = live_bytes() - before;
+        drop(grid);
+        live
+    };
+    let none = fill(0);
+    (fill(HISTORY_LINES) - none) / isize::try_from(HISTORY_LINES).unwrap()
+}
+
+/// A plain 80-column history line costs at most 256 heap bytes once
+/// packed (#51; 1 664 bytes as `Line`s).
+#[test]
+fn a_plain_history_line_costs_at_most_256_bytes() {
+    let per_line = heap_per_line(true);
+    assert!(per_line <= 256, "{per_line} bytes per plain line");
+}
+
+/// A coloured, wide-character history line costs at most 400 heap bytes
+/// once packed (#51; 1 781 bytes as `Line`s).
+#[test]
+fn a_mixed_history_line_costs_at_most_400_bytes() {
+    let per_line = heap_per_line(false);
+    assert!(per_line <= 400, "{per_line} bytes per mixed line");
 }

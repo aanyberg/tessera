@@ -19,6 +19,8 @@ use std::cmp::Ordering;
 use std::ops::Range;
 
 use crate::line::MarkAnchors;
+use crate::packed::{Block, JoinSink};
+use crate::scrollback::Taken;
 use crate::{Cell, GraphemeTable, Hyperlink, Line, Mark, Point, Scrollback, Style};
 
 /// The parts of one screen a resize rewrites.
@@ -288,21 +290,31 @@ fn rewrap(
 ) -> bool {
     let rows = usize::from(size.rows);
     let anchored = scrolled || anchored_at_bottom(screen.lines, screen.cursor.row);
-    let mut source = history.take_lines();
-    let top = source.len();
+    let hot_rows = history.hot_rows();
+    let Taken { blocks, skip, hot } = history.take();
+    let top = blocks.iter().map(Block::len).sum::<usize>() - skip + hot.len();
     let cursor = SourceCursor {
         index: top + usize::from(screen.cursor.row),
         col: usize::from(screen.cursor.col),
         pending_wrap: *screen.pending_wrap,
     };
-    source.append(screen.lines);
-    let source_len = source.len();
+    let source_len = top + screen.lines.len();
 
     let keep = history.cap().saturating_add(rows.saturating_mul(2));
     let mut rewrapper = Rewrapper::new(size.cols, cursor, top, anchored, keep);
+    rewrapper.window = hot_rows.saturating_add(rows.saturating_mul(2));
     let mut group = Vec::new();
-    for line in source {
-        let wrapped = line.wrapped;
+    // Packed rows are read in place (ADR 0051): no line is built for them.
+    let packed = blocks.iter().enumerate().flat_map(|(b, block)| {
+        let from = if b == 0 { skip } else { 0 };
+        (from..block.len()).map(move |r| Src::Packed(block, r))
+    });
+    let lines = hot
+        .into_iter()
+        .chain(std::mem::take(screen.lines))
+        .map(Src::Line);
+    for line in packed.chain(lines) {
+        let wrapped = line.wrapped();
         group.push(line);
         if !wrapped {
             rewrapper.logical_line(&mut group);
@@ -316,17 +328,22 @@ fn rewrap(
     }
     let Rewrapped {
         mut out,
+        mut store,
         placed,
         top,
         dropped,
     } = rewrapper.finish();
+    drop(group);
+    drop(blocks);
+    // Rows before `out` are packed in `store`.
+    let dropped_or_packed = dropped + store.len();
 
     // Blank rows under the cursor absorb growth before real rows are
     // pushed into history: the whole buffer's growth on a screen that has
     // scrolled, only the screen block's on a cleared one (#86). They are
     // counted after the re-wrap: a blank row that continued a wrapped one
     // has been joined into its line and is gone already.
-    let total = dropped + out.len();
+    let total = dropped_or_packed + out.len();
     let growth = if scrolled {
         total.saturating_sub(source_len)
     } else {
@@ -352,7 +369,7 @@ fn rewrap(
             last.wrapped = false;
         }
     }
-    let total = dropped + out.len();
+    let total = dropped_or_packed + out.len();
     let pushed_block = total.saturating_sub(top) > rows;
     // Where the window starts, counting the dropped rows: the last `rows`
     // rows (pulling history down when the block is short and the screen
@@ -366,8 +383,11 @@ fn rewrap(
     // The output keeps at least the cap plus twice the screen (`keep`),
     // and the prune removed at most one screen of it, so the window never
     // starts in the dropped rows; it always ends at or past the last row.
-    debug_assert!(start >= dropped && start + rows >= total);
-    let first = start.saturating_sub(dropped);
+    // The output keeps at least `window` rows unpacked, more than the
+    // screen and the blank rows dropped under the cursor: the window
+    // starts in them.
+    debug_assert!(start >= dropped_or_packed && start + rows >= total);
+    let first = start.saturating_sub(dropped_or_packed);
     out.resize_with(first + rows, || Line::blank(size.cols, Style::DEFAULT));
     *screen.lines = out.split_off(first);
     let placed = placed.unwrap_or(Placed {
@@ -384,17 +404,56 @@ fn rewrap(
         *screen.cursor = Point::new(0, placed.col);
         *screen.pending_wrap = false;
     }
-    for line in &mut out {
+    store.set_hot_rows(hot_rows);
+    for mut line in out {
         line.graphemes.compact();
+        drop(store.push(line));
     }
-    history.set_lines(out);
+    history.replace_with(store);
     pushed_block
+}
+
+/// A source row of a re-wrap: a line (hot history or the screen) or a
+/// packed history row, read in place.
+enum Src<'a> {
+    /// An unpacked row.
+    Line(Line),
+    /// Row `.1` of a packed block.
+    Packed(&'a Block, usize),
+}
+
+impl Src<'_> {
+    /// Whether the row continues onto the next.
+    fn wrapped(&self) -> bool {
+        match self {
+            Self::Line(line) => line.wrapped,
+            Self::Packed(block, r) => block.wrapped(*r),
+        }
+    }
+
+    /// The row's width.
+    fn cols(&self) -> usize {
+        match self {
+            Self::Line(line) => line.cells.len(),
+            Self::Packed(block, r) => block.cols(*r),
+        }
+    }
+
+    /// Whether the row's last cell is padding ([`Cell::is_pad`]).
+    fn last_is_pad(&self) -> bool {
+        match self {
+            Self::Line(line) => line.cells.last().is_some_and(Cell::is_pad),
+            Self::Packed(block, r) => block.last_is_pad(*r),
+        }
+    }
 }
 
 /// What a [`Rewrapper`] produced.
 struct Rewrapped {
-    /// The kept rows.
+    /// The newest kept rows, unpacked.
     out: Vec<Line>,
+    /// The kept rows before them, packed.
+    store: Scrollback,
     /// The cursor's place.
     placed: Option<Placed>,
     /// Index of the row holding the old top screen row's first cell,
@@ -446,8 +505,14 @@ struct Placed {
 struct Rewrapper {
     /// The new width.
     cols: u16,
-    /// Rows produced so far, except the oldest `dropped`.
+    /// The newest rows produced so far, unpacked (at least `window` of
+    /// them, and every row of the logical line being re-wrapped).
     out: Vec<Line>,
+    /// The rows before `out`, except the oldest `dropped`, packed as they
+    /// leave `out` (ADR 0051).
+    store: Scrollback,
+    /// How many of the newest rows stay unpacked in `out`.
+    window: usize,
     /// How many rows the buffer must keep: what history and the screen
     /// can hold plus the screen rows the prune may remove. Older rows are
     /// dropped as the re-wrap goes, so narrowing to a few columns does not
@@ -502,6 +567,8 @@ impl Rewrapper {
         Self {
             cols,
             out: Vec::new(),
+            store: Scrollback::with_hot_rows(usize::MAX, 0),
+            window: usize::MAX,
             keep,
             dropped: 0,
             #[cfg(test)]
@@ -530,6 +597,7 @@ impl Rewrapper {
         let total = self.next_index();
         Rewrapped {
             out: self.out,
+            store: self.store,
             placed: self.placed,
             top: self.top.unwrap_or(total),
             dropped: self.dropped,
@@ -538,7 +606,7 @@ impl Rewrapper {
 
     /// Index of the next output row, counting the dropped ones.
     fn next_index(&self) -> usize {
-        self.dropped + self.out.len()
+        self.dropped + self.store.len() + self.out.len()
     }
 
     /// Appends an output row, then drops the oldest rows if the output
@@ -548,7 +616,7 @@ impl Rewrapper {
         self.out.push(line);
         #[cfg(test)]
         {
-            self.peak = self.peak.max(self.out.len());
+            self.peak = self.peak.max(self.store.len() + self.out.len());
         }
         self.drop_oldest();
     }
@@ -557,9 +625,12 @@ impl Rewrapper {
     /// keep (so each row moves at most once on average): the output never
     /// holds more than `max(2 * keep, 1024)` rows.
     fn drop_oldest(&mut self) {
-        if self.out.len() >= self.keep.saturating_mul(2).max(1024) {
-            let excess = self.out.len() - self.keep;
-            self.out.drain(..excess);
+        let held = self.store.len() + self.out.len();
+        if held >= self.keep.saturating_mul(2).max(1024) {
+            let excess = held - self.keep;
+            let packed = excess.min(self.store.len());
+            drop(self.store.drop_oldest(packed));
+            self.out.drain(..excess - packed);
             self.dropped += excess;
         }
     }
@@ -567,13 +638,41 @@ impl Rewrapper {
     /// Joins the rows of one logical line (all but the last are wrapped)
     /// and appends it, split at the new width, to the output.
     ///
+    /// Appends the first `len` cells of the unpacked source `row` to the
+    /// joined line, with its clusters, links and marks, and frees the row's
+    /// cells: a long logical line would otherwise be held twice (rows and
+    /// joined) on top of its output rows.
+    fn join_line(&mut self, row: &mut Line, len: usize) {
+        let base = self.joined.len();
+        self.joined.extend_from_slice(&row.cells[..len]);
+        row.cells = Vec::new();
+        self.clusters.extend(
+            row.graphemes
+                .take()
+                .filter(|&(col, _)| col < len)
+                .map(|(col, text)| (base + col, text)),
+        );
+        self.links
+            .extend(row.graphemes.take_links().filter_map(|(run, link)| {
+                let end = run.end.min(len);
+                (run.start < end).then(|| (base + run.start..base + end, link))
+            }));
+        if !row.marks.is_empty() {
+            self.row_marks.push((
+                base,
+                std::mem::take(&mut row.marks),
+                std::mem::take(&mut row.anchors),
+            ));
+        }
+    }
+
     /// The rows' cells are concatenated, except that a wrapped row's last
     /// cell is skipped when it is padding ([`Cell::is_pad`]): the column a
     /// wide character left behind when it did not fit, not text. Any other
     /// cell is text, a space before a wide character included. Trailing
     /// blanks of the whole line are trimmed. Marks stay with their rows
     /// (D-MARKPOS, ADR 0022): see [`Rewrapper::place_marks`].
-    fn logical_line(&mut self, rows: &mut [Line]) {
+    fn logical_line(&mut self, rows: &mut [Src<'_>]) {
         let first = self.next_source;
         self.next_source += rows.len();
         self.joined.clear();
@@ -582,12 +681,10 @@ impl Rewrapper {
         self.row_marks.clear();
         let mut cursor_offset = None;
         let mut top_offset = None;
-        self.joined
-            .reserve_exact(rows.iter().map(|row| row.cells.len()).sum());
+        self.joined.reserve_exact(rows.iter().map(Src::cols).sum());
         for k in 0..rows.len() {
-            let stranded = k + 1 < rows.len() && rows[k].cells.last().is_some_and(Cell::is_pad);
-            let row = &mut rows[k];
-            let len = row.cells.len() - usize::from(stranded);
+            let stranded = k + 1 < rows.len() && rows[k].last_is_pad();
+            let len = rows[k].cols() - usize::from(stranded);
             let base = self.joined.len();
             if first + k == self.cursor.index {
                 cursor_offset =
@@ -602,28 +699,23 @@ impl Rewrapper {
                     top_offset = Some(base);
                 }
             }
-            self.joined.extend_from_slice(&row.cells[..len]);
-            // Free the source row now: a long logical line would otherwise
-            // be held twice (rows and joined) on top of its output rows.
-            row.cells = Vec::new();
-            self.clusters.extend(
-                row.graphemes
-                    .take()
-                    .filter(|&(col, _)| col < len)
-                    .map(|(col, text)| (base + col, text)),
-            );
-            self.links
-                .extend(row.graphemes.take_links().filter_map(|(run, link)| {
-                    let end = run.end.min(len);
-                    (run.start < end).then(|| (base + run.start..base + end, link))
-                }));
-            if !row.marks.is_empty() {
-                self.row_marks.push((
-                    base,
-                    std::mem::take(&mut row.marks),
-                    std::mem::take(&mut row.anchors),
-                ));
-            }
+            let row = match &mut rows[k] {
+                Src::Packed(block, r) => {
+                    block.join_into(
+                        *r,
+                        len,
+                        JoinSink {
+                            joined: &mut self.joined,
+                            clusters: &mut self.clusters,
+                            links: &mut self.links,
+                            row_marks: &mut self.row_marks,
+                        },
+                    );
+                    continue;
+                }
+                Src::Line(row) => row,
+            };
+            self.join_line(row, len);
         }
         let end = self
             .joined
@@ -686,6 +778,20 @@ impl Rewrapper {
             plain,
         };
         self.put_marks(rows, top_row);
+        self.pack_settled();
+    }
+
+    /// Packs the oldest rows of `out` once it holds twice `window` rows:
+    /// rows of finished logical lines, which nothing changes any more.
+    fn pack_settled(&mut self) {
+        if self.out.len() <= self.window.saturating_mul(2) {
+            return;
+        }
+        let n = self.out.len() - self.window;
+        for mut line in self.out.drain(..n) {
+            line.graphemes.compact();
+            drop(self.store.push(line));
+        }
     }
 
     /// Puts the collected marks of the line just split into `rows` on its
@@ -827,7 +933,7 @@ impl Rewrapper {
     /// dropped.
     fn out_line(&mut self, index: usize) -> Option<&mut Line> {
         index
-            .checked_sub(self.dropped)
+            .checked_sub(self.dropped + self.store.len())
             .and_then(|i| self.out.get_mut(i))
     }
 
@@ -1245,6 +1351,7 @@ mod tests {
             if let Some(last) = rows.last_mut() {
                 last.wrapped = false;
             }
+            let mut rows: Vec<Src<'_>> = rows.into_iter().map(Src::Line).collect();
             rewrapper.logical_line(&mut rows);
             let bound = (2 * keep).max(1024);
             assert!(rewrapper.peak <= bound, "peak {} rows", rewrapper.peak);
@@ -1255,9 +1362,10 @@ mod tests {
                 placed,
                 top,
                 dropped,
+                store,
             } = rewrapper.finish();
             assert_eq!(top, 0, "the first row is the top row");
-            assert_eq!(dropped + out.len(), produced);
+            assert_eq!(dropped + store.len() + out.len(), produced);
             assert_eq!(
                 placed.map(|p| p.index),
                 Some(0),

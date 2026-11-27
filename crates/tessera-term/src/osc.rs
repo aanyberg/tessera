@@ -376,7 +376,6 @@ pub fn shown_in_title(ch: char) -> bool {
 #[cfg(test)]
 mod tests {
     use proptest::prelude::*;
-    use tessera_grid::Line;
 
     use super::*;
     use crate::Terminal;
@@ -444,8 +443,12 @@ mod tests {
         let grid = term.grid();
         let marks = (0..grid.scrollback_len())
             .filter_map(|i| grid.scrollback_line(i))
-            .chain(grid.visible_lines())
-            .map(|line: &Line| line.marks.clone())
+            .chain(
+                grid.visible_lines()
+                    .iter()
+                    .map(tessera_grid::LineRef::borrowed),
+            )
+            .map(|line| line.marks.clone())
             .collect();
         (requests, marks, calls)
     }

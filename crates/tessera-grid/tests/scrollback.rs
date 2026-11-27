@@ -55,14 +55,14 @@ fn ring_drops_oldest_when_full() {
     }
     assert_eq!(sb.len(), 3);
     assert_eq!(sb.cap(), 3);
-    let texts: Vec<String> = sb.iter().map(Line::text).collect();
+    let texts: Vec<String> = sb.iter().map(|line| line.text()).collect();
     assert_eq!(texts, ["c", "d", "e"]);
-    assert_eq!(sb.get(0).map(Line::text).as_deref(), Some("c"));
+    assert_eq!(sb.get(0).map(|line| line.text()).as_deref(), Some("c"));
     assert_eq!(sb.get(3), None);
 }
 
 /// Correctness of eviction at scale through `Grid`. The O(1) timing bound
-/// lives on the ring itself (`million_pushes_into_ring_with_10k_cap`): a
+/// lives on the ring itself (`a_push_costs_the_same_whatever_the_history_holds`): a
 /// wall-clock bound here would mostly time debug-build per-line grid work
 /// and flake on a loaded or efficiency core.
 #[test]
@@ -93,16 +93,43 @@ fn million_line_scroll_with_10k_cap_keeps_newest_10k() {
     assert_eq!(marked, expected);
 }
 
-#[test]
-fn million_pushes_into_ring_with_10k_cap() {
-    let mut sb = Scrollback::new(10_000);
+/// A million pushes into a full store of `cap` lines, timed.
+fn million_pushes(cap: usize) -> Duration {
+    let mut sb = Scrollback::new(cap);
+    for _ in 0..cap {
+        sb.push(Line::default());
+    }
     let start = Instant::now();
     for _ in 0..1_000_000 {
         sb.push(Line::default());
     }
     let elapsed = start.elapsed();
-    assert_eq!(sb.len(), 10_000);
-    assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
+    assert_eq!(sb.len(), cap);
+    elapsed
+}
+
+/// A push costs the same whatever the history holds (O(1): it packs at
+/// most one row and evicts at most one, ADR 0051): a million pushes into a
+/// full store of 100 000 lines take about as long as into one of 1 000.
+/// A ratio, not a wall-clock budget: a debug build's absolute time mostly
+/// measures the machine's load. A push linear in the history would read
+/// about 100x.
+#[test]
+fn a_push_costs_the_same_whatever_the_history_holds() {
+    const MAX_RATIO: f64 = 3.0;
+    let mut ratios = Vec::new();
+    for _ in 0..3 {
+        let small = million_pushes(1_000);
+        let large = million_pushes(100_000);
+        let ratio = large.as_secs_f64() / small.as_secs_f64();
+        if ratio < MAX_RATIO {
+            return;
+        }
+        ratios.push(ratio);
+    }
+    panic!(
+        "a push into 100 000 lines cost more than {MAX_RATIO}x one into 1 000 in every attempt: {ratios:.2?}"
+    );
 }
 
 // -------------------------------------------------------- (2) set the cap
@@ -179,17 +206,25 @@ fn assert_logical_view(grid: &Grid) {
             grid.scrollback_line(i)
         } else {
             grid.line(u16::try_from(i - history).unwrap())
+                .map(tessera_grid::LineRef::borrowed)
         };
         assert!(expected.is_some(), "line {i} missing");
         assert_eq!(grid.logical_line(i), expected, "logical line {i}");
     }
     assert_eq!(grid.logical_line(grid.total_lines()), None);
-    let all: Vec<&Line> = grid.logical_lines().collect();
+    let all: Vec<Line> = grid
+        .logical_lines()
+        .map(tessera_grid::LineRef::into_owned)
+        .collect();
     assert_eq!(all.len(), grid.total_lines());
     for (i, line) in all.iter().enumerate() {
-        assert_eq!(Some(*line), grid.logical_line(i));
+        assert_eq!(Some(line), grid.logical_line(i).as_deref());
     }
-    let reversed: Vec<&Line> = grid.logical_lines().rev().collect();
+    let reversed: Vec<Line> = grid
+        .logical_lines()
+        .rev()
+        .map(tessera_grid::LineRef::into_owned)
+        .collect();
     assert!(reversed.iter().rev().eq(all.iter()));
 }
 
@@ -203,7 +238,7 @@ fn logical_buffer_is_history_then_screen() {
     write_numbered(&mut grid, 2, 7);
     assert_eq!(history(&grid), numbered(5..9));
     assert_logical_view(&grid);
-    let texts: Vec<String> = grid.logical_lines().map(Line::text).collect();
+    let texts: Vec<String> = grid.logical_lines().map(|line| line.text()).collect();
     assert_eq!(texts, ["L5", "L6", "L7", "L8", "", "", ""]);
 }
 
@@ -215,7 +250,7 @@ fn logical_buffer_on_alt_screen_shows_primary_history_then_alt_screen() {
     grid.goto(0, 0);
     grid.put_str("alt");
     assert_logical_view(&grid);
-    let texts: Vec<String> = grid.logical_lines().map(Line::text).collect();
+    let texts: Vec<String> = grid.logical_lines().map(|line| line.text()).collect();
     assert_eq!(texts, ["L0", "L1", "L2", "alt", ""]);
 }
 
@@ -553,4 +588,68 @@ proptest! {
             prop_assert!(ring.get(model.len()).is_none());
         }
     }
+}
+
+// ------------------------------------- (n) packed rows release their links
+
+/// Writes one row of `links` one-cell OSC 8 links tagged `tag`, then CR LF.
+fn row_of_links(grid: &mut Grid, tag: usize, links: usize) {
+    for c in 0..links {
+        grid.begin_hyperlink(&format!("https://x.test/{tag}/{c}"), None)
+            .expect("a short link opens");
+        grid.put_char('a');
+    }
+    grid.end_hyperlink();
+    grid.carriage_return();
+    grid.line_feed();
+}
+
+/// Writes `n` plain rows.
+fn plain_rows(grid: &mut Grid, n: usize) {
+    for _ in 0..n {
+        grid.put_str("plain");
+        grid.carriage_return();
+        grid.line_feed();
+    }
+}
+
+/// Evicting the front of a packed block releases the links of the
+/// evicted rows at once, though the block itself stays (ADR 0051 D6).
+#[test]
+fn evicting_part_of_a_packed_block_releases_its_links() {
+    let mut grid = Grid::with_scrollback(24, 80, 600);
+    for t in 0..700 {
+        row_of_links(&mut grid, t, 10);
+    }
+    assert_eq!(grid.scrollback_len(), 600);
+    let before = grid.live_hyperlinks();
+    plain_rows(&mut grid, 100);
+    let after = grid.live_hyperlinks();
+    assert_eq!(before - after, 1_000, "before {before}, after {after}");
+}
+
+/// Rows read at random (and so cached decoded, ADR 0051 D4) hold no
+/// hyperlink entity once evicted, nor once the history is switched off.
+#[test]
+fn evicted_rows_read_before_hold_no_links() {
+    let filled = || {
+        let mut grid = Grid::with_scrollback(24, 80, 2_000);
+        for t in 0..800 {
+            row_of_links(&mut grid, t, 80);
+        }
+        for i in 0..grid.scrollback_len() {
+            drop(grid.scrollback_line(i));
+        }
+        grid
+    };
+    let mut grid = filled();
+    assert_eq!(grid.live_hyperlinks(), 800 * 80);
+    plain_rows(&mut grid, 2_100);
+    assert_eq!(grid.live_hyperlinks(), 0, "evicted rows keep links");
+    let mut grid = filled();
+    let screen = grid.live_hyperlinks() - grid.scrollback_len() * 80;
+    assert!(grid.scrollback_len() > 700 && screen > 0);
+    grid.set_max_scrollback(0);
+    assert_eq!(grid.scrollback_len(), 0);
+    assert_eq!(grid.live_hyperlinks(), screen, "a cap of 0 keeps links");
 }

@@ -499,7 +499,7 @@ pub fn render_state(grid: &Grid) -> String {
     );
     for i in 0..grid.scrollback_len() {
         let line = grid.scrollback_line(i).expect("scrollback line");
-        let _ = writeln!(out, "sb> {}", render_row(line));
+        let _ = writeln!(out, "sb> {}", render_row(&line));
     }
     for line in grid.visible_lines() {
         let _ = writeln!(out, "v>  {}", render_row(line));

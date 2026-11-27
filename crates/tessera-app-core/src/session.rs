@@ -2966,7 +2966,7 @@ pub(crate) mod tests {
     fn screen(term: &Terminal) -> (Vec<tessera_grid::Line>, Vec<tessera_grid::Line>, String) {
         let grid = term.grid();
         let scrollback = (0..grid.scrollback_len())
-            .map(|i| grid.scrollback_line(i).expect("in range").clone())
+            .map(|i| grid.scrollback_line(i).expect("in range").into_owned())
             .collect();
         (
             grid.visible_lines().to_vec(),

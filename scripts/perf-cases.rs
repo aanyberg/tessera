@@ -352,7 +352,7 @@ macro_rules! cases {
         pub fn search(lines: usize) -> u64 {
             let term = filled(lines);
             let rows: Vec<_> = (0..term.grid().scrollback_len())
-                .filter_map(|i| term.grid().scrollback_line(i).cloned())
+                .filter_map(|i| term.grid().scrollback_line(i).map(|line| (*line).clone()))
                 .collect();
             let mut found = 0u64;
             for (pattern, regex) in [("needle42", false), (r"needle\d+ \S+", true)] {

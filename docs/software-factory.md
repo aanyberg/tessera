@@ -406,7 +406,7 @@ Agents use these instead of rebuilding the setup in every run:
   lines through `/usr/bin/time -l`; session-level growth is guarded by the #216 budgets in the release timing step). One JSON line per case (`sha`, `base`, `instructions`,
   `heap_bytes`, `ratio`, `status`) is appended to `perf-state/perf.jsonl`, kept in the Actions cache between runs and
   uploaded as the `perf-trend` artifact. A case over 1.02 in all three probe builds, or a heap over 1.02 of the
-  baseline's, opens or comments on a `type:bug` issue ("perf: the scheduled performance job found a regression")
+  baseline's (or over the bar of an accepted step in `scripts/perf-steps.txt` that the baseline does not have yet), opens or comments on a `type:bug` issue ("perf: the scheduled performance job found a regression")
   naming the SHA range; a failed timing step does not stop the case set, the state or the trend; it files its own issue ("perf: the scheduled
   performance job failed"). The job's token is `contents: read` and `issues:
   write`. Triage the issue like any bug (the lead may bisect with `cargo xtask ab`); a `noisy` line means the machine

@@ -97,6 +97,9 @@ mod grapheme;
 mod grid;
 mod hyperlink;
 mod line;
+mod packed;
+#[cfg(test)]
+mod packed_rewrap_tests;
 mod rect;
 mod reflow;
 mod scrollback;
@@ -113,5 +116,5 @@ pub use hyperlink::{
 };
 pub use line::{Line, Mark};
 pub use rect::Rect;
-pub use scrollback::Scrollback;
+pub use scrollback::{HOT_ROWS, LineRef, MAX_UNPACKED_CELLS, Scrollback};
 pub use tabs::TabStops;

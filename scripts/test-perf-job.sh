@@ -230,7 +230,45 @@ for st in "Case set against" "Save the state" "Upload the trend"; do
     step_if "$st" | grep -q 'success()' && fail "workflow step '$st' must not wait on success()"
 done
 
-# 11. Bad input.
+# 11. An accepted step (scripts/perf-steps.txt, ADR 0049 D9): a line head has and base has not raises that case's bar
+# for that comparison only; the next comparison, whose base has the line, is back at the default bar.
+reset
+s="$tmp/s11"
+steps="$tmp/steps"; rm -rf "$steps"; mkdir -p "$steps"
+export PERF_JOB_STEPS_DIR="$steps"
+printf '# case bar reason\n' > "$steps/$A"
+printf '# case bar reason\nscroll 1.30 ADR 0051, packed scrollback (#51)\nheap_idle 1.05 a test step\n' > "$steps/$B"
+cp "$steps/$B" "$steps/$C"
+run "$s" "$A" || fail "step baseline run failed: $(cat "$tmp/out.log")"
+reset
+printf '1.250\n' > "$stub/ratio-scroll"
+printf '1.250\n1.250\n1.250\n' > "$stub/ratio-cat"
+echo 1040 > "$stub/heap-head-heap_idle"
+run "$s" "$B" || fail "step run failed: $(cat "$tmp/out.log")"
+jq -e --arg b "$B" 'select(.sha == $b and .case == "scroll") | .status == "ok" and .bar == 1.3 and (.note | test("accepted step.*#51"))' \
+    "$s/perf.jsonl" > /dev/null || fail "a step's line at head and not at base raises that case's bar"
+jq -e --arg b "$B" 'select(.sha == $b and .case == "heap_idle") | .status == "ok" and .bar == 1.05' "$s/perf.jsonl" > /dev/null \
+    || fail "a step raises a heap case's bar too"
+jq -e --arg b "$B" 'select(.sha == $b and .case == "cat") | .status == "regressed" and .bar == 1.02' "$s/perf.jsonl" > /dev/null \
+    || fail "a step raises no other case's bar"
+reset
+printf '1.250\n' > "$stub/ratio-cat"
+run "$s" "$C" || fail "step follow-up run failed: $(cat "$tmp/out.log")"
+grep -q "init base=$A" "$stub/ab.log" || fail "the baseline stays at $A while $B is regressed"
+jq -e --arg c "$C" 'select(.sha == $c and .case == "scroll") | .bar == 1.3' "$s/perf.jsonl" > /dev/null \
+    || fail "the step applies while the base still lacks its line"
+reset
+s="$tmp/s11b"
+run "$s" "$B" || fail "step baseline run at B failed"
+reset
+printf '1.250\n1.250\n1.250\n' > "$stub/ratio-scroll"
+run "$s" "$C" || fail "step run after the step failed"
+jq -e --arg c "$C" 'select(.sha == $c and .case == "scroll") | .status == "regressed" and .bar == 1.02' "$s/perf.jsonl" > /dev/null \
+    || fail "a step whose line the base has no longer raises the bar"
+grep -qE '\| scroll \| regressed \| 1\.250? \| 1\.02 \|' "$stub"/body-*.md || fail "the issue lists each case's bar"
+unset PERF_JOB_STEPS_DIR
+
+# 12. Bad input.
 expect "a non-sha head is refused" bash -c "! '$script' check --state '$tmp/s8' --head 'main; rm -rf /'"
 expect "an unknown subcommand is refused" bash -c "! '$script' frobnicate"
 

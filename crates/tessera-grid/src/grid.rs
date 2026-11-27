@@ -11,6 +11,7 @@ use crate::damage::{Damage, DamageRows, DamageTracker};
 use crate::grapheme::MAX_CLUSTER_SCALARS;
 use crate::hyperlink::LinkPool;
 use crate::reflow::{self, ScreenMut, Size};
+use crate::scrollback::LineRef;
 use crate::{
     Cell, CellFlags, Hyperlink, Line, LinkRefused, Mark, Point, Scrollback, Style, TabStops,
     char_width,
@@ -430,8 +431,10 @@ impl Grid {
     /// The hyperlink of the cell at `col` of line `index` of the logical
     /// buffer ([`Grid::logical_line`]), if it has one.
     #[must_use]
-    pub fn hyperlink_at(&self, index: usize, col: u16) -> Option<&Hyperlink> {
-        self.logical_line(index)?.hyperlink(usize::from(col))
+    pub fn hyperlink_at(&self, index: usize, col: u16) -> Option<Hyperlink> {
+        self.logical_line(index)?
+            .hyperlink(usize::from(col))
+            .cloned()
     }
 
     /// Hyperlink entities alive: those on the screens, in scrollback and
@@ -456,6 +459,13 @@ impl Grid {
     /// The visible line at `row`, if in range.
     pub fn line(&self, row: u16) -> Option<&Line> {
         self.lines.get(usize::from(row))
+    }
+
+    /// The history store, for crate tests that swap in a store with a
+    /// different hot-row count.
+    #[cfg(test)]
+    pub(crate) fn scrollback_mut(&mut self) -> &mut Scrollback {
+        &mut self.scrollback
     }
 
     /// Mutable access to the visible line at `row`, if in range.
@@ -566,7 +576,9 @@ impl Grid {
 
     /// A scrollback line; index `0` is the oldest, `scrollback_len() - 1`
     /// the one most recently scrolled off the screen.
-    pub fn scrollback_line(&self, index: usize) -> Option<&Line> {
+    ///
+    /// A packed row (ADR 0051) is decoded into the returned [`LineRef`].
+    pub fn scrollback_line(&self, index: usize) -> Option<LineRef<'_>> {
         self.scrollback.get(index)
     }
 
@@ -578,17 +590,24 @@ impl Grid {
     /// A line of the logical buffer. Index `0` is the oldest scrollback
     /// line; `scrollback_len()..total_lines()` are the visible rows of the
     /// active screen, top to bottom.
-    pub fn logical_line(&self, index: usize) -> Option<&Line> {
+    ///
+    /// A packed scrollback row (ADR 0051) is decoded into the returned
+    /// [`LineRef`]; a visible row is borrowed.
+    pub fn logical_line(&self, index: usize) -> Option<LineRef<'_>> {
         match index.checked_sub(self.scrollback.len()) {
             None => self.scrollback.get(index),
-            Some(row) => self.lines.get(row),
+            Some(row) => self.lines.get(row).map(LineRef::borrowed),
         }
     }
 
     /// Every line of the logical buffer, oldest scrollback line first and
-    /// the bottom visible row last, without allocating.
-    pub fn logical_lines(&self) -> impl DoubleEndedIterator<Item = &Line> + Clone + '_ {
-        self.scrollback.iter().chain(&self.lines)
+    /// the bottom visible row last; hot and visible rows are borrowed.
+    ///
+    /// Packed scrollback rows (ADR 0051) are decoded one at a time.
+    pub fn logical_lines(&self) -> impl DoubleEndedIterator<Item = LineRef<'_>> + Clone + '_ {
+        self.scrollback
+            .iter()
+            .chain(self.lines.iter().map(LineRef::borrowed))
     }
 
     /// True while the alternate screen is active.
@@ -2624,7 +2643,7 @@ impl Grid {
             ));
         }
         for (i, line) in self.scrollback.iter().enumerate() {
-            line_errors(LineAt::Scrollback(i), line, cols, &mut errors);
+            line_errors(LineAt::Scrollback(i), &line, cols, &mut errors);
         }
         errors
     }

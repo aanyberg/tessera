@@ -186,7 +186,9 @@ slips past them: every other day it measures main against the last measured SHA 
 search, `cat` throughput, rewrap, vtebench's ten streams; idle heap, full-scrollback heap, heap per plain and per mixed
 scrollback line, the resident set of 1 000 000 lines; the heap cases measure a `Terminal` only, about a third of an
 idle session, and session-level growth stays with the #216 budgets; the baselines are in ADR 0049) and runs the release timing bars, and a case past its bar opens or comments
-on a `type:bug` issue naming the SHA range. It never gates a PR. `just perf-job-test` checks its logic offline.
+on a `type:bug` issue naming the SHA range. A regression accepted under the policy above (a justification in the PR and
+the area's ADR) also gets a line in `scripts/perf-steps.txt` (`<case> <bar> <reason>`): the job holds the first
+comparison across it to that bar, and every later one to the default against a baseline that includes it (ADR 0049). It never gates a PR. `just perf-job-test` checks its logic offline.
 
 What the job enforces on its GitHub runner, and what it leaves to `just check` and local runs (#682): the absolute
 wall-time budgets come from a local Mac, so the startup budget (`startup_to_the_first_frame_stays_within_its_budget`,
