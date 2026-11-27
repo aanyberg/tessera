@@ -258,6 +258,9 @@ impl Run<'_> {
                     break;
                 }
                 pty.write(b"\x03").expect("type a Ctrl-C");
+                // A Ctrl-C at a prompt makes bash draw a new one: the next
+                // line waits for it, not for the prompt already shown.
+                n = n.max(count(&output, PROMPT.as_bytes()));
                 continue;
             }
             // Typed ahead: the M10 launches may not show `PROMPT`.
@@ -590,6 +593,7 @@ mod rcexit {
         "E1", "E2", "E3", "E4", "E5", "E6", "E7", "E8", "E9", "E10", "E11", "E12", "E13", "E14",
         "E15", "E16", "E17", "E18", "E19", "E20", "E21", "E22", "E23", "E24", "E25", "E26", "E27",
         "E28", "E29", "E30", "E31", "E32", "E33", "E34", "E35", "E36", "E37", "E38", "E39", "E40",
+        "E41", "E42", "E43", "E44", "E45", "E46", "E47",
     ];
     row_tests!(rcexit_row:
         e1 => "E1", e2 => "E2", e3 => "E3", e4 => "E4", e5 => "E5", e6 => "E6", e7 => "E7",
@@ -598,7 +602,8 @@ mod rcexit {
         e20 => "E20", e21 => "E21", e22 => "E22", e23 => "E23", e24 => "E24", e25 => "E25",
         e26 => "E26", e27 => "E27", e28 => "E28", e29 => "E29", e30 => "E30", e31 => "E31",
         e32 => "E32", e33 => "E33", e34 => "E34", e35 => "E35", e36 => "E36", e37 => "E37",
-        e38 => "E38", e39 => "E39", e40 => "E40",
+        e38 => "E38", e39 => "E39", e40 => "E40", e41 => "E41", e42 => "E42",
+        e43 => "E43", e44 => "E44", e45 => "E45", e46 => "E46", e47 => "E47",
     );
 }
 
@@ -1193,7 +1198,7 @@ fn an_unset_prompt_command_turned_into_an_array_keeps_only_the_users_and_ours() 
         "declare -p PROMPT_COMMAND",
     ];
     let element =
-        "_tessera_si_element && builtin eval \\\"\\$_tessera_si_go\\\" && _tessera_si_nop";
+        "_tessera_si_element && builtin eval \\\"\\$_tessera_si_go\\\" && _tessera_si_xon";
     let want_ours = format!("declare -a PROMPT_COMMAND=([1]=\"f1\" [2]=\"{element}\")");
     let mut failures = Vec::new();
     for program in bashes("5.3 5.1", "unset to array") {
@@ -1262,7 +1267,7 @@ fn an_empty_array_gets_our_element_at_index_1() {
             &[("starship.bash", &starship)],
         );
         let want = "declare -a PROMPT_COMMAND=([0]=\"starship_precmd\" \
-                    [1]=\"_tessera_si_element && builtin eval \\\"\\$_tessera_si_go\\\" && _tessera_si_nop\")";
+                    [1]=\"_tessera_si_element && builtin eval \\\"\\$_tessera_si_go\\\" && _tessera_si_xon\")";
         if !injected.text.contains(want) || d_marks(&injected.text) != ["0", "1", "0"] {
             failures.push(format!("{}: {:?}", program.display(), injected.text));
         }
@@ -1276,7 +1281,7 @@ fn an_empty_array_gets_our_element_at_index_1() {
 #[test]
 fn a_copy_of_our_element_at_startup_is_not_appended_again() {
     let startup = "u1() { :; }\n\
-                   PROMPT_COMMAND=(u1 '_tessera_si_element && builtin eval \"$_tessera_si_go\" && _tessera_si_nop')";
+                   PROMPT_COMMAND=(u1 '_tessera_si_element && builtin eval \"$_tessera_si_go\" && _tessera_si_xon')";
     let mut failures = Vec::new();
     for program in bashes("5.3 5.1", "array copy") {
         let output = Run {
@@ -1423,15 +1428,16 @@ fn a_ctrl_c_in_the_heads_read_keeps_set_x() {
     report("#740 stopped head", &failures);
 }
 
-/// #740 B1: a Ctrl-C while the user's DEBUG trap runs at top level for the
-/// head's `builtin set -x` (no `set -T` needed) stops the head with
+/// #740 B1: a Ctrl-C while the user's DEBUG trap runs at top level for a
+/// head command run with `set -x` off (no `set -T` needed; since #752 the
+/// head's last such command, the install of our trap) stops the head with
 /// `set -x` still off; the flag is still set there, so `set -x` comes back
 /// when bash runs `PROMPT_COMMAND` again, and the flag is cleared. String
 /// and array `PROMPT_COMMAND`; the trace goes to /dev/null through
 /// descriptor 3 (bash 4.1 and later).
 #[test]
 fn a_ctrl_c_before_the_heads_restore_keeps_set_x() {
-    let trap = "trap 'case $BASH_COMMAND in \"builtin set -x\") [[ -e $HOME/slow ]] && \
+    let trap = "trap 'case $BASH_COMMAND in \"builtin trap -- \"*) [[ -e $HOME/slow ]] && \
                 { rm -f $HOME/slow; echo READY; sleep 3; } ;; esac' DEBUG\n\
                 exec 3>/dev/null\nBASH_XTRACEFD=3\nset -x";
     let line = "echo \"x=${-//[^x]/} xo=[$_tessera_si_xoff]\"";
@@ -1460,6 +1466,112 @@ fn a_ctrl_c_before_the_heads_restore_keeps_set_x() {
         }
     }
     report("#740 B1", &failures);
+}
+
+/// #752 B2: a Ctrl-C at the prompt leaves our trap set when bash runs
+/// `PROMPT_COMMAND` again; the head's read and install of it are ours, so
+/// the trace (to a file through descriptor 5; on 3.2, hidden by `PS4`, on
+/// the terminal) holds neither the install with the trap text nor the
+/// read, with and without `set -T`, as bash alone. The prompt
+/// shows `QQ1R` (typed as `$((0+1))`) once the line before the Ctrl-C ran
+/// and the prompt is drawn; the `R` is only in the prompt, so the wait
+/// never matches 3.2's trace of `zp=QQ1` on the terminal, which would put
+/// the Ctrl-C inside our head (#751).
+#[test]
+fn a_ctrl_c_at_the_prompt_traces_none_of_ours() {
+    let line = "echo \"n=$(grep -cE 'trap -- |trap -p DEBUG' xt)\"";
+    let lines = [
+        "PS1='${zp}R'\"$PS1\"",
+        "set -x",
+        "zp=QQ$((0+1))",
+        "^C QQ1R",
+        "zp=",
+        "set +x",
+        line,
+    ];
+    let mut failures = Vec::new();
+    for program in bashes("3.2 5.1 5.3", "#752 B2") {
+        for extra in ["", "set -T\n"] {
+            let startup = format!("{extra}exec 5>xt\nBASH_XTRACEFD=5\nPS4=$'\\rP\\r> '");
+            for injected in [true, false] {
+                let output = Run {
+                    program: &program,
+                    route: Route::Rcfile,
+                    injected,
+                    startup: &startup,
+                    args: None,
+                    env: &[],
+                    ahead: false,
+                }
+                .lines(&lines);
+                let got = transcript(&output.text);
+                if output.injected != injected
+                    || !got.iter().any(|line| line.ends_with("n=0"))
+                    || got.iter().any(|line| line.contains("_tessera_si"))
+                {
+                    failures.push(format!(
+                        "{} {extra:?} injected={injected}: got {got:?}: {:?}",
+                        program.display(),
+                        output.text
+                    ));
+                }
+            }
+        }
+    }
+    report("#752 B2", &failures);
+}
+
+/// Bash-preexec 0.7's text, for [`bash_preexec_adds_few_trace_lines`].
+const BASH_PREEXEC: &str = include_str!("fixtures/bash-tools/bash-preexec-0.7.sh");
+
+/// #752 B3: with bash-preexec, our functions run with `set -x` off: one
+/// command and its prompt trace at most `bound` lines more than bash and
+/// bash-preexec alone (counted in `PS4`, traced to /dev/null). Most of
+/// them are bash-preexec's own trap running for our entry's commands
+/// (measured: 3.2 74, 5.3 42; 110 and 78 before the fix).
+#[test]
+fn bash_preexec_adds_few_trace_lines() {
+    let startup = "exec 5>/dev/null\nBASH_XTRACEFD=5\n. ~/bp.sh\nPS4='+$((zq+=1)) '";
+    let lines = ["set -x", ":", "m=$zq", ":", "echo \"d=$((zq-m))\""];
+    let mut failures = Vec::new();
+    for program in bashes("3.2 5.1 5.3", "#752 B3") {
+        let bound = if major(&program) == Some(3) { 80 } else { 48 };
+        let mut d = Vec::new();
+        for injected in [true, false] {
+            let output = Run {
+                program: &program,
+                route: Route::Rcfile,
+                injected,
+                startup,
+                args: None,
+                env: &[],
+                ahead: false,
+            }
+            .lines_with(&lines, &[("bp.sh", BASH_PREEXEC)]);
+            let got = transcript(&output.text);
+            let n = got
+                .iter()
+                .find_map(|line| line.strip_prefix("d="))
+                .and_then(|n| n.parse::<usize>().ok());
+            if output.injected != injected || n.is_none() {
+                failures.push(format!(
+                    "{} injected={injected}: got {got:?}: {:?}",
+                    program.display(),
+                    output.text
+                ));
+            }
+            d.extend(n);
+        }
+        if let [ours, theirs] = d[..]
+            && ours > theirs + bound
+        {
+            failures.push(format!(
+                "{}: {ours} trace lines, bash-preexec alone {theirs}, bound +{bound}",
+                program.display()
+            ));
+        }
+    }
+    report("#752 B3", &failures);
 }
 
 /// #676: the --rcfile route's end runs also when there is no startup file

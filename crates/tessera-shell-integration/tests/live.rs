@@ -2899,3 +2899,93 @@ fn zsh_reports_the_shells_directory_not_a_subshells() {
         "{paths:?}"
     );
 }
+
+/// #751: Ctrl-C pressed about 30 times at 7 ms intervals after it
+/// interrupted `sleep 2` lands, at least once, inside the prompt's hooks.
+/// The shell must survive that, as bash alone does: it then runs the next
+/// command. Returns what went wrong, for the caller to collect.
+fn ctrl_c_spam_keeps_the_shell(bash: &Path, bashrc: &str, route: Route) -> Result<(), String> {
+    let prepared = prepare_via(
+        &Case {
+            shell: Shell::Bash,
+            program: bash.to_path_buf(),
+            args: Some(&["-i"]),
+            files: &[(".bashrc", bashrc)],
+            env: &[],
+        },
+        route,
+    );
+    let what = format!("{} {route:?} with {bashrc:?}", bash.display());
+    let (mut pty, events) = NativePty::spawn(&prepared.options).expect("spawn the shell");
+    let pid = pty.child_pid().expect("the shell's pid");
+    let mut out = Output {
+        bytes: Vec::new(),
+        answered: [0; ANSWERS.len()],
+    };
+    let text = |out: &Output| String::from_utf8_lossy(&out.bytes).into_owned();
+    if !pump(&mut pty, &events, &mut out, |bytes| {
+        route == Route::ByHand || count(bytes, b"\x1b]133;B") >= 1
+    }) || !pump_until_reading(pid, &mut pty, &events, &mut out)
+    {
+        return Err(format!("{what}: no first prompt: {:?}", text(&out)));
+    }
+    pty.write(b"sleep 2\r").expect("type a command");
+    if !pump_until_child(pid, "sleep", &mut pty, &events, &mut out) {
+        return Err(format!("{what}: no sleep: {:?}", text(&out)));
+    }
+    for _ in 0..30 {
+        if pty.write(b"\x03").is_err() {
+            break;
+        }
+        // Drain as it comes, so the shell never blocks on its output.
+        let pause = Instant::now() + Duration::from_millis(7);
+        while let Some(left) = pause.checked_duration_since(Instant::now()) {
+            match events.recv_timeout(left) {
+                Ok(PtyEvent::Output(bytes)) => out.push(&mut pty, &bytes),
+                Ok(PtyEvent::Exited(_)) => {
+                    return Err(format!("{what}: exited during the spam: {:?}", text(&out)));
+                }
+                Err(_) => break,
+            }
+        }
+    }
+    // The shell settles at a prompt, then runs one more command.
+    let _ = pump_until_reading(pid, &mut pty, &events, &mut out);
+    let _ = pty.write(b"echo alive-$((6*7))\r");
+    if !pump(&mut pty, &events, &mut out, |bytes| {
+        count(bytes, b"alive-42") >= 1
+    }) {
+        return Err(format!(
+            "{what}: the shell did not survive: {:?}",
+            text(&out)
+        ));
+    }
+    let _ = pty.write(b"exit\r");
+    wait_exit(&mut pty, &events, &mut out);
+    Ok(())
+}
+
+/// #751: on bash 3.2 a Ctrl-C landing inside the prompt's hooks ended the
+/// shell (`exit`, status 1), and bash 5.3 quits as well; bash alone
+/// survives the same input. Runs
+/// each bash with an empty `.bashrc`, with the issue's (a
+/// `PROMPT_COMMAND`, a DEBUG trap with a command substitution, `set -x`)
+/// and with `set -x` alone.
+#[test]
+#[ignore = "#751: bash parser EOF on SIGINT in DEBUG trap"]
+fn bash_survives_ctrl_c_spam_after_an_interrupted_command() {
+    let bashrcs = [
+        "",
+        "PROMPT_COMMAND=':'\ntrap '_t=$(date +%s)' DEBUG\nset -x\n",
+        "set -x\n",
+    ];
+    let mut failures = Vec::new();
+    for bash in bashes() {
+        for bashrc in bashrcs {
+            if let Err(failure) = ctrl_c_spam_keeps_the_shell(&bash, bashrc, Route::Injected) {
+                failures.push(failure);
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
