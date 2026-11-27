@@ -925,9 +925,7 @@ final class TerminalWindow: NSWindow {
 
     /// Ordered in (``NSWindowController/showWindow(_:)``,
     /// `makeKeyAndOrderFront`, a tab's selection): the window now has a
-    /// number on screen, so a blur radius waiting for one is set (ADR 0045).
-    /// AppKit posts no occlusion change for a first show, whose state can
-    /// already be visible. The same path as a tab's selection
+    /// number on screen. The same path as a tab's selection
     /// (``TerminalWindowContentView/windowDidBecomeVisible()``).
     override func order(_ place: NSWindow.OrderingMode, relativeTo otherWin: Int) {
         super.order(place, relativeTo: otherWin)

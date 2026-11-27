@@ -4,7 +4,9 @@
 0.2.0. The app does not read `blur_radius` and has no Settings slider for
 it, so every blurred window keeps the material blur of ADR 0043; the key
 still parses, is clamped and is reported by `tessera_app_blur_radius`, and
-has no effect. It returns with the rework in 0.3.0, #491)
+has no effect. It returns with the rework in 0.3.0, #491) · amended
+2026-11-26 (#491: the private call is gone; one masked material view per
+window, see the last amendment)
 
 ## Context
 
@@ -160,3 +162,61 @@ brought up to date when they become visible again, as above.
   title bar and tab bar as last measured over panes with height (#403 m2), so
   a programmatic frame at the smallest size leaves each pane its smallest
   size in a tabbed window too.
+
+## Amendment: one masked material per window, no private call (#491, 2026-11-26)
+
+Supersedes the CGS path above (the key, its range and its clamping stay).
+
+**What the user saw (#491).** With a radius above 0, `CGSSetWindowBackgroundBlurRadius`
+blurs the window's whole square rectangle, so a sharp-cornered outline with a dark edge
+showed round the rounded window, also on a theme change at opacity 0.5. Radius 0 fell back
+to the panes' material, which looks like no slider position, so "Off" was not off.
+
+**Path taken: the fallback the lead decision names.** The CGS call takes a window number
+and a radius and nothing else; no public call clips it, its result cannot be measured by a
+test (the hosted tests have no screen capture and the call reports success for any window),
+and a second private call to reshape the window would add a risk for a look no test can
+check. So the app no longer calls it, nor looks it up: `WindowBlurRadius` has no `dlopen`,
+`dlsym` or `TESSERA_WINDOW_BLUR_RADIUS` any more, and the Distribution concern above is gone.
+
+- **One view per window.** A translucent window has one `WindowBackdropView`
+  (`NSVisualEffectView`, `.behindWindow`, `.fullScreenUI`, always active) under everything
+  in its content view, filling it. Panes have no effect view of their own any more.
+- **The shape.** The view's layer has a `CAShapeLayer` mask whose path is the window's
+  outline (a rectangle with the window's corner radius: AppKit's private `_cornerRadius`,
+  read by key-value coding where the window answers it, read-only, else 10 pt before macOS
+  26 and 16 pt from it; 0 in native full screen) intersected with the strip under the title
+  bar and tab bar and each shown translucent pane that asks for `blur`; a pane hidden behind
+  a maximized one is left out. AppKit's own `maskImage` is a layer mask over the material's
+  `CABackdropLayer` (with `capInsets` as its `contentsCenter`), so a shape-layer mask is the
+  same mechanism. A `maskImage` the window's size was a 32-bit bitmap, about 20 MB per window
+  and tab at 2x, drawn again on every resize step (#491 B3); the path has no bitmap in the
+  app (0 bytes of mask backing, bar 256 KB), and an update per resize or divider step takes
+  a median 21 µs under TSan (bar 1 ms; 8 µs for the path alone, optimised), measured at a
+  load of about 76. The path changes, without animation, only when the regions, the corner
+  radius or the size change. Tests render the mask layer and read its pixels at the corners
+  and along the arc.
+- **Off is off.** Radius 0, an opaque window and Reduce Transparency (the app sets radius
+  0) leave no effect view in the window: no blur under the panes or under the title bar and
+  tab bar, whose tint stays.
+- **The radius, approximated without a private call.** AppKit has no behind-window blur of a
+  chosen radius, so `blur_radius` is the strength of the material: the view's `alphaValue`
+  is `radius / 64`, the material over the unblurred desktop. 64 is today's material blur,
+  the strongest there is.
+- **Default 48** (was 0), three quarters of the material: close to the old look with room
+  above it; the eye check on #589 confirms it or moves it toward 64. Range 0..=64 kept.
+- **Option ii is dropped.** A tab of mixed panes no longer has to agree: each pane that
+  asks for blur is in the mask, one that does not is not, and the strip always is while the
+  radius is above 0.
+- **Migration.** The meaning of a stored 0 changes: it was the material behind each pane
+  that asked for `blur`, and is now no blur. The 0.2.0 and 0.2.1 templates wrote
+  `blur_radius = 0` under the comment "No effect in 0.2.0 ... It returns in 0.3.0.", so
+  the loader reads that line, untouched (in `[appearance]`, right under those two comment
+  lines, exactly `blur_radius = 0`), as the default 48: in memory only, the file is never
+  rewritten. A 0 the user wrote (no such comment, an edited comment, another spelling) is
+  no blur. Setting the key in Settings takes the stale comment off it (the editor lists the
+  two lines as removed), so a 0 chosen there stays Off.
+- **The off-screen rules of the #405 amendment** were about the window number the call
+  needed; a view needs none, so the occlusion observer is gone and an update applies at
+  once whatever the window's state.
+

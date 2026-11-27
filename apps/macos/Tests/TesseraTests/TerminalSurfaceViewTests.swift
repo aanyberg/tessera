@@ -1021,7 +1021,7 @@ final class TerminalSurfaceViewTests: XCTestCase {
         XCTAssertEqual(view.backgroundAppearance?.opaque, true)
         XCTAssertEqual(view.backgroundAppearance?.blur, false)
         XCTAssertEqual(view.backgroundAppearance?.background.alpha, 1, "an opaque background")
-        XCTAssertNil(view.backdrop)
+        XCTAssertFalse(view.wantsBlur)
         XCTAssertFalse(view.isDisplayLinkPaused, "a re-theme wakes the link")
         let before = view.renderCount
         view.displayLinkDidFire()

@@ -344,21 +344,23 @@ pub struct Appearance {
     /// bar and tab bar of a translucent window are always blurred, whatever
     /// this says. Off while the system's Reduce Transparency setting is on.
     pub blur: bool,
-    /// Has no effect in 0.2.0: the app ignores it and every pane that
-    /// asks for `blur` keeps the system's standard blur. It returns in
-    /// 0.3.0 (#491); a file that sets it still loads, with the checks
-    /// below. How strongly a window blurs what is behind it, from 0 to 64
-    /// ([`Appearance::MAX_BLUR_RADIUS`]). 0 keeps the system's standard
-    /// blur behind each pane that asks for `blur`; 1 to 64 blurs the whole
-    /// window at that radius instead, but only while every translucent
-    /// pane of the tab asks for `blur` (otherwise each pane keeps the
-    /// standard blur). The title bar and tab bar keep the standard blur
-    /// either way. A value above 64 is lowered to 64 with a warning; a
-    /// negative or fractional one (`-1`, `20.0`) makes the file invalid,
-    /// as for `scrollback_lines`. From 0.3.0 it applies to open windows when
-    /// the file changes. Set it here only: in a profile's `appearance` it is
-    /// ignored with a warning, since the window, not the session, is
-    /// blurred.
+    /// How strongly a translucent window blurs what is behind it, from 0
+    /// to 64 ([`Appearance::MAX_BLUR_RADIUS`]); default 48. 0 is no blur at
+    /// all, under the title bar and tab bar too; 1 to 64 blurs the title bar
+    /// and tab bar of a translucent window and each translucent pane that
+    /// asks for `blur`, inside the window's rounded corners. macOS has no
+    /// blur of a chosen radius behind a window, so the value is the strength
+    /// of the system's blur: 64 is all of it, 32 half of it over the
+    /// unblurred desktop. Until 0.3.0, 0 (then the default) kept the
+    /// system's blur behind each pane that asked for `blur`: the line
+    /// `blur_radius = 0` the 0.2.0 and 0.2.1 templates wrote, untouched
+    /// under their comment ("No effect in 0.2.0 ..."), still reads as the
+    /// default (the file is not rewritten), and setting the key in Settings
+    /// drops that comment; any other 0 turns the blur off. A value above 64 is lowered to 64 with a warning;
+    /// a negative or fractional one (`-1`, `20.0`) makes the file invalid,
+    /// as for `scrollback_lines`. It applies to open windows when the file
+    /// changes. Set it here only: in a profile's `appearance` it is ignored
+    /// with a warning, since the window, not the session, is blurred.
     pub blur_radius: u32,
     /// The cursor's shape: `"block"`, `"underline"` or `"beam"` (a
     /// vertical bar), exactly as written here. A program may change it
@@ -460,7 +462,7 @@ impl Default for Appearance {
             font_size: 13.0,
             opacity: 1.0,
             blur: false,
-            blur_radius: 0,
+            blur_radius: 48,
             cursor_shape: CursorShape::Block,
             cursor_blink: false,
             dim_inactive_panes: 0.0,

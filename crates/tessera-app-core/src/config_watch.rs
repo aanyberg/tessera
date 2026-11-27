@@ -4047,7 +4047,7 @@ font_size = 14.0
         .unwrap();
         let store = ConfigStore::open(paths.clone()).unwrap();
         let app = App::new((*store.config()).clone(), paths.clone());
-        assert_eq!(app.blur_radius(), 0);
+        assert_eq!(app.blur_radius(), 48, "the default (#491)");
         let recorder = Recorder::default();
         app.set_observer(Some(Box::new(recorder.clone())));
         let id = attach_fake_profile(&app, None);
@@ -4082,7 +4082,7 @@ font_size = 14.0
         assert_eq!(app.blur_radius(), 64, "the configured radius");
         recorder.take();
         reload("[appearance]\nopacity = 0.5\nblur = true\n");
-        assert_eq!(app.blur_radius(), 0);
+        assert_eq!(app.blur_radius(), 48, "back to the default");
         assert_eq!(recorder.take(), [true], "told once, opaque under REDUCE");
         // A profile cannot change it.
         reload(

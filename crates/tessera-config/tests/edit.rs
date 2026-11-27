@@ -1838,3 +1838,47 @@ fn an_edit_by_name_finds_the_name_the_loader_gave() {
         Some("/bin/sh")
     );
 }
+
+/// #491: setting `[appearance] blur_radius` in an untouched 0.2.x file
+/// takes the template's stale comment off the key, so a 0 chosen in
+/// Settings is no blur, not the template's 0 the loader reads as the
+/// default; any other edit keeps the file's 0 the default.
+#[test]
+fn setting_the_blur_radius_retires_the_0_2_template_comment() {
+    let template = include_str!("fixtures/default-config-0.2.1.toml");
+    let (_dir, path, mut editor) = open(template);
+    editor
+        .set("appearance.opacity", toml::Value::Float(0.5))
+        .unwrap();
+    editor.save().unwrap();
+    let text = read(&path);
+    assert!(
+        text.contains("It returns in 0.3.0.\nblur_radius = 0\n"),
+        "{text}"
+    );
+    let loaded = tessera_config::Config::from_toml_lenient(&text).unwrap();
+    assert_eq!(
+        loaded.config.appearance.blur_radius, 48,
+        "another edit: still the default"
+    );
+
+    for value in [0, 20] {
+        let (_dir, path, mut editor) = open(template);
+        editor
+            .set("appearance.blur_radius", toml::Value::Integer(value))
+            .unwrap();
+        editor.save().unwrap();
+        let text = read(&path);
+        assert!(!text.contains("No effect in 0.2.0"), "{value}: {text}");
+        assert!(
+            text.contains(&format!("blur = false\nblur_radius = {value}\n")),
+            "{value}: {text}"
+        );
+        let loaded = tessera_config::Config::from_toml_lenient(&text).unwrap();
+        assert_eq!(
+            i64::from(loaded.config.appearance.blur_radius),
+            value,
+            "{value}: the user's choice"
+        );
+    }
+}

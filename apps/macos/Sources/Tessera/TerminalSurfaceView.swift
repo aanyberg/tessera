@@ -243,10 +243,6 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
     /// This pane's search and its find bar (#46b), from the first ⌘F.
     /// See TerminalSurfaceView+Find.swift.
     var findController: FindController?
-    /// The blur under the render view while the session's appearance asks
-    /// for it, and that appearance as last read, `nil` before the first
-    /// attach (#42). See TerminalSurfaceView+Backdrop.swift, the only writer.
-    var backdrop: PaneBackdropView?
     var backgroundAppearance: TesseraSession.Appearance?
     /// The left-button gesture the view handles itself (the core did not
     /// report the press to a program), from press to release.
