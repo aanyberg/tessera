@@ -246,14 +246,25 @@ pub(crate) struct BenchReport {
 /// The built-in case that does nothing, run to measure process overhead.
 const EMPTY_CASE: &str = "__empty";
 
-/// A case must do at least this many times the spread of the empty runs'
-/// instruction counts (their run-to-run noise), so the subtracted overhead
-/// moves the ratio by no more than about 0.1%.
-const MIN_WORK_OVER_NOISE: u64 = 1000;
-
-/// Empty runs needed to estimate the noise; with fewer, a case must do at
-/// least the overhead itself in work.
-const MIN_EMPTY_RUNS_FOR_NOISE: usize = 3;
+/// A case must do at least this many times the process overhead (the
+/// fewest instructions any empty run retired) in work, or `bench` reports
+/// it as too small.
+///
+/// The floor exists to refuse cases whose signal is lost in measurement
+/// overhead: the gated ratio is net of the subtracted overhead, so what can
+/// distort it is how far a run's real startup cost strays from that
+/// subtracted minimum. The floor is tied to the overhead's level, not to the
+/// spread of the empty runs (#769): that spread is the machine's load, not
+/// the case. Under load the empty runs spread by about 2M instructions, and
+/// a floor of 1000 times the spread (about 2G) refused real 0.4-1.8G cases
+/// even base against base, while the best-of-N gate keeps the quietest run
+/// per side and so never carries most of that spread. The minimum barely
+/// moves with load, since load adds instructions to a run and never removes
+/// them. At 20 times the overhead (about 320M for the measured ~16M probe), a run whose
+/// startup strays by the 2M seen under load moves its side by under 1%, and
+/// even a run that pays the whole overhead twice moves it by 5%; a case near
+/// the overhead itself, where the stray swamps the work, is refused.
+const MIN_WORK_OVER_OVERHEAD: u64 = 20;
 
 /// Builds the probe in `dir` and runs `case` in `pairs` alternating
 /// base/head process pairs, each preceded by a run of the empty case to
@@ -421,20 +432,13 @@ fn report(
         }
     }
 
-    let empty_counts: Vec<u64> = empty.iter().filter_map(|s| s.instructions).collect();
     let base_work = base.iter().filter_map(|s| s.instructions).min();
     if let (Some(work), Some(overhead)) = (base_work, overhead_instructions) {
-        let floor = if empty_counts.len() >= MIN_EMPTY_RUNS_FOR_NOISE {
-            let spread = empty_counts.iter().max().unwrap_or(&overhead) - overhead;
-            spread.saturating_mul(MIN_WORK_OVER_NOISE).max(1)
-        } else {
-            overhead
-        };
+        let floor = overhead.saturating_mul(MIN_WORK_OVER_OVERHEAD).max(1);
         if work < floor {
             problems.push(format!(
                 "case too small: base does {work} instructions of work, under the floor of {floor} \
-                 ({MIN_WORK_OVER_NOISE}x the spread of the empty runs, or the overhead itself with \
-                 fewer than {MIN_EMPTY_RUNS_FOR_NOISE} of them)"
+                 ({MIN_WORK_OVER_OVERHEAD}x the process overhead of {overhead})"
             ));
         }
     }
@@ -803,10 +807,10 @@ mod tests {
     #[test]
     fn report_subtracts_process_overhead_before_the_ratio() {
         // Head does twice the work of base on top of a fixed 14M startup cost:
-        // the gross ratio would read 1.5, the net one must read 2.
+        // the gross ratio would read about 1.96, the net one must read 2.
         let overhead = 14_000_000;
-        let base = [sample(100, Some(overhead + 14_000_000))];
-        let head = [sample(200, Some(overhead + 28_000_000))];
+        let base = [sample(100, Some(overhead + 300_000_000))];
+        let head = [sample(200, Some(overhead + 600_000_000))];
         let quiet = [
             sample(1, Some(overhead + 5_000)),
             sample(1, Some(overhead)),
@@ -819,30 +823,57 @@ mod tests {
     }
 
     #[test]
-    fn report_rejects_cases_drowned_by_overhead_noise() {
+    fn report_rejects_cases_drowned_by_overhead() {
         let overhead = 14_000_000;
-        let base = [sample(100, Some(overhead + 14_000_000))];
-        let head = [sample(100, Some(overhead + 14_000_000))];
-        // A 50k spread needs 50M instructions of work.
-        let noisy = [
-            sample(1, Some(overhead + 50_000)),
+        let quiet = [
+            sample(1, Some(overhead + 5_000)),
             sample(1, Some(overhead)),
-            sample(1, Some(overhead + 10_000)),
+            sample(1, Some(overhead + 2_000)),
         ];
-        let small = report("x", &base, &head, &noisy, "");
-        assert!(
-            small.problems.iter().any(|p| p.contains("too small")),
-            "{:?}",
-            small.problems
-        );
+        let too_small = |work: u64, empty: &[Sample]| {
+            let side = [sample(100, Some(overhead + work))];
+            report("x", &side, &side, empty, "")
+                .problems
+                .iter()
+                .any(|p| p.contains("too small"))
+        };
+        // The floor is 20x the overhead (280M) however quiet the empty runs
+        // are, and however few of them there are.
+        assert!(too_small(1_000, &quiet));
+        assert!(too_small(14_000_000, &quiet));
+        assert!(too_small(279_999_999, &quiet));
+        assert!(!too_small(280_000_000, &quiet));
+        let one = [sample(1, Some(overhead))];
+        assert!(too_small(1_000, &one));
+        assert!(!too_small(280_000_000, &one));
+    }
 
-        // With fewer than three empty runs the floor is the overhead itself.
-        let few = [sample(1, Some(overhead))];
+    #[test]
+    fn report_floor_ignores_load_noise_in_the_empty_runs() {
+        // #769: under load the empty runs spread by about 2M instructions. A
+        // floor that scales with that spread (1000x it, 2G) refused real
+        // 0.4G cases base against base; the floor must stay at 20x the
+        // overhead, so the 0.4G case passes and a tiny one is still refused.
+        let overhead = 14_000_000;
+        let loaded = [
+            sample(1, Some(overhead + 2_000_000)),
+            sample(1, Some(overhead)),
+            sample(1, Some(overhead + 1_500_000)),
+            sample(1, Some(overhead + 800_000)),
+        ];
+        let real = [
+            sample(100, Some(overhead + 400_000_000)),
+            sample(130, Some(overhead + 401_900_000)),
+        ];
+        let accepted = report("x", &real, &real, &loaded, "load average: 120");
+        assert_eq!(accepted.problems, Vec::<String>::new(), "{}", accepted.text);
+
         let tiny = [sample(100, Some(overhead + 1_000))];
-        assert_eq!(report("x", &tiny, &tiny, &few, "").problems.len(), 1);
-        assert_eq!(
-            report("x", &base, &head, &few, "").problems,
-            Vec::<String>::new()
+        let refused = report("x", &tiny, &tiny, &loaded, "load average: 120");
+        assert!(
+            refused.problems.iter().any(|p| p.contains("too small")),
+            "{}",
+            refused.text
         );
     }
 

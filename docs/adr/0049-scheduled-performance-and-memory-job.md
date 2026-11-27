@@ -28,8 +28,8 @@ restore. A dispatch input `force` bypasses that. It runs only on `main`.
 
 **D3. Bars.** Instructions head/base at most 1.02 in at least one of three independent probe builds (the noise-floor
 rule of the factory: a probe build alone moves the base by about 1 %), so a case is rebuilt only while it is over.
-Heap at most 1.02 of the baseline's. A `problem:` line from `ab` (case too small for the machine's load, checksums
-differ) makes the line `noisy`, never `regressed`.
+Heap at most 1.02 of the baseline's. A `problem:` line from `ab` (case too small against the process overhead,
+checksums differ) makes the line `noisy`, never `regressed`.
 
 **D4. Baseline.** The newest SHA none of whose lines is `regressed`. A regression that stays on main is compared to
 the last good SHA on every run instead of becoming the new normal. When the case set does not build at that SHA (an

@@ -513,7 +513,8 @@ pub fn bench(case: &str, side: Side) -> Option<u64> {
         };
     }
     Some(match case {
-        // Instruction cases: well over a few tens of millions of instructions each.
+        // Instruction cases: each must clear ab's floor of 20x the empty probe
+        // (about 320M); search is the closest, at about 1.3x the floor.
         "feed" => pick!(feed, 60_000),
         "scroll" => pick!(scroll, 40_000),
         "search" => pick!(search, 12_000),

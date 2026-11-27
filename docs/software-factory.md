@@ -324,9 +324,10 @@ Agents use these instead of rebuilding the setup in every run:
   depends on each crate at the base revision (`base_<name>`) and in the worktree (`head_<name>`). Write cases in
   the probe's `src/cases.rs`, then `cargo xtask ab bench <dir> --case <c> [--max-ratio <bar>]` (alternating
   base/head processes; best-of-N wall time, instructions retired and cycles net of the measured process overhead,
-  gating on instructions because a loaded machine distorts wall time; a case too small to measure or whose sides
-  compute different checksums fails the bar) and `cargo xtask ab diff <dir> --case <c> --seeds <n>`
-  (differential fuzzing). Implementers measure performance bars with it, critics re-measure and diff-fuzz fast
+  gating on instructions because a loaded machine distorts wall time; a case doing under 20x the process overhead
+  in work, or whose sides compute different checksums, fails the bar) and
+  `cargo xtask ab diff <dir> --case <c> --seeds <n>` (differential fuzzing).
+  Implementers measure performance bars with it, critics re-measure and diff-fuzz fast
   paths, the adversarial tester uses it for its own probes. The instrument's noise floor is about 1%: a probe
   build alone moves the base by that much (#175: `feed_combining_heavy` read 1.010 once and 1.000 in three other
   probes). A bar tighter than 1.02 therefore counts as met only when three independent probe builds (a fresh
