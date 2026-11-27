@@ -280,9 +280,23 @@ mod tests {
         assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
     }
 
+    /// How long [`a_flooding_session_keeps_wake_ups_bounded`] lets the
+    /// flood go without a single event before it fails. A working flood
+    /// posts every few milliseconds, and the longest stall of a test
+    /// process seen under gate load is 26 s (#419). It is below nextest's
+    /// 300 s slow-timeout, so a stall fails here with its message.
+    const STALL: Duration = Duration::from_secs(60);
+
     /// The real observer path: a child flooding a session while the "event
     /// loop" (this thread) drains slowly. Wake-ups outstanding never exceed
     /// two, however many output events the reader thread produces.
+    ///
+    /// There is no deadline on the whole flood: it is CPU work (the parse
+    /// of every byte, in a debug build) that load stretches without bound,
+    /// and a fixed 60 s for 20 MB failed at load 100 on 10 cores (#771).
+    /// The test fails instead when the flood stops, no event for
+    /// [`STALL`]; nextest's slow-timeout is the backstop for a flood that
+    /// crawls without stopping.
     #[test]
     fn a_flooding_session_keeps_wake_ups_bounded() {
         // A configuration directory that does not exist yet, in one removed
@@ -313,15 +327,26 @@ mod tests {
         let mut options = SpawnOptions::login_shell("");
         options.program = Program::Command {
             program: "/bin/sh".into(),
-            args: vec!["-c".into(), "yes 0123456789 | head -c 20000000".into()],
+            args: vec!["-c".into(), "yes 0123456789 | head -c 4000000".into()],
         };
         let id = app.spawn_session(options).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(60);
         let mut drains = 0_usize;
+        let mut seen = 0_usize;
+        let mut last_event = Instant::now();
         let exit = loop {
-            assert!(Instant::now() < deadline, "the flood did not finish");
             // A slow frame: the reader keeps posting meanwhile.
             std::thread::sleep(Duration::from_millis(16));
+            let now_posted = posted.load(Ordering::Relaxed);
+            if now_posted == seen {
+                let quiet = last_event.elapsed();
+                assert!(
+                    quiet < STALL,
+                    "the flood stopped: no event for {quiet:?} after {seen} events"
+                );
+            } else {
+                seen = now_posted;
+                last_event = Instant::now();
+            }
             if outstanding.load(Ordering::SeqCst) == 0 {
                 continue;
             }
