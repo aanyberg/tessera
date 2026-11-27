@@ -900,6 +900,48 @@ final class TerminationSignalTests: XCTestCase {
         }
     }
 
+    /// #640: a child that stops at ``TerminationSignalChild/launchStage``
+    /// and opens no window (here on purpose, as
+    /// children spinning in Thread Sanitizer's `dispatch_once` did under
+    /// load) is killed and started once more, and the test runs on the
+    /// second one.
+    func testAChildThatStallsAtLaunchIsRelaunchedOnce() async throws {
+        let result = try await run(.sheet, command: "sleep 100", trigger: .signal(SIGTERM), stallingLaunches: 1)
+        let first = try XCTUnwrap(result.relaunchedAfter, "the first launch stalled, and a second ran")
+        XCTAssertEqual(first.kind, .stalledAtLaunch)
+        XCTAssertTrue(
+            first.description.hasPrefix(#"the child stalled at "\#(TerminationSignalChild.launchStage)" for "#),
+            first.description)
+        XCTAssertTrue(
+            first.description.contains("stages:\nthe test bundle loaded\n\(TerminationSignalChild.launchStage)\n\n"),
+            "no stage after it: \(first.description)")
+        XCTAssertTrue(first.description.contains("threads:\n"), "with the stalled child's sample: \(first.description)")
+        assertQuit(result, within: Self.exitDeadline, "SIGTERM to the relaunched child")
+    }
+
+    /// #640: a second stall fails the test with both tries' diagnoses, so
+    /// a launch that really hangs is not retried away.
+    func testAChildThatStallsAtLaunchTwiceFails() async throws {
+        do {
+            _ = try await run(.sheet, command: "sleep 100", trigger: .signal(SIGTERM), stallingLaunches: 2)
+            XCTFail("a child that stalled at both launches got ready")
+        } catch let failure as ChildFailedTwice {
+            let text = failure.description
+            XCTAssertTrue(text.hasPrefix("the relaunched child failed too: the child stalled at launch"), text)
+            XCTAssertEqual(text.components(separatedBy: "the child stalled at \"").count, 3, "both tries: \(text)")
+            XCTAssertTrue(text.contains("\nan earlier try: the child stalled at launch (#640): "), text)
+        }
+    }
+
+    /// #640: the child runs without AppKit's window restoration, whose
+    /// launch work in Thread Sanitizer's `dispatch_once` was a partner of
+    /// the stall; AppKit says so in the child's output.
+    func testTheChildRunsWithoutAppKitsWindowRestoration() async throws {
+        let result = try await run(.sheet, command: "sleep 100", trigger: .signal(SIGTERM))
+        XCTAssertTrue(result.output.contains("ApplePersistence=NO"), result.output)
+        assertQuit(result, within: Self.exitDeadline, "SIGTERM")
+    }
+
     /// The summary of a crash report, whether or not this machine still
     /// writes them (OSAnalytics stops at 25 a process): the exception, the
     /// abort reason and the crashed thread's frames with their images, from
@@ -1283,23 +1325,32 @@ final class TerminationSignalTests: XCTestCase {
     /// signal before its first stage (#625: Thread Sanitizer's runtime
     /// faulted in its own allocator inside `NSApplication.shared` under
     /// load); the output says so, with the signal and the crash report.
-    /// Each kind is relaunched once (the two are unrelated, and the second
-    /// can strike the relaunch of the first under load); a second failure
+    /// So is a child that reached ``TerminationSignalChild/launchStage``
+    /// and no later stage for ``launchStallLimit`` without that fork hang
+    /// (#640: under load, its main thread and AppKit's
+    /// `NSPersistentUILocalStorageClient` queue spun in Thread Sanitizer's
+    /// `dispatch_once` while another thread sat in its allocator, for
+    /// 60 s). Each kind is relaunched once (the kinds are unrelated, and one
+    /// can strike the relaunch of another under load); a second failure
     /// of the same kind fails the test, with every try's diagnosis.
     ///
     /// The first `crashingLaunches` launches crash on purpose before their
-    /// first stage (``TerminationSignalChild/crashVariable``), for the
-    /// tests of that relaunch.
+    /// first stage (``TerminationSignalChild/crashVariable``), and the first
+    /// `stallingLaunches` stop at ``TerminationSignalChild/launchStage``
+    /// (``TerminationSignalChild/stallVariable``), for the tests of those
+    /// relaunches.
     private func run(
         _ mode: TerminationSignalChild.Mode, command: String, trigger: Trigger?, thenExpect expected: String? = nil,
-        followedBy followUp: Int32? = nil, quitKeepsWindows: Bool? = nil, crashingLaunches: Int = 0
+        followedBy followUp: Int32? = nil, quitKeepsWindows: Bool? = nil, crashingLaunches: Int = 0,
+        stallingLaunches: Int = 0
     ) async throws -> Result {
         var launches = 0
         func attempt() async throws -> Result {
             launches += 1
             return try await runOnce(
                 mode, command: command, trigger: trigger, thenExpect: expected, followedBy: followUp,
-                quitKeepsWindows: quitKeepsWindows, crashesAtLaunch: launches <= crashingLaunches)
+                quitKeepsWindows: quitKeepsWindows, crashesAtLaunch: launches <= crashingLaunches,
+                stallsAtLaunch: launches <= stallingLaunches)
         }
         var relaunched: [RelaunchedChild] = []
         while true {
@@ -1325,12 +1376,18 @@ final class TerminationSignalTests: XCTestCase {
     /// (a child gets ready in 11-16 s on CI).
     private static let forkHangProbe: Duration = .seconds(20)
 
+    /// How long a child may stay at ``TerminationSignalChild/launchStage``
+    /// before it counts as stalled at launch (#640): its next stage, the
+    /// window, comes within a few seconds even on a loaded CI runner.
+    private static let launchStallLimit: Duration = .seconds(20)
+
     /// A child that never got ready for a reason of the machine's rather
     /// than the app's, so it is started once more: its main thread was
-    /// stuck in Thread Sanitizer's fork hook (#278), or it died of a signal
-    /// before its first stage (#625).
+    /// stuck in Thread Sanitizer's fork hook (#278), it died of a signal
+    /// before its first stage (#625), or it stalled at launch, at
+    /// ``TerminationSignalChild/launchStage`` (#640).
     struct RelaunchedChild: Error, CustomStringConvertible {
-        enum Kind { case forkHang, diedBeforeItsFirstStage }
+        enum Kind { case forkHang, diedBeforeItsFirstStage, stalledAtLaunch }
         let kind: Kind
         let description: String
         /// The crash report ReportCrash wrote for it, if one was found.
@@ -1340,6 +1397,7 @@ final class TerminationSignalTests: XCTestCase {
             switch kind {
             case .forkHang: "TSan fork hang in the child (#278)"
             case .diedBeforeItsFirstStage: "the child died before its first stage (#625)"
+            case .stalledAtLaunch: "the child stalled at launch (#640)"
             }
         }
     }
@@ -1352,7 +1410,7 @@ final class TerminationSignalTests: XCTestCase {
 
     private func runOnce(
         _ mode: TerminationSignalChild.Mode, command: String, trigger: Trigger?, thenExpect expected: String?,
-        followedBy followUp: Int32?, quitKeepsWindows: Bool?, crashesAtLaunch: Bool
+        followedBy followUp: Int32?, quitKeepsWindows: Bool?, crashesAtLaunch: Bool, stallsAtLaunch: Bool
     ) async throws -> Result {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("tessera-441-\(UUID().uuidString)")
         addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
@@ -1375,13 +1433,16 @@ final class TerminationSignalTests: XCTestCase {
         }
 
         let launchedAt = Date()
-        let child = try TerminationSignalChild.launch(in: dir, crashing: crashesAtLaunch)
+        let child = try TerminationSignalChild.launch(in: dir, crashing: crashesAtLaunch, stalling: stallsAtLaunch)
         let ready = dir.appendingPathComponent(TerminationSignalChild.readyFile)
         let failure = dir.appendingPathComponent(TerminationSignalChild.errorFile)
         let stages = dir.appendingPathComponent(TerminationSignalChild.stagesFile)
         let launched = ContinuousClock.now
         var nextProbe = Self.forkHangProbe
         let inFork = { (graph: [String]?) in graph.map(TerminationSignalChild.isForkHang) ?? false }
+        // The stages so far, and when they last changed (#640).
+        var reached = ""
+        var reachedAt = launched
         while !FileManager.default.fileExists(atPath: ready.path) {
             if let error = try? String(contentsOf: failure, encoding: .utf8) {
                 let diagnosis = TerminationSignalChild.diagnose(child, in: dir)
@@ -1394,8 +1455,15 @@ final class TerminationSignalTests: XCTestCase {
             let loaded = FileManager.default.fileExists(atPath: stages.path)
             let waited = ContinuousClock.now - launched
             let timedOut = !child.isRunning || waited >= .seconds(60) || (!loaded && waited >= .seconds(20))
+            if let now = try? String(contentsOf: stages, encoding: .utf8), now != reached {
+                (reached, reachedAt) = (now, ContinuousClock.now)
+            }
+            let stalledFor = ContinuousClock.now - reachedAt
+            let stalled = child.isRunning
+                && reached.split(separator: "\n").last.map(String.init) == TerminationSignalChild.launchStage
+                && stalledFor >= Self.launchStallLimit
             var graph: [String]?
-            if !timedOut, loaded, waited >= nextProbe {
+            if !timedOut, loaded, waited >= nextProbe || stalled {
                 nextProbe += Self.forkHangProbe
                 graph = TerminationSignalChild.callGraph(of: child, in: dir)
             }
@@ -1411,10 +1479,12 @@ final class TerminationSignalTests: XCTestCase {
                         + "\(TerminationSignalChild.diagnose(child, in: dir))\n\(reason)",
                     crashReport: crashReport)
             }
-            if timedOut || forkHang {
+            if timedOut || forkHang || stalled {
                 let what: String
                 if forkHang {
                     what = "hung in TSan's fork hook"
+                } else if stalled {
+                    what = "stalled at \"\(TerminationSignalChild.launchStage)\" for \(stalledFor)"
                 } else if !child.isRunning {
                     what = "exited"
                 } else {
@@ -1427,6 +1497,7 @@ final class TerminationSignalTests: XCTestCase {
                 child.waitUntilExit()
                 let description = "the child \(what) after \(waited)\n\(diagnosis)"
                 if hung { throw RelaunchedChild(kind: .forkHang, description: description) }
+                if stalled { throw RelaunchedChild(kind: .stalledAtLaunch, description: description) }
                 throw PollTimedOut(description: description)
             }
             try await Task.sleep(for: .milliseconds(20))
@@ -1511,6 +1582,12 @@ enum TerminationSignalChild {
     /// Set to 1, the child crashes before its first stage (the tests of
     /// #625's relaunch).
     nonisolated static let crashVariable = "TESSERA_TESTS_SIGNAL_CHILD_CRASH"
+    /// Set to 1, the child stops at ``launchStage`` and never opens its
+    /// window (the tests of #640's relaunch); its 90 s cap still ends it.
+    nonisolated static let stallVariable = "TESSERA_TESTS_SIGNAL_CHILD_STALL"
+    /// The stage the child marks once it runs (``runIfRequested()``); a
+    /// child that reaches no later one stalled at launch (#640).
+    nonisolated static let launchStage = "the test bundle started"
     /// Written when `NSApplication.willTerminateNotification` is posted.
     static let willTerminateFile = "will-terminate"
     /// The child's sheets and modal alert once its sheet or alert is up,
@@ -1601,8 +1678,9 @@ enum TerminationSignalChild {
     /// Starts a copy of this test host that runs the child in `dir`
     /// (``requestFile`` there says what), its output in `output.log`.
     /// XCTest in the copy reads a copy of this run's configuration that
-    /// reports to no IDE, from a file.
-    static func launch(in dir: URL, crashing: Bool = false) throws -> Process {
+    /// reports to no IDE, from a file. `crashing` and `stalling` set the
+    /// seams of the relaunch tests (``crashVariable``, ``stallVariable``).
+    static func launch(in dir: URL, crashing: Bool = false, stalling: Bool = false) throws -> Process {
         guard let configurationClass = NSClassFromString("XCTestConfiguration") as? NSObject.Type,
             let active = configurationClass.perform(NSSelectorFromString("activeTestConfiguration"))?
                 .takeUnretainedValue() as? NSObject
@@ -1648,12 +1726,13 @@ enum TerminationSignalChild {
         ]
         .compactMap(\.self).filter { !$0.isEmpty }.joined(separator: ":")
         environment[crashVariable] = crashing ? "1" : nil
+        environment[stallVariable] = stalling ? "1" : nil
 
         let output = dir.appendingPathComponent("output.log")
         FileManager.default.createFile(atPath: output.path, contents: Data())
         let child = Process()
         child.executableURL = Bundle.main.executableURL
-        child.arguments = Array(ProcessInfo.processInfo.arguments.dropFirst())
+        child.arguments = Array(ProcessInfo.processInfo.arguments.dropFirst()) + noPersistentUIArguments
         child.environment = environment
         child.currentDirectoryURL = dir
         child.standardOutput = try FileHandle(forWritingTo: output)
@@ -1666,6 +1745,17 @@ enum TerminationSignalChild {
         try child.run()
         return child
     }
+
+    /// Turns AppKit's window restoration (NSPersistentUI) off in the child
+    /// (#640): AppKit logs "ApplePersistence=NO" and keeps no restorable
+    /// state. `-ApplePersistenceIgnoreState YES`, which xcodebuild passes
+    /// the host, only moves that state to a `<bundle id>.savedState` in the
+    /// temporary directory, shared by every host and child of this bundle
+    /// id. Under load, AppKit's `NSPersistentUILocalStorageClient` queue was
+    /// one partner of a child stuck in Thread Sanitizer's `dispatch_once`
+    /// before its window opened. The terminal windows are
+    /// not restorable anyway (the window state store restores them).
+    static let noPersistentUIArguments = ["-ApplePersistence", "NO"]
 
     /// The path of XCTest's injector library loaded in this process.
     private static func injectorPath() -> String? {
@@ -1865,7 +1955,7 @@ enum TerminationSignalChild {
     static func runIfRequested() {
         guard let path = ProcessInfo.processInfo.environment[directoryVariable] else { return }
         let dir = URL(fileURLWithPath: path)
-        mark("the test bundle started")
+        mark(launchStage)
         // A cap of the child's own, whatever its mode: the quit alert's
         // `runModal` would wait forever if the parent died before
         // signalling (Xcode's Stop, a crash).
@@ -1873,6 +1963,11 @@ enum TerminationSignalChild {
         DispatchQueue.global().asyncAfter(deadline: .now() + .seconds(90)) {
             try? "no signal came within 90 s".write(to: failure, atomically: true, encoding: .utf8)
             _exit(3)
+        }
+        if ProcessInfo.processInfo.environment[stallVariable] == "1" {
+            // As #640's children did: the main thread makes no progress
+            // after the first stage, until the cap above ends the child.
+            while true { Thread.sleep(forTimeInterval: 1) }
         }
         do {
             try run(in: dir)
