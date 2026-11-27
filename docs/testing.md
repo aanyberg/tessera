@@ -56,7 +56,14 @@ another test failed in it. The watchdog does not see the same hang in a child co
 sampled, and again every 20 s after that. If one thread spent the whole sample in `wrap_fork` with an atfork prepare
 handler or `__tsan::` frames on the same stack (only the sample is read, never the child's output), the child is killed
 and started once more. The deadlock never resolves, so a retry costs about 25 s and the test stays within the default
-120 s allowance and the watchdog's 150 s limit. A second hang fails the test as the second try. A test that waits for
+120 s allowance and the watchdog's 150 s limit. A second hang fails the test as the second try. A child that stays at
+the stage "the test bundle started" for 20 s without that fork hang is also killed and started once more, and
+a second such stall fails the test (#640). Under load, such a child's main thread and AppKit's
+`NSPersistentUILocalStorageClient` queue had spun in TSan's `dispatch_once` for 60 s while another thread sat in the
+runtime's allocator (`__tsan::MetaMap::AllocBlock`). The child now starts with `-ApplePersistence NO`, so AppKit
+keeps no restorable state there. xcodebuild's `-ApplePersistenceIgnoreState YES` only moves that state to a
+`<bundle id>.savedState` in the temporary directory, which every host and child of the bundle id shares. Other
+partners may remain, hence the relaunch. A test that waits for
 a child's output should wait for all of it and allow 30 s, so that it does not fail on its own on a loaded host. To
 reproduce locally, run the affected classes under TSan with `-test-iterations 20` through the watchdog (`taskpolicy -b`
 and a concurrent `cargo build`). On main that gave 1 hang in 60 iterations of `TabVisibilityTests` and
