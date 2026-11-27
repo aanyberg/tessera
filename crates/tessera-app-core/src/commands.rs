@@ -57,7 +57,7 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use tessera_grid::{Grid, Line, Mark, Style};
+use tessera_grid::{Grid, Line, LineRef, Mark, Style};
 use tessera_term::Terminal;
 
 use crate::search::TerminalSource;
@@ -776,7 +776,7 @@ fn scan(
     }
 }
 
-fn has(line: Option<&Line>, mark: &Mark) -> bool {
+fn has(line: Option<LineRef<'_>>, mark: &Mark) -> bool {
     line.is_some_and(|line| line.marks.contains(mark))
 }
 
@@ -1176,7 +1176,7 @@ pub(crate) fn last_output(session: &Session) -> Option<OutputRange> {
             line -= 1;
             col = grid
                 .logical_line(index)
-                .and_then(|row| last_text_col(row, this == end - 1 && row.wrapped));
+                .and_then(|row| last_text_col(&row, this == end - 1 && row.wrapped));
             this < first || col.is_some()
         },
     );

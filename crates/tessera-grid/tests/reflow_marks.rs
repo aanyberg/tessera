@@ -24,8 +24,10 @@ fn end(code: i32) -> Mark {
 }
 
 /// Every line of the buffer, oldest scrollback line first.
-fn lines(grid: &Grid) -> Vec<&Line> {
-    grid.logical_lines().collect()
+fn lines(grid: &Grid) -> Vec<Line> {
+    grid.logical_lines()
+        .map(tessera_grid::LineRef::into_owned)
+        .collect()
 }
 
 /// Panics unless every line holds at most one mark of each kind.
@@ -517,7 +519,7 @@ impl Model {
             discriminant(&t.mark) != discriminant(&m)
                 || Self::line_of(grid, &places, t) != Some(row)
         });
-        let ch = first_char(grid.logical_line(row).expect("cursor row"));
+        let ch = first_char(&grid.logical_line(row).expect("cursor row"));
         self.tracked.push(Tracked {
             mark: m.clone(),
             ch,

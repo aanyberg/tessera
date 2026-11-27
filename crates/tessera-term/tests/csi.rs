@@ -892,7 +892,11 @@ fn invariant_errors(grid: &Grid) -> Vec<String> {
     let mut errors = Vec::new();
     let cols = usize::from(grid.cols());
     let scrollback = (0..grid.scrollback_len()).filter_map(|i| grid.scrollback_line(i));
-    for (i, line) in grid.visible_lines().iter().chain(scrollback).enumerate() {
+    let visible = grid
+        .visible_lines()
+        .iter()
+        .map(tessera_grid::LineRef::borrowed);
+    for (i, line) in visible.chain(scrollback).enumerate() {
         let cells = &line.cells;
         if cells.len() != cols {
             errors.push(format!("line {i}: {} cells", cells.len()));

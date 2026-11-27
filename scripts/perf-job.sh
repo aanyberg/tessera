@@ -26,13 +26,14 @@
 #
 # The baseline is the newest SHA none of whose lines is `regressed`, so a regression that stays does not become the
 # new normal. Bars: instructions head/base <= PERF_JOB_BAR (1.02) in at least one of PERF_JOB_BUILDS (3) independent
-# probe builds; heap and resident head <= base * PERF_JOB_BAR.
+# probe builds; heap and resident head <= base * PERF_JOB_BAR. An accepted step (scripts/perf-steps.txt, ADR 0049 D9)
+# raises one case's bar for the comparisons whose head has its line and whose base does not.
 #
 # Test hooks (scripts/test-perf-job.sh): PERF_JOB_AB (default `cargo xtask ab`), PERF_JOB_PROBE (default the built
 # probe binary; called `<case> <side>`, prints the checksum), PERF_JOB_RSS (default `/usr/bin/time -l` around the
 # probe; called `<probe> <case> <side>`, prints the peak resident bytes; the highest of PERF_JOB_RSS_RUNS (3) runs per
-# side counts), PERF_JOB_GH (default `gh`), PERF_JOB_WORK
-# (scratch).
+# side counts), PERF_JOB_GH (default `gh`), PERF_JOB_STEPS_DIR (default unset: the steps file is read with `git show
+# <sha>:scripts/perf-steps.txt`; set, <dir>/<sha> is that SHA's file), PERF_JOB_WORK (scratch).
 #
 # Bash 3.2 compatible (the macOS system bash).
 set -euo pipefail
@@ -136,11 +137,48 @@ run_link() {
     fi
 }
 
+# The accepted steps at <sha>: the data lines of scripts/perf-steps.txt (`<case> <bar> <reason>`), comments and blank
+# lines dropped, sorted; nothing when the file or the commit is missing.
+steps_at() {
+    local text
+    if [[ -n "${PERF_JOB_STEPS_DIR:-}" ]]; then
+        text="$(cat "$PERF_JOB_STEPS_DIR/$1" 2>/dev/null || true)"
+    else
+        text="$(git -C "$root" show "$1:scripts/perf-steps.txt" 2>/dev/null || true)"
+    fi
+    printf '%s\n' "$text" | sed -e 's/[[:space:]]*$//' | awk 'NF >= 3 && $1 !~ /^#/' | sort
+}
+
+# The steps of this comparison: the lines at head that are not at base (set by `run` once base is known).
+new_steps=""
+
+# The bar of one case in this comparison: the highest bar a new step gives it, else PERF_JOB_BAR. Args: case.
+case_bar() {
+    local raised=""
+    if [[ -n "$new_steps" ]]; then
+        raised="$(printf '%s\n' "$new_steps" | awk -v c="$1" '$1 == c { print $2 }' | sort -g | tail -n 1)"
+    fi
+    printf '%s\n' "${raised:-$bar}"
+}
+
+# The note of one case in this comparison: the reason of its new step, joined to the run's note. Args: case note.
+case_note() {
+    local why=""
+    if [[ -n "$new_steps" ]]; then
+        why="$(printf '%s\n' "$new_steps" | awk -v c="$1" '$1 == c { $1 = ""; $2 = ""; sub(/^ +/, ""); print }' | tail -n 1)"
+    fi
+    if [[ -n "$why" ]]; then
+        printf 'accepted step, bar %s (scripts/perf-steps.txt): %s%s\n' "$(case_bar "$1")" "$why" "${2:+; $2}"
+    else
+        printf '%s\n' "$2"
+    fi
+}
+
 # One JSON line. Args: case base instructions base_instructions ratio heap base_heap status note
 line() {
     jq -nc --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg sha "$head" --arg base "$2" --arg case "$1" \
-        --arg i "$3" --arg bi "$4" --arg r "$5" --arg h "$6" --arg bh "$7" --arg bar "$bar" \
-        --arg status "$8" --arg note "$9" '
+        --arg i "$3" --arg bi "$4" --arg r "$5" --arg h "$6" --arg bh "$7" --arg bar "$(case_bar "$1")" \
+        --arg status "$8" --arg note "$(case_note "$1" "$9")" '
         def num: if . == "" then null else tonumber end;
         {ts: $ts, sha: $sha, base: $base, case: $case, instructions: ($i | num), base_instructions: ($bi | num),
          ratio: ($r | num), heap_bytes: ($h | num), base_heap_bytes: ($bh | num), bar: ($bar | tonumber),
@@ -188,6 +226,10 @@ run)
     base="$(last_good)"
     note=""
     if [[ -z "$base" ]]; then base="$head"; note="baseline: no earlier measurement"; fi
+    # Accepted steps (ADR 0049 D9): a line of scripts/perf-steps.txt that head has and base has not.
+    steps_at "$head" > "$work/steps-head.txt"
+    steps_at "$base" > "$work/steps-base.txt"
+    new_steps="$(comm -13 "$work/steps-base.txt" "$work/steps-head.txt")"
 
     results="$work/results.jsonl"; : > "$results"
     todo="$instr_cases"
@@ -223,7 +265,7 @@ run)
                     continue
                 fi
                 if [[ "$problems" != 0 ]]; then verdict=noisy
-                elif awk -v r="$3" -v b="$bar" 'BEGIN { exit !(r <= b) }'; then verdict=ok
+                elif awk -v r="$3" -v b="$(case_bar "$c")" 'BEGIN { exit !(r <= b) }'; then verdict=ok
                 else verdict=regressed; fi
                 echo "$3 $1 $2 $verdict" >> "$work/best-$c.txt"
                 [[ "$verdict" == ok ]] || still="$still $c"
@@ -236,6 +278,7 @@ run)
             if [[ "$base" != "$head" ]]; then
                 echo "perf-job: the case set did not build or run at $base; measuring $head against itself" >&2
                 base="$head"; note="baseline: the case set does not build at the last measured SHA"
+                new_steps=""
                 rm -f "$work"/best-*.txt
                 continue
             fi
@@ -266,7 +309,7 @@ run)
         head_heap="$($probe_bin bench "$c" head | sed -n 's/.*sum=\([0-9][0-9]*\).*/\1/p')"
         base_heap="$($probe_bin bench "$c" base | sed -n 's/.*sum=\([0-9][0-9]*\).*/\1/p')"
         [[ -n "$head_heap" && -n "$base_heap" ]] || die "no heap reading for $c"
-        if awk -v h="$head_heap" -v b="$base_heap" -v r="$bar" 'BEGIN { exit !(h <= b * r) }'; then status=ok
+        if awk -v h="$head_heap" -v b="$base_heap" -v r="$(case_bar "$c")" 'BEGIN { exit !(h <= b * r) }'; then status=ok
         else status=regressed; fi
         ratio="$(awk -v h="$head_heap" -v b="$base_heap" 'BEGIN { printf "%.4f", (b > 0 ? h / b : 1) }')"
         line "$c" "$base" "" "" "$ratio" "$head_heap" "$base_heap" "$status" "$note" >> "$results"
@@ -291,7 +334,7 @@ run)
         # shellcheck disable=SC2086 # intentional split of the two readings
         set -- $reading
         head_rss="$1" base_rss="$2"
-        if awk -v h="$head_rss" -v b="$base_rss" -v r="$bar" 'BEGIN { exit !(h <= b * r) }'; then status=ok
+        if awk -v h="$head_rss" -v b="$base_rss" -v r="$(case_bar "$c")" 'BEGIN { exit !(h <= b * r) }'; then status=ok
         else status=regressed; fi
         ratio="$(awk -v h="$head_rss" -v b="$base_rss" 'BEGIN { printf "%.4f", (b > 0 ? h / b : 1) }')"
         line "$c" "$base" "" "" "$ratio" "$head_rss" "$base_rss" "$status" \
@@ -304,11 +347,12 @@ run)
         body="$work/issue.md"
         {
             echo "The scheduled performance job measured \`$head\` against \`$base\` (\`git log --oneline $base..$head\`)"
-            echo "and a case is past its bar (instructions or heap at most ${bar}x the baseline)."
+            echo "and a case is past its bar (instructions or heap at most ${bar}x the baseline, or the bar of an accepted"
+            echo "step in scripts/perf-steps.txt)."
             echo
-            echo "| case | status | head/base | instructions (head) | heap bytes (head) |"
-            echo "| --- | --- | --- | --- | --- |"
-            jq -r '"| \(.case) | \(.status) | \(.ratio) | \(.instructions // "-") | \(.heap_bytes // "-") |"' "$results"
+            echo "| case | status | head/base | bar | instructions (head) | heap bytes (head) |"
+            echo "| --- | --- | --- | --- | --- | --- |"
+            jq -r '"| \(.case) | \(.status) | \(.ratio) | \(.bar) | \(.instructions // "-") | \(.heap_bytes // "-") |"' "$results"
             echo
             echo "Policy: docs/testing.md, Performance and memory bars. Trend: the \`perf-trend\` artifact of the run."
             run_link

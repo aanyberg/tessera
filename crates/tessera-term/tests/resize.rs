@@ -71,7 +71,7 @@ fn styled_trailing_spaces_survive_a_resize() {
     let count = |term: &Terminal, flag: u16| {
         term.grid()
             .logical_lines()
-            .flat_map(|line| line.cells.iter())
+            .flat_map(|line| line.cells.clone())
             .filter(|cell| cell.style.has(flag))
             .count()
     };
@@ -94,7 +94,7 @@ fn styled_trailing_spaces_survive_a_resize() {
 fn screen_text(term: &Terminal) -> Vec<String> {
     term.grid()
         .logical_lines()
-        .map(tessera_grid::Line::text)
+        .map(|line| line.text())
         .collect()
 }
 
@@ -726,7 +726,7 @@ fn a_redrawn_right_prompt_survives_a_window_drag() {
     let lines: Vec<String> = term
         .grid()
         .logical_lines()
-        .map(tessera_grid::Line::text)
+        .map(|line| line.text())
         .filter(|t| t.starts_with('L'))
         .collect();
     // Back at 80 columns every line is one row again.

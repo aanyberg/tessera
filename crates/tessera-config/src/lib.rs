@@ -479,10 +479,13 @@ pub struct Terminal {
     /// Maximum number of scrollback lines kept per pane. Applies to sessions
     /// started after a change; running sessions keep the size they started with.
     /// Large values cost time on every width change: resizing a window
-    /// re-wraps the whole history while the terminal is locked, about 0.2 ms
-    /// per 1,000 lines (1-4 ms at 10,000 lines, 14-41 ms at 100,000), so at
-    /// the 10,000,000 limit a full history takes about 18 GB of memory and
-    /// each resize stalls the pane for 2-4 seconds.
+    /// re-wraps the whole history while the terminal is locked. Estimated
+    /// from earlier timings scaled by the measured re-wrap ratio, that is
+    /// about 0.35 ms per 1,000 lines (2-7 ms at 10,000 lines, 24-71 ms at
+    /// 100,000), so at the 10,000,000 limit each resize stalls the pane for
+    /// 3.5-7 seconds. A full history at that limit takes about 1.6 GB of
+    /// memory if its lines are plain text, and about twice that if they
+    /// mix styles or links (estimated from the measured cost of one line).
     pub scrollback_lines: u32,
     /// Shell integration for zsh, bash and fish:
     /// `"auto"` makes the shells Tessera starts load its scripts, which mark

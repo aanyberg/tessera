@@ -559,8 +559,14 @@ fn outcome(row: &Row, mut term: Terminal) -> Outcome {
     requests.retain(|request| !matches!(request, Request::Mark { .. }));
     let grid = term.grid();
     let marks = marks_of(grid.visible_lines());
-    let marks_scrollback =
-        marks_of((0..grid.scrollback_len()).filter_map(|i| grid.scrollback_line(i)));
+    let marks_scrollback = marks_of(
+        &(0..grid.scrollback_len())
+            .filter_map(|i| {
+                grid.scrollback_line(i)
+                    .map(tessera_grid::LineRef::into_owned)
+            })
+            .collect::<Vec<_>>(),
+    );
     let alt_screen = term.modes().alt_screen;
     let state = render_state(&term, &[]);
     let main_marks = row.main_marks.as_ref().map(|_| {

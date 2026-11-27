@@ -420,11 +420,11 @@ fn check_run(row: &Row, chunking: Chunking) -> (String, Vec<String>) {
         for s in 0..grid.scrollback_len() {
             let line = grid.scrollback_line(s).expect("history line");
             let want = expected_cells(history, s);
-            let got = cells_of(line);
+            let got = cells_of(&line);
             if got != want {
                 fail(format!(
                     "history {s} links {:?} != expected {want:?}",
-                    runs_of(line)
+                    runs_of(&line)
                 ));
             }
         }

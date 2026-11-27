@@ -1,6 +1,6 @@
 # ADR 0049: A scheduled performance and memory job
 
-**Status:** accepted · 2026-11-25
+**Status:** accepted · 2026-11-25 · amended 2026-11-27 (#51: accepted steps, the baselines after packed scrollback)
 
 ## Context
 
@@ -126,3 +126,29 @@ throughput that makes.
 | scrolling_top_region | 56 | 51 | 20.6 |
 | scrolling_top_small_region | 57 | 49 | 21.4 |
 | unicode | 202 | 13 | 85.1 |
+
+## Amendment: accepted steps and the baselines after packed scrollback (#51, 2026-11-27)
+
+Packed scrollback (ADR 0051) trades instructions for memory on purpose: `scroll` 1.256, `cat` 1.167, `search` 1.263
+and `rewrap` 1.718 of the phase 1 baseline, for 11x less heap per history line. Under D3 and D4 alone the first run
+after it would be `regressed` on four cases, and because D4 never makes a regressed SHA the baseline, so would every
+run after it.
+
+**D9. Accepted steps.** `scripts/perf-steps.txt` holds one line per accepted step: `<case> <bar> <reason>`. A line
+that the measured head has and the baseline has not (`git show <sha>:scripts/perf-steps.txt`, compared line by line)
+raises that case's bar to `<bar>` for that comparison; the line's `bar` field and its `note` say so, and the issue
+body lists each case's bar. The first run whose cases are all `ok` becomes the baseline (D4); it has the line, so the
+case is back at 1.02 from the next run on. A step is added only for a regression accepted under `docs/testing.md`,
+with its justification in the PR and the area's ADR; lines are never edited or removed. While the baseline lags (a
+regression elsewhere in the range), the step keeps applying, so it can hide up to its own margin of another change to
+that case in the same range; the bar is the measured ratio plus the 2 % noise margin, which keeps that margin small.
+
+The steps of #51 are `scroll` 1.282, `cat` 1.191, `search` 1.289 and `rewrap` 1.753 (ADR 0051 D7, D8); `feed`, the
+heap cases and `rss_1m` keep 1.02. After #51 the memory cases measure (the instruction baselines are the job's first
+run past it):
+
+| case | measure | before | after |
+| --- | --- | --- | --- |
+| `heap_lines_plain` | heap bytes per line | 1 664 | 151 |
+| `heap_lines_mixed` | heap bytes per line | 1 781 | 319 |
+| `rss_1m` | resident bytes per line | 1 895 | about 159 (11.9x lower) |

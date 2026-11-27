@@ -60,6 +60,7 @@
 //! and a frame whose marks differ from the last presented one's is drawn
 //! even without damage. The alternate screen has no marks.
 
+use std::ops::Deref;
 use std::time::{Duration, Instant};
 
 use tessera_config::{Appearance, Config};
@@ -1239,7 +1240,7 @@ impl Snapshot {
         };
         let mut changed = DamageRows::None;
         for r in range {
-            if self.sync_row(r, line(r), cols) {
+            if self.sync_row(r, &line(r), cols) {
                 changed = changed.with_row(u16::try_from(r).unwrap_or(u16::MAX));
             }
         }
@@ -1315,9 +1316,9 @@ impl Snapshot {
     /// straight copy, no comparison and no default fill first (this runs
     /// under the terminal lock on every full-screen scroll, resize and
     /// move of a scrolled-back view).
-    fn copy_all<'a>(
+    fn copy_all<L: Deref<Target = Line>>(
         &mut self,
-        lines: impl ExactSizeIterator<Item = &'a Line> + Clone,
+        lines: impl ExactSizeIterator<Item = L> + Clone,
         cols: usize,
     ) {
         let count = lines.len();
@@ -3593,9 +3594,13 @@ mod tests {
     /// stepping the view 3 lines per frame over the whole history keeps
     /// the 99th percentile of capture + frame under 1 ms, and the cost
     /// does not grow with the history: a capture at offset 50 000 costs
-    /// within 1.10x of one at offset 0, and one at offset 5 000 within
+    /// within 1.10x of one at offset 5 000, and one at offset 5 000 within
     /// 1.05x between 10 000 and 100 000 lines of history (best of 400
-    /// each; three attempts, as the other release timing bars).
+    /// each; three attempts, as the other release timing bars). Both
+    /// offsets show packed rows (ADR 0051), which a capture decodes: one at
+    /// offset 50 000 costs about 2x one of the live screen at offset 0
+    /// (1.99-2.21x measured, the decode cost ADR 0051 D7 accepts), held
+    /// under 2.5x.
     #[test]
     #[cfg_attr(debug_assertions, ignore = "timing bar; run in release")]
     fn scrolling_through_a_long_history_is_smooth() {
@@ -3620,19 +3625,26 @@ mod tests {
             let ratio = |a: Duration, b: Duration| a.as_secs_f64() / b.as_secs_f64();
             eprintln!(
                 "attempt {attempt}: {} frames, p50 {:?}, p99 {p99:?}, max {:?}; full capture at 0 \
-                 {live:?}, at 50 000 {deep:?} ({:.3}x); at 5 000 with 10k history {short:?}, \
-                 100k {long:?} ({:.3}x)",
+                 {live:?}, at 50 000 {deep:?} ({:.3}x, {:.3}x of 5 000); at 5 000 with 10k \
+                 history {short:?}, 100k {long:?} ({:.3}x)",
                 times.len(),
                 times[times.len() / 2],
                 times.last().expect("frames"),
                 ratio(deep, live),
+                ratio(deep, long),
                 ratio(long, short),
             );
             let mut miss = Vec::new();
             if p99 >= Duration::from_millis(1) {
                 miss.push(format!("p99 {p99:?} >= 1 ms"));
             }
-            if ratio(deep, live) > 1.10 {
+            if ratio(deep, long) > 1.10 {
+                miss.push(format!(
+                    "offset 50 000 costs {:.3}x offset 5 000",
+                    ratio(deep, long)
+                ));
+            }
+            if ratio(deep, live) > 2.5 {
                 miss.push(format!(
                     "offset 50 000 costs {:.3}x offset 0",
                     ratio(deep, live)
