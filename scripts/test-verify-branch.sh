@@ -291,7 +291,7 @@ EOF2
 if [ "$what_count" -eq "${#unreadable_filters[@]}" ]; then ok "every unreadable filter has a label ($what_count)"
 else not_ok "unreadable labels ($what_count) differ from unreadable_filters (${#unreadable_filters[@]})"; fi
 list real-toml
-real_targets="tessera-app-core:lib${nl}tessera-app-core:plugins${nl}tessera-app-core:smart_selection${nl}tessera-app-core:theme${nl}tessera-config:edit${nl}tessera-config:reload${nl}tessera-config:watch_themes${nl}tessera-devtool:theme${nl}tessera-devwin:lib${nl}tessera-ffi:lifecycle${nl}tessera-ffi:surface${nl}tessera-pty:close${nl}tessera-render:device_loss${nl}tessera-render:shaping${nl}tessera-term:decscusr${nl}tessera-term:rect${nl}tessera-term:rect_fixes${nl}tessera-term:wide"
+real_targets="tessera-app-core:lib${nl}tessera-app-core:plugins${nl}tessera-app-core:smart_selection${nl}tessera-app-core:theme${nl}tessera-config:edit${nl}tessera-config:profile_files${nl}tessera-config:reload${nl}tessera-config:watch_themes${nl}tessera-devtool:theme${nl}tessera-devwin:lib${nl}tessera-ffi:budgets${nl}tessera-ffi:lifecycle${nl}tessera-ffi:surface${nl}tessera-pty:close${nl}tessera-render:device_loss${nl}tessera-render:lib${nl}tessera-render:shaping${nl}tessera-term:decscusr${nl}tessera-term:osc_color${nl}tessera-term:rect${nl}tessera-term:rect_fixes${nl}tessera-term:stuck_modes${nl}tessera-term:wide"
 expect 'the repository nextest.toml yields its exact targets' "$header${nl}$real_targets" --list-targets
 list everything
 all="tessera-app-core:lib${nl}tessera-config:reload${nl}tessera-devwin:bins${nl}tessera-render:golden${nl}tessera-render:tests${nl}tessera-term:decscusr${nl}tessera-term:lib"
