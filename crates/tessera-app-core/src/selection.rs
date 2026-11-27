@@ -3373,6 +3373,16 @@ mod tests {
         assert!(MATCHES_SEEN.with(std::cell::Cell::get) > SMART_CLOCK_STRIDE);
     }
 
+    /// ADR 0042 (the table's click-time row and the #557 amendment) states
+    /// the stride as a number: the clock is read at the 16th, 32nd, ...
+    /// match, and a rule matching everywhere stops within the budget plus
+    /// 16 matches. The tests above use the constant, so a change to it
+    /// fails only here, where the ADR must change with it (#590).
+    #[test]
+    fn the_clock_stride_is_the_one_adr_0042_states() {
+        assert_eq!(SMART_CLOCK_STRIDE, 16, "update ADR 0042 with the stride");
+    }
+
     /// Runs `f` with the rule budget counting only the charged test costs,
     /// not the thread's CPU time, so tests that expect exact counts do not
     /// depend on the machine's speed (#525: the budget was wall time then,
