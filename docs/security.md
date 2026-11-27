@@ -166,7 +166,9 @@ Tracked: churn and leak checks for Rust, FFI and the app (#214); FFI fuzzing, AS
 - OSC 52 writes are on by default (only a `config.toml` that exists but does not load at launch, or sits behind a
   configuration directory symlink whose target is missing, turns them off until it loads: the store fails closed,
   `crates/tessera-config/src/store.rs`); each write shows a notice in its pane, at most one a second, after the fact
-  (#471). A multi-line paste without bracketed paste asks first unless `paste_guard = "off"` (#471). The guard trusts
+  (#471), held while the pane is hidden or a sheet covers its tab, and moved to the pane left when its pane closes
+  first (#763). A write whose pane closes when no terminal window is left (the last window's program wrote and exited)
+  shows no notice; the paste guard below is the defence there. A multi-line paste without bracketed paste asks first unless `paste_guard = "off"` (#471). The guard trusts
   the program's DECSET 2004 state: output that leaves 2004 on (a `cat` of `ESC[?2004h`, a remote tmux that died)
   lets a multi-line paste into a shell that reads no bracketed paste through without asking.
 - Link opening (ADR 0027, #437): a local file whose default handler is a regular third-party app opens with it,

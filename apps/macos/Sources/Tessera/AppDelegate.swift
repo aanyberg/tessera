@@ -1393,6 +1393,35 @@ extension AppDelegate: TerminalWindowControllerDelegate {
         }
         windowControllers.removeAll { $0 === controller }
         scheduleWindowStateSave()
+        // A clipboard write the tab did not show for long enough (its last
+        // pane's program wrote and exited, #763) shows on the tab the user
+        // is left with, once AppKit has picked it.
+        if let unseen = controller.takeUnseenClipboardNotice() {
+            let siblings = (controller.window?.tabGroup?.windows ?? []).map { WeakWindow(window: $0) }
+            Task { @MainActor [weak self] in
+                self?.adoptClipboardNotice(unseen, fromTabsOf: siblings)
+            }
+        }
+    }
+
+    /// Shows a closed tab's unseen clipboard writes (#763) on the tab the
+    /// user is left with: the selected tab of its tab bar, else the selected
+    /// tab of the frontmost window that is not minimised, else of any
+    /// terminal window, where it waits until that pane is on screen. With no
+    /// terminal window left nothing shows (ADR 0022 D-NOTICE52).
+    private func adoptClipboardNotice(_ notice: ClipboardNoticeThrottle.Notice, fromTabsOf siblings: [WeakWindow]) {
+        let controllers = windowControllers
+        func controller(of window: NSWindow?) -> TerminalWindowController? {
+            guard let window else { return nil }
+            return controllers.first { $0.window === (window.tabGroup?.selectedWindow ?? window) }
+        }
+        let windows = windowsFrontToBack()
+        let successor =
+            siblings.lazy.compactMap { controller(of: $0.window) }.first
+            ?? windows.lazy.filter { !$0.isMiniaturized }.compactMap(controller(of:)).first
+            ?? windows.lazy.compactMap(controller(of:)).first
+            ?? controllers.first
+        successor?.adoptClipboardNotice(notice)
     }
 
     func terminalWindowControllerFocusMayHaveChanged(_ controller: TerminalWindowController) {

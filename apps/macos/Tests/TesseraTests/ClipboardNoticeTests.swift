@@ -157,6 +157,26 @@ final class ClipboardNoticeTests: XCTestCase {
             Throttle.Notice(writes: 12, bytes: 5).text, "A program copied to the clipboard at least 12 times, last 5 bytes")
     }
 
+    func testAClosedPanesNoticeSaysSoAndCountsWithThePanesOwn() {
+        let closed = Throttle.Notice(writes: 2, bytes: 5).fromClosedPane
+        XCTAssertEqual(closed, .init(writes: 2, bytes: 5, closedWrites: 2))
+        XCTAssertEqual(
+            Throttle.Notice(writes: 1, bytes: 5, closedWrites: 1).text,
+            "A program in a closed pane copied 5 bytes to the clipboard")
+        XCTAssertEqual(
+            closed.text, "A program in a closed pane copied to the clipboard at least 2 times, last 5 bytes")
+        var throttle = Throttle()
+        let t0 = ContinuousClock.now
+        XCTAssertEqual(throttle.offer(Self.write(3), at: t0), .init(writes: 1, bytes: 3))
+        XCTAssertNil(throttle.offer(closed, at: t0 + .milliseconds(100)), "the same interval as the pane's own")
+        throttle.hold(Self.write(7))
+        let mixed = throttle.takeHeld()
+        XCTAssertEqual(mixed, .init(writes: 3, bytes: 7, closedWrites: 2))
+        XCTAssertEqual(
+            mixed?.text, "Programs here and in a closed pane copied to the clipboard at least 3 times, last 7 bytes")
+        XCTAssertNil(throttle.held, "taken")
+    }
+
     func testTheNoticeViewLetsClicksThrough() {
         let view = ClipboardNoticeView(frame: NSRect(x: 0, y: 0, width: 200, height: 30))
         XCTAssertNil(view.hitTest(NSPoint(x: 10, y: 10)))
@@ -360,6 +380,105 @@ final class ClipboardNoticeTests: XCTestCase {
         frontWindow.selectPreviousTab(nil)
         XCTAssertEqual(background.clipboardNotice.shownCount, 2, "shown as the tab is back")
         XCTAssertEqual(background.clipboardNotice.lastShown, .init(writes: 1, bytes: 3))
+    }
+
+    // MARK: A pane that closes (#763)
+
+    func testAWriteFromAPaneThatExitsShowsOnThePaneTheFocusMovesTo() async throws {
+        weak var weakClosed: TerminalSurfaceView?
+        let remaining = try openTab("echo kept")
+        let controller = try XCTUnwrap(appDelegate.windowControllers.first)
+        // Writes, then exits 0 at once: its pane closes.
+        appDelegate.spawnOptions = .init(program: "/bin/sh", arguments: ["-c", "echo ready; read go; \(Self.hello)"])
+        try autoreleasepool {
+            let closing = try XCTUnwrap(controller.splitFocusedPane(.right)).view
+            onScreen(closing)
+            weakClosed = closing
+        }
+        try await release(try XCTUnwrap(weakClosed))
+        try await waitUntil("the pane closes") { controller.panes.count == 1 }
+        XCTAssertEqual(pasteboard.string(forType: .string), "hello")
+        try await waitUntil("the notice shows on the pane left") { remaining.clipboardNotice.shownCount == 1 }
+        XCTAssertIdentical(controller.focusedPane.view, remaining)
+        XCTAssertEqual(remaining.clipboardNotice.lastShown, .init(writes: 1, bytes: 5, closedWrites: 1))
+        XCTAssertEqual(remaining.clipboardNotice.view?.text, "A program in a closed pane copied 5 bytes to the clipboard")
+        XCTAssertTrue(remaining.clipboardNotice.isShowing)
+        try await Task.sleep(for: .milliseconds(1500))
+        XCTAssertTrue(remaining.clipboardNotice.isShowing, "its full time")
+        try? await waitUntil("the closed pane is freed") { weakClosed == nil }
+        XCTAssertNil(weakClosed, "the closed pane's view")
+    }
+
+    func testAWriteFromATabThatExitsShowsOnTheTabLeftInItsWindow() async throws {
+        let kept = try openTab("echo kept")
+        let window = try XCTUnwrap(kept.window as? TerminalWindow)
+        appDelegate.spawnOptions = .init(program: "/bin/sh", arguments: ["-c", "echo ready; read go; \(Self.hello)"])
+        let closing = onScreen(try appDelegate.newTab(in: window).focusedPane.view)
+        XCTAssertFalse(kept.isShownToUser, "in a background tab")
+        try await release(closing)
+        try await waitUntil("the tab closes") { appDelegate.windowControllers.count == 1 }
+        XCTAssertEqual(pasteboard.string(forType: .string), "hello")
+        try await waitUntil("the notice shows on the tab left") { kept.clipboardNotice.shownCount == 1 }
+        XCTAssertTrue(kept.isShownToUser)
+        XCTAssertEqual(kept.clipboardNotice.view?.text, "A program in a closed pane copied 5 bytes to the clipboard")
+    }
+
+    func testAClosedTabsNoticeWaitsForAHiddenSuccessor() async throws {
+        // The window left is minimised: the notice waits for it.
+        let kept = try openTab("echo kept")
+        kept.occlusionOverride = true
+        // Writes, then exits 0: its window closes.
+        appDelegate.spawnOptions = .init(program: "/bin/sh", arguments: ["-c", "echo ready; read go; \(Self.hello)"])
+        let other = onScreen(try appDelegate.newWindow().focusedPane.view)
+        try await release(other)
+        try await waitUntil("the other window closes") { appDelegate.windowControllers.count == 1 }
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertEqual(kept.clipboardNotice.shownCount, 0, "held while the window is hidden")
+        XCTAssertEqual(kept.clipboardNotice.throttle.held, .init(writes: 1, bytes: 5, closedWrites: 1))
+        kept.occlusionOverride = false
+        XCTAssertEqual(kept.clipboardNotice.shownCount, 1, "shown as the window is")
+    }
+
+    func testANoticeSeenInFullDoesNotMoveWhenItsPaneCloses() async throws {
+        let remaining = try openTab("echo kept")
+        let controller = try XCTUnwrap(appDelegate.windowControllers.first)
+        appDelegate.spawnOptions = .init(
+            program: "/bin/sh", arguments: ["-c", "\(Self.hello); read go"])
+        let closing = onScreen(try XCTUnwrap(controller.splitFocusedPane(.right)).view)
+        try await waitUntil("the notice shows") { closing.clipboardNotice.shownCount == 1 }
+        try await waitUntil("the notice goes away", seconds: 10) { !closing.clipboardNotice.isShowing }
+        try closing.session.write(Array("\n".utf8))
+        try await waitUntil("the pane closes") { controller.panes.count == 1 }
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertEqual(remaining.clipboardNotice.shownCount, 0, "seen: nothing moves")
+    }
+
+    // MARK: Under a sheet (#763)
+
+    func testANoticeWaitsForASheetOnItsTabToEnd() async throws {
+        let view = try openTab("echo ready; read go; \(Self.hello)")
+        let window = try XCTUnwrap(view.window)
+        let sheet = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 500, height: 324), styleMask: [.titled],
+            backing: .buffered, defer: false)
+        sheet.isReleasedWhenClosed = false
+        window.beginSheet(sheet) { _ in }
+        try await waitUntil("the sheet is up") { window.attachedSheet === sheet }
+        try await release(view)
+        try await waitUntil("the write reaches the pasteboard") { pasteboard.string(forType: .string) == "hello" }
+        try await Task.sleep(for: .milliseconds(1500))
+        XCTAssertEqual(view.clipboardNotice.shownCount, 0, "held while the sheet covers the pane")
+        window.endSheet(sheet)
+        try await waitUntil("the notice shows as the sheet ends") { view.clipboardNotice.shownCount == 1 }
+        XCTAssertTrue(view.clipboardNotice.isShowing)
+        // A sheet that begins while the notice is up: it shows again after.
+        window.beginSheet(sheet) { _ in }
+        try await waitUntil("the sheet is up again") { window.attachedSheet === sheet }
+        try await Task.sleep(for: ClipboardNoticeView.holdDuration + .milliseconds(500))
+        window.endSheet(sheet)
+        try await waitUntil("the sheet ends") { window.attachedSheet == nil }
+        try await Task.sleep(for: .milliseconds(200))
+        XCTAssertTrue(view.clipboardNotice.isShowing, "shown again, its full time")
+        XCTAssertEqual(view.clipboardNotice.shownCount, 1, "the same notice")
     }
 
     // MARK: Bounds and lifetime
