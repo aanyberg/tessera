@@ -15,15 +15,42 @@ struct PasteConfirmation: Equatable {
         preview.lines == 1 ? "Paste 1 line?" : "Paste \(preview.lines.formatted()) lines?"
     }
 
+    /// A risk the question names.
+    enum Risk: Hashable, CaseIterable {
+        /// Each line break runs what comes before it (no bracketed paste).
+        case lineBreaksRun
+        /// The text holds control characters, which pasting removes.
+        case controls
+    }
+
+    /// The risks the question names; none when it asks only because
+    /// `paste_guard = "always"`.
+    var risks: Set<Risk> {
+        var risks: Set<Risk> = []
+        if preview.hasLineBreaks && !bracketed { risks.insert(.lineBreaksRun) }
+        if preview.hasControls { risks.insert(.controls) }
+        return risks
+    }
+
+    /// Whether a Paste answered to this question still holds when the
+    /// program's state now gives `current` (#748): it names no risk this
+    /// one did not. Bracketed paste turned off after the sheet opened adds
+    /// one (the lines now run), so the paste asks again; turned on, it
+    /// takes one away, and the paste goes ahead.
+    func covers(_ current: PasteConfirmation) -> Bool {
+        current.risks.isSubset(of: risks)
+    }
+
     /// Why it asks: each line runs, the text holds controls, or neither
     /// (`paste_guard = "always"`).
     var informativeText: String {
         var reasons: [String] = []
-        if preview.hasLineBreaks && !bracketed {
+        let risks = risks
+        if risks.contains(.lineBreaksRun) {
             reasons.append(
                 "The program has not turned on bracketed paste, so each line break runs what comes before it as a command.")
         }
-        if preview.hasControls {
+        if risks.contains(.controls) {
             reasons.append("The text holds control characters, shown escaped (^[ is Escape); pasting removes them.")
         }
         if reasons.isEmpty {

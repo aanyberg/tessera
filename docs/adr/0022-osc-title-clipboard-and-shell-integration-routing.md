@@ -394,7 +394,11 @@ read asks first, and OSC 52 stays on by default but every write is seen.
   most 16 079 bytes (`TESSERA_PASTE_PREVIEW_MAX_BYTES`) whatever the
   paste's size (16 MiB at most); the sheet adds "… n more lines". A second
   paste while the sheet is up, or into a window that already shows a sheet,
-  beeps and sends nothing; a pane that leaves its window (closed) ends its
+  beeps and sends nothing. Paste checks again before it sends (#748): when
+  the program has turned bracketed paste off since the sheet opened, so a
+  risk the sheet did not name now holds, a new sheet asks with the reasons
+  that hold now; a risk that went away (bracketed paste turned on) needs no
+  second answer, and the text goes bracketed; a pane that leaves its window (closed) ends its
   sheet as Cancel, and closing the tab ends it with the tab's other sheets.
 - **D-NOTICE52** (lead decision, #217): each OSC 52 write the bridge hands
   the pasteboard is reported to the session's delegate as a size and a
