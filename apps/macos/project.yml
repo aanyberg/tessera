@@ -3,8 +3,8 @@ options:
   bundleIdPrefix: com.aanyberg
   deploymentTarget:
     macOS: "15.0"
-  # The Xcode CI and releases build with (the project's LastUpgradeCheck); the
-  # README's Xcode 16 minimum still builds it.
+  # The Xcode CI and releases build with (the project's LastUpgradeCheck). CI
+  # builds with no other Xcode, so the README's Xcode 16 minimum is not tested.
   xcodeVersion: "27.1"
   createIntermediateGroups: true
   generateEmptyDirectories: true
