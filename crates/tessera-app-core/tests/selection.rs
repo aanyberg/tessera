@@ -548,8 +548,9 @@ fn select_all_then_copy_during_continuous_output_at_the_cap_copies_text() {
     // #191 (LD-1, ADR 0025 "When the selection is cleared"): a real PTY,
     // a shell printing about 100 lines a second, the history at a cap of
     // 500 lines. Every new line evicts the oldest; Select All must still
-    // copy the text that is left, 20 times out of 20. The shell loop ends
-    // when the test process does (`kill -0 $PPID`), even on a kill -9.
+    // copy the text that is left on every copy (at least 20, and one after
+    // an eviction). The shell loop ends when the test process does
+    // (`kill -0 $PPID`), even on a kill -9.
     let app = app();
     let script = "i=0; while [ $i -lt 700 ]; do echo fill $i; i=$((i+1)); done; \
                   i=0; while kill -0 $PPID 2>/dev/null; do echo line $i; i=$((i+1)); sleep 0.01; done";
@@ -589,17 +590,29 @@ fn select_all_then_copy_during_continuous_output_at_the_cap_copies_text() {
     };
     app.select_all(id).unwrap();
     let before = pushed_at(&app);
-    for copied in 0..20 {
+    // Copy at least 20 times, and keep copying until one copy follows an
+    // eviction (the history is at its cap, so every pushed line evicts
+    // one): a loaded machine may print nothing for seconds, so the
+    // precondition waits on the count, not on wall-clock speed (#778).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut copied = 0u32;
+    let mut copied_after_eviction = false;
+    while copied < 20 || !copied_after_eviction {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no line evicted during the copies ({copied} copies in 60 s)"
+        );
         std::thread::sleep(std::time::Duration::from_millis(50));
+        // Read the count before the copy: when it has moved, this copy
+        // sees a selection the eviction trimmed.
+        copied_after_eviction |= pushed_at(&app) > before;
         let text = app.selection_text(id).unwrap();
         assert!(
             text.as_deref().is_some_and(|t| t.contains("line ")),
             "Copy {copied} after Select All got {:?}",
             text.map(|t| t.chars().take(80).collect::<String>())
         );
+        copied += 1;
     }
-    // The output kept evicting lines meanwhile (the test exercised the trim).
-    let after = pushed_at(&app);
     app.close_session(id).unwrap();
-    assert!(after > before, "no line evicted during the copies");
 }
