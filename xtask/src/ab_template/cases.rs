@@ -5,9 +5,9 @@
 //! its output; `cargo xtask ab bench` reports differing checksums as a
 //! problem, which fails `--max-ratio`. Keep setup (corpus generation,
 //! allocation) identical on both sides: the probe times the whole call. The
-//! case must also be large enough to measure: at least 1000x the run-to-run
-//! spread of the empty process (a few tens of millions of instructions is
-//! typical); `bench` reports a smaller case as a problem.
+//! case must also be large enough to measure: at least 20x the instructions
+//! of the empty process (about 320M for the measured ~16M probe); `bench`
+//! reports a smaller case as a problem.
 
 use std::hint::black_box;
 
