@@ -28,7 +28,9 @@ struct ClipboardNoticeThrottle {
     /// When the previous notice showed, or `nil` before the first.
     private var lastShown: ContinuousClock.Instant?
 
-    /// When the held notice falls due, or `nil` if none is held.
+    /// When the held notice falls due, or `nil` if none is held or none
+    /// showed before it (a notice ``hold(_:)`` kept from a pane's first
+    /// writes is due at once).
     var dueAt: ContinuousClock.Instant? {
         guard held != nil else { return nil }
         return lastShown.map { $0 + Self.minimumInterval }
@@ -49,9 +51,16 @@ struct ClipboardNoticeThrottle {
         return notice
     }
 
+    /// Counts `write` into the held notice without showing anything: its
+    /// pane is not on screen (#747). The notice waits for ``release(at:)``,
+    /// one held notice as ever, however long the pane stays hidden.
+    mutating func hold(_ write: TesseraClipboardWrite) {
+        held = Notice(writes: Self.sum(held?.writes ?? 0, max(1, write.writes)), bytes: write.bytes)
+    }
+
     /// Takes the held notice if it is due at `now`: the notice to show now.
     mutating func release(at now: ContinuousClock.Instant) -> Notice? {
-        guard let due = dueAt, now >= due, let notice = held else { return nil }
+        guard let notice = held, dueAt.map({ now >= $0 }) ?? true else { return nil }
         held = nil
         lastShown = now
         return notice
@@ -149,6 +158,14 @@ final class ClipboardNoticeView: NSView {
 /// that shows a held notice when it falls due, and the
 /// ``ClipboardNoticeView`` it shows them in, made at the first notice and
 /// kept. Each ``TerminalSurfaceView`` owns one.
+///
+/// A notice shows only while its pane is on screen (#747): a write in a
+/// pane behind a maximized one, in a background tab or in a hidden window
+/// is counted into the held notice, which shows once the pane is (its host
+/// calls ``hostVisibilityChanged()``). It is held, not shown on the pane
+/// the user sees: the notice belongs to the pane whose program wrote, and
+/// over another pane it would name the wrong program. A notice on screen
+/// when its pane hides shows its full time again once the pane is back.
 @MainActor
 final class PaneClipboardNotice {
     /// The fade in and out, skipped under Reduce Motion.
@@ -159,11 +176,20 @@ final class PaneClipboardNotice {
     /// Whether to show and hide without the fade (the pane's scroll bar
     /// follows the system's Reduce Motion setting).
     var reducesMotion: @MainActor () -> Bool = { false }
+    /// Whether the user can see the pane now; notices wait until they can.
+    var isHostShown: @MainActor () -> Bool = { true }
+    /// The find bar's frame in the host while it is open: the notice sits
+    /// below it, never under it (#747).
+    var obstacle: @MainActor () -> NSRect? = { nil }
 
-    private var throttle = ClipboardNoticeThrottle()
+    /// The pane's throttle; read by tests.
+    private(set) var throttle = ClipboardNoticeThrottle()
     private(set) var view: ClipboardNoticeView?
     private var releaseTask: Task<Void, Never>?
     private var hideTask: Task<Void, Never>?
+    /// The notice on screen when the pane hid: it shows again, its full
+    /// time, once the pane is back.
+    private var hidWhileShowing = false
     /// Notices shown (tests).
     private(set) var shownCount = 0
     /// The latest notice shown and when (tests).
@@ -176,19 +202,48 @@ final class PaneClipboardNotice {
     /// A program wrote the clipboard: show the notice now, or count the
     /// write into the one that shows when the interval has passed.
     func offer(_ write: TesseraClipboardWrite) {
+        guard isHostShown() else {
+            throttle.hold(write)
+            return
+        }
         if let notice = throttle.offer(write, at: .now) {
             show(notice)
         }
         scheduleRelease()
     }
 
-    /// One timer at most, whatever the program sends.
+    /// The pane was shown or hidden: a held notice shows now, or when the
+    /// interval has passed, once the pane is on screen; a notice on screen
+    /// as it hides waits for it to be back.
+    func hostVisibilityChanged() {
+        guard isHostShown() else {
+            if isShowing, !hidWhileShowing {
+                hidWhileShowing = true
+                hideTask?.cancel()
+                hideTask = nil
+            }
+            return
+        }
+        if hidWhileShowing, let view {
+            hidWhileShowing = false
+            present(view)
+        }
+        if let notice = throttle.release(at: .now) {
+            show(notice)
+        }
+        scheduleRelease()
+    }
+
+    /// One timer at most, whatever the program sends. A timer that falls
+    /// due while the pane is hidden leaves the notice held for
+    /// ``hostVisibilityChanged()``.
     private func scheduleRelease() {
         guard releaseTask == nil, let due = throttle.dueAt else { return }
         releaseTask = Task { [weak self] in
             try? await Task.sleep(until: due, clock: .continuous)
             guard let self else { return }
             self.releaseTask = nil
+            guard self.isHostShown() else { return }
             if let notice = self.throttle.release(at: .now) {
                 self.show(notice)
             }
@@ -203,6 +258,19 @@ final class PaneClipboardNotice {
         lastShownAt = .now
         let view = self.view ?? makeView(in: host)
         view.text = notice.text
+        hidWhileShowing = false
+        layout()
+        present(view)
+        NSAccessibility.post(
+            element: view, notification: .announcementRequested,
+            userInfo: [
+                .announcement: notice.text,
+                .priority: NSAccessibilityPriorityLevel.medium.rawValue,
+            ])
+    }
+
+    /// Shows the view, fading in, and hides it after ``holdDuration``.
+    private func present(_ view: ClipboardNoticeView) {
         let reduced = reducesMotion()
         if view.isHidden {
             view.alphaValue = reduced ? 1 : 0
@@ -213,12 +281,6 @@ final class PaneClipboardNotice {
         } else {
             view.alphaValue = 1
         }
-        NSAccessibility.post(
-            element: view, notification: .announcementRequested,
-            userInfo: [
-                .announcement: notice.text,
-                .priority: NSAccessibilityPriorityLevel.medium.rawValue,
-            ])
         hideTask?.cancel()
         hideTask = Task { [weak self] in
             try? await Task.sleep(for: ClipboardNoticeView.holdDuration)
@@ -246,16 +308,39 @@ final class PaneClipboardNotice {
         }
     }
 
+    /// The space between the notice and the pane's edges or the find bar.
+    static let margin: CGFloat = 8
+
+    /// Places the notice centred at the top of the pane, as wide as its
+    /// text up to the pane's width less the margins, and while the find bar
+    /// is open just below the bar, whatever the width: never under it
+    /// (#747). A pane too short for both shows the notice as low as it
+    /// fits, over the bar (it is the higher subview). The host calls it as
+    /// it lays the find bar out.
+    func layout() {
+        guard let host, let view else { return }
+        let bounds = host.bounds
+        let size = view.fittingSize
+        let width = max(0, min(size.width, bounds.width - 2 * Self.margin))
+        var fromTop = Self.margin
+        if let bar = obstacle() {
+            let below = fromTop + (host.isFlipped ? bar.maxY : bounds.height - bar.minY)
+            fromTop = max(Self.margin, min(below, bounds.height - Self.margin - size.height))
+        }
+        let y = host.isFlipped ? fromTop : bounds.height - fromTop - size.height
+        let frame = NSRect(x: (bounds.width - width) / 2, y: y, width: width, height: size.height).integral
+        if view.frame != frame { view.frame = frame }
+    }
+
     private func makeView(in host: NSView) -> ClipboardNoticeView {
         let view = ClipboardNoticeView()
         view.isHidden = true
-        view.translatesAutoresizingMaskIntoConstraints = false
-        host.addSubview(view)
-        NSLayoutConstraint.activate([
-            view.centerXAnchor.constraint(equalTo: host.centerXAnchor),
-            view.topAnchor.constraint(equalTo: host.topAnchor, constant: 8),
-            view.widthAnchor.constraint(lessThanOrEqualTo: host.widthAnchor, constant: -16),
-        ])
+        // Above the find bar, below a dimmed pane's shade.
+        if let shade = host.subviews.last(where: { $0 is PaneDimView }) {
+            host.addSubview(view, positioned: .below, relativeTo: shade)
+        } else {
+            host.addSubview(view)
+        }
         self.view = view
         return view
     }

@@ -66,10 +66,28 @@ final class ClipboardNoticeTests: XCTestCase {
         appDelegate.programPasteboard = pasteboard
     }
 
-    /// A tab running `script` (sh), then `cat`.
+    /// A tab running `script` (sh), then `cat`. Its pane counts as on
+    /// screen (``onScreen(_:)``).
     private func openTab(_ script: String) throws -> TerminalSurfaceView {
         appDelegate.spawnOptions = .init(program: "/bin/sh", arguments: ["-c", script + "; exec cat"])
-        return try appDelegate.newWindow().focusedPane.view
+        return onScreen(try appDelegate.newWindow().focusedPane.view)
+    }
+
+    /// The hosted test app's windows report themselves occluded, and a
+    /// notice waits for its pane to be on screen (#747): `view`'s window
+    /// counts as visible. Whether the pane is hidden by an ancestor or in
+    /// a background tab still counts.
+    @discardableResult
+    private func onScreen(_ view: TerminalSurfaceView) -> TerminalSurfaceView {
+        view.occlusionOverride = false
+        return view
+    }
+
+    /// Lets the child of `view`, waiting in `read go` after printing
+    /// "ready", go on.
+    private func release(_ view: TerminalSurfaceView) async throws {
+        try await waitUntil("the child is ready") { try view.session.accessibleText().string.contains("ready") }
+        try view.session.write(Array("\n".utf8))
     }
 
     /// OSC 52 writing "hello" (5 bytes).
@@ -98,6 +116,26 @@ final class ClipboardNoticeTests: XCTestCase {
         XCTAssertNil(throttle.offer(Self.write(1), at: t0 + .milliseconds(1500)), "a second from the counted one")
         XCTAssertEqual(throttle.offer(Self.write(2), at: t0 + .seconds(3)), .init(writes: 2, bytes: 2), "late: folded")
         XCTAssertNil(throttle.held)
+    }
+
+    func testAHiddenPanesWritesAreHeldAsOneNoticeUntilReleased() {
+        var throttle = Throttle()
+        let t0 = ContinuousClock.now
+        throttle.hold(Self.write(5))
+        throttle.hold(Self.write(7, 2))
+        XCTAssertEqual(throttle.held, .init(writes: 3, bytes: 7), "one notice, counted")
+        XCTAssertNil(throttle.dueAt, "none showed before: due at once")
+        XCTAssertEqual(throttle.release(at: t0), .init(writes: 3, bytes: 7))
+        XCTAssertNil(throttle.held)
+        // Held within a second of a notice: it waits out the interval.
+        throttle.hold(Self.write(1))
+        XCTAssertEqual(throttle.dueAt, t0 + .seconds(1))
+        XCTAssertNil(throttle.release(at: t0 + .milliseconds(500)))
+        XCTAssertEqual(throttle.release(at: t0 + .seconds(1)), .init(writes: 1, bytes: 1))
+        _ = throttle.offer(Self.write(1, .max), at: t0 + .seconds(1))
+        throttle.hold(Self.write(1, .max))
+        throttle.hold(Self.write(1, .max))
+        XCTAssertEqual(throttle.held?.writes, .max, "saturates")
     }
 
     func testTheCountSaturates() {
@@ -199,6 +237,131 @@ final class ClipboardNoticeTests: XCTestCase {
         XCTAssertEqual(view.clipboardNotice.view?.alphaValue, 1)
     }
 
+    // MARK: Never unseen (#747)
+
+    func testTheNoticeSitsBelowTheFindBarNeverUnderIt() async throws {
+        let view = try openTab("echo ready; read go; \(Self.hello)")
+        let window = try XCTUnwrap(view.window)
+        window.setContentSize(NSSize(width: window.contentMinSize.width, height: 400))
+        window.layoutIfNeeded()
+        view.showFindBar(nil)
+        let bar = try XCTUnwrap(view.findBar)
+        try await release(view)
+        try await waitUntil("the notice") { view.clipboardNotice.shownCount == 1 }
+        let notice = try XCTUnwrap(view.clipboardNotice.view)
+        func assertClear(_ what: String, line: UInt = #line) {
+            view.layoutSubtreeIfNeeded()
+            XCTAssertFalse(
+                notice.frame.intersects(bar.frame), "\(what): \(notice.frame) under \(bar.frame)", line: line)
+            XCTAssertLessThanOrEqual(notice.frame.maxY, bar.frame.minY, "\(what): below the bar", line: line)
+            XCTAssertTrue(
+                view.bounds.contains(notice.frame), "\(what): \(notice.frame) in the pane \(view.bounds)", line: line)
+            XCTAssertGreaterThan(notice.frame.width, 0, line: line)
+        }
+        XCTAssertGreaterThan(bar.frame.width, view.bounds.width / 2, "the narrowest pane: the bar spans it")
+        assertClear("shown with the bar open, at the narrowest width")
+        view.closeFindBar()
+        view.layoutSubtreeIfNeeded()
+        XCTAssertEqual(
+            notice.frame.maxY, view.bounds.height - PaneClipboardNotice.margin, accuracy: 1, "back at the top")
+        view.showFindBar(nil)
+        let reopened = try XCTUnwrap(view.findBar)
+        view.layoutSubtreeIfNeeded()
+        XCTAssertFalse(notice.frame.intersects(reopened.frame), "the bar opened over a notice: \(notice.frame)")
+        let order = { (subview: NSView) in view.subviews.firstIndex { $0 === subview } ?? -1 }
+        XCTAssertGreaterThan(order(notice), order(reopened), "the notice is the higher subview")
+        // Too short for both: as low as it fits, over the bar.
+        window.setContentSize(window.contentMinSize)
+        window.layoutIfNeeded()
+        view.layoutSubtreeIfNeeded()
+        XCTAssertTrue(view.bounds.contains(notice.frame), "\(notice.frame) in the smallest pane \(view.bounds)")
+        XCTAssertLessThan(notice.frame.minY, reopened.frame.minY, "lower than the bar")
+        let minimum = window.contentMinSize
+        window.setContentSize(NSSize(width: minimum.width + 400, height: minimum.height + 200))
+        window.layoutIfNeeded()
+        view.layoutSubtreeIfNeeded()
+        XCTAssertFalse(notice.frame.intersects(reopened.frame), "after a resize: \(notice.frame)")
+        XCTAssertTrue(view.clipboardNotice.isShowing)
+    }
+
+    func testAWriteInAPaneBehindAMaximizedOneShowsWhenThePaneIsShown() async throws {
+        appDelegate.spawnOptions = .init(
+            program: "/bin/sh", arguments: ["-c", "echo ready; read go; \(Self.hello); exec cat"])
+        let controller = try appDelegate.newWindow()
+        let hidden = onScreen(controller.focusedPane.view)
+        let shown = onScreen(try XCTUnwrap(controller.splitFocusedPane(.right)).view)
+        controller.toggleZoomPane(nil)
+        XCTAssertTrue(controller.isZoomed)
+        XCTAssertFalse(hidden.isShownToUser, "behind the maximized pane")
+        XCTAssertTrue(shown.isShownToUser)
+        try await release(hidden)
+        try await waitUntil("the write reaches the pasteboard") { pasteboard.string(forType: .string) == "hello" }
+        try await Task.sleep(for: .milliseconds(1500))
+        XCTAssertEqual(hidden.clipboardNotice.shownCount, 0, "held while the pane is hidden")
+        XCTAssertFalse(hidden.clipboardNotice.isShowing)
+        XCTAssertEqual(shown.clipboardNotice.shownCount, 0, "not shown on another pane")
+        controller.toggleZoomPane(nil)
+        XCTAssertFalse(controller.isZoomed)
+        XCTAssertEqual(hidden.clipboardNotice.shownCount, 1, "shown as the pane is")
+        XCTAssertEqual(hidden.clipboardNotice.lastShown, .init(writes: 1, bytes: 5))
+        XCTAssertTrue(hidden.clipboardNotice.isShowing)
+        try await Task.sleep(for: .milliseconds(1500))
+        XCTAssertTrue(hidden.clipboardNotice.isShowing, "its full time from when it shows")
+    }
+
+    func testAWriteInABackgroundTabShowsWhenItsTabIsSelected() async throws {
+        let background = try openTab("echo ready; read go; \(Self.hello)")
+        let window = try XCTUnwrap(background.window as? TerminalWindow)
+        let front = onScreen(try appDelegate.newTab(in: window).focusedPane.view)
+        let frontWindow = try XCTUnwrap(front.window as? TerminalWindow)
+        XCTAssertTrue(window.tabGroup?.selectedWindow === frontWindow)
+        XCTAssertFalse(background.isShownToUser, "in a background tab")
+        try await release(background)
+        try await waitUntil("the write reaches the pasteboard") { pasteboard.string(forType: .string) == "hello" }
+        try await Task.sleep(for: .milliseconds(1500))
+        XCTAssertEqual(background.clipboardNotice.shownCount, 0, "held while the tab is in the background")
+        XCTAssertEqual(front.clipboardNotice.shownCount, 0, "not shown on another tab")
+        frontWindow.selectPreviousTab(nil)
+        XCTAssertTrue(window.tabGroup?.selectedWindow === window)
+        XCTAssertEqual(background.clipboardNotice.shownCount, 1, "shown as its tab is selected")
+        XCTAssertTrue(background.clipboardNotice.isShowing)
+        // Away again at once, for longer than a notice stays: it waits.
+        window.selectNextTab(nil)
+        XCTAssertFalse(background.isShownToUser)
+        try await Task.sleep(for: ClipboardNoticeView.holdDuration + .seconds(1))
+        frontWindow.selectPreviousTab(nil)
+        XCTAssertTrue(background.clipboardNotice.isShowing, "shown again as the tab is back")
+        XCTAssertEqual(background.clipboardNotice.shownCount, 1, "the same notice")
+        try await Task.sleep(for: .milliseconds(1500))
+        XCTAssertTrue(background.clipboardNotice.isShowing, "its full time again")
+    }
+
+    func testANoticeHeldAsItsTabGoesToTheBackgroundWaitsForTheTab() async throws {
+        let background = try openTab("echo ready; read go; \(Self.hello); read go; \(Self.hi)")
+        let window = try XCTUnwrap(background.window as? TerminalWindow)
+        let front = onScreen(try appDelegate.newTab(in: window).focusedPane.view)
+        let frontWindow = try XCTUnwrap(front.window as? TerminalWindow)
+        frontWindow.selectPreviousTab(nil)
+        try await release(background)
+        try await waitUntil("the first notice") { background.clipboardNotice.shownCount == 1 }
+        try background.session.write(Array("\n".utf8))
+        try await waitUntil("the second write is held") {
+            background.clipboardNotice.throttle.held != nil || background.clipboardNotice.shownCount > 1
+        }
+        guard background.clipboardNotice.shownCount == 1 else {
+            throw XCTSkip("the second write came after the interval (a loaded host)")
+        }
+        // Away before the held notice falls due: its timer finds the tab
+        // hidden and leaves it held.
+        window.selectNextTab(nil)
+        XCTAssertFalse(background.isShownToUser)
+        try await Task.sleep(for: Throttle.minimumInterval + .milliseconds(500))
+        XCTAssertEqual(background.clipboardNotice.shownCount, 1, "held while the tab is in the background")
+        frontWindow.selectPreviousTab(nil)
+        XCTAssertEqual(background.clipboardNotice.shownCount, 2, "shown as the tab is back")
+        XCTAssertEqual(background.clipboardNotice.lastShown, .init(writes: 1, bytes: 3))
+    }
+
     // MARK: Bounds and lifetime
 
     func testAFloodOfWritesKeepsNoticesMemoryAndCloseBounded() async throws {
@@ -243,7 +406,7 @@ final class ClipboardNoticeTests: XCTestCase {
         try autoreleasepool {
             let controller = try appDelegate.newWindow()
             weakController = controller
-            weakView = controller.focusedPane.view
+            weakView = onScreen(controller.focusedPane.view)
             weakSession = controller.focusedPane.session
         }
         try await waitUntil("a notice shows") { weakView?.clipboardNotice.shownCount == 1 }

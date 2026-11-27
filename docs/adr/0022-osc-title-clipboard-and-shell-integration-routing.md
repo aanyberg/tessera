@@ -413,6 +413,15 @@ read asks first, and OSC 52 stays on by default but every write is seen.
   The count is of the writes the core delivers: it keeps the last write of
   each output chunk, so writes within one chunk count as one, and the
   notice says "at least".
+  The notice shows only while its pane is on screen (#747): a write in a
+  pane behind a maximized one, in a background tab or in a minimised,
+  hidden or covered window is counted into the same held notice, which
+  shows (its full 2.5 s) once the pane is shown; a notice on screen as its
+  pane hides shows again when it is back. It is held rather than shown on
+  the pane the user sees because it belongs to the pane whose program
+  wrote; the paste guard (D-PASTE) still checks whatever a paste carries.
+  With the find bar open the notice sits just below the bar, never under
+  it; a pane too short for both shows it as low as fits, over the bar.
 
 ## Consequences
 

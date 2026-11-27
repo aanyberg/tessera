@@ -86,10 +86,14 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
     #endif
     /// The focus state last sent to the session.
     private(set) var sentFocus: Bool?
-    /// Forces the occlusion state the display link follows (tests; the
-    /// hosted test app's windows always report themselves occluded).
+    /// Forces the occlusion state the display link and the clipboard
+    /// notice follow (tests; the hosted test app's windows always report
+    /// themselves occluded).
     var occlusionOverride: Bool? {
-        didSet { updateDisplayLinkPause() }
+        didSet {
+            updateDisplayLinkPause()
+            clipboardNotice.hostVisibilityChanged()
+        }
     }
     /// The status ``render()`` acts on instead of the one the core reported
     /// for the frame it just rendered (tests; errors still come from the
@@ -289,6 +293,8 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
 
         clipboardNotice.host = self
         clipboardNotice.reducesMotion = { [weak self] in self?.scroller.reducesMotion ?? true }
+        clipboardNotice.isHostShown = { [weak self] in self?.isShownToUser ?? false }
+        clipboardNotice.obstacle = { [weak self] in self?.findBar?.frame }
 
         scroller.onScroll = { [weak self] target in self?.scrollerMoved(to: target) }
         scroller.onStyleChange = { [weak self] in self?.scrollerStyleChanged() }
@@ -394,7 +400,10 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
         for name in names {
             windowObservers.append(
                 center.addObserver(forName: name, object: window, queue: .main) { [weak self] _ in
-                    MainActor.assumeIsolated { self?.updateDisplayLinkPause() }
+                    MainActor.assumeIsolated {
+                        self?.updateDisplayLinkPause()
+                        self?.clipboardNotice.hostVisibilityChanged()
+                    }
                 })
         }
         windowObservers.append(
@@ -420,6 +429,7 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
         link.add(to: .main, forMode: .common)
         displayLink = link
         updateDisplayLinkPause()
+        clipboardNotice.hostVisibilityChanged()
     }
 
     /// The window closes: tears down, deactivates the view's input context
@@ -486,16 +496,28 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
         return window.isMiniaturized || !window.occlusionState.contains(.visible)
     }
 
+    /// Whether the user can see the pane: not ``isOccluded``, and its tab
+    /// the selected one of its group (the group's selection changes before
+    /// the window's occlusion state follows). The clipboard notice waits
+    /// for it (#747).
+    var isShownToUser: Bool {
+        guard !isOccluded, let window else { return false }
+        if let selected = window.tabGroup?.selectedWindow, selected !== window { return false }
+        return true
+    }
+
     /// Hidden, or shown again, with an ancestor (a pane behind a maximized
     /// one, #323): the link follows, and a pane shown again is redrawn.
     override func viewDidHide() {
         super.viewDidHide()
         updateDisplayLinkPause()
+        clipboardNotice.hostVisibilityChanged()
     }
 
     override func viewDidUnhide() {
         super.viewDidUnhide()
         updateDisplayLinkPause()
+        clipboardNotice.hostVisibilityChanged()
     }
 
     /// Whether the display link is paused.
@@ -927,8 +949,10 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
     /// Another tab of the window's group was selected: AppKit sends a
     /// button held meanwhile no release here, so the core gets it now, and
     /// a local gesture ends with its autoscroller, so neither runs on in a
-    /// hidden tab (#289.2) nor opens a stale link later (#299.2).
+    /// hidden tab (#289.2) nor opens a stale link later (#299.2). This tab
+    /// selected: its held clipboard notice shows (#747).
     private func tabSelectionChanged() {
+        clipboardNotice.hostVisibilityChanged()
         guard let window, let selected = window.tabGroup?.selectedWindow, selected !== window else { return }
         releaseHeldButtons()
         autoscroller.stop()
