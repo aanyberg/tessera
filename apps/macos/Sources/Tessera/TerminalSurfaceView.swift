@@ -2137,12 +2137,52 @@ extension TerminalSurfaceView: NSMenuItemValidation {
         }
         let confirmation = PasteConfirmation(preview: TesseraSession.pastePreview(text), bracketed: check.bracketed)
         isConfirmingPaste = true
+        ask(confirmation, toPaste: text, in: window)
+    }
+
+    /// Asks `confirmation` on a sheet of `window`. Paste checks again
+    /// first (#748): the program may have turned bracketed paste off while
+    /// the sheet was up, so the lines would now run though the sheet did
+    /// not say so. A check that names a risk the answered question did not
+    /// asks again with the reasons that hold now; otherwise the text goes,
+    /// bracketed or not as the program's mode is now.
+    private func ask(_ confirmation: PasteConfirmation, toPaste text: String, in window: NSWindow) {
         pasteConfirmationPresenter.confirm(confirmation, sheetFor: window) { [weak self] paste in
             guard let self else { return }
-            self.isConfirmingPaste = false
-            if paste {
-                self.send(paste: text)
+            guard paste else {
+                self.isConfirmingPaste = false
+                return
             }
+            let check: TesseraSession.PasteCheck
+            do {
+                check = try self.session.pasteCheck(text)
+            } catch {
+                self.isConfirmingPaste = false
+                Self.log.error("paste not sent: \(String(describing: error), privacy: .public)")
+                NSSound.beep()
+                return
+            }
+            let current = PasteConfirmation(preview: confirmation.preview, bracketed: check.bracketed)
+            if check.ask, !confirmation.covers(current) {
+                // The answered sheet is still ending here, and AppKit clears
+                // the Cancel key equivalent of a sheet begun now once it
+                // attaches, so Return would do nothing. The second sheet
+                // opens on the next turn, as the first did, if the view is
+                // still in the window it asked in (leaving it is Cancel).
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    guard self.window === window else {
+                        self.isConfirmingPaste = false
+                        Self.log.info("paste not sent: its risks changed and the view left the window it asked in")
+                        NSSound.beep()
+                        return
+                    }
+                    self.ask(current, toPaste: text, in: window)
+                }
+                return
+            }
+            self.isConfirmingPaste = false
+            self.send(paste: text)
         }
     }
 

@@ -96,7 +96,14 @@ final class PasteGuardTests: XCTestCase {
         bracketed: Bool, presenter: (any PasteConfirmationPresenter)? = nil
     ) async throws -> (TerminalWindowController, TerminalSurfaceView) {
         let mode = bracketed ? #"printf '\033[?2004h'; "# : ""
-        appDelegate.spawnOptions = .init(program: "/bin/sh", arguments: ["-c", mode + "echo ready; exec cat"])
+        return try await openTab(script: mode + "echo ready; exec cat", presenter: presenter)
+    }
+
+    /// A tab whose child runs `script`, which says `ready` when it waits.
+    private func openTab(
+        script: String, presenter: (any PasteConfirmationPresenter)? = nil
+    ) async throws -> (TerminalWindowController, TerminalSurfaceView) {
+        appDelegate.spawnOptions = .init(program: "/bin/sh", arguments: ["-c", script])
         let controller = try appDelegate.newWindow()
         let view = controller.focusedPane.view
         view.pasteboard = pasteboard
@@ -131,6 +138,20 @@ final class PasteGuardTests: XCTestCase {
         XCTAssertFalse(controls.informativeText.contains("bracketed"), "the program has it on")
         XCTAssertEqual(controls.shownText, "rm ^[[201~x", "escaped by the core")
         XCTAssertEqual(confirmation("ls", bracketed: true).informativeText, "Check the text before it is sent to the program.")
+
+        // A Paste answered still holds when it names every risk there is now
+        // (#748).
+        let text = "echo a\u{1b}\necho b\n"
+        let on = confirmation(text, bracketed: true)
+        let off = confirmation(text, bracketed: false)
+        XCTAssertEqual(on.risks, [.controls])
+        XCTAssertEqual(off.risks, [.lineBreaksRun, .controls])
+        XCTAssertFalse(on.covers(off), "bracketed paste went off: the lines now run")
+        XCTAssertTrue(off.covers(on), "bracketed paste came on: one risk fewer")
+        XCTAssertTrue(off.covers(off))
+        let always = confirmation("echo a\necho b\n", bracketed: true)
+        XCTAssertEqual(always.risks, [], "only `always` asks")
+        XCTAssertFalse(always.covers(confirmation("echo a\necho b\n", bracketed: false)))
     }
 
     func testAMegabytePasteShowsItsFirstLinesAndCountsTheRest() {
@@ -222,6 +243,121 @@ final class PasteGuardTests: XCTestCase {
         paste("echo one\necho two\u{1b}\n", into: offView)
         XCTAssertEqual(presenter.confirmations.count, 1, "off never asks")
         XCTAssertEqual(offView.pasteCount, 1)
+    }
+
+    // MARK: The program changes its mode while the sheet is up (#748)
+
+    /// Lets the child's `read` go on: the paste is not sent yet, so the
+    /// line the test types is all it reads.
+    private func proceed(_ view: TerminalSurfaceView, until marker: String) async throws {
+        try view.session.write(Array("go\r".utf8))
+        try await waitUntil("the child says \(marker)") { try screen(of: view).contains(marker) }
+    }
+
+    /// The issue's sequence: the sheet opens while bracketed paste is on and
+    /// names only the controls; the program turns it off; Paste must not
+    /// send lines that now run without saying so.
+    func testAPasteConfirmedAfterBracketedPasteWentOffAsksAgainWithTheLineBreaks() async throws {
+        let presenter = RecordingPastePresenter()
+        let script = #"printf '\033[?2004h'; echo ready; read go; printf '\033[?2004l'; stty -echo; echo mode-off; exec cat -v"#
+        let (_, view) = try await openTab(script: script, presenter: presenter)
+        paste("echo a\u{1b}\necho b\n", into: view)
+        let first = try XCTUnwrap(presenter.confirmations.first, "controls ask")
+        XCTAssertTrue(first.bracketed)
+        XCTAssertEqual(first.risks, [.controls])
+        XCTAssertFalse(first.informativeText.contains("bracketed paste"), first.informativeText)
+
+        try await proceed(view, until: "mode-off")
+        presenter.answer(true)
+        XCTAssertEqual(view.pasteCount, 0, "not sent on reasons that no longer hold")
+        XCTAssertTrue(view.isConfirmingPaste)
+        // On the next turn, once the answered sheet has ended.
+        try await waitUntil("asks again") { presenter.confirmations.count == 2 }
+        XCTAssertEqual(view.pasteCount, 0)
+        XCTAssertTrue(view.isConfirmingPaste)
+        let second = try XCTUnwrap(presenter.confirmations.last)
+        XCTAssertFalse(second.bracketed)
+        XCTAssertEqual(second.risks, [.lineBreaksRun, .controls])
+        XCTAssertTrue(second.informativeText.contains("bracketed paste"), second.informativeText)
+        XCTAssertEqual(second.preview, first.preview, "the same text")
+
+        // The second Paste names what holds: the lines go, unbracketed.
+        presenter.answer(true)
+        XCTAssertEqual(view.pasteCount, 1)
+        XCTAssertFalse(view.isConfirmingPaste)
+        XCTAssertEqual(presenter.confirmations.count, 2)
+        try await waitUntil("cat shows the paste") { try screen(of: view).contains("echo b") }
+        XCTAssertFalse(try screen(of: view).contains("[200~"), "bracketed paste is off")
+    }
+
+    func testAPasteConfirmedAfterBracketedPasteCameOnGoesBracketedWithoutAskingAgain() async throws {
+        let presenter = RecordingPastePresenter()
+        let script = #"echo ready; read go; printf '\033[?2004h'; stty -echo; echo mode-on; exec cat -v"#
+        let (_, view) = try await openTab(script: script, presenter: presenter)
+        // The controls still ask once the mode is on, so the check asks
+        // again; the answered question named them already.
+        paste("echo a\u{1b}\necho b\n", into: view)
+        let first = try XCTUnwrap(presenter.confirmations.first, "the lines would run")
+        XCTAssertEqual(first.risks, [.lineBreaksRun, .controls])
+
+        try await proceed(view, until: "mode-on")
+        presenter.answer(true)
+        XCTAssertEqual(presenter.confirmations.count, 1, "a risk gone needs no second answer")
+        XCTAssertEqual(view.pasteCount, 1)
+        XCTAssertFalse(view.isConfirmingPaste)
+        try await waitUntil("cat shows the paste, bracketed") { try screen(of: view).contains("^[[200~echo a") }
+    }
+
+    /// The same with the real sheet, opened as the app opens it: Paste
+    /// ends the first sheet and a second one says why it asks now.
+    func testTheRealSheetAsksAgainWhenBracketedPasteWentOff() async throws {
+        let script = #"printf '\033[?2004h'; echo ready; read go; printf '\033[?2004l'; stty -echo; echo mode-off; exec cat -v"#
+        let (controller, view) = try await openTab(script: script)
+        let window = try XCTUnwrap(controller.window)
+        paste("echo a\u{1b}\necho b\n", into: view)
+        let first = try XCTUnwrap(window.attachedSheet as? PasteConfirmationSheet, "the sheet is up")
+        XCTAssertFalse(first.informativeLabel.stringValue.contains("bracketed paste"))
+
+        try await proceed(view, until: "mode-off")
+        first.pasteButton.performClick(nil)
+        try await waitUntil("a second sheet") {
+            (window.attachedSheet as? PasteConfirmationSheet).map { $0 !== first } ?? false
+        }
+        let second = try XCTUnwrap(window.attachedSheet as? PasteConfirmationSheet)
+        XCTAssertTrue(second.informativeLabel.stringValue.contains("bracketed paste"), second.informativeLabel.stringValue)
+        XCTAssertIdentical(second.defaultButtonCell, second.cancelButton.cell, "Cancel is the default again")
+        XCTAssertEqual(view.pasteCount, 0)
+        XCTAssertTrue(view.isConfirmingPaste)
+
+        second.pasteButton.performClick(nil)
+        try await waitUntil("Paste ends the sheet and sends") { window.attachedSheet == nil && view.pasteCount == 1 }
+        XCTAssertFalse(view.isConfirmingPaste)
+        try await waitUntil("cat shows the paste") { try screen(of: view).contains("echo b") }
+    }
+
+    /// The second sheet answers Return as Cancel, like the first: it
+    /// opens while the first one ends, and AppKit clears a key equivalent
+    /// set then.
+    func testReturnOnTheSecondSheetIsCancel() async throws {
+        let script = #"printf '\033[?2004h'; echo ready; read go; printf '\033[?2004l'; stty -echo; echo mode-off; exec cat -v"#
+        let (controller, view) = try await openTab(script: script)
+        let window = try XCTUnwrap(controller.window)
+        paste("echo a\u{1b}\necho b\n", into: view)
+        let first = try XCTUnwrap(window.attachedSheet as? PasteConfirmationSheet, "the sheet is up")
+        try await proceed(view, until: "mode-off")
+        first.pasteButton.performClick(nil)
+        try await waitUntil("a second sheet") {
+            (window.attachedSheet as? PasteConfirmationSheet).map { $0 !== first } ?? false
+        }
+        let second = try XCTUnwrap(window.attachedSheet as? PasteConfirmationSheet)
+        let returnKey = try XCTUnwrap(
+            NSEvent.keyEvent(
+                with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: second.windowNumber,
+                context: nil, characters: "\r", charactersIgnoringModifiers: "\r", isARepeat: false, keyCode: 36))
+        second.sendEvent(returnKey)
+        try await waitUntil("Return ends the second sheet") { window.attachedSheet == nil && !view.isConfirmingPaste }
+        XCTAssertEqual(view.pasteCount, 0, "Return is Cancel")
+        XCTAssertFalse(view.isConfirmingPaste)
     }
 
     // MARK: The real sheet
