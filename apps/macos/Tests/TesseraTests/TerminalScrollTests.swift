@@ -314,9 +314,9 @@ final class TerminalScrollTests: XCTestCase {
     /// live screen) exactly, and the knob AppKit draws for them to the
     /// device pixel.
     ///
-    /// The geometry is measured against AppKit's own track, found by
-    /// moving the knob to either end, not against `rect(for: .knobSlot)`:
-    /// on macOS 15 (the CI runner) the overlay slot is the scroller's full
+    /// The geometry is measured against AppKit's own track, found by moving
+    /// the knob to either end, not against `rect(for: .knobSlot)`: on macOS
+    /// 15 (CI's runner before #584) the overlay slot is the scroller's full
     /// height while the knob travels about a point less, and AppKit floors
     /// the knob's origin and length to device pixels (whole points at 1x).
     /// Both ends and the knob are floored the same way, so the knob's
