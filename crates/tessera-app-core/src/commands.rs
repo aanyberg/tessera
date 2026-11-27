@@ -55,9 +55,10 @@
 //! nothing is locked while it is held.
 
 use std::collections::VecDeque;
+use std::ops::Range;
 use std::time::{Duration, Instant};
 
-use tessera_grid::{Grid, Line, LineRef, Mark, Style};
+use tessera_grid::{Grid, Line, LineMarks, Mark, Style};
 use tessera_term::Terminal;
 
 use crate::search::TerminalSource;
@@ -623,14 +624,15 @@ fn rank(grid: &Grid, anchor: i64) -> Option<Rank> {
         return Some(Rank::Evicted);
     };
     let count = line_count(grid);
-    if index >= count || !has(grid.logical_line(index), &Mark::OutputStart) {
+    if index >= count || !has(grid.line_marks(index), &Mark::OutputStart) {
         return Some(Rank::Erased);
     }
     if count - index > MAX_PROMPT_SCAN_LINES {
         return None;
     }
-    let below = (index..count)
-        .filter(|&i| has(grid.logical_line(i), &Mark::OutputStart))
+    let below = grid
+        .marked_lines(index..count)
+        .filter(|(_, marks)| marks.contains(&Mark::OutputStart))
         .count();
     Some(Rank::Nth(below))
 }
@@ -638,11 +640,12 @@ fn rank(grid: &Grid, anchor: i64) -> Option<Rank> {
 /// The index of the `n`th line with a [`Mark::OutputStart`] from the
 /// bottom of `grid`, within [`MAX_PROMPT_SCAN_LINES`] lines.
 fn nth_from_bottom(grid: &Grid, n: usize) -> Option<usize> {
-    (0..line_count(grid))
+    let count = line_count(grid);
+    grid.marked_lines(count.saturating_sub(MAX_PROMPT_SCAN_LINES)..count)
         .rev()
-        .take(MAX_PROMPT_SCAN_LINES)
-        .filter(|&i| has(grid.logical_line(i), &Mark::OutputStart))
+        .filter(|(_, marks)| marks.contains(&Mark::OutputStart))
         .nth(n.checked_sub(1)?)
+        .map(|(index, _)| index)
 }
 
 /// Resizes `term` to `rows` × `cols` and carries the `C` lines of the last
@@ -729,10 +732,56 @@ enum Bound {
 fn scan(
     source: &impl TerminalSource,
     epoch: u64,
-    mut at: i64,
+    at: i64,
     bound: Bound,
     budget: &mut usize,
     mut hit: impl FnMut(&Grid, usize) -> bool,
+) -> Scan {
+    walk(source, epoch, at, bound, budget, |grid, window| {
+        if bound == Bound::Up {
+            window.rev().find(|&index| hit(grid, index))
+        } else {
+            window.into_iter().find(|&index| hit(grid, index))
+        }
+    })
+}
+
+/// [`scan`] for a `hit` that holds only for lines with marks: it is given
+/// those lines alone, with their marks ([`Grid::marked_lines`]), so a
+/// packed history row is never decoded (#781). Lines without marks still
+/// take their line of `budget` and of the chunk, as in [`scan`].
+fn scan_marks(
+    source: &impl TerminalSource,
+    epoch: u64,
+    at: i64,
+    bound: Bound,
+    budget: &mut usize,
+    mut hit: impl FnMut(&Grid, usize, LineMarks<'_>) -> bool,
+) -> Scan {
+    walk(source, epoch, at, bound, budget, |grid, window| {
+        let mut marked = grid.marked_lines(window);
+        let found = if bound == Bound::Up {
+            marked.rfind(|&(index, marks)| hit(grid, index, marks))
+        } else {
+            marked.find(|&(index, marks)| hit(grid, index, marks))
+        };
+        found.map(|(index, _)| index)
+    })
+}
+
+/// The walk of [`scan`] and [`scan_marks`]: under each hold of the lock
+/// it hands `find` the window of line indices (ascending) it may look at
+/// in this hold, at most [`PROMPT_SCAN_LINES_PER_LOCK`] and what is left
+/// of `budget`, and `find` returns the first index, in the direction of
+/// `bound`, its predicate holds for. The lines up to and including the
+/// one found are taken from `budget`.
+fn walk(
+    source: &impl TerminalSource,
+    epoch: u64,
+    mut at: i64,
+    bound: Bound,
+    budget: &mut usize,
+    mut find: impl FnMut(&Grid, Range<usize>) -> Option<usize>,
 ) -> Scan {
     loop {
         let step = source.read_terminal(|term, _| {
@@ -746,25 +795,39 @@ fn scan(
                 // Evicted meanwhile: go on from the oldest line left.
                 at = at.max(base);
             }
-            for _ in 0..PROMPT_SCAN_LINES_PER_LOCK {
-                let inside = match bound {
-                    Bound::Up => at >= base,
-                    Bound::DownToScreen => at < top,
-                };
-                if !inside {
-                    return Some(Scan::Exhausted);
-                }
-                if *budget == 0 {
-                    return Some(Scan::Capped);
-                }
-                *budget -= 1;
-                let index = usize::try_from(at - base).unwrap_or(usize::MAX);
-                if hit(grid, index) {
-                    return Some(Scan::Found(at));
-                }
-                at += if bound == Bound::Up { -1 } else { 1 };
+            // Lines left before the bound.
+            let room = match bound {
+                Bound::Up => at - base + 1,
+                Bound::DownToScreen => top - at,
+            };
+            let room = usize::try_from(room).unwrap_or(0);
+            if room == 0 {
+                return Some(Scan::Exhausted);
             }
-            None
+            let n = room.min(PROMPT_SCAN_LINES_PER_LOCK).min(*budget);
+            if n == 0 {
+                return Some(Scan::Capped);
+            }
+            // At or above `base` here.
+            let index = usize::try_from(at - base).unwrap_or(usize::MAX);
+            let window = match bound {
+                Bound::Up => index + 1 - n..index + 1,
+                Bound::DownToScreen => index..index + n,
+            };
+            if let Some(found) = find(grid, window) {
+                *budget -= found.abs_diff(index) + 1;
+                return Some(Scan::Found(base + id(found as u64)));
+            }
+            *budget -= n;
+            let step = id(n as u64);
+            at += if bound == Bound::Up { -step } else { step };
+            if n == PROMPT_SCAN_LINES_PER_LOCK {
+                None
+            } else if n == room {
+                Some(Scan::Exhausted)
+            } else {
+                Some(Scan::Capped)
+            }
         });
         if let Some(scan) = step {
             return scan;
@@ -776,20 +839,26 @@ fn scan(
     }
 }
 
-fn has(line: Option<LineRef<'_>>, mark: &Mark) -> bool {
-    line.is_some_and(|line| line.marks.contains(mark))
+fn has(line: Option<LineMarks<'_>>, mark: &Mark) -> bool {
+    line.is_some_and(|line| line.contains(mark))
 }
 
 /// Whether the line at `index` starts a prompt: it has a
 /// [`Mark::PromptStart`] and is not the continuation of a prompt that
 /// soft-wrapped into it (a redrawn long prompt marks both rows: one stop).
 /// A secondary prompt (`k=s`) has no mark at all.
-fn prompt_stop(grid: &Grid, index: usize) -> bool {
-    has(grid.logical_line(index), &Mark::PromptStart)
-        && !index.checked_sub(1).is_some_and(|above| {
-            grid.logical_line(above)
-                .is_some_and(|line| line.wrapped && line.marks.contains(&Mark::PromptStart))
-        })
+fn prompt_stop(grid: &Grid, index: usize, marks: LineMarks<'_>) -> bool {
+    marks.contains(&Mark::PromptStart) && !continues_prompt(grid, index)
+}
+
+/// Whether the line above `index` wraps into it with a
+/// [`Mark::PromptStart`] on it: an `A` on line `index` continues that
+/// prompt.
+fn continues_prompt(grid: &Grid, index: usize) -> bool {
+    index.checked_sub(1).is_some_and(|above| {
+        grid.line_marks(above)
+            .is_some_and(|line| line.wrapped && line.contains(&Mark::PromptStart))
+    })
 }
 
 /// Calls `mark(row, exit_code)` for each row of the view `offset` lines
@@ -822,23 +891,21 @@ pub(crate) fn gutter(grid: &Grid, offset: usize, mut mark: impl FnMut(u16, Optio
     // whether its output started (`C`).
     let mut pending: Option<(u16, bool)> = None;
     // The line above wrapped into this one with a prompt on it: this
-    // line's `A` continues that prompt (a redrawn long prompt).
-    let mut continues = first.checked_sub(1).is_some_and(|above| {
-        grid.logical_line(above)
-            .is_some_and(|line| line.wrapped && line.marks.contains(&Mark::PromptStart))
-    });
-    for index in first..end {
+    // line's `A` continues that prompt (a redrawn long prompt). Lines
+    // without marks change nothing but this, so only the marked lines are
+    // read (#781).
+    let mut above: Option<(usize, LineMarks<'_>)> = first
+        .checked_sub(1)
+        .and_then(|index| Some((index, grid.line_marks(index)?)));
+    for (index, line) in grid.marked_lines(first..end) {
         if index >= view_end && pending.is_none() {
             break;
         }
-        let Some(line) = grid.logical_line(index) else {
-            break;
-        };
-        if line.marks.is_empty() {
-            continues = false;
-            continue;
-        }
-        for kind in &line.marks {
+        let continues = above.is_some_and(|(at, above)| {
+            at + 1 == index && above.wrapped && above.contains(&Mark::PromptStart)
+        });
+        above = Some((index, line));
+        for kind in line.marks {
             match kind {
                 Mark::PromptStart if !continues => {
                     if let Some((row, true)) = pending {
@@ -860,7 +927,6 @@ pub(crate) fn gutter(grid: &Grid, offset: usize, mut mark: impl FnMut(u16, Optio
                 _ => {}
             }
         }
-        continues = line.wrapped && line.marks.contains(&Mark::PromptStart);
     }
 }
 
@@ -899,8 +965,8 @@ pub(crate) fn command_mark_at(session: &Session, row: u16) -> Option<CommandMark
     })
 }
 
-fn has_prompt(grid: &Grid, index: usize) -> bool {
-    has(grid.logical_line(index), &Mark::PromptStart)
+fn has_prompt(_: &Grid, _: usize, marks: LineMarks<'_>) -> bool {
+    marks.contains(&Mark::PromptStart)
 }
 
 /// The view's position for a scan, read in one look.
@@ -955,7 +1021,7 @@ pub(crate) fn scroll_to_prompt(session: &Session, previous: bool) -> bool {
     let mut budget = MAX_PROMPT_SCAN_LINES;
     let epoch = start.epoch;
     if previous {
-        match scan(
+        match scan_marks(
             session,
             epoch,
             start.top - 1,
@@ -965,7 +1031,7 @@ pub(crate) fn scroll_to_prompt(session: &Session, previous: bool) -> bool {
         ) {
             Scan::Found(line) => session.scroll_to_line(line, epoch),
             Scan::Exhausted => {
-                match scan(
+                match scan_marks(
                     session,
                     epoch,
                     start.top,
@@ -982,7 +1048,7 @@ pub(crate) fn scroll_to_prompt(session: &Session, previous: bool) -> bool {
             Scan::Capped | Scan::Invalid => false,
         }
     } else {
-        match scan(
+        match scan_marks(
             session,
             epoch,
             start.top + 1,
@@ -995,7 +1061,7 @@ pub(crate) fn scroll_to_prompt(session: &Session, previous: bool) -> bool {
                 // Nothing newer in the history: whether there is any prompt
                 // in it decides between the live screen and a page.
                 let from = start.top.min(top_of(session) - 1);
-                match scan(session, epoch, from, Bound::Up, &mut budget, has_prompt) {
+                match scan_marks(session, epoch, from, Bound::Up, &mut budget, has_prompt) {
                     Scan::Found(_) => session.scroll_to(ScrollTarget::Bottom),
                     Scan::Exhausted | Scan::Capped => session.scroll_to(page),
                     Scan::Invalid => false,
@@ -1099,19 +1165,14 @@ pub(crate) fn last_output(session: &Session) -> Option<OutputRange> {
     // A `D` with an exit status on the rows below the one looked at.
     let mut ended_below = false;
     let mut ran = false;
-    let mut line = bottom;
-    let result = scan(
+    let result = scan_marks(
         session,
         epoch,
         bottom,
         Bound::Up,
         &mut budget,
-        |grid, index| {
-            let this = line;
-            line -= 1;
-            let Some(row) = grid.logical_line(index) else {
-                return false;
-            };
+        |grid, index, row| {
+            let this = base_of(grid) + id(index as u64);
             let at = |kind: &Mark| row.marks.iter().position(|mark| mark == kind);
             let prompt = at(&Mark::PromptStart);
             match (at(&Mark::OutputStart), prompt) {
@@ -1135,7 +1196,7 @@ pub(crate) fn last_output(session: &Session) -> Option<OutputRange> {
                 next_prompt = Some(this);
                 ran = ended_below || ran_after(&row.marks[prompt + 1..]);
             }
-            ended_below |= ran_after(&row.marks);
+            ended_below |= ran_after(row.marks);
             false
         },
     );
@@ -1154,7 +1215,7 @@ pub(crate) fn last_output(session: &Session) -> Option<OutputRange> {
             let kept = recorded
                 .checked_sub(base_of(grid))
                 .and_then(|index| usize::try_from(index).ok())
-                .is_some_and(|index| has(grid.logical_line(index), &Mark::OutputStart));
+                .is_some_and(|index| has(grid.line_marks(index), &Mark::OutputStart));
             first < recorded && (kept || blanked || ran)
         })
     });
@@ -1832,7 +1893,8 @@ mod tests {
             &mut budget,
             |grid, index| {
                 looked.set(looked.get() + 1);
-                prompt_stop(grid, index)
+                grid.line_marks(index)
+                    .is_some_and(|marks| prompt_stop(grid, index, marks))
             },
         );
         // The mark scrolled off with line 0, evicted at the cap.
@@ -1840,11 +1902,30 @@ mod tests {
         let holds = source.holds.load(Ordering::Relaxed);
         assert_eq!(looked.get(), 5000, "every line of the history");
         assert_eq!(holds, 5000usize.div_ceil(PROMPT_SCAN_LINES_PER_LOCK));
+        // The mark walk holds the lock as often and takes as much budget,
+        // though it is handed the marked lines alone.
+        let mut budget = MAX_PROMPT_SCAN_LINES;
+        source.holds.store(0, Ordering::Relaxed);
+        let found = scan_marks(&source, epoch, top - 1, Bound::Up, &mut budget, prompt_stop);
+        assert_eq!(found, Scan::Exhausted);
+        assert_eq!(MAX_PROMPT_SCAN_LINES - budget, 5000);
+        let holds = source.holds.load(Ordering::Relaxed);
+        assert_eq!(holds, 5000usize.div_ceil(PROMPT_SCAN_LINES_PER_LOCK));
         // The budget caps the scan.
         let mut budget = 100;
         let found = scan(&source, epoch, top - 1, Bound::Up, &mut budget, |_, _| {
             false
         });
+        assert_eq!((found, budget), (Scan::Capped, 0));
+        let mut budget = 100;
+        let found = scan_marks(
+            &source,
+            epoch,
+            top - 1,
+            Bound::Up,
+            &mut budget,
+            |_, _, _| false,
+        );
         assert_eq!((found, budget), (Scan::Capped, 0));
         // A resize between holds gives up.
         source.term.lock().unwrap().resize(5, 10);
@@ -1873,6 +1954,204 @@ mod tests {
         assert_eq!(marks, [(0, Some(0)), (2, Some(1))]);
     }
 
+    /// The gutter as it was before #781: every line decoded and read in
+    /// turn. The reference for [`gutter`], which reads marked lines only.
+    fn gutter_by_decoding(grid: &Grid, offset: usize) -> Vec<(u16, Option<i32>)> {
+        let mut out = Vec::new();
+        let first = grid.scrollback_len().saturating_sub(offset);
+        let view_end = first + usize::from(grid.rows());
+        let end = view_end
+            .saturating_add(MAX_GUTTER_SCAN_LINES)
+            .min(grid.total_lines());
+        let mut pending: Option<(u16, bool)> = None;
+        let mut continues = first.checked_sub(1).is_some_and(|above| {
+            grid.logical_line(above)
+                .is_some_and(|line| line.wrapped && line.marks.contains(&Mark::PromptStart))
+        });
+        for index in first..end {
+            if index >= view_end && pending.is_none() {
+                break;
+            }
+            let line = grid.logical_line(index).unwrap();
+            for kind in &line.marks {
+                match kind {
+                    Mark::PromptStart if !continues => {
+                        if let Some((row, true)) = pending {
+                            out.push((row, None));
+                        }
+                        pending = (index < view_end)
+                            .then(|| (u16::try_from(index - first).unwrap(), false));
+                    }
+                    Mark::OutputStart => {
+                        if let Some((_, ran)) = &mut pending {
+                            *ran = true;
+                        }
+                    }
+                    Mark::CommandEnd { exit_code } => {
+                        if let Some((row, true)) = pending.take() {
+                            out.push((row, *exit_code));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            continues = line.wrapped && line.marks.contains(&Mark::PromptStart);
+        }
+        out
+    }
+
+    /// A history of 1 500 commands, most of it packed (ADR 0051): every
+    /// fifth prompt is long and redrawn, so it wraps into a second marked
+    /// row; every seventh command runs nothing, nor does every eleventh,
+    /// whose prompt wraps onto a row without marks.
+    fn marked_history() -> Terminal {
+        let mut term = Terminal::new(4, 12);
+        term.set_max_scrollback(10_000);
+        for i in 0..1_500 {
+            let prompt: &[u8] = if i % 5 == 0 {
+                b"\x1b]133;A\x07~/a/long/dir \x1b]133;A\x07$ "
+            } else {
+                b"\x1b]133;A\x07$ "
+            };
+            term.advance(prompt);
+            if i % 7 == 0 {
+                term.advance(b"\r\n");
+                continue;
+            }
+            if i % 11 == 0 {
+                // A prompt that wraps onto a row of its own, without a mark.
+                term.advance(b"0123456789abc\r\n");
+                continue;
+            }
+            term.advance(b"\x1b]133;B\x07ls\r\n\x1b]133;C\x07out\r\n\r\nmore\r\n");
+            term.advance(format!("\x1b]133;D;{}\x07", i % 3).as_bytes());
+        }
+        term.advance(b"\x1b]133;A\x07$ ");
+        let grid = term.grid();
+        assert!(grid.scrollback_len() > 4 * tessera_grid::HOT_ROWS);
+        assert_eq!(grid.cached_scrollback_cells(), 0);
+        term
+    }
+
+    /// #781: a resize's ranks and the gutter read packed history rows'
+    /// marks without decoding a row, and find what the decoded rows say.
+    #[test]
+    fn ranks_and_the_gutter_decode_no_packed_row() {
+        let term = marked_history();
+        let grid = term.grid();
+        // The oldest and a middle `C`, and a line without one.
+        let outputs: Vec<usize> = grid
+            .marked_lines(0..grid.total_lines())
+            .filter(|(_, m)| m.contains(&Mark::OutputStart))
+            .map(|(i, _)| i)
+            .collect();
+        let anchors = [outputs[0], outputs[outputs.len() / 2], 3];
+        let ranks: Vec<_> = anchors
+            .iter()
+            .map(|&index| rank(grid, base_of(grid) + id(index as u64)))
+            .collect();
+        let ns = [1, outputs.len() / 2, outputs.len(), outputs.len() + 1];
+        let nth: Vec<_> = ns.iter().map(|&n| nth_from_bottom(grid, n)).collect();
+        let offsets = [0, 100, 777, 2_000, grid.scrollback_len()];
+        let gutters: Vec<_> = offsets
+            .iter()
+            .map(|&offset| {
+                let mut marks = Vec::new();
+                gutter(grid, offset, |row, exit| marks.push((row, exit)));
+                marks
+            })
+            .collect();
+        assert_eq!(
+            grid.cached_scrollback_cells(),
+            0,
+            "a mark scan decoded a row"
+        );
+
+        // The decoded rows (these reads fill the cache).
+        let c = |index: usize| {
+            grid.logical_line(index)
+                .unwrap()
+                .marks
+                .contains(&Mark::OutputStart)
+        };
+        let count = grid.total_lines();
+        let want_ranks: Vec<_> = anchors
+            .iter()
+            .map(|&index| {
+                Some(if c(index) {
+                    Rank::Nth((index..count).filter(|&i| c(i)).count())
+                } else {
+                    Rank::Erased
+                })
+            })
+            .collect();
+        assert_eq!(ranks, want_ranks);
+        assert_eq!(ranks[0], Some(Rank::Nth(outputs.len())));
+        let want_nth: Vec<_> = ns
+            .iter()
+            .map(|&n| (0..count).rev().filter(|&i| c(i)).nth(n - 1))
+            .collect();
+        assert_eq!(nth, want_nth);
+        assert_eq!(nth[2], Some(outputs[0]));
+        for (offset, got) in offsets.iter().zip(&gutters) {
+            assert_eq!(*got, gutter_by_decoding(grid, *offset), "offset {offset}");
+        }
+        assert!(
+            gutters.iter().filter(|g| !g.is_empty()).count() >= 3,
+            "{gutters:?}"
+        );
+    }
+
+    /// #781: prompt navigation's walks read packed history rows' marks
+    /// without decoding a row, and stop where the decoded rows say, having
+    /// taken one line of budget per line looked at.
+    #[test]
+    fn prompt_walks_decode_no_packed_row() {
+        for back in [3_000, 3_001, 2_222] {
+            // A fresh decode cache for each walk.
+            let source = Counting {
+                term: Mutex::new(marked_history()),
+                holds: AtomicUsize::new(0),
+            };
+            let (epoch, top) =
+                source.read_terminal(|t, _| (t.line_epoch(), id(t.grid().scrollback_pushed())));
+            let from = top - back;
+            let mut up_budget = MAX_PROMPT_SCAN_LINES;
+            let up = scan_marks(&source, epoch, from, Bound::Up, &mut up_budget, prompt_stop);
+            let mut down_budget = MAX_PROMPT_SCAN_LINES;
+            let down = scan_marks(
+                &source,
+                epoch,
+                from,
+                Bound::DownToScreen,
+                &mut down_budget,
+                prompt_stop,
+            );
+            let term = source.term.lock().unwrap();
+            let grid = term.grid();
+            assert_eq!(
+                grid.cached_scrollback_cells(),
+                0,
+                "a mark scan decoded a row"
+            );
+            // The nearest prompt stops above and below line `from`, decoded.
+            let at = usize::try_from(from - base_of(grid)).unwrap();
+            let stop = |i: usize| {
+                let marked = |i: usize| {
+                    grid.logical_line(i)
+                        .is_some_and(|l| l.marks.contains(&Mark::PromptStart))
+                };
+                marked(i) && !(marked(i - 1) && grid.logical_line(i - 1).unwrap().wrapped)
+            };
+            let above = (0..=at).rev().find(|&i| stop(i)).unwrap();
+            let below = (at..grid.scrollback_len()).find(|&i| stop(i)).unwrap();
+            assert_eq!(up, Scan::Found(base_of(grid) + id(above as u64)));
+            assert_eq!(MAX_PROMPT_SCAN_LINES - up_budget, at - above + 1);
+            assert_eq!(down, Scan::Found(base_of(grid) + id(below as u64)));
+            assert_eq!(MAX_PROMPT_SCAN_LINES - down_budget, below - at + 1);
+        }
+    }
+
     /// N09: a prompt redrawn over two rows (the first soft-wrapped into
     /// the second, both marked) is one stop, at its first row.
     #[test]
@@ -1882,10 +2161,11 @@ mod tests {
         term.advance(b"ij\x1b]133;A\x07");
         let grid = term.grid();
         assert!(grid.logical_line(1).is_some_and(|l| l.wrapped));
-        assert!(has_prompt(grid, 2));
-        assert!(prompt_stop(grid, 0));
-        assert!(prompt_stop(grid, 1));
-        assert!(!prompt_stop(grid, 2), "the continuation of row 1");
+        let marks = |index| grid.line_marks(index).unwrap();
+        assert!(has_prompt(grid, 2, marks(2)));
+        assert!(prompt_stop(grid, 0, marks(0)));
+        assert!(prompt_stop(grid, 1, marks(1)));
+        assert!(!prompt_stop(grid, 2, marks(2)), "the continuation of row 1");
     }
 
     /// #377: a screen clear whose top is line 20 takes the lines of the

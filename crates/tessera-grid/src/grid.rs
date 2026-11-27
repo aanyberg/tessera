@@ -3,6 +3,7 @@
 
 use std::cmp::Ordering;
 use std::mem;
+use std::ops::Range;
 
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -11,7 +12,7 @@ use crate::damage::{Damage, DamageRows, DamageTracker};
 use crate::grapheme::MAX_CLUSTER_SCALARS;
 use crate::hyperlink::LinkPool;
 use crate::reflow::{self, ScreenMut, Size};
-use crate::scrollback::LineRef;
+use crate::scrollback::{LineMarks, LineRef};
 use crate::{
     Cell, CellFlags, Hyperlink, Line, LinkRefused, Mark, Point, Scrollback, Style, TabStops,
     char_width,
@@ -598,6 +599,46 @@ impl Grid {
             None => self.scrollback.get(index),
             Some(row) => self.lines.get(row).map(LineRef::borrowed),
         }
+    }
+
+    /// The marks and wrap flag of a line of the logical buffer (indexed as
+    /// [`Grid::logical_line`]), without decoding a packed scrollback row
+    /// (ADR 0051): for scans that read only marks.
+    pub fn line_marks(&self, index: usize) -> Option<LineMarks<'_>> {
+        match index.checked_sub(self.scrollback.len()) {
+            None => self.scrollback.marks(index),
+            Some(row) => self.lines.get(row).map(LineMarks::of),
+        }
+    }
+
+    /// The lines of the logical buffer in `range` (indexed as
+    /// [`Grid::logical_line`], clamped to [`Grid::total_lines`]) that carry
+    /// marks, oldest first, with their indices; reverse it to walk up.
+    ///
+    /// Packed scrollback rows are read from their blocks' mark records:
+    /// O(packed blocks in the range + marked rows), no row is decoded or
+    /// cached. Hot and visible rows are read in place, O(lines).
+    pub fn marked_lines(
+        &self,
+        range: Range<usize>,
+    ) -> impl DoubleEndedIterator<Item = (usize, LineMarks<'_>)> + Clone + '_ {
+        let sb = self.scrollback.len();
+        let end = range.end.min(self.total_lines());
+        let start = range.start.min(end);
+        let rows = start.max(sb) - sb..end.max(sb) - sb;
+        let screen = self.lines[rows.clone()]
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| !line.marks.is_empty())
+            .map(move |(row, line)| (start.max(sb) + row, LineMarks::of(line)));
+        self.scrollback.marked(start..end.min(sb)).chain(screen)
+    }
+
+    /// Cells of decoded scrollback rows cached now (tests check that mark
+    /// scans decode nothing).
+    #[doc(hidden)]
+    pub fn cached_scrollback_cells(&self) -> usize {
+        self.scrollback.cached_cells()
     }
 
     /// Every line of the logical buffer, oldest scrollback line first and
@@ -2998,6 +3039,85 @@ fn recycle(mut line: Line, cols: u16, pen: Style) -> Line {
 mod tests {
     use super::*;
     use crate::{Color, Mark};
+
+    /// `line_marks` and `marked_lines` over packed, hot and visible rows
+    /// agree with the decoded lines and decode nothing (#781).
+    #[test]
+    fn marks_are_read_from_every_kind_of_row_without_decoding() {
+        let mut grid = Grid::new(4, 6);
+        grid.set_max_scrollback(5_000);
+        for n in 0..(crate::HOT_ROWS + 3 * crate::packed::BLOCK_ROWS) {
+            grid.put_char('x');
+            if n % 7 == 0 {
+                grid.lines[0].set_mark(Mark::OutputStart);
+            }
+            grid.lines[0].wrapped = n % 3 == 0;
+            grid.scroll_up(1);
+        }
+        grid.lines[2].set_mark(Mark::PromptStart);
+        grid.lines[2].wrapped = true;
+        let total = grid.total_lines();
+        let want: Vec<(usize, Vec<Mark>, bool)> = (0..total)
+            .map(|i| grid.logical_line(i).unwrap())
+            .enumerate()
+            .filter(|(_, l)| !l.marks.is_empty())
+            .map(|(i, l)| (i, l.marks.clone(), l.wrapped))
+            .collect();
+        let cached = grid.cached_scrollback_cells();
+        // A fresh copy: the reference reads above filled the decode cache.
+        let grid = grid.clone();
+        assert!(cached > 0 && grid.cached_scrollback_cells() == 0);
+        let got = |range: Range<usize>| -> Vec<_> {
+            grid.marked_lines(range)
+                .map(|(i, m)| (i, m.marks.to_vec(), m.wrapped))
+                .collect()
+        };
+        assert_eq!(got(0..usize::MAX), want);
+        let mut rev: Vec<_> = grid
+            .marked_lines(0..total)
+            .rev()
+            .map(|(i, m)| (i, m.marks.to_vec(), m.wrapped))
+            .collect();
+        rev.reverse();
+        assert_eq!(rev, want);
+        let sb = grid.scrollback_len();
+        assert!(
+            want.iter().any(|(i, ..)| *i >= sb),
+            "a visible row is marked"
+        );
+        for range in [
+            0..sb,
+            sb - 1..total,
+            300..900,
+            sb + 1..sb + 3,
+            total..total + 4,
+        ] {
+            let expect: Vec<_> = want
+                .iter()
+                .filter(|(i, ..)| range.contains(i))
+                .cloned()
+                .collect();
+            assert_eq!(got(range.clone()), expect, "{range:?}");
+        }
+        for i in 0..total {
+            let line = grid.line_marks(i).unwrap();
+            let want = want.iter().find(|(j, ..)| *j == i);
+            assert_eq!(
+                line.marks,
+                want.map_or(&[][..], |w| w.1.as_slice()),
+                "line {i}"
+            );
+            if let Some(want) = want {
+                assert_eq!(line.wrapped, want.2, "line {i}");
+            }
+        }
+        assert_eq!(grid.line_marks(total), None);
+        assert_eq!(
+            grid.cached_scrollback_cells(),
+            0,
+            "a mark read decoded a row"
+        );
+    }
 
     fn text(grid: &Grid) -> Vec<String> {
         grid.visible_lines().iter().map(Line::text).collect()

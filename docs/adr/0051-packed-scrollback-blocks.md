@@ -33,6 +33,13 @@ dereferences to `Line`: a borrowed hot or visible row, or a decoded packed row. 
 `logical_line`, so the rows it reads are decoded through the D4 cache. `Grid::hyperlink_at` returns an owned
 `Option<Hyperlink>`. These are Rust API changes only; the C ABI is unchanged.
 
+*Amended 2026-11-28 (#781).* Scans that read only marks (app-core's prompt navigation, Select Last Output's look for
+the output, the exit-status gutter and the ranks a resize carries records by) read `Grid::line_marks` and
+`Grid::marked_lines` instead of `logical_line`. Both return `LineMarks` (a row's marks and wrap flag) from the packed
+block's per-row records, so a packed row is never decoded or cached for them, and `marked_lines` walks a range in
+O(blocks + marked rows). Decoding every row made a resize's scans over 1 000 000 packed lines take about 0.4-0.8 s
+under the terminal lock (67-69x the unpacked store). The packed format is unchanged.
+
 **D4. Decoded-row cache.** Random access (`Scrollback::get`) caches decoded rows: at most `MAX_UNPACKED_CELLS` (65 536)
 cells and at most 1 024 rows, evicted oldest first (docs/security.md bounds). Evicting history drops the cached copies
 of the evicted rows at once, so a cached row never keeps an evicted row's links alive; a cap of 0 empties the cache. It
