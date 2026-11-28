@@ -133,17 +133,21 @@ final class TerminalWindowContentView: NSView {
     /// (``TabRowInsets``): read from the accessory of whichever of its
     /// windows holds the tab bar now (the selected one, which a tab
     /// selection may not have moved it to yet); `nil` while the group shows
-    /// no tab bar, or where AppKit has no `NSTabBar` to read.
+    /// no tab bar, or where AppKit has no `NSTabBar` to read. The bar is
+    /// looked for at any depth under the accessory's view, should a macOS
+    /// nest it.
     static func tabRowInsets(of window: NSWindow) -> TabRowInsets? {
         guard let tabBarClass = NSClassFromString("NSTabBar") else { return nil }
+        func tabBar(under view: NSView) -> NSView? {
+            let shown = view.subviews.filter { !$0.isHidden }
+            return shown.first { $0.isKind(of: tabBarClass) } ?? shown.lazy.compactMap(tabBar(under:)).first
+        }
         func insets(in window: NSWindow) -> TabRowInsets? {
             for accessory in window.titlebarAccessoryViewControllers
             where !(accessory is TabRowSpacerController) && !accessory.isHidden {
                 let bar = accessory.view
-                guard let row = bar.subviews.first(where: { $0.isKind(of: tabBarClass) && !$0.isHidden }) else {
-                    continue
-                }
-                let frame = row.frame
+                guard let row = tabBar(under: bar) else { continue }
+                let frame = row.convert(row.bounds, to: bar)
                 let bounds = bar.bounds
                 return bar.isFlipped
                     ? TabRowInsets(top: frame.minY - bounds.minY, bottom: bounds.maxY - frame.maxY)

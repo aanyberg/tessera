@@ -529,13 +529,13 @@ final class TerminalScroller: NSScroller {
             let width = from.width - to.width
             addWidening(knobLayer, "position.x", from.midX - to.midX)
             addWidening(knobLayer, "bounds.size.width", width)
-            // The fill and rim are centred in the knob layer.
-            func radius(_ size: CGSize) -> CGFloat { min(size.width, size.height) / 2 }
-            for (sublayer, inset) in [(knobFill, CGFloat(1)), (knobRim, 0)] {
+            // The fill and rim are centred in the knob layer, and round:
+            // half their shorter side, which an inset shortens by as much
+            // narrow as wide, so their radii change by the knob's.
+            let radiusDelta = (min(from.width, from.height) - min(to.width, to.height)) / 2
+            for sublayer in [knobFill, knobRim] {
                 addWidening(sublayer, "position.x", width / 2)
                 addWidening(sublayer, "bounds.size.width", width)
-                let radiusDelta = radius(from.insetBy(dx: inset, dy: inset).size)
-                    - radius(to.insetBy(dx: inset, dy: inset).size)
                 addWidening(sublayer, "cornerRadius", radiusDelta)
             }
         }
@@ -687,6 +687,10 @@ final class TerminalScroller: NSScroller {
 
     override func mouseEntered(with event: NSEvent) {
         super.mouseEntered(with: event)
+        // A hidden scroller (no history) is not hovered: an enter that
+        // reaches it would widen the knob unseen, to come back wide with
+        // no widening (#634).
+        guard !isHidden else { return }
         // A flash that has ended, whose hide the main queue has yet to
         // run, ends now: the knob narrows first, and widens anew (#695).
         if let flashEnd, now() >= flashEnd { hideAfterFlash() }
