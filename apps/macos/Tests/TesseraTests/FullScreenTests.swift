@@ -256,6 +256,44 @@ final class FullScreenLayoutTests: XCTestCase {
             "windowed with a tab bar: the layout of #494")
     }
 
+    /// The tab row's insets are read from AppKit's tab bar wherever it sits
+    /// under its accessory's view (#621 minor): a direct subview, or nested
+    /// in a view of its own, the same; a bar in a hidden view is not read.
+    func testTheTabRowIsReadFromATabBarAtAnyDepth() throws {
+        let tabBarClass = try XCTUnwrap(NSClassFromString("NSTabBar") as? NSView.Type, "AppKit's NSTabBar")
+        func insets(_ placement: String) -> TerminalWindowContentView.TabRowInsets? {
+            let window = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 400, height: 300), styleMask: [.titled], backing: .buffered,
+                defer: true)
+            window.isReleasedWhenClosed = false
+            defer { window.close() }
+            let view = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: 40))
+            // In the accessory's view: from y 8 to 36, 4 pt under its top.
+            let bar = tabBarClass.init(frame: NSRect(x: 0, y: 8, width: 400, height: 28))
+            if placement == "direct" {
+                view.addSubview(bar)
+            } else {
+                let holder = NSView(frame: NSRect(x: 0, y: 2, width: 400, height: 38))
+                bar.setFrameOrigin(NSPoint(x: 0, y: 6))
+                holder.addSubview(bar)
+                holder.isHidden = placement == "hidden"
+                view.addSubview(holder)
+            }
+            let accessory = NSTitlebarAccessoryViewController()
+            accessory.layoutAttribute = .bottom
+            accessory.view = view
+            window.addTitlebarAccessoryViewController(accessory)
+            return TerminalWindowContentView.tabRowInsets(of: window).map {
+                // As tall as AppKit made the accessory: 4 pt above the bar.
+                .init(top: $0.top - (view.bounds.height - 40), bottom: $0.bottom)
+            }
+        }
+        let expected = TerminalWindowContentView.TabRowInsets(top: 4, bottom: 8)
+        XCTAssertEqual(insets("direct"), expected, "a direct subview")
+        XCTAssertEqual(insets("nested"), expected, "nested in a view of its own")
+        XCTAssertNil(insets("hidden"), "in a hidden view")
+    }
+
     /// Two tabs of `profile` in one window (so it has a tab bar), the
     /// first selected.
     private func openTabs(profile: String?) throws -> (TerminalWindowController, TerminalWindowController) {

@@ -92,15 +92,22 @@ final class AppAppearanceTests: XCTestCase {
         }
     }
 
+    /// Whether a ``waitUntilEach(draws:_:_:)`` of this test ran out: the
+    /// later ones do not wait.
+    private var appearanceWaitSpent = false
+
     /// Waits until each of `targets` draws as `dark` says, read from its
     /// effective appearance, the state the assertions after it check, for
     /// at most a ``ChildStartBudget`` of 10 s scaled by the load per core
-    /// up to 30 s (#609), so that a failed value ends the test within its
-    /// allowance. A missing target is left to those assertions. It throws
-    /// with the targets that still draw otherwise.
+    /// up to 30 s (#609). A missing target is left to those assertions.
+    /// Run out, it fails with the targets that still draw otherwise and
+    /// returns, so the assertions after it report every value and target;
+    /// no later wait of the test waits, so that a failed value ends the
+    /// test within its allowance.
     private func waitUntilEach(
         draws dark: Bool, _ what: String, _ targets: () -> [(name: String, item: (any NSAppearanceCustomization)?)]
     ) async throws {
+        guard !appearanceWaitSpent else { return }
         var budget = ChildStartBudget(base: .seconds(10), cap: .seconds(30))
         func wrong() -> [String] {
             targets().compactMap { target in
@@ -111,9 +118,9 @@ final class AppAppearanceTests: XCTestCase {
         var still = wrong()
         while !still.isEmpty {
             guard !budget.isSpent() else {
-                throw PollTimedOut(
-                    description: "\(what): still not \(dark ? "dark" : "light") \(budget.summary): "
-                        + still.joined(separator: ", "))
+                appearanceWaitSpent = true
+                return XCTFail(
+                    "\(what): still not \(dark ? "dark" : "light") \(budget.summary): " + still.joined(separator: ", "))
             }
             try await Task.sleep(for: .milliseconds(10))
             still = wrong()

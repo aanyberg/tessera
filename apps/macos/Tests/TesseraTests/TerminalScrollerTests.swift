@@ -694,6 +694,7 @@ final class TerminalScrollerTests: XCTestCase {
         XCTAssertEqual(layers.fill.cornerRadius, wideKnob.width / 2)
         XCTAssertEqual(layers.rim.frame.size, layers.knob.bounds.size)
         XCTAssertEqual(layers.rim.cornerRadius, wideKnob.width / 2 + 1)
+        XCTAssertEqual(layers.rim.borderWidth, 1, "a 1 pt rim")
 
         // Every width animation is AppKit's, additive, ending at the model.
         var count = 0
@@ -793,6 +794,33 @@ final class TerminalScrollerTests: XCTestCase {
             layers.knob.frame, drawn(scroller.rect(for: .knob), wide: true, in: scroller).insetBy(dx: -1, dy: -1),
             "the next hover widens it")
         XCTAssertFalse(layers.slot.isHidden)
+        XCTAssertNotNil(widening(layers.knob, "bounds.size.width"), "with its animation")
+        XCTAssertEqual(startFrame(layers.knob), narrowKnob, "from the narrow knob")
+    }
+
+    /// An enter and exit that reach the scroller while it is hidden (no
+    /// history, as under vim or less) do not widen the knob (#634
+    /// adversarial): shown again, it is narrow, and the next hover widens
+    /// it with its animation.
+    func testAnEnterWhileHiddenLeavesTheKnobNarrow() throws {
+        let (scroller, window) = makeScroller()
+        defer { window.close() }
+        let layers = try knobLayers(scroller)
+        let narrowKnob = layers.knob.frame
+        scroller.update(.init(offset: 0, history: 0, rows: 24))
+        XCTAssertTrue(scroller.isHidden)
+        try enter(scroller)
+        XCTAssertFalse(scroller.isRevealed, "a hidden scroller is not revealed by the pointer")
+        try exit(scroller)
+
+        scroller.update(Self.middle)
+        XCTAssertFalse(scroller.isHidden)
+        XCTAssertEqual(layers.knob.frame, narrowKnob, "shown again after a crossing while hidden: narrow")
+        XCTAssertTrue(layers.slot.isHidden, "no slot behind it")
+        XCTAssertEqual(try overlayAnimations(scroller).keys.sorted(), [])
+        CATransaction.flush()
+        try enter(scroller)
+        XCTAssertGreaterThan(layers.knob.frame.width, narrowKnob.width, "the next hover widens it")
         XCTAssertNotNil(widening(layers.knob, "bounds.size.width"), "with its animation")
         XCTAssertEqual(startFrame(layers.knob), narrowKnob, "from the narrow knob")
     }

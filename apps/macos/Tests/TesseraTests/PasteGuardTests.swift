@@ -335,6 +335,28 @@ final class PasteGuardTests: XCTestCase {
         try await waitUntil("cat shows the paste") { try screen(of: view).contains("echo b") }
     }
 
+    /// A pane that leaves its window while the second sheet is up ends
+    /// that sheet, not the first, already ended one (#748): nothing is
+    /// pasted and the view asks no more.
+    func testAPaneLeavingItsWindowEndsTheSecondSheet() async throws {
+        let script = #"printf '\033[?2004h'; echo ready; read go; printf '\033[?2004l'; stty -echo; echo mode-off; exec cat -v"#
+        let (controller, view) = try await openTab(script: script)
+        let window = try XCTUnwrap(controller.window)
+        paste("echo a\u{1b}\necho b\n", into: view)
+        let first = try XCTUnwrap(window.attachedSheet as? PasteConfirmationSheet, "the sheet is up")
+        try await proceed(view, until: "mode-off")
+        first.pasteButton.performClick(nil)
+        try await waitUntil("a second sheet") {
+            (window.attachedSheet as? PasteConfirmationSheet).map { $0 !== first } ?? false
+        }
+        XCTAssertTrue(view.isConfirmingPaste)
+
+        view.removeFromSuperview()
+        try await waitUntil("the second sheet ends") { window.attachedSheet == nil }
+        XCTAssertFalse(view.isConfirmingPaste)
+        XCTAssertEqual(view.pasteCount, 0, "nothing is pasted")
+    }
+
     /// The second sheet answers Return as Cancel, like the first: it
     /// opens while the first one ends, and AppKit clears a key equivalent
     /// set then.
