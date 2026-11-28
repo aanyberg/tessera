@@ -603,7 +603,10 @@ impl Grid {
 
     /// The marks and wrap flag of a line of the logical buffer (indexed as
     /// [`Grid::logical_line`]), without decoding a packed scrollback row
-    /// (ADR 0051): for scans that read only marks.
+    /// (ADR 0051): for lookups that read only marks. Each call finds a
+    /// packed row's block and extras by binary search (about 20 times the
+    /// per-row cost of a walk), so a scan over many lines walks
+    /// [`Grid::marked_lines`] instead.
     pub fn line_marks(&self, index: usize) -> Option<LineMarks<'_>> {
         match index.checked_sub(self.scrollback.len()) {
             None => self.scrollback.marks(index),
@@ -615,9 +618,10 @@ impl Grid {
     /// [`Grid::logical_line`], clamped to [`Grid::total_lines`]) that carry
     /// marks, oldest first, with their indices; reverse it to walk up.
     ///
-    /// Packed scrollback rows are read from their blocks' mark records:
-    /// O(packed blocks in the range + marked rows), no row is decoded or
-    /// cached. Hot and visible rows are read in place, O(lines).
+    /// Packed scrollback rows are read from their blocks' extras (the
+    /// records of rows with marks, links or anchors): O(packed blocks in
+    /// the range + packed rows with extras), no row is decoded or cached.
+    /// Hot and visible rows are read in place, O(lines).
     pub fn marked_lines(
         &self,
         range: Range<usize>,
