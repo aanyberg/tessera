@@ -294,7 +294,9 @@ impl std::fmt::Display for LookupStep {
 /// Errors from spawning or driving a PTY.
 #[derive(Debug, thiserror::Error)]
 pub enum PtyError {
-    /// The PTY pair could not be allocated.
+    /// The PTY pair could not be allocated, or the helper thread that opens
+    /// it could not be started (`EAGAIN` when the process is out of
+    /// threads, #568).
     #[error("failed to open pty: {0}")]
     Open(String),
     /// The child could not be started: the program is missing, a
@@ -352,12 +354,13 @@ pub enum PtyError {
         /// The step the taken helpers were waiting on.
         stalled: LookupStep,
     },
-    /// Opening the PTY pair gave no answer within 5 s, or four earlier
-    /// opens are still without one (#568): on macOS `grantpt(3)` can, very
-    /// rarely, spin in the kernel and never return while other ptys are
-    /// opened and closed at the same time. Nothing was forked; a stuck open
-    /// is left on its helper thread, and should it return, the pty it
-    /// opened is closed there.
+    /// Opening the PTY pair gave no answer within 5 s, four earlier opens
+    /// are still without one, or every helper that opens ptys stayed busy
+    /// with earlier opens for the whole 5 s (#568): on macOS `grantpt(3)`
+    /// can, very rarely, spin in the kernel and never return while other
+    /// ptys are opened and closed at the same time. Nothing was forked; a
+    /// stuck open is left on its helper thread, and should it return, the
+    /// pty it opened is closed there.
     #[error("failed to open pty: no answer in time")]
     OpenTimedOut,
     /// A window-size update was rejected by the kernel.

@@ -28,6 +28,9 @@ restore. A dispatch input `force` bypasses that. It runs only on `main`.
 
 **D3. Bars.** Instructions head/base at most 1.02 in at least one of three independent probe builds (the noise-floor
 rule of the factory: a probe build alone moves the base by about 1 %), so a case is rebuilt only while it is over.
+The job clears a case when any one build is under the bar and flags it only when all three are over; this is the
+reverse of the review rule (docs/software-factory.md, `cargo xtask ab`), under which a bar counts as met only when all
+three builds are under it. Review proves a change is fast enough; the job only reports a change it is sure of.
 Heap at most 1.02 of the baseline's. A `problem:` line from `ab` (case too small against the process overhead,
 checksums differ) makes the line `noisy`, never `regressed`.
 

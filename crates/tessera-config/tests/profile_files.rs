@@ -961,7 +961,10 @@ fn saving_adding_and_removing_a_profile_file_each_reload_once() {
 /// of `tests/reload.rs` (#283 item 4): a save that took under half a
 /// debounce, from before the truncation to after the write, gets exactly
 /// one reload; a slower one at most one more, before it, that shows the
-/// empty file. Every save's last reload shows the new document. A watcher
+/// empty file. The measured time includes all of the `open` that
+/// truncates, not only the time from the truncation on, so it reads a
+/// little long: a save near the line gets the looser check, never a wrong
+/// one. Every save's last reload shows the new document. A watcher
 /// that reloads twice per save fails both cases.
 #[test]
 fn a_truncating_in_place_save_reloads_once_unless_the_writer_stalls() {

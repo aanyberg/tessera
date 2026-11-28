@@ -405,7 +405,8 @@ Agents use these instead of rebuilding the setup in every run:
   10 000 plain or mixed scrollback lines, through the probe's counting allocator; the peak resident set of 1 000 000
   lines through `/usr/bin/time -l`; session-level growth is guarded by the #216 budgets in the release timing step). One JSON line per case (`sha`, `base`, `instructions`,
   `heap_bytes`, `ratio`, `status`) is appended to `perf-state/perf.jsonl`, kept in the Actions cache between runs and
-  uploaded as the `perf-trend` artifact. A case over 1.02 in all three probe builds, or a heap over 1.02 of the
+  uploaded as the `perf-trend` artifact. A case over 1.02 in all three probe builds (the reverse of the review rule
+  above, where all three must be under; ADR 0049 D3), or a heap over 1.02 of the
   baseline's (or over the bar of an accepted step in `scripts/perf-steps.txt` that the baseline does not have yet), opens or comments on a `type:bug` issue ("perf: the scheduled performance job found a regression")
   naming the SHA range; a failed timing step does not stop the case set, the state or the trend; it files its own issue ("perf: the scheduled
   performance job failed"). The job's token is `contents: read` and `issues:

@@ -32,6 +32,10 @@ init)
     while (( $# )); do case "$1" in --out) out="$2";; --base) base="$2";; esac; shift; done
     echo "init base=$base" >> "$stub/ab.log"
     if [[ -f "$stub/no-build-at" && "$base" == "$(cat "$stub/no-build-at")" ]]; then echo "does not build" >&2; exit 1; fi
+    # no-build-call: the init call of that number (counted in ab.log) fails.
+    if [[ -f "$stub/no-build-call" && "$(grep -c '^init' "$stub/ab.log")" == "$(cat "$stub/no-build-call")" ]]; then
+        echo "does not build" >&2; exit 1
+    fi
     mkdir -p "$out/probe/src"
     ;;
 bench)
@@ -162,6 +166,20 @@ echo "$A" > "$stub/no-build-at"
 run "$s" "$B" || fail "fallback run failed: $(cat "$tmp/out.log")"
 jq -e --arg b "$B" 'select(.sha == $b and .case == "feed") | .base == $b and (.note | test("does not build"))' "$s/perf.jsonl" > /dev/null \
     || fail "a case set that does not build at the baseline falls back to a baseline run"
+
+# 7a. The case set builds at the baseline once, then not (a probe build failing in attempt 2): the fallback measures
+# every case again, not only those the first build left over the bar.
+reset
+s="$tmp/s7a"
+run "$s" "$A" || fail "baseline run failed"
+: > "$stub/ab.log"
+echo 2 > "$stub/no-build-call"
+printf '1.080\n' > "$stub/ratio-search"
+run "$s" "$B" || fail "a fallback after a narrowed first build failed: $(cat "$tmp/out.log")"
+for c in feed scroll search cat; do
+    jq -e --arg b "$B" --arg c "$c" 'select(.sha == $b and .case == $c) | .base == $b and (.note | test("does not build"))' \
+        "$s/perf.jsonl" > /dev/null || fail "after a narrowed first build the fallback measures $c again"
+done
 
 # 7b. A machine without instruction counters (a virtual machine): the case set is still taken, the instruction cases
 # are `noisy` with the wall ratio and a note (no failure, no retry), and the heap cases still bind.

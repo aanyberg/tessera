@@ -373,7 +373,7 @@ fn rerun_alone(name: &str) -> bool {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        output.status.success() && stdout.contains("1 passed"),
+        output.status.success() && stdout.contains("test result: ok. 1 passed;"),
         "{name} alone: {}\n{stdout}\n{stderr}",
         output.status
     );
@@ -401,13 +401,25 @@ fn children() -> Vec<i32> {
     pids
 }
 
-/// This process's children, running or not yet reaped, in no order.
+/// This process's children, running or not yet reaped, in no order. A
+/// thread that exits while it is read has none (`NotFound` or `ESRCH`).
+/// The `children` files need a kernel built with `CONFIG_PROC_CHILDREN`;
+/// without it no child is seen, so the fork checks pass unchecked there.
 #[cfg(not(target_os = "macos"))]
 fn children() -> Vec<i32> {
     let mut pids = Vec::new();
     for task in std::fs::read_dir("/proc/self/task").expect("list this process's threads") {
-        let listed = std::fs::read_to_string(task.unwrap().path().join("children"))
-            .expect("read a thread's children");
+        let Ok(task) = task else { continue };
+        let listed = match std::fs::read_to_string(task.path().join("children")) {
+            Ok(listed) => listed,
+            Err(err)
+                if err.kind() == std::io::ErrorKind::NotFound
+                    || err.raw_os_error() == Some(nix::libc::ESRCH) =>
+            {
+                continue;
+            }
+            Err(err) => panic!("read a thread's children: {err}"),
+        };
         pids.extend(
             listed
                 .split_whitespace()
@@ -422,8 +434,9 @@ fn children() -> Vec<i32> {
 /// reaped) when it returns: a child `f` forked and left behind. A child
 /// that existed before the call is not counted, so a child of an earlier
 /// spawn, or the one a failed `posix_spawn` leaves for the kernel to reap
-/// (XNU), cannot fail the check. Only children of the calls in `f` when
-/// the test runs [`alone`].
+/// (XNU), cannot fail the check. Nor is a child that `f` forked and
+/// reaped before it returned: only what is left is seen. Only children of
+/// the calls in `f` when the test runs [`alone`].
 fn new_children<T>(f: impl FnOnce() -> T) -> (T, Vec<i32>) {
     let before = children();
     let result = f();

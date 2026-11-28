@@ -429,6 +429,17 @@ mod tests {
         );
         assert_eq!(spawn_errno("nul byte found in provided data"), None);
         assert_eq!(spawn_errno("(os error x)"), None);
+        // `portable-pty`'s search with `PATH` unset (#519 m2): no candidate
+        // line, so `ENOENT`, whatever the name holds.
+        for name in ["x", "x because it is a directory"] {
+            assert_eq!(
+                spawn_errno(&format!(
+                    "Unable to spawn {name} because:\nUnable to resolve the PATH"
+                )),
+                Some(errno::ENOENT),
+                "{name}"
+            );
+        }
     }
 
     /// Every reason `check_interpreter` gives, as `format!` builds it there.
@@ -555,8 +566,20 @@ mod tests {
         let plain = hostile.join("cmd-plain");
         std::fs::write(&plain, "").unwrap();
         std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o644)).unwrap();
+        // `cmd-both`: a file that is not executable early on `PATH`, a
+        // directory later; the directory names the `errno` (#519 m3).
+        let early = root.join("early");
+        std::fs::create_dir(&early).unwrap();
+        std::fs::write(early.join("cmd-both"), "").unwrap();
+        std::fs::set_permissions(
+            early.join("cmd-both"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        std::fs::create_dir(hostile.join("cmd-both")).unwrap();
         let in_path = format!(
-            "{}:/nonexistent/(os error 13):/nonexistent/x exists but is a directory.\n:/n (os error 4)",
+            "{}:{}:/nonexistent/(os error 13):/nonexistent/x exists but is a directory.\n:/n (os error 4)",
+            early.display(),
             hostile.display()
         );
         let reason = |options: SpawnOptions| match tessera_pty::NativePty::spawn(&options) {
@@ -574,6 +597,7 @@ mod tests {
             (searched("tessera-no-such-command"), errno::ENOENT),
             (searched("cmd-dir"), errno::EISDIR),
             (searched("cmd-plain"), errno::EACCES),
+            (searched("cmd-both"), errno::EISDIR),
             (
                 reason(SpawnOptions::command(
                     hostile.join("missing (os error 13)"),

@@ -1495,6 +1495,11 @@ mod shared_fonts {
     /// The shared scan, the first call scanning and starting the index,
     /// or `None` when nothing is shared or the indexes are held: a held
     /// load wants an index of its own that waits for the release (#594).
+    ///
+    /// `SHARE` is not read again under the `SHARED` lock, so a load racing
+    /// [`set`]`(false)` can fill `SHARED` after `set` emptied it, and that
+    /// scan is the one the next sharing load reuses. Test-only, and tests
+    /// switch sharing while no font loads, so it is left so.
     pub(super) fn get() -> Option<Shared> {
         if !SHARE.load(Ordering::SeqCst) || test_hold::held() {
             return None;
@@ -1512,6 +1517,12 @@ mod shared_fonts {
     /// Calls `notice` once the index lands in `slot`, on a thread of its
     /// own as an unshared index's notice is called, or on this one, after
     /// the landing, if no thread can be spawned.
+    ///
+    /// Test-only limits, left so: a shared build that panicked never
+    /// lands, so every later load leaves one thread here waiting for ever;
+    /// and when the build's own thread cannot be spawned, [`get`] builds
+    /// the index inline while it holds the `SHARED` lock, so other loads
+    /// wait for that build.
     pub(super) fn notice_on_landing(slot: &Arc<OnceLock<Coverage>>, notice: IndexNotice) {
         let notice = Arc::new(Mutex::new(Some(notice)));
         let (thread_slot, thread_notice) = (Arc::clone(slot), Arc::clone(&notice));
@@ -1527,6 +1538,34 @@ mod shared_fonts {
             .spawn(move || call(&thread_slot, &thread_notice));
         if spawned.is_err() {
             call(slot, &notice);
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        use super::*;
+
+        /// #660 M2: a shared load's notice waits for the index to land,
+        /// and comes once.
+        #[test]
+        fn a_shared_notice_comes_once_the_index_lands() {
+            let slot = Arc::new(OnceLock::new());
+            let (tx, rx) = mpsc::channel();
+            notice_on_landing(&slot, Box::new(move || tx.send(()).expect("receiver")));
+            assert!(
+                rx.recv_timeout(Duration::from_millis(300)).is_err(),
+                "a notice before the index landed"
+            );
+            assert!(slot.set(Coverage::default()).is_ok());
+            rx.recv_timeout(Duration::from_secs(30))
+                .expect("the notice once the index landed");
+            assert!(
+                rx.recv_timeout(Duration::from_millis(300)).is_err(),
+                "a second notice"
+            );
         }
     }
 }
