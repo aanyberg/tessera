@@ -439,23 +439,52 @@ final class ClipboardNoticeTests: XCTestCase {
         XCTAssertEqual(kept.clipboardNotice.shownCount, 1, "shown as the window is")
     }
 
+    /// How long each of a starting tab's two waits lasts
+    /// (``openStartingTab(in:program:completion:)``): under the 5 s a
+    /// program lookup may take before its spawn fails.
+    private static let startingWait: UInt64 = 3500
+
     /// A tab of `window` opened as ⌘T opens it, whose session starts in
     /// the background and, through `program` (a symlink of this test's),
-    /// only after `delay`: it shows its placeholder meanwhile.
+    /// only after about twice ``startingWait``: it shows its placeholder
+    /// meanwhile. The core starts sessions one at a time, so the tab's
+    /// spawn first waits for a window's opened just before it, whose
+    /// lookup is slowed by ``startingWait``, and then for its own lookup,
+    /// slowed as much: the tab starts long after a closing tab's writes
+    /// have moved to it, however slow the host, while each lookup stays
+    /// under its limit. The window closes as soon as its session runs.
     private func openStartingTab(
-        in window: NSWindow?, program: URL, delay: UInt64, completion: @escaping @MainActor (Bool) -> Void
+        in window: NSWindow?, program: URL, completion: @escaping @MainActor (Bool) -> Void
     ) throws -> NSWindow {
         guard TesseraTestsCoreTestHooksLinked() else {
             throw XCTSkip("the test host does not export the core's test hooks (a core built without test-hooks)")
         }
-        XCTAssertEqual(tessera_test_delay_program_lookup(program.path, delay), 0)
-        appDelegate.spawnOptions = .init(program: program.path, arguments: ["-c", "echo kept; exec cat"])
+        let first = try symlink(to: "/bin/sh")
+        XCTAssertEqual(tessera_test_delay_program_lookup(first.path, Self.startingWait), 0)
+        XCTAssertEqual(tessera_test_delay_program_lookup(program.path, Self.startingWait), 0)
         let background = appDelegate.spawnsInBackground
         appDelegate.spawnsInBackground = true
         defer { appDelegate.spawnsInBackground = background }
+        appDelegate.spawnOptions = .init(program: first.path, arguments: ["-c", "exec cat"])
+        XCTAssertNotNil(appDelegate.openWindow { (try? $0.get())?.window?.close() })
+        appDelegate.spawnOptions = .init(program: program.path, arguments: ["-c", "echo kept; exec cat"])
         let tab = try XCTUnwrap(appDelegate.openTab(in: window) { completion((try? $0.get()) != nil) })
-        XCTAssertEqual(appDelegate.pendingTerminals.count, 1, "starting")
+        XCTAssertEqual(appDelegate.pendingTerminals.count, 2, "both starting")
         return tab
+    }
+
+    /// The writes a closed tab left with `tab` while its session starts:
+    /// fails at once if `tab` is no longer starting, as then they went to
+    /// its running pane instead and the test proves nothing.
+    private func waitForWritesHeld(by tab: NSWindow) async throws -> ClipboardNoticeThrottle.Notice? {
+        func pending() throws -> PendingTerminal {
+            try XCTUnwrap(
+                appDelegate.pendingTerminals.first { $0.window === tab },
+                "the tab started before the writes moved to it: its start was not held long enough")
+        }
+        // They move once AppKit has picked the tab left.
+        try await waitUntil("the starting tab holds the writes") { try pending().clipboardNotice != nil }
+        return try pending().clipboardNotice
     }
 
     private func symlink(to target: String) throws -> URL {
@@ -476,21 +505,30 @@ final class ClipboardNoticeTests: XCTestCase {
         let writing = onScreen(writer.focusedPane.view)
         try await waitUntil("the child is ready") { try writing.session.accessibleText().string.contains("ready") }
         var started: Bool?
-        let tab = try openStartingTab(in: writer.window, program: try symlink(to: "/bin/sh"), delay: 3000) {
-            started = $0
-        }
+        let tab = try openStartingTab(in: writer.window, program: try symlink(to: "/bin/sh")) { started = $0 }
         try await waitUntil("the starting tab is selected") { writer.window?.tabGroup?.selectedWindow === tab }
         try writing.session.write(Array("\n".utf8))
         try await waitUntil("the writing tab closes") { !appDelegate.windowControllers.contains { $0 === writer } }
         XCTAssertEqual(pasteboard.string(forType: .string), "hello")
-        try await waitUntil("the starting tab runs", seconds: 15) { started != nil }
+        let expected = ClipboardNoticeThrottle.Notice(writes: 1, bytes: 5, closedWrites: 1)
+        let kept = try await waitForWritesHeld(by: tab)
+        XCTAssertEqual(kept, .init(writes: 1, bytes: 5), "kept for the starting tab")
+        try await waitUntil("the starting tab runs", seconds: 20) { started != nil }
         XCTAssertEqual(started, true)
-        let controller = try XCTUnwrap(appDelegate.windowControllers.first)
-        XCTAssertIdentical(controller.window, tab)
+        let controller = try XCTUnwrap(appDelegate.windowControllers.first { $0.window === tab })
         let view = controller.focusedPane.view
-        XCTAssertEqual(view.clipboardNotice.throttle.held, .init(writes: 1, bytes: 5, closedWrites: 1), "held until shown")
-        onScreen(view)
+        // A locked console's windows are not visible, a CI runner's are:
+        // the pane shows the writes as it runs if the user can see it, and
+        // holds them until then otherwise.
+        if view.clipboardNotice.shownCount == 0 {
+            XCTAssertFalse(view.isShownToUser)
+            XCTAssertEqual(view.clipboardNotice.throttle.held, expected, "held until shown")
+            onScreen(view)
+        } else {
+            XCTAssertNil(view.clipboardNotice.throttle.held, "shown as it runs")
+        }
         XCTAssertEqual(view.clipboardNotice.shownCount, 1, "shown on the tab the user is left with")
+        XCTAssertEqual(view.clipboardNotice.lastShown, expected)
         XCTAssertEqual(view.clipboardNotice.view?.text, "A program in a closed pane copied 5 bytes to the clipboard")
     }
 
@@ -503,13 +541,14 @@ final class ClipboardNoticeTests: XCTestCase {
         // Its program is missing: its session never runs.
         let missing = try symlink(to: "/nonexistent-\(UUID().uuidString)")
         var started: Bool?
-        let tab = try openStartingTab(in: writer.window, program: missing, delay: 2000) { started = $0 }
+        let tab = try openStartingTab(in: writer.window, program: missing) { started = $0 }
         try await waitUntil("the starting tab is selected") { writer.window?.tabGroup?.selectedWindow === tab }
         try writing.session.write(Array("\n".utf8))
         try await waitUntil("the writing tab closes") { !appDelegate.windowControllers.contains { $0 === writer } }
-        try await Task.sleep(for: .milliseconds(200))
+        let kept = try await waitForWritesHeld(by: tab)
+        XCTAssertEqual(kept, .init(writes: 1, bytes: 5), "kept for the starting tab")
         XCTAssertEqual(other.clipboardNotice.shownCount, 0, "kept for the starting tab")
-        try await waitUntil("the starting tab fails", seconds: 15) { started != nil }
+        try await waitUntil("the starting tab fails", seconds: 20) { started != nil }
         XCTAssertEqual(started, false)
         try await waitUntil("the writes go on to the window left") { other.clipboardNotice.shownCount == 1 }
         XCTAssertEqual(other.clipboardNotice.lastShown, .init(writes: 1, bytes: 5, closedWrites: 1))
