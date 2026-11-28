@@ -116,5 +116,5 @@ pub use hyperlink::{
 };
 pub use line::{Line, Mark};
 pub use rect::Rect;
-pub use scrollback::{HOT_ROWS, LineRef, MAX_UNPACKED_CELLS, Scrollback};
+pub use scrollback::{HOT_ROWS, LineMarks, LineRef, MAX_UNPACKED_CELLS, Scrollback};
 pub use tabs::TabStops;

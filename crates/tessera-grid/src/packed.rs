@@ -451,6 +451,27 @@ impl Block {
         line.wrapped = meta.wrapped;
     }
 
+    /// Row `r`'s marks ([`Line::marks`]), read from its extras without
+    /// decoding the row: empty for a row with none.
+    pub(crate) fn marks(&self, r: usize) -> &[Mark] {
+        self.extra(r).map_or(&[], |extra| &extra.marks)
+    }
+
+    /// The rows with marks, by ascending row: each row's index in the
+    /// block, its marks and its [`Line::wrapped`]. Reads only the rows'
+    /// extras and metadata (O(rows with extras)), never their cells.
+    pub(crate) fn marked_rows(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = (usize, &[Mark], bool)> + Clone + '_ {
+        self.extras
+            .iter()
+            .filter(|extra| !extra.marks.is_empty())
+            .map(|extra| {
+                let r = usize::from(extra.row);
+                (r, extra.marks.as_slice(), self.rows[r].wrapped)
+            })
+    }
+
     /// Row `r` as a new line.
     pub(crate) fn decode(&self, r: usize) -> Line {
         let mut line = Line::default();

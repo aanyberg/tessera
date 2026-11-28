@@ -43,11 +43,11 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
-use std::ops::Deref;
+use std::ops::{Deref, Range};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use crate::Line;
 use crate::packed::{BLOCK_ROWS, Block};
+use crate::{Line, Mark};
 
 /// Newest scrollback rows kept unpacked, as [`Line`]s.
 pub const HOT_ROWS: usize = 256;
@@ -136,6 +136,35 @@ impl Eq for LineRef<'_> {}
 impl PartialEq<Line> for LineRef<'_> {
     fn eq(&self, other: &Line) -> bool {
         **self == *other
+    }
+}
+
+/// A line's marks and wrap flag, read without its cells: what mark scans
+/// (shell-integration prompts and outputs) need of a line. A packed row's
+/// come from its block's extras, so reading them decodes nothing
+/// (ADR 0051 D3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LineMarks<'a> {
+    /// [`Line::marks`].
+    pub marks: &'a [Mark],
+    /// [`Line::wrapped`].
+    pub wrapped: bool,
+}
+
+impl<'a> LineMarks<'a> {
+    /// The marks and wrap flag of `line`.
+    #[must_use]
+    pub fn of(line: &'a Line) -> Self {
+        Self {
+            marks: &line.marks,
+            wrapped: line.wrapped,
+        }
+    }
+
+    /// Whether the line carries `mark`.
+    #[must_use]
+    pub fn contains(&self, mark: &Mark) -> bool {
+        self.marks.contains(mark)
     }
 }
 
@@ -285,16 +314,75 @@ impl Scrollback {
         self.packed
     }
 
+    /// The sequence number in the blocks of packed row `index`.
+    fn block_seq(&self, index: usize) -> u64 {
+        self.blocks.front().map_or(0, |b| b.first) + (self.skip + index) as u64
+    }
+
+    /// The index in `blocks` of the block holding packed row `index`.
+    fn block_of(&self, index: usize) -> usize {
+        let target = self.block_seq(index);
+        self.blocks.partition_point(|blk| blk.first <= target) - 1
+    }
+
     /// The block and row of packed row `index`.
     fn locate(&self, index: usize) -> (&Block, usize) {
-        let front = self.blocks.front().map_or(0, |b| b.first);
-        let target = front + (self.skip + index) as u64;
-        let b = self.blocks.partition_point(|blk| blk.first <= target) - 1;
-        let block = &self.blocks[b];
+        let block = &self.blocks[self.block_of(index)];
         // Below `BLOCK_ROWS`.
         #[allow(clippy::cast_possible_truncation)]
-        let row = (target - block.first) as usize;
+        let row = (self.block_seq(index) - block.first) as usize;
         (block, row)
+    }
+
+    /// The marks and wrap flag of the line at `index`, without decoding a
+    /// packed row (nothing is cached).
+    pub fn marks(&self, index: usize) -> Option<LineMarks<'_>> {
+        if index >= self.packed {
+            return self.hot.get(index - self.packed).map(LineMarks::of);
+        }
+        let (block, row) = self.locate(index);
+        Some(LineMarks {
+            marks: block.marks(row),
+            wrapped: block.wrapped(row),
+        })
+    }
+
+    /// The lines in `range` (clamped to `len()`) that carry marks, oldest
+    /// first, with their indices; reversible. Packed rows are read from
+    /// their blocks' extras: O(blocks in the range + rows with extras),
+    /// never a decode, and nothing is cached. Hot rows are read in place.
+    pub fn marked(
+        &self,
+        range: Range<usize>,
+    ) -> impl DoubleEndedIterator<Item = (usize, LineMarks<'_>)> + Clone + '_ {
+        let end = range.end.min(self.len());
+        let start = range.start.min(end);
+        let (packed_start, packed_end) = (start.min(self.packed), end.min(self.packed));
+        let blocks = if packed_start < packed_end {
+            self.block_of(packed_start)..self.block_of(packed_end - 1) + 1
+        } else {
+            0..0
+        };
+        let origin = self.block_seq(0);
+        let packed = self.blocks.range(blocks).flat_map(move |block| {
+            block
+                .marked_rows()
+                .filter_map(move |(row, marks, wrapped)| {
+                    let index =
+                        usize::try_from((block.first + row as u64).checked_sub(origin)?).ok()?;
+                    (packed_start..packed_end)
+                        .contains(&index)
+                        .then_some((index, LineMarks { marks, wrapped }))
+                })
+        });
+        let (hot_start, hot_end) = (start.max(self.packed), end.max(self.packed));
+        let hot = self
+            .hot
+            .range(hot_start - self.packed..hot_end - self.packed)
+            .zip(hot_start..hot_end)
+            .filter(|(line, _)| !line.marks.is_empty())
+            .map(|(line, index)| (index, LineMarks::of(line)));
+        packed.chain(hot)
     }
 
     /// The line at `index`; `0` is the oldest, `len() - 1` the newest.
@@ -557,8 +645,10 @@ impl fmt::Debug for Scrollback {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
-    use crate::{Cell, CellFlags, Mark, Style};
+    use crate::{Cell, CellFlags, Style};
 
     fn line(n: usize) -> Line {
         let mut line = Line::blank(2, Style::DEFAULT);
@@ -706,6 +796,156 @@ mod tests {
         let cache = narrow.cache.lock().unwrap();
         assert_eq!(cache.order.len(), MAX_UNPACKED_ROWS);
         assert_eq!(cache.rows.len(), MAX_UNPACKED_ROWS);
+    }
+
+    /// The reference: every line's marks and wrap flag, decoded.
+    fn decoded_marks(sb: &Scrollback) -> Vec<(Vec<Mark>, bool)> {
+        sb.iter().map(|l| (l.marks.clone(), l.wrapped)).collect()
+    }
+
+    /// `marks` and `marked` (every range, both ways) agree with the
+    /// decoded rows, and leave nothing in the decode cache.
+    fn check_marks(sb: &Scrollback) -> Result<(), String> {
+        let want = decoded_marks(sb);
+        let len = sb.len();
+        for (i, (marks, wrapped)) in want.iter().enumerate() {
+            let got = sb.marks(i).ok_or(format!("no marks for row {i}"))?;
+            if got.marks != marks.as_slice() || got.wrapped != *wrapped {
+                return Err(format!("row {i}: {got:?}, want {marks:?} {wrapped}"));
+            }
+        }
+        if sb.marks(len).is_some() {
+            return Err("marks past the end".into());
+        }
+        // Every edge that matters (the ends, block and hot-row edges) and a
+        // stride between them.
+        let mut points: Vec<usize> = (0..=len + 2).step_by(41).collect();
+        for edge in [0, len, sb.packed_len()]
+            .into_iter()
+            .chain((1..=len / BLOCK_ROWS).map(|b| b * BLOCK_ROWS))
+        {
+            points.extend([edge.saturating_sub(1), edge, edge + 1]);
+        }
+        points.sort_unstable();
+        points.dedup();
+        for &start in &points {
+            for &end in points.iter().filter(|&&end| end >= start) {
+                let expect: Vec<_> = (start..end.min(len))
+                    .filter(|&i| !want[i].0.is_empty())
+                    .map(|i| (i, want[i].0.as_slice(), want[i].1))
+                    .collect();
+                let fwd: Vec<_> = sb
+                    .marked(start..end)
+                    .map(|(i, m)| (i, m.marks, m.wrapped))
+                    .collect();
+                let mut rev: Vec<_> = sb
+                    .marked(start..end)
+                    .rev()
+                    .map(|(i, m)| (i, m.marks, m.wrapped))
+                    .collect();
+                rev.reverse();
+                if fwd != expect || rev != expect {
+                    return Err(format!(
+                        "{start}..{end}: {fwd:?} / {rev:?}, want {expect:?}"
+                    ));
+                }
+            }
+        }
+        if sb.cached_cells() != 0 {
+            return Err(format!("{} cells cached by a mark read", sb.cached_cells()));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn marks_are_read_without_decoding() {
+        for mut sb in stores(700) {
+            for n in 0..1_000 {
+                sb.push(line(n));
+            }
+            check_marks(&sb).unwrap();
+            let _ = sb.pop_newest();
+            sb.set_cap(333);
+            check_marks(&sb).unwrap();
+        }
+    }
+
+    /// What a generated store does next.
+    #[derive(Debug, Clone)]
+    enum Op {
+        /// Push a line: its marks (bits: `A`, `B`, `C`, `D`), whether it
+        /// wraps, whether it has a link (an extra without marks).
+        Push(u8, bool, bool),
+        Pop,
+        /// Mark the newest line (unpacking it when packed).
+        MarkNewest(u8),
+        Cap(usize),
+    }
+
+    fn op() -> impl Strategy<Value = Op> {
+        prop_oneof![
+            8 => (any::<u8>(), any::<bool>(), any::<bool>()).prop_map(|(m, w, l)| Op::Push(m, w, l)),
+            1 => Just(Op::Pop),
+            1 => any::<u8>().prop_map(Op::MarkNewest),
+            1 => (0usize..40).prop_map(Op::Cap),
+        ]
+    }
+
+    fn set_marks(line: &mut Line, bits: u8) {
+        let kinds = [
+            Mark::PromptStart,
+            Mark::CommandStart,
+            Mark::OutputStart,
+            Mark::CommandEnd { exit_code: Some(1) },
+        ];
+        for (bit, mark) in kinds.into_iter().enumerate() {
+            if bits & (1 << bit) != 0 {
+                line.set_mark(mark);
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(48))]
+
+        /// Marks read from packed blocks match the decoded rows through
+        /// pushes, evictions, pops and edits of the newest line, with
+        /// blocks small enough (hot rows 0-3) to cross block edges.
+        #[test]
+        fn marks_match_decoded_rows(
+            hot in 0usize..4,
+            ops in proptest::collection::vec(op(), 1..700),
+        ) {
+            let mut pool = crate::hyperlink::LinkPool::new();
+            let link = pool.open("https://example.com", None).unwrap();
+            let mut sb = Scrollback::with_hot_rows(600, hot);
+            for (k, op) in ops.into_iter().enumerate() {
+                match op {
+                    Op::Push(bits, wrapped, linked) => {
+                        let mut l = Line::blank(3, Style::DEFAULT);
+                        l.cells[0].ch = 'x';
+                        set_marks(&mut l, bits);
+                        l.wrapped = wrapped;
+                        if linked {
+                            l.cells[1].flags = CellFlags::LINK;
+                            l.graphemes.set_link_range(1..2, &link);
+                        }
+                        sb.push(l);
+                    }
+                    Op::Pop => drop(sb.pop_newest()),
+                    Op::MarkNewest(bits) => {
+                        if let Some(l) = sb.newest_mut() {
+                            set_marks(l, bits);
+                        }
+                    }
+                    Op::Cap(cap) => sb.set_cap(cap * 20),
+                }
+                if k % 97 == 0 {
+                    check_marks(&sb).map_err(TestCaseError::fail)?;
+                }
+            }
+            check_marks(&sb).map_err(TestCaseError::fail)?;
+        }
     }
 
     #[test]

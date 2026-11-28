@@ -573,6 +573,44 @@ fn s02_multi_row_output() {
     );
 }
 
+/// #781: an output whose first line is deep in the packed history. The
+/// menu's check walks the marks up to it without decoding a packed row,
+/// and the selection starts on that line.
+#[test]
+fn a_long_output_in_the_packed_history_is_found_without_decoding() {
+    const LINES: usize = 2_000;
+    let app = app();
+    let id = session(&app, 4, 20, 10_000);
+    for line in &b1_lines()[..8] {
+        feed(&app, id, line.as_bytes());
+    }
+    feed(
+        &app,
+        id,
+        format!("{}\r\n{}", prompt(Some(0), "seq"), m("C")).as_bytes(),
+    );
+    feed(&app, id, &plain(LINES));
+    feed(&app, id, prompt(Some(0), "").as_bytes());
+    let cached = |app: &App| {
+        app.with_terminal(id, |t| t.grid().cached_scrollback_cells())
+            .unwrap()
+    };
+    let packed = app
+        .with_terminal(id, |t| t.grid().scrollback_len())
+        .unwrap()
+        .checked_sub(tessera_grid::HOT_ROWS)
+        .unwrap();
+    assert!(packed > LINES / 2, "{packed} packed lines");
+    assert_eq!(cached(&app), 0);
+    assert!(app.has_command_output(id).unwrap());
+    assert_eq!(cached(&app), 0, "the menu check decoded a packed row");
+    let text = select(&app, id).1.unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), LINES);
+    assert_eq!(lines.first(), Some(&"line 0"));
+    assert_eq!(lines.last(), Some(&"line 1999"));
+}
+
 /// D-EMPTY-OUTPUT: `true` printed nothing; the selection there was stays.
 #[test]
 fn s03_command_with_no_output() {
