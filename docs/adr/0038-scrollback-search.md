@@ -127,8 +127,10 @@ a quarter of a dense literal search:
   never short without saying so. A self-overlapping literal (`aa` in
   `aaaa`) cut inside an occurrence may be found at a shifted occurrence
   behind the cut, but the pieces' matches are disjoint occurrences, so
-  they never count more than the full limit's (#526). The count is a lower
-  bound for patterns whose matches are maximal runs of one class
+  there are never more of them than the segment's disjoint occurrences
+  (#526); that can be more than the full limit finds, since it loses one
+  at each of its own cuts too (a segment over 64 KiB). The count is a
+  lower bound for patterns whose matches are maximal runs of one class
   (`[0-9]+`, `\w+`). A pattern whose text behind a dropped part matches
   differently on its own (`x\d*|\d` behind a cut inside `x12345`) can
   still report matches the whole line would not, with `lines_skipped` set,
