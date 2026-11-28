@@ -122,13 +122,23 @@ a quarter of a dense literal search:
   a cut: its match is the query's whole text, never a part (amended in
   #569: one stall of a first piece halves the limit for the rest of the
   search, and dropping every literal match beside a cut then lost matches
-  of a plain Find while a program printed). A segment cut at a halved limit therefore
-  counts as skipped too (`lines_skipped`), so the count is never short
-  without saying so. It is a lower bound for patterns whose matches are
-  maximal runs (`[0-9]+`, `\w+`); a pattern whose text behind a dropped
-  part matches differently on its own (`x\d*|\d` behind a cut inside
-  `x12345`) can still report matches the whole line would not, with
-  `lines_skipped` set.
+  of a plain Find while a program printed). A segment cut at a halved
+  limit therefore counts as skipped too (`lines_skipped`), so the count is
+  never short without saying so. A self-overlapping literal (`aa` in
+  `aaaa`) cut inside an occurrence may be found at a shifted occurrence
+  behind the cut, but the pieces' matches are disjoint occurrences, so
+  there are never more of them than the segment's disjoint occurrences
+  (#526); that can be more than the full limit finds, since it loses one
+  at each of its own cuts too (a segment over 64 KiB). The count is a
+  lower bound for patterns whose matches are maximal runs of one class
+  (`[0-9]+`, `\w+`). A pattern whose text behind a dropped part matches
+  differently on its own (`x\d*|\d` behind a cut inside `x12345`) can
+  still report matches the whole line would not, with `lines_skipped` set,
+  and so can one with an inner separator (`\w+(?:-\w+)*`, a dotted number
+  such as `\d+(?:\.\d+)*`): a match cut more than once keeps each part
+  between separators that touches no cut, so
+  `1.2.3.4.5.6.7.8.9.1.2.3.4.5.6.7` in pieces of 3 bytes counts five
+  matches of the dotted number where the whole line has one (#526).
 - A later piece of the step gets the step's own deadline; one that runs
   out is not halved but runs first in the next step, at a first piece's
   deadline.

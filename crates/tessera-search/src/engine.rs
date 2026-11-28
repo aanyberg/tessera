@@ -807,8 +807,13 @@ pub struct PieceScan {
 /// is therefore not handed to `found` (#531): it may be such a part. A
 /// literal query's match is the query's whole text, never a part, so it is
 /// kept (#569: dropping it lost a match at every cut once a stall halved
-/// the limit). The caller reports such a segment as not searched whole: a
-/// match across the cut is not found either way.
+/// the limit). A self-overlapping literal (`aa` in `aaaa`) cut inside an
+/// occurrence may be found at a shifted occurrence behind the cut, but the
+/// pieces' matches are disjoint occurrences of the query, so there are
+/// never more of them than the segment's disjoint occurrences. That can be
+/// more than the full limit finds, since it loses one at each of its own
+/// cuts too (a segment over 64 KiB). The caller reports such a segment as
+/// not searched whole: a match across the cut is not found either way.
 pub fn scan_piece(
     query: &Query,
     rows: &[Line],
@@ -1164,6 +1169,47 @@ mod tests {
             prop_assert_eq!(pieces, whole, "{:?} in {:?}", needle, text);
         }
 
+        /// #569, #526: a longer literal is lost where a cut splits it, and
+        /// the pieces never count more than the whole segment (their
+        /// matches are disjoint occurrences). One that cannot overlap
+        /// itself finds piece by piece exactly the whole segment's
+        /// occurrences that no cut splits: one that only touches a cut,
+        /// starting at it or ending at it, is kept. A self-overlapping one
+        /// (`aa`) may be found shifted behind a cut.
+        #[test]
+        fn pieces_below_the_full_limit_find_no_more_of_a_longer_literal(
+            cols in 2u16..12,
+            text in "[01a ]{0,90}",
+            bytes in 1usize..24,
+            cells in 1usize..16,
+            needle in "[01a]{2,4}",
+        ) {
+            let rows = rows(cols, &text);
+            let options = QueryOptions { regex: false, case_sensitive: true };
+            let query = Query::new(&needle, options).unwrap().unwrap();
+            let whole = query_matches(&rows, &query, PieceLimit::FULL);
+            let (pieces, cuts) = query_matches_and_cuts(&rows, &query, limit(bytes, cells));
+            prop_assert!(
+                pieces.len() <= whole.len(),
+                "{:?} in {:?}: {:?} against {:?}", needle, text, pieces, whole
+            );
+            let overlaps = (1..needle.len()).any(|n| needle[..n] == needle[needle.len() - n..]);
+            if !overlaps {
+                // A match is split when its first cell is before a cut and
+                // its last cell at or behind it (ASCII: a cell per byte).
+                let split = |m: &Match| {
+                    let first = (usize::try_from(m.start_line).unwrap(), usize::from(m.start_col));
+                    let last = (usize::try_from(m.end_line).unwrap(), usize::from(m.end_col) - 1);
+                    cuts.iter().any(|&cut| first < cut && cut <= last)
+                };
+                let kept: Vec<Match> = whole.iter().copied().filter(|m| !split(m)).collect();
+                prop_assert_eq!(
+                    &pieces, &kept,
+                    "{:?} in {:?} cut at {:?}", needle, text, cuts
+                );
+            }
+        }
+
         /// The run-length cell map gives every byte the cell the per-cell
         /// map gives it.
         #[test]
@@ -1213,6 +1259,16 @@ mod tests {
     /// The matches of `query` in `rows`, taken as one segment and searched
     /// piece by piece at `at`.
     fn query_matches(rows: &[Line], query: &Query, at: PieceLimit) -> Vec<Match> {
+        query_matches_and_cuts(rows, query, at).0
+    }
+
+    /// [`query_matches`] and the cuts the pieces were made at: the row
+    /// within the segment and the column of each piece after the first.
+    fn query_matches_and_cuts(
+        rows: &[Line],
+        query: &Query,
+        at: PieceLimit,
+    ) -> (Vec<Match>, Vec<(usize, usize)>) {
         let segment = Segment {
             start: 0,
             end: rows.len(),
@@ -1221,6 +1277,7 @@ mod tests {
         };
         let mut haystack = Haystack::new();
         let mut found = Vec::new();
+        let mut cuts = Vec::new();
         let mut piece = Piece::first(0, segment);
         loop {
             let scan = scan_piece(query, rows, piece, at, None, &mut haystack, |m| {
@@ -1228,8 +1285,9 @@ mod tests {
                 ControlFlow::Continue(())
             });
             let Some(next) = scan.next else {
-                return found;
+                return (found, cuts);
             };
+            cuts.push(next.from);
             piece = next;
         }
     }

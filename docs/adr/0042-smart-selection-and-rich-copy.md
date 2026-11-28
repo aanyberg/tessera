@@ -332,6 +332,13 @@ too large once compiled, usually from counted repetition of a Unicode class,
 and suggests ASCII classes or `(?-u)`. Any other compile failure keeps the
 existing warning. Neither quotes the pattern (S8).
 
+The advice does not fit every such pattern (#526). Under `(?-u)` a class
+that can match a byte outside ASCII (`.`, `\W`, `\D`) could match invalid
+UTF-8, which a text pattern refuses, so `.{5000}`, `\W{100}` or `\D{500}`
+then gets the invalid-pattern warning instead; those need an ASCII class
+spelled out (`[ -~]`) or a smaller count. Nested counted repetition
+(`a{1000}{1000}`) is too large whatever its classes.
+
 ## Amendment: each rule attempt bounded by construction (#518, 2026-11-22)
 
 The #433 budget stopped a click between matches, but one match attempt of

@@ -648,6 +648,12 @@ fn a_wrong_size_fails_at_once_at_the_callers_line() {
 /// panic it raised, or `None` when it returned. The panic is recorded by a
 /// panic hook while `f` runs; a panic on another thread meanwhile goes to
 /// the hook installed before, which is put back afterwards (#340).
+///
+/// The panic hook is process-global, so this needs a process per test, as
+/// nextest runs them: under plain `cargo test`, two tests calling it at
+/// once on threads of one process would put back each other's recorder,
+/// and `recording_a_panic_keeps_the_previous_hook` replaces the hook
+/// whatever else runs (#526).
 fn panic_of(f: impl FnOnce()) -> Option<(String, u32, String)> {
     type Hook = Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Sync + Send + 'static>;
     let seen: Arc<Mutex<Option<(String, u32, String)>>> = Arc::default();

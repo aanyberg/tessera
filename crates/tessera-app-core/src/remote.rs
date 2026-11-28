@@ -454,6 +454,22 @@ mod tests {
             Some(Remote::Unnamed),
             "decoded invisible text is not shown"
         );
+        // #526 (25.3 r2 M2): a bidi override (U+202E) or isolate (U+2066)
+        // that arrives percent-encoded is removed after decoding, as when
+        // sent raw; an encoded C1 control (CSI, U+009B) refuses the report.
+        assert_eq!(
+            sent(&mut tracker, b"file://ev%E2%80%AEil.com/tmp", "Mac"),
+            Some(Remote::Host("evil.com".into()))
+        );
+        assert_eq!(
+            sent(&mut tracker, b"file://%E2%80%AE%E2%81%A6/tmp", "Mac"),
+            Some(Remote::Unnamed),
+            "decoded bidi controls alone are not shown"
+        );
+        assert_eq!(
+            tessera_shell_integration::osc7::parse_osc7(b"file://ev%C2%9Bil.com/tmp"),
+            None
+        );
     }
 
     #[test]
