@@ -280,9 +280,11 @@ run)
                 base="$head"; note="baseline: the case set does not build at the last measured SHA"
                 new_steps=""
                 rm -f "$work"/best-*.txt
-                # An earlier build may have narrowed the cases and set the probe: start the set again.
+                # An earlier build may have narrowed the cases and set the probe: start the set again, with all
+                # three builds (ADR 0049 D3).
                 todo="$instr_cases"
                 first_probe=""
+                attempt=1
                 continue
             fi
             die "the case set could not be measured at $head (logs in $work)"

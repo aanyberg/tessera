@@ -174,12 +174,15 @@ s="$tmp/s7a"
 run "$s" "$A" || fail "baseline run failed"
 : > "$stub/ab.log"
 echo 2 > "$stub/no-build-call"
-printf '1.080\n' > "$stub/ratio-search"
+printf '1.080\n1.080\n1.080\n1.080\n' > "$stub/ratio-search"
 run "$s" "$B" || fail "a fallback after a narrowed first build failed: $(cat "$tmp/out.log")"
 for c in feed scroll search cat; do
     jq -e --arg b "$B" --arg c "$c" 'select(.sha == $b and .case == $c) | .base == $b and (.note | test("does not build"))' \
         "$s/perf.jsonl" > /dev/null || fail "after a narrowed first build the fallback measures $c again"
 done
+# The fallback gets all three builds (ADR 0049 D3): search stays over the bar, so the run makes the narrowing build,
+# the failed one and three more.
+[[ "$(grep -c '^init' "$stub/ab.log")" == 5 ]] || fail "the fallback after build 2 gets three builds: $(grep -c '^init' "$stub/ab.log") inits"
 
 # 7b. A machine without instruction counters (a virtual machine): the case set is still taken, the instruction cases
 # are `noisy` with the wall ratio and a note (no failure, no retry), and the heap cases still bind.
