@@ -672,27 +672,44 @@ fn four_stalled_profile_tabs_at_once_each_start_the_default_shell() {
     let (callers, finished) = test_hooks::program_lookup_calls(&tool);
     assert_eq!(callers.len(), 4, "{callers:?}");
     assert_eq!(finished, 0, "a held lookup returned");
+
+    // Every shared helper is stuck now: a fifth tab is refused at once and
+    // falls back too. It starts before the four's shells are checked: a
+    // held lookup gives up after 10 s (the hook's cap), and under load
+    // those checks can outlast that, freeing a helper for the fifth's
+    // lookup (#780).
+    let gave_up = test_hooks::program_lookup_calls(&tool).1;
+    let fifth = app
+        .spawn_session_with_profile(options(home.path()), Some("stalled"))
+        .expect("a fifth tab starts the default shell");
+    // The right reason follows from whether the fifth's lookup was made:
+    // refused at once (`EAGAIN`) while the four's holds stand, or made and
+    // timed out (`ETIMEDOUT`) on a helper one of them freed by giving up
+    // first, which takes a stall of over 10 s less the four's wait just
+    // before this start. A lookup made while every hold stood is a fifth
+    // helper past the cap (docs/security.md S5).
+    let lookups = test_hooks::program_lookup_calls(&tool).0.len();
+    let fifth_reason = match lookups {
+        4 => nix::errno::Errno::EAGAIN,
+        5 if gave_up > 0 => nix::errno::Errno::ETIMEDOUT,
+        n => panic!("{n} lookups of the stalled command, {gave_up} given up before the fifth"),
+    };
     let timed_out = notice("stalled", &errno_text(nix::errno::Errno::ETIMEDOUT));
     for &id in &ids {
         let rows = wait_for_row(&app, id, &timed_out);
         assert_eq!(rows[0], timed_out, "{rows:?}");
         assert_a_shell_in(&app, id, home.path());
     }
-
-    // Every shared helper is stuck now: a fifth tab is refused at once and
-    // falls back too, as does a tab that changes nothing.
-    let fifth = app
-        .spawn_session_with_profile(options(home.path()), Some("stalled"))
-        .expect("a fifth tab starts the default shell");
-    let busy = notice("stalled", &errno_text(nix::errno::Errno::EAGAIN));
+    let busy = notice("stalled", &errno_text(fifth_reason));
     let rows = wait_for_row(&app, fifth, &busy);
     assert_eq!(rows[0], busy, "{rows:?}");
     assert_a_shell_in(&app, fifth, home.path());
+    // As does a tab that changes nothing.
     let plain = app
         .spawn_session(options(home.path()))
         .expect("a built-in tab starts");
     assert_a_shell_in(&app, plain, home.path());
-    assert_eq!(test_hooks::program_lookup_calls(&tool).0.len(), 4);
+    assert_eq!(test_hooks::program_lookup_calls(&tool).0.len(), lookups);
 
     for id in ids.into_iter().chain([fifth, plain]) {
         app.close_session(id).unwrap();
@@ -790,8 +807,15 @@ fn a_working_directory_whose_lookup_never_answers_starts_the_default_shell_at_ho
         .spawn_session_with_profile(options(home.path()), Some("far"))
         .expect("the fallback starts");
     let waited = started.elapsed();
+    // One lookup timeout, then the fallback; under 2 of them, which a
+    // fallback that waited a second lookup out would take. The fallback's
+    // own start took 2.5 s at load 70 (#780), so no tighter slack.
     assert!(
-        waited < test_hooks::PROGRAM_LOOKUP_TIMEOUT + Duration::from_secs(2),
+        waited >= test_hooks::PROGRAM_LOOKUP_TIMEOUT,
+        "fell back after {waited:?}"
+    );
+    assert!(
+        waited < test_hooks::PROGRAM_LOOKUP_TIMEOUT * 2,
         "fell back after {waited:?}"
     );
     assert_eq!(
