@@ -168,15 +168,24 @@ final class ClipboardNoticeView: NSView {
         label.lineBreakMode = .byTruncatingTail
         label.translatesAutoresizingMaskIntoConstraints = false
         background.addSubview(label)
+        // Just below required at the far edges: the view's frame comes from
+        // its autoresizing mask, and while it is smaller than the padding
+        // (as it is made, empty) the label gives way instead of the layout
+        // reporting conflicting constraints. `fittingSize` still sizes the
+        // view to the text and padding.
+        let trailing = label.trailingAnchor.constraint(equalTo: background.trailingAnchor, constant: -12)
+        let bottom = label.bottomAnchor.constraint(equalTo: background.bottomAnchor, constant: -6)
+        trailing.priority = .init(999)
+        bottom.priority = .init(999)
         NSLayoutConstraint.activate([
             background.leadingAnchor.constraint(equalTo: leadingAnchor),
             background.trailingAnchor.constraint(equalTo: trailingAnchor),
             background.topAnchor.constraint(equalTo: topAnchor),
             background.bottomAnchor.constraint(equalTo: bottomAnchor),
             label.leadingAnchor.constraint(equalTo: background.leadingAnchor, constant: 12),
-            label.trailingAnchor.constraint(equalTo: background.trailingAnchor, constant: -12),
+            trailing,
             label.topAnchor.constraint(equalTo: background.topAnchor, constant: 6),
-            label.bottomAnchor.constraint(equalTo: background.bottomAnchor, constant: -6),
+            bottom,
         ])
         // VoiceOver reads the notice once: the view is the element, its
         // label is not.
@@ -240,12 +249,20 @@ final class PaneClipboardNotice {
     private var hidWhileShowing = false
     /// Notices shown (tests).
     private(set) var shownCount = 0
-    /// The latest notice shown and when (tests).
+    /// The latest notice shown (tests), and when it last went on screen for
+    /// its full time: as it showed, or as its pane was back.
     private(set) var lastShown: ClipboardNoticeThrottle.Notice?
     private(set) var lastShownAt: ContinuousClock.Instant?
 
-    /// Whether a notice is on screen now.
+    /// Whether a notice is on screen now, fading out included.
     var isShowing: Bool { view.map { !$0.isHidden } ?? false }
+
+    /// Whether the notice on screen has not yet had its
+    /// ``ClipboardNoticeView/holdDuration``: one that is fading out has.
+    private var isInItsHold: Bool {
+        guard isShowing, let lastShownAt else { return false }
+        return ContinuousClock.now - lastShownAt < ClipboardNoticeView.holdDuration
+    }
 
     /// A program wrote the clipboard: show the notice now, or count the
     /// write into the one that shows when the interval has passed.
@@ -275,11 +292,12 @@ final class PaneClipboardNotice {
     /// full time, which its host hands to the pane the user is left with.
     /// That is the held notice, and the notice still on screen (or on
     /// screen as the pane hid), which has not had its
-    /// ``ClipboardNoticeView/holdDuration``; `nil` when every write was seen. Nothing shows here after this.
+    /// ``ClipboardNoticeView/holdDuration``; not one that is fading out.
+    /// `nil` when every write was seen. Nothing shows here after this.
     func takeUnseen() -> ClipboardNoticeThrottle.Notice? {
         let held = throttle.takeHeld()
         var unseen: ClipboardNoticeThrottle.Notice?
-        if isShowing, let lastShown {
+        if hidWhileShowing || isInItsHold, let lastShown {
             unseen = lastShown
         }
         if let held {
@@ -296,10 +314,10 @@ final class PaneClipboardNotice {
 
     /// The pane was shown or hidden: a held notice shows now, or when the
     /// interval has passed, once the pane is on screen; a notice on screen
-    /// as it hides waits for it to be back.
+    /// as it hides, and not yet fading out, waits for it to be back.
     func hostVisibilityChanged() {
         guard isHostShown() else {
-            if isShowing, !hidWhileShowing {
+            if isInItsHold, !hidWhileShowing {
                 hidWhileShowing = true
                 hideTask?.cancel()
                 hideTask = nil
@@ -308,6 +326,7 @@ final class PaneClipboardNotice {
         }
         if hidWhileShowing, let view {
             hidWhileShowing = false
+            lastShownAt = .now
             present(view)
         }
         if let notice = throttle.release(at: .now) {
