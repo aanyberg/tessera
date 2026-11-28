@@ -289,7 +289,12 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
 
         clipboardNotice.host = self
         clipboardNotice.reducesMotion = { [weak self] in self?.scroller.reducesMotion ?? true }
-        clipboardNotice.isHostShown = { [weak self] in self?.isShownToUser ?? false }
+        // A sheet on the tab (the paste guard's, a close confirmation) would
+        // cover the notice: it waits for the sheet to end (#763).
+        clipboardNotice.isHostShown = { [weak self] in
+            guard let self else { return false }
+            return isShownToUser && window?.attachedSheet == nil
+        }
         clipboardNotice.obstacle = { [weak self] in self?.findBar?.frame }
 
         scroller.onScroll = { [weak self] target in self?.scrollerMoved(to: target) }
@@ -400,6 +405,14 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
                         self?.updateDisplayLinkPause()
                         self?.clipboardNotice.hostVisibilityChanged()
                     }
+                })
+        }
+        // Not delivered synchronously: a sheet is attached only after its
+        // will-begin notification, and still attached during its did-end one.
+        for name in [NSWindow.willBeginSheetNotification, NSWindow.didEndSheetNotification] {
+            windowObservers.append(
+                center.addObserver(forName: name, object: window, queue: .main) { [weak self] _ in
+                    Task { @MainActor [weak self] in self?.clipboardNotice.hostVisibilityChanged() }
                 })
         }
         windowObservers.append(

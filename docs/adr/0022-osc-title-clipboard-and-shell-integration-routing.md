@@ -359,7 +359,9 @@ shell runs on another machine, as `⇢ <host>: <title>`.
 ### Amendment 2026-11-26: paste guard and OSC 52 write notice (#471, #217)
 
 The #217 decisions ship: a paste that would run lines the user did not
-read asks first, and OSC 52 stays on by default but every write is seen.
+read asks first, and OSC 52 stays on by default but every write is seen
+while a terminal window is open (#763 below names the one case that is
+not).
 
 - **D-PASTE** (lead decision, #217): `[terminal] paste_guard =
   "unbracketed" | "always" | "off"` (default `"unbracketed"`; any other
@@ -426,6 +428,26 @@ read asks first, and OSC 52 stays on by default but every write is seen.
   wrote; the paste guard (D-PASTE) still checks whatever a paste carries.
   With the find bar open the notice sits just below the bar, never under
   it; a pane too short for both shows it as low as fits, over the bar.
+  While a sheet is attached to the pane's tab (the paste guard's, a close
+  confirmation) the pane counts as not shown, so the notice is held, or
+  shows again, until the sheet ends (#763): the sheet would cover it.
+  A pane that closes (its program wrote and exited 0, or the user closed
+  it) with a notice held, or on screen for less than its 2.5 s, hands
+  those writes to the pane the user is left with (#763): within the tab,
+  the pane the focus moves to; with the tab's last pane, the tab its tab
+  bar selects next, else the selected tab of the frontmost window that is
+  not minimised, else of any terminal window. A tab whose session is
+  still starting (its placeholder) keeps them for its pane, or passes
+  them on by the same rules if it closes or fails to start first. There
+  the writes count into that pane's notice under the same rules (one a second, held while
+  hidden) and say where they came from ("A program in a closed pane
+  copied 5 bytes to the clipboard"; "Programs here and in a closed pane
+  …" when that pane wrote too). When no terminal window is left (the last
+  window's last program wrote and exited, or the app quits) nothing shows:
+  there is nothing to show it on, and a notification or a new window
+  would outlast the write's meaning. The paste guard (D-PASTE) is the
+  defence there: it still checks whatever a paste of what the program
+  left carries.
 
 ## Consequences
 
@@ -436,8 +458,9 @@ read asks first, and OSC 52 stays on by default but every write is seen.
   window's mailbox) gain an arm.
 - A program can still replace the clipboard without asking, which is what
   OSC 52 is for; `clipboard_write = false` is the opt-out, and since #471
-  each write shows a notice in its pane (D-NOTICE52). Reading is not
-  possible at all.
+  each write shows a notice in its pane, or in the pane left when its pane
+  closes first (#763), except once no terminal window is open
+  (D-NOTICE52). Reading is not possible at all.
 - Divergences from xterm worth knowing: CAN/SUB/ESC apply a partial OSC
   (D-CAN), empty OSC 52 data does not clear (D-EMPTY52), unknown `Pc`
   letters reject the sequence (D-SEL), titles lose bidi characters.

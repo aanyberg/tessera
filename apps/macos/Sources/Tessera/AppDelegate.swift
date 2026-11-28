@@ -499,6 +499,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.pendingTerminals.removeAll { $0 === pending }
             // The saved state lists the tab while its session starts.
             self?.scheduleWindowStateSave()
+            if let pending { self?.passOnClipboardNotice(of: pending) }
         }
         pendingTerminals.append(pending)
         spawn(profile: profile) { [weak self] result in
@@ -511,6 +512,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 pending.dropTyped()
                 if pending.isPlaced, !pending.isClosed {
                     window.delegate = nil
+                    passOnClipboardNotice(of: pending)
                     window.close()
                     scheduleWindowStateSave()
                 }
@@ -539,6 +541,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 } else {
                     place(window)
                 }
+                if let notice = pending.takeClipboardNotice() {
+                    controller.adoptClipboardNotice(notice)
+                }
                 completion(.success(controller))
             }
         }
@@ -547,6 +552,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         place(pending.window)
         pending.isPlaced = true
         return pending.window
+    }
+
+    /// A starting tab that holds a closed tab's unseen clipboard writes
+    /// closes before its session runs (#763): they go to the tab the user
+    /// is left with instead, once AppKit has picked it.
+    private func passOnClipboardNotice(of pending: PendingTerminal) {
+        guard let notice = pending.takeClipboardNotice() else { return }
+        let siblings = (pending.window.tabGroup?.windows ?? []).map { WeakWindow(window: $0) }
+        Task { @MainActor [weak self] in
+            self?.adoptClipboardNotice(notice, fromTabsOf: siblings)
+        }
     }
 
     /// `pending`'s window if a controller took it over.
@@ -1393,6 +1409,49 @@ extension AppDelegate: TerminalWindowControllerDelegate {
         }
         windowControllers.removeAll { $0 === controller }
         scheduleWindowStateSave()
+        // A clipboard write the tab did not show for long enough (its last
+        // pane's program wrote and exited, #763) shows on the tab the user
+        // is left with, once AppKit has picked it.
+        if let unseen = controller.takeUnseenClipboardNotice() {
+            let siblings = (controller.window?.tabGroup?.windows ?? []).map { WeakWindow(window: $0) }
+            Task { @MainActor [weak self] in
+                self?.adoptClipboardNotice(unseen, fromTabsOf: siblings)
+            }
+        }
+    }
+
+    /// Shows a closed tab's unseen clipboard writes (#763) on the tab the
+    /// user is left with: the selected tab of its tab bar, else the selected
+    /// tab of the frontmost window that is not minimised, else of any
+    /// terminal window, where it waits until that pane is on screen. A tab
+    /// whose session is still starting (its placeholder) keeps them for its
+    /// pane, or passes them on if it closes first. With no terminal window
+    /// left nothing shows (ADR 0022 D-NOTICE52).
+    private func adoptClipboardNotice(_ notice: ClipboardNoticeThrottle.Notice, fromTabsOf siblings: [WeakWindow]) {
+        let controllers = windowControllers
+        let starting = pendingTerminals.filter { !$0.isClosed }
+        /// Gives the writes to `window`'s selected tab, running or starting.
+        func adopt(into window: NSWindow) -> Bool {
+            let shown = window.tabGroup?.selectedWindow ?? window
+            if let controller = controllers.first(where: { $0.window === shown }) {
+                controller.adoptClipboardNotice(notice)
+                return true
+            }
+            if let pending = starting.first(where: { $0.window === shown }) {
+                pending.holdClipboardNotice(notice)
+                return true
+            }
+            return false
+        }
+        let windows = windowsFrontToBack()
+        // The first candidate that takes them.
+        let candidates = siblings.compactMap(\.window) + windows.filter { !$0.isMiniaturized } + windows
+        guard !candidates.contains(where: adopt(into:)) else { return }
+        if let controller = controllers.first {
+            controller.adoptClipboardNotice(notice)
+        } else {
+            starting.first?.holdClipboardNotice(notice)
+        }
     }
 
     func terminalWindowControllerFocusMayHaveChanged(_ controller: TerminalWindowController) {

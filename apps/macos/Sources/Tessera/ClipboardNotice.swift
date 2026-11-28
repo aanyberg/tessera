@@ -17,10 +17,36 @@ struct ClipboardNoticeThrottle {
     static let minimumInterval: Duration = .seconds(1)
 
     /// What a notice says: how many writes it reports and the size of the
-    /// latest.
+    /// latest, and how many of them came from a pane that has closed since
+    /// (#763): a notice its pane did not show long enough moves to the pane
+    /// the user is left with.
     struct Notice: Equatable {
         var writes: Int
         var bytes: Int
+        var closedWrites = 0
+
+        init(writes: Int, bytes: Int, closedWrites: Int = 0) {
+            self.writes = writes
+            self.bytes = bytes
+            self.closedWrites = closedWrites
+        }
+
+        init(_ write: TesseraClipboardWrite) {
+            self.init(writes: max(1, write.writes), bytes: write.bytes)
+        }
+
+        /// This notice's writes and then `later`'s: `later` names the
+        /// latest size.
+        func adding(_ later: Notice) -> Notice {
+            Notice(
+                writes: ClipboardNoticeThrottle.sum(writes, later.writes), bytes: later.bytes,
+                closedWrites: ClipboardNoticeThrottle.sum(closedWrites, later.closedWrites))
+        }
+
+        /// The same writes, every one from a pane that has closed.
+        var fromClosedPane: Notice {
+            Notice(writes: writes, bytes: bytes, closedWrites: writes)
+        }
     }
 
     /// The writes waiting for the interval to pass, or `nil`.
@@ -39,7 +65,13 @@ struct ClipboardNoticeThrottle {
     /// Offers `write` at `now`: the notice to show now, or `nil` when it is
     /// counted into the held notice until ``dueAt``.
     mutating func offer(_ write: TesseraClipboardWrite, at now: ContinuousClock.Instant) -> Notice? {
-        let notice = Notice(writes: Self.sum(held?.writes ?? 0, max(1, write.writes)), bytes: write.bytes)
+        offer(Notice(write), at: now)
+    }
+
+    /// Offers `incoming`'s writes at `now`, as the write's offer does one
+    /// write: a closed pane's notice moves in this way (#763).
+    mutating func offer(_ incoming: Notice, at now: ContinuousClock.Instant) -> Notice? {
+        let notice = held.map { $0.adding(incoming) } ?? incoming
         if let lastShown, now - lastShown < Self.minimumInterval {
             held = notice
             return nil
@@ -55,7 +87,18 @@ struct ClipboardNoticeThrottle {
     /// pane is not on screen (#747). The notice waits for ``release(at:)``,
     /// one held notice as ever, however long the pane stays hidden.
     mutating func hold(_ write: TesseraClipboardWrite) {
-        held = Notice(writes: Self.sum(held?.writes ?? 0, max(1, write.writes)), bytes: write.bytes)
+        hold(Notice(write))
+    }
+
+    /// Counts `incoming`'s writes into the held notice.
+    mutating func hold(_ incoming: Notice) {
+        held = held.map { $0.adding(incoming) } ?? incoming
+    }
+
+    /// Takes the held notice, due or not: its pane is closing.
+    mutating func takeHeld() -> Notice? {
+        defer { held = nil }
+        return held
     }
 
     /// Takes the held notice if it is due at `now`: the notice to show now.
@@ -66,7 +109,7 @@ struct ClipboardNoticeThrottle {
         return notice
     }
 
-    private static func sum(_ a: Int, _ b: Int) -> Int {
+    fileprivate static func sum(_ a: Int, _ b: Int) -> Int {
         let (total, overflow) = a.addingReportingOverflow(b)
         return overflow ? Int.max : total
     }
@@ -79,9 +122,14 @@ extension ClipboardNoticeThrottle.Notice {
     /// one.
     var text: String {
         let size = Self.bytesText(bytes)
+        // Where the writes came from: this pane, a closed one, or both
+        // (#763).
+        let who =
+            closedWrites == 0
+            ? "A program" : closedWrites >= writes ? "A program in a closed pane" : "Programs here and in a closed pane"
         return writes == 1
-            ? "A program copied \(size) to the clipboard"
-            : "A program copied to the clipboard at least \(Self.count(writes)) times, last \(size)"
+            ? "\(who) copied \(size) to the clipboard"
+            : "\(who) copied to the clipboard at least \(Self.count(writes)) times, last \(size)"
     }
 
     static func bytesText(_ bytes: Int) -> String {
@@ -202,14 +250,48 @@ final class PaneClipboardNotice {
     /// A program wrote the clipboard: show the notice now, or count the
     /// write into the one that shows when the interval has passed.
     func offer(_ write: TesseraClipboardWrite) {
+        offer(ClipboardNoticeThrottle.Notice(write))
+    }
+
+    /// A notice that a closed pane left unseen (#763, ``takeUnseen()``):
+    /// shown here as this pane's own writes are, held while this pane is
+    /// hidden, and worded as a closed pane's.
+    func offer(fromClosedPane notice: ClipboardNoticeThrottle.Notice) {
+        offer(notice.fromClosedPane)
+    }
+
+    private func offer(_ notice: ClipboardNoticeThrottle.Notice) {
         guard isHostShown() else {
-            throttle.hold(write)
+            throttle.hold(notice)
             return
         }
-        if let notice = throttle.offer(write, at: .now) {
+        if let notice = throttle.offer(notice, at: .now) {
             show(notice)
         }
         scheduleRelease()
+    }
+
+    /// The pane is closing (#763): the writes it has not shown for their
+    /// full time, which its host hands to the pane the user is left with.
+    /// That is the held notice, and the notice still on screen (or on
+    /// screen as the pane hid), which has not had its
+    /// ``ClipboardNoticeView/holdDuration``; `nil` when every write was seen. Nothing shows here after this.
+    func takeUnseen() -> ClipboardNoticeThrottle.Notice? {
+        let held = throttle.takeHeld()
+        var unseen: ClipboardNoticeThrottle.Notice?
+        if isShowing, let lastShown {
+            unseen = lastShown
+        }
+        if let held {
+            unseen = unseen.map { $0.adding(held) } ?? held
+        }
+        releaseTask?.cancel()
+        releaseTask = nil
+        hideTask?.cancel()
+        hideTask = nil
+        hidWhileShowing = false
+        view?.isHidden = true
+        return unseen
     }
 
     /// The pane was shown or hidden: a held notice shows now, or when the

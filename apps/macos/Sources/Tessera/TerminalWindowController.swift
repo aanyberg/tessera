@@ -559,6 +559,9 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, NSMe
         // An active input context (the key window's first responder's)
         // retains its view until it is deactivated.
         pane.view.inputContext?.deactivate()
+        // A clipboard write it did not show for long enough shows on the
+        // pane the focus moves to (#763).
+        let unseen = pane.view.clipboardNotice.takeUnseen()
         let wasFocused = pane === focusedPane
         setCommandMark(false, for: pane)
         unzoom()
@@ -575,6 +578,22 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, NSMe
         } else if window?.firstResponder === window {
             focus(focusedPane)
         }
+        if let unseen {
+            adoptClipboardNotice(unseen)
+        }
+    }
+
+    /// The clipboard writes this tab's panes have not shown for long enough
+    /// (#763): the tab is closing, and its controller's delegate hands them
+    /// to the tab the user is left with.
+    func takeUnseenClipboardNotice() -> ClipboardNoticeThrottle.Notice? {
+        panes.compactMap { $0.view.clipboardNotice.takeUnseen() }.reduce(nil) { $0?.adding($1) ?? $1 }
+    }
+
+    /// Shows a closed pane's or tab's unseen clipboard writes on this tab's
+    /// focused pane, as soon as it is on screen (#763).
+    func adoptClipboardNotice(_ notice: ClipboardNoticeThrottle.Notice) {
+        focusedPane.view.clipboardNotice.offer(fromClosedPane: notice)
     }
 
     private func closeSession(of pane: Pane) {
