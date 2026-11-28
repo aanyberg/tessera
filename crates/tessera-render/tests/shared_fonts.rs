@@ -101,7 +101,9 @@ fn shared_fonts_build_one_index_that_every_load_hears_land() {
         "a held load builds its own"
     );
 
-    // Sharing stopped: each load builds its own again.
+    // Sharing stopped: each load builds its own again, the second too
+    // (#660 M6: an off switch that only forgot the shared index would let
+    // the second share the first's).
     share_installed_fonts(false);
     let own = Fonts::new(&config("Menlo")).expect("Menlo");
     wait_ready(&own, "unshared");
@@ -109,5 +111,12 @@ fn shared_fonts_build_one_index_that_every_load_hears_land() {
         fallback_index_builds() - before,
         3,
         "an unshared load builds its own"
+    );
+    let second = Fonts::new(&config("Menlo")).expect("Menlo");
+    wait_ready(&second, "second unshared");
+    assert_eq!(
+        fallback_index_builds() - before,
+        4,
+        "a second unshared load builds its own too"
     );
 }

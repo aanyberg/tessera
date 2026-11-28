@@ -1205,8 +1205,11 @@ fn time_cat(
 /// session sleeps, so the reader's CPU time would not see it. That mutant
 /// (the reader waits for room in the queue instead of dropping the event,
 /// or runs the plugin itself) reads 100 MB in hours, so a read with the
-/// plugin that takes 20 times its pair's read without, plus 10 s, fails at
-/// once.
+/// plugin that takes 20 times a read without, plus 10 s (at least 200 s
+/// in all, as one read on an efficiency core took 30 times its pair's),
+/// fails at once. That read without is its pair's when the pair reads
+/// without the plugin first, and the fastest so far when it reads with
+/// it first (the odd pairs).
 #[test]
 #[cfg_attr(debug_assertions, ignore = "timing bar; run in release")]
 fn a_slow_plugin_keeps_session_throughput() {
@@ -1224,8 +1227,9 @@ fn a_slow_plugin_keeps_session_throughput() {
 
     let unbounded = Duration::from_secs(3600);
     // The longest a read with the plugin may take: 20 times a read without
-    // it plus 10 s.
-    let deadline = |without: Duration| without * 20 + Duration::from_secs(10);
+    // it plus 10 s, and never under 200 s.
+    let deadline =
+        |without: Duration| (without * 20 + Duration::from_secs(10)).max(Duration::from_secs(200));
     let mut ratios = Vec::new();
     let mut fastest_without = unbounded;
     let passed = (0..PAIRS).any(|pair| {
@@ -1238,7 +1242,7 @@ fn a_slow_plugin_keeps_session_throughput() {
                 || {
                     panic!(
                         "the slow plugin blocked the session: a read with it took over \
-                         {:?}, 20x a read without it plus 10 s",
+                         {:?}, 20x a read without it plus 10 s (200 s at least)",
                         deadline(without)
                     )
                 },

@@ -28,6 +28,7 @@ mod common;
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::ffi::{CString, c_char};
+use std::io::Read as _;
 use std::process::{Command, Stdio};
 use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -538,18 +539,31 @@ fn startup_in_a_child() -> Startup {
         .stderr(Stdio::inherit())
         .spawn()
         .expect("start the child");
+    // Read on a thread of its own while the child runs, so more output
+    // than a pipe buffer holds cannot block the child until the deadline.
+    let mut pipe = child.stdout.take().expect("the child's stdout is piped");
+    let reader = thread::spawn(move || {
+        let mut out = Vec::new();
+        pipe.read_to_end(&mut out).map(|_| out)
+    });
     let deadline = Instant::now() + 2 * TIMEOUT;
-    while child.try_wait().expect("poll the child").is_none() {
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll the child") {
+            break status;
+        }
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
             panic!("the startup child did not finish in {:?}", 2 * TIMEOUT);
         }
         thread::sleep(POLL);
-    }
-    let output = child.wait_with_output().expect("the child's output");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(output.status.success(), "the child failed: {stdout}");
+    };
+    let out = reader
+        .join()
+        .expect("the reader thread")
+        .expect("the child's output");
+    let stdout = String::from_utf8_lossy(&out);
+    assert!(status.success(), "the child failed: {stdout}");
     let nanos: Option<Vec<u64>> = stdout
         .lines()
         .find_map(|line| line.strip_prefix(STARTUP_LINE))

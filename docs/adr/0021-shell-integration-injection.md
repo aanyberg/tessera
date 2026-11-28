@@ -716,7 +716,8 @@ more without the injection, and the session's first line says so:
 the error gives them; the user learns how much to trim to get shell
 integration back. The size check runs before anything is opened or forked,
 so the refused start leaves nothing behind and the retry costs no fork.
-One warning is logged with the two sizes as fields and nothing else: no
+One warning per refused start is logged (a profile start and its fallback
+over the limit log two), with the two sizes as fields and nothing else: no
 variable's name or value, no path, no shell name (which may come from
 `$SHELL`; docs/security.md S8). The notice is fixed text and numbers.
 

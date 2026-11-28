@@ -601,7 +601,8 @@ fn every_name_row() {
 /// a reply path that rescans the queued replies per query reads 100 or
 /// more and fails every attempt. The large run is fed `SMALL` queries at
 /// a time without taking the replies (so a rescan still sees all of them)
-/// and stops once it is over budget, so such a mutant fails in seconds. A
+/// and stops once it is over budget, so such a mutant fails within a
+/// minute on an idle machine (185-242 s under load). A
 /// large run that lands on a slower core than the small one can still read
 /// high, so up to five attempts are made and every ratio is printed.
 #[test]

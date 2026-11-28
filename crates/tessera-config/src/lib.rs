@@ -491,7 +491,10 @@ pub struct Terminal {
     /// `"auto"` makes the shells Tessera starts load its scripts, which mark
     /// prompts and commands and report the working directory; `"off"` starts
     /// them unchanged. A session started with `TESSERA_SHELL_INTEGRATION` in
-    /// its environment is never changed.
+    /// its environment is never changed. A start whose environment the
+    /// scripts would take over the system's size limit for a program's
+    /// arguments and environment runs without them, and its first line
+    /// says so.
     #[cfg_attr(feature = "schema", schemars(schema_with = "ShellIntegration::schema"))]
     pub shell_integration: ShellIntegration,
     /// Whether programs may write the clipboard (OSC 52, as tmux and

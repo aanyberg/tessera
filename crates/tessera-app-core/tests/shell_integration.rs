@@ -380,6 +380,19 @@ fn a_changed_setting_applies_to_the_next_spawn() {
     assert!(injected("auto-2"));
 }
 
+/// Gives a directory locked with mode 000 its mode back when dropped, so
+/// a test that fails while it is locked still leaves a temporary directory
+/// that can be removed (#519 m7).
+struct Unlock<'a>(&'a Path);
+
+impl Drop for Unlock<'_> {
+    fn drop(&mut self) {
+        // Nothing to report from a drop: a failure here leaves the
+        // directory behind, as before the guard.
+        let _ = std::fs::set_permissions(self.0, Permissions::from_mode(0o700));
+    }
+}
+
 /// With a profile (#333): a profile whose start fails falls back to the
 /// login shell, and the injection taking that start over the limit too
 /// gives both notices, each once: the profile's first, then shell
@@ -393,6 +406,7 @@ fn a_profile_fallback_and_the_exec_limit_retry_each_say_so_once() {
     let locked = setup.root.join("locked");
     std::fs::create_dir(&locked).unwrap();
     std::fs::set_permissions(&locked, Permissions::from_mode(0o000)).unwrap();
+    let unlock = Unlock(&locked);
     let entered = std::fs::read_dir(&locked).is_ok();
     let with_profile = |dir: &Path, setting: &str| {
         let text = format!(
@@ -435,7 +449,7 @@ fn a_profile_fallback_and_the_exec_limit_retry_each_say_so_once() {
         );
         let _ = auto.close_session(id);
     }
-    std::fs::set_permissions(&locked, Permissions::from_mode(0o700)).unwrap();
+    drop(unlock);
 
     // A directory that can: the profile's session, one notice.
     let auto = with_profile(&setup.home, "auto");

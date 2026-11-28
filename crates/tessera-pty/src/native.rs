@@ -237,7 +237,8 @@ impl NativePty {
     /// anything is opened or forked), [`PtyError::Open`] if no PTY could be
     /// allocated (an open that lost the kernel's pty allocation race to a
     /// concurrent one, in this or another process, is retried a few times
-    /// first, #563), [`PtyError::Spawn`] if the program is missing, a
+    /// first, #563) or the `pty-open` helper thread could not be started
+    /// (`EAGAIN` when the process is out of threads), [`PtyError::Spawn`] if the program is missing, a
     /// directory or not executable, if it is a `#!` script whose
     /// interpreter is missing, not a regular file or not executable
     /// (checked before anything is opened or forked; a script with CRLF
@@ -250,7 +251,8 @@ impl NativePty {
     /// [`PtyError::ProgramLookupBusy`] if the lookup was not made because
     /// four earlier lookups or checks are still stuck (see below),
     /// [`PtyError::OpenTimedOut`] if opening the PTY gave no answer within
-    /// 5 s or four earlier opens are still without one (the open runs on
+    /// 5 s, four earlier opens are still without one, or every open helper
+    /// stayed busy with earlier opens for the whole 5 s (the open runs on
     /// a helper thread, so a `grantpt(3)` that never returns fails this
     /// spawn only), [`PtyError::Io`] if the
     /// reader or writer side of the master or one of their threads could
@@ -1685,8 +1687,9 @@ static OPEN_HELPERS: Pool = Pool::new(MAX_STUCK_HELPERS);
 /// Opens a pty pair of `size` ([`redrive_open`] over `openpty(3)`) on a
 /// `pty-open` helper thread of [`OPEN_HELPERS`], waited for at most
 /// [`PTY_OPEN_TIMEOUT`] (see [`run_bounded_in`]). Without an answer in
-/// time, or with [`MAX_STUCK_HELPERS`] earlier opens still stuck (the
-/// spawn then fails at once and starts no thread), the spawn fails with
+/// time, with [`MAX_STUCK_HELPERS`] earlier opens still stuck (the spawn
+/// then fails at once and starts no thread), or with every helper busy
+/// with earlier opens for the whole wait, the spawn fails with
 /// [`PtyError::OpenTimedOut`] before anything is forked; a helper thread
 /// that cannot be started fails it with [`PtyError::Open`] and that
 /// error's reason (`EAGAIN` when the process is out of threads). An open that
@@ -3487,14 +3490,14 @@ mod tests {
     fn a_program_found_on_path_is_handed_over_by_its_path() {
         let temp = scratch_dir("path-lookup");
         let dir = temp.path();
-        let held = dir.join("held");
-        std::fs::create_dir_all(&held).unwrap();
+        let held_dir = dir.join("held");
+        std::fs::create_dir_all(&held_dir).unwrap();
         let mut options = SpawnOptions::command("sh", "path");
-        let path = std::env::join_paths([held.as_path(), Path::new("/bin")]).unwrap();
+        let path = std::env::join_paths([held_dir.as_path(), Path::new("/bin")]).unwrap();
         options.env.push(("PATH".into(), path));
 
         // The first candidate is probed first, through the seam.
-        let candidate = held.join("sh");
+        let candidate = held_dir.join("sh");
         let held = hold(&candidate, slow_read::Stage::Lookup);
         let command = build_command(&options);
         let lookup = thread::spawn(move || resolve_program(&command, &Progress::default()));
