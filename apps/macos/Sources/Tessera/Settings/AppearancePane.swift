@@ -49,11 +49,7 @@ struct AppearancePane: View {
             Section("Theme") {
                 SettingsFieldRow(field: Self.theme, context: .init(model: model, path: Self.theme.key))
                 LabeledContent("") {
-                    Button("Import Theme…") {
-                        SettingsPanels.present(SettingsPanels.themeFilePanel(), on: model.window) { file in
-                            model.importTheme(at: file)
-                        }
-                    }
+                    Button("Import Theme…") { Self.importTheme(SettingsPanels.themeFilePanel(), model) }
                 }
                 SettingsMessage(text: model.message(SettingsModel.importThemeKey))
             }
@@ -61,6 +57,15 @@ struct AppearancePane: View {
             Section("Window") { rows(Self.window) }
             Section("Cursor") { rows(Self.cursor) }
             Section("Panes") { rows(Self.panes) }
+        }
+    }
+
+    /// Import Theme…: `panel` as a sheet on the Settings window, and the
+    /// file chosen imported (a test passes a recording panel, as for
+    /// ``SettingsFieldRow/chooseDirectory(_:for:_:)``, 21.6a m1).
+    static func importTheme(_ panel: some SettingsOpenPanel, _ model: SettingsModel) {
+        SettingsPanels.present(panel, on: model.window) { file in
+            model.importTheme(at: file)
         }
     }
 

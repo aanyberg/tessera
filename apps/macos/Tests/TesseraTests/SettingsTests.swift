@@ -1970,7 +1970,10 @@ extension SettingsTests {
     /// buttons take no synthetic click in a hosted window, so the test
     /// presents a panel as they do: a recording one, since a real panel's
     /// bridge can block the main thread for a minute in a full run, #492.)
-    func testTheOpenPanelsAreSheetsOnTheSettingsWindow() throws {
+    /// Import Theme…'s own wiring last: its sheet is on the Settings window
+    /// and the file chosen is imported (21.6a m1; Choose…'s is
+    /// ``testChooseAfterTypedTextKeepsTheChosenDirectory``).
+    func testTheOpenPanelsAreSheetsOnTheSettingsWindow() async throws {
         let model = try openSettings(config: "")
         let controller = try XCTUnwrap(appDelegate.settingsWindowController)
         let window = try XCTUnwrap(controller.window)
@@ -1995,6 +1998,17 @@ extension SettingsTests {
         let alone = RecordingOpenPanel(url: file)
         SettingsPanels.present(alone, on: nil) { chosen.append($0) }
         XCTAssertEqual(alone.runs, [.alone])
+
+        let scheme = try XCTUnwrap(dir).appendingPathComponent("Mine.itermcolors")
+        try itermcolors(at: scheme)
+        let theme = RecordingOpenPanel(url: scheme)
+        AppearancePane.importTheme(theme, model)
+        XCTAssertEqual(theme.runs, [.sheet(on: ObjectIdentifier(window))], "Import Theme…: a sheet on the window")
+        XCTAssertFalse(model.themes.contains { $0.source == .user }, "nothing imported while the sheet is open")
+        theme.end(.OK)
+        try await waitUntil("Import Theme… imported the file chosen") {
+            !model.isWriting && model.themes.contains { $0.source == .user }
+        }
     }
 
     /// A real open panel (the directory one) becomes a sheet on the
