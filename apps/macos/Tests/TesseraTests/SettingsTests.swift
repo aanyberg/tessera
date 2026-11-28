@@ -3328,7 +3328,8 @@ extension SettingsTests {
             return TesseraConfigEditError(.conflict, message: "config.toml changed on disk")
         }
         model?.set("profiles[1].command", .string("/bin/sh"))
-        weak var gone = model
+        weak var gone: SettingsModel?
+        gone = model
         model = nil
         try await waitUntil("first attempt") { writer.calls.count >= 1 }
         try await Task.sleep(for: .milliseconds(300))

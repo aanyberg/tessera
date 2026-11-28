@@ -109,8 +109,8 @@ A hosted test that cannot exercise what it checks on this host skips with the re
   the macOS 15 SDK (Xcode 16); linked against SDK 27, as CI and releases are since #584, it is SwiftUI's own control
   with no AppKit control to drive. They stay as coverage of older-SDK builds (#583). The binding tests in the same
   file drive the field's `doubleBinding` and `editingChanged` directly and cover the hold and hand-edit logic on every
-  SDK. On the macOS 15 runner 5 of the 8 skipped there too (the synthetic drag did not move the knob, or the press had
-  no gesture recognizer).
+  SDK. On the macOS 15 runner 5 of the 8 real-`NSSlider` tests skipped too (the synthetic drag did not move the knob,
+  or the press had no gesture recognizer).
 - **Tests that need a visible window or a full screen transition** (`FullScreenToggleTests`, `ResizeFootprintTests`)
   skip on a locked console, where nothing is drawn and no transition finishes; CI runs them.
 

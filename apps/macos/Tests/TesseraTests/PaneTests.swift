@@ -1121,18 +1121,35 @@ final class PaneTests: XCTestCase {
             worstLag = max(worstLag, ContinuousClock.now - start - .milliseconds(20))
         }
         // Each grid is the whole cells its pane's frame holds once the
-        // resizing stops.
-        try await Task.sleep(for: .milliseconds(200))
-        for pane in [left, right] where pane.view.surface.isAttached {
-            let view = pane.view
-            let metrics = try XCTUnwrap(view.metrics)
-            let scale = CGFloat(metrics.scale)
-            XCTAssertEqual(metrics.widthPx, UInt32((view.renderView.bounds.width * scale).rounded()), "the frame's width")
-            XCTAssertEqual(metrics.heightPx, UInt32((view.bounds.height * scale).rounded()), "the frame's height")
-            let padding = 2 * metrics.paddingPx
-            XCTAssertEqual(UInt32(metrics.cols), (metrics.widthPx - padding) / metrics.cellWidthPx, "whole columns")
-            XCTAssertEqual(UInt32(metrics.rows), (metrics.heightPx - padding) / metrics.cellHeightPx, "whole rows")
+        // resizing stops: waited for, then asserted, so a grid that never
+        // follows is named with what is off.
+        func gridMismatches() -> [String] {
+            [left, right].enumerated().flatMap { index, pane -> [String] in
+                let view = pane.view
+                guard view.surface.isAttached else { return [] }
+                guard let metrics = view.metrics else { return ["pane \(index): no metrics"] }
+                let scale = CGFloat(metrics.scale)
+                let padding = 2 * metrics.paddingPx
+                let expected = (
+                    width: UInt32((view.renderView.bounds.width * scale).rounded()),
+                    height: UInt32((view.bounds.height * scale).rounded()),
+                    cols: (metrics.widthPx - padding) / metrics.cellWidthPx,
+                    rows: (metrics.heightPx - padding) / metrics.cellHeightPx
+                )
+                return [
+                    metrics.widthPx == expected.width
+                        ? nil : "the frame's width \(metrics.widthPx) != \(expected.width)",
+                    metrics.heightPx == expected.height
+                        ? nil : "the frame's height \(metrics.heightPx) != \(expected.height)",
+                    UInt32(metrics.cols) == expected.cols ? nil : "whole columns \(metrics.cols) != \(expected.cols)",
+                    UInt32(metrics.rows) == expected.rows ? nil : "whole rows \(metrics.rows) != \(expected.rows)",
+                ].compactMap { $0.map { "pane \(index): \($0)" } }
+            }
         }
+        do {
+            try await waitUntil("each grid follows its frame") { gridMismatches().isEmpty }
+        } catch is PollTimedOut {}
+        XCTAssertEqual(gridMismatches(), [], "each grid is the whole cells its pane's frame holds")
 
         let closeStart = ContinuousClock.now
         window.close()
