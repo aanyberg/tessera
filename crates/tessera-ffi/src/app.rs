@@ -410,7 +410,7 @@ pub unsafe extern "C" fn tessera_app_blur_radius(app: *const App, out: *mut u32)
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AppAppearance {
-    /// The host draws its windows, menus and settings dark.
+    /// The host draws its windows, context menus and Settings dark.
     Dark = 0,
     /// The host draws them light.
     Light = 1,
@@ -432,10 +432,11 @@ impl From<tessera_app_core::AppAppearance> for AppAppearance {
 /// Stores `[appearance] app_appearance` of the configuration in effect in
 /// `*out` (#365): `TESSERA_APP_APPEARANCE_DARK` (0, the default and what
 /// an unknown value in the file gives), `_LIGHT` (1) or `_SYSTEM` (2). The
-/// host draws its own windows, menus and settings with it; the terminal's
-/// colours stay the theme's. App-wide: no profile changes it, and the
-/// display options leave it alone. No callback reports a change of it:
-/// read it at start and again on every `on_config_applied`.
+/// host draws its own windows, context menus and Settings with it (the menu
+/// bar follows the system setting); the terminal's colours stay the
+/// theme's. App-wide: no profile changes it, and the display options leave
+/// it alone. No callback reports a change of it: read it at start and
+/// again on every `on_config_applied`.
 ///
 /// Returns `TESSERA_ERROR_NULL_POINTER` if `app` or `out` is `NULL`; `*out`
 /// is set to `TESSERA_APP_APPEARANCE_DARK` on failure when `out` is not

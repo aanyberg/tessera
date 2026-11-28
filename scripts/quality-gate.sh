@@ -58,9 +58,9 @@ finish() { local rc=${1:-$?}; rm -f "$nextest_log"; print -r -- "quality gate ru
 trap finish EXIT
 # zsh skips the EXIT trap when a signal kills it (a `timeout`, Ctrl-C, a closed terminal), which left the log above in
 # $TMPDIR (#698). A signal stops the watchdog's command, runs finish with 128 + the signal's number and then kills
-# the gate with the same signal (INT, TERM), so its caller sees the signal. zsh holds a trap back until a foreground command
-# ends, so the watchdog (nextest, the C tests: up to TESSERA_GATE_NEXTEST_MINUTES) runs in the background and is
-# waited for; a signal during the other steps (fmt, clippy, the builds) acts once that step ends.
+# the gate with the same signal (INT, TERM), so its caller sees the signal. zsh holds a trap back until a foreground
+# command ends, so the watchdog (nextest, the C tests: up to TESSERA_GATE_NEXTEST_MINUTES) runs in the background and
+# is waited for; a signal during the other steps (fmt, clippy, the builds) acts once that step ends.
 watchdog_pid=""
 on_signal() {
     setopt localoptions noerrexit

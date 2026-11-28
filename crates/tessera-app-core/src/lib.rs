@@ -2638,7 +2638,8 @@ impl App {
 
     /// The app's own appearance: `[appearance] app_appearance` of the
     /// configuration in effect (#365), whether the host draws its windows,
-    /// menus and settings dark, light or as the system's appearance says.
+    /// context menus and Settings dark, light or as the system's appearance
+    /// says (the menu bar follows the system setting, ADR 0043).
     /// The terminal's colours stay the theme's. An app-wide key, so no
     /// profile changes it, and the display options leave it alone. No
     /// callback reports a change of it: the host reads it at start and
