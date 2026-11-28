@@ -228,6 +228,7 @@ impl Run<'_> {
             options = options.env(key, value);
         }
         let (mut pty, events) = NativePty::spawn(&options).expect("spawn bash");
+        let pid = pty.child_pid().expect("bash's pid");
         let mut output = Vec::new();
         let mut exited = false;
         let read_until = |output: &mut Vec<u8>, done: &dyn Fn(&[u8]) -> bool| -> bool {
@@ -236,7 +237,8 @@ impl Run<'_> {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 assert!(
                     !remaining.is_zero(),
-                    "no prompt within {STEP_TIMEOUT:?}: {:?}",
+                    "no prompt within {STEP_TIMEOUT:?} (shell: {}): {:?}",
+                    processes(pid),
                     String::from_utf8_lossy(output)
                 );
                 match events.recv_timeout(remaining) {
@@ -251,11 +253,24 @@ impl Run<'_> {
         for line in lines.iter().chain(&["exit"]) {
             // `^C <text>`: a Ctrl-C once the shell printed the text (before
             // any prompt, while a startup file runs), not a typed line.
-            if let Some(text) = line.strip_prefix("^C ") {
+            // `^C> <text>`: a Ctrl-C at the prompt that shows the text, once
+            // readline waits for a key (#783): one that lands while bash
+            // is still drawing the prompt is lost or hangs bash itself
+            // (see `wait_until_asleep`).
+            let at_prompt = line.strip_prefix("^C> ");
+            if let Some(text) = at_prompt.or_else(|| line.strip_prefix("^C ")) {
                 let shown = |output: &[u8]| count(output, text.as_bytes()) > 0;
                 if !read_until(&mut output, &shown) {
                     exited = true;
                     break;
+                }
+                let drawn = |output: &[u8]| count(output, PROMPT.as_bytes()) > n;
+                if at_prompt.is_some() {
+                    if !read_until(&mut output, &drawn) {
+                        exited = true;
+                        break;
+                    }
+                    wait_until_asleep(pid);
                 }
                 pty.write(b"\x03").expect("type a Ctrl-C");
                 // A Ctrl-C at a prompt makes bash draw a new one: the next
@@ -281,6 +296,67 @@ impl Run<'_> {
             injected: !injection.is_empty(),
         }
     }
+}
+
+/// Waits until the shell `pid` sleeps (`ps` state `S` or `I`, twice in a
+/// row): once the prompt is shown, readline is then blocked in its read of
+/// the terminal, where a Ctrl-C interrupts the read.
+///
+/// A Ctrl-C a moment earlier, once the prompt is written but before
+/// readline reads (a window that load stretches), is bash's own race
+/// (#783), the same without Tessera: bash 5.x handles the signal and goes
+/// on to block in the read, and only throws the line away once the next
+/// key (or another signal) arrives, so no prompt follows. Bash 3.2 jumps
+/// out of its handler while readline holds the stdout lock (it echoes
+/// the prompt); the shell itself goes on (the lock is recursive), but a
+/// forked command substitution, as the head's trap read, then blocks for
+/// ever on that lock in its first `fileno(stdout)`, and so does the shell
+/// waiting for it.
+fn wait_until_asleep(pid: u32) {
+    let deadline = Instant::now() + STEP_TIMEOUT;
+    let mut asleep = 0;
+    while asleep < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "the shell never waited within {STEP_TIMEOUT:?}: {}",
+            processes(pid)
+        );
+        let state = std::process::Command::new("/bin/ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .expect("run ps");
+        let state = String::from_utf8_lossy(&state.stdout);
+        asleep = if state.starts_with(['S', 'I']) {
+            asleep + 1
+        } else {
+            0
+        };
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// The processes of the shell `pid` (itself and its children) with their
+/// state, for a failure message: a child of an interactive bash that
+/// sleeps for ever is the bash 3.2 lock of [`wait_until_asleep`].
+fn processes(pid: u32) -> String {
+    std::process::Command::new("/bin/ps")
+        .args(["-A", "-o", "pid=,ppid=,stat=,etime="])
+        .output()
+        .map_or_else(
+            |error| format!("ps: {error}"),
+            |out| {
+                String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .filter(|line| {
+                        let mut fields = line.split_whitespace();
+                        let (own, parent) = (fields.next(), fields.next());
+                        [own, parent].contains(&Some(pid.to_string().as_str()))
+                    })
+                    .map(str::trim)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            },
+        )
 }
 
 fn count(haystack: &[u8], needle: &[u8]) -> usize {
@@ -1476,7 +1552,8 @@ fn a_ctrl_c_before_the_heads_restore_keeps_set_x() {
 /// shows `QQ1R` (typed as `$((0+1))`) once the line before the Ctrl-C ran
 /// and the prompt is drawn; the `R` is only in the prompt, so the wait
 /// never matches 3.2's trace of `zp=QQ1` on the terminal, which would put
-/// the Ctrl-C inside our head (#751).
+/// the Ctrl-C inside our head (#751). The Ctrl-C waits for readline's
+/// read of the terminal (`^C>`, #783).
 #[test]
 fn a_ctrl_c_at_the_prompt_traces_none_of_ours() {
     let line = "echo \"n=$(grep -cE 'trap -- |trap -p DEBUG' xt)\"";
@@ -1484,7 +1561,7 @@ fn a_ctrl_c_at_the_prompt_traces_none_of_ours() {
         "PS1='${zp}R'\"$PS1\"",
         "set -x",
         "zp=QQ$((0+1))",
-        "^C QQ1R",
+        "^C> QQ1R",
         "zp=",
         "set +x",
         line,
