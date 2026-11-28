@@ -37,8 +37,9 @@ dereferences to `Line`: a borrowed hot or visible row, or a decoded packed row. 
 the output, the exit-status gutter and the ranks a resize carries records by) read `Grid::line_marks` and
 `Grid::marked_lines` instead of `logical_line`. Both return `LineMarks` (a row's marks and wrap flag) from the packed
 block's per-row records, so a packed row is never decoded or cached for them, and `marked_lines` walks a range in
-O(blocks + marked rows). Decoding every row made a resize's scans over 1 000 000 packed lines take about 0.4-0.8 s
-under the terminal lock (67-69x the unpacked store). The packed format is unchanged.
+O(blocks + rows with extras), the packed rows with marks, links or anchors (hot and visible rows in O(lines)).
+Decoding every row made a resize's scans over 1 000 000 packed lines take about 0.4-0.8 s under the terminal lock
+(67-69x the unpacked store). The packed format is unchanged.
 
 **D4. Decoded-row cache.** Random access (`Scrollback::get`) caches decoded rows: at most `MAX_UNPACKED_CELLS` (65 536)
 cells and at most 1 024 rows, evicted oldest first (docs/security.md bounds). Evicting history drops the cached copies

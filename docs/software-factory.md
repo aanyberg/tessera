@@ -254,13 +254,10 @@ Agents use these instead of rebuilding the setup in every run:
   `CARGO_TERM_COLOR=always`). The gate builds the test binaries first (`cargo nextest run --no-run`, same arguments), so
   the watchdog's window covers the run and not the compilation, and a watchdog whose gate was killed (SIGKILL included)
   exits without acting. After the ffi release build the gate runs the ffi C tests (`scripts/ffi-c-test.sh`, under the
-  same watchdog; `surface.c` skips itself under `TESSERA_SKIP_GPU_TESTS`) and the release-only timing bars
-  `reader_lock_hold_is_bounded`, `view_metrics_are_fast_while_output_floods_the_terminal`,
-  `scrolling_through_a_long_history_is_smooth` and `a_flood_under_a_scrolled_view_keeps_captures_short` (#114, #175) and
-  `a_double_click_with_64_rules_on_2048_columns_takes_under_5_ms` (#47) and `a_slow_plugin_keeps_session_throughput`
-  (#48), the `b02_*` cost bars of the rectangular operations (`crates/tessera-term/tests/rect.rs`, #251), the two
-  cluster bars of `tests/rect_fixes.rs` and `an_edit_among_many_mark_like_lines_is_fast`
-  (`crates/tessera-config/tests/edit.rs`, #324) (`timing` group), and the budgets of `tessera-ffi`'s `tests/budgets.rs`
+  same watchdog; `surface.c` skips itself under `TESSERA_SKIP_GPU_TESTS`) and the release-only timing bars (#114, #175),
+  one filter term each in `release_timing`, whose comment in `scripts/quality-gate.sh` names them all (each is in the
+  `timing` group): lock holds, latencies and cost bars such as `reader_lock_hold_is_bounded` and the `b02_*` bars of
+  the rectangular operations, and the budgets of `tessera-ffi`'s `tests/budgets.rs`
   (#216, each main's measurement plus 20 %, recorded beside it with the date, `hw.model` and rustc):
   `an_idle_session_stays_within_its_heap_budget` (live Rust heap of an idle 80x24 bash after its first prompt),
   `a_full_scrollback_stays_within_its_heap_budget` (the same session with 10 000 scrollback lines of 80 columns), and

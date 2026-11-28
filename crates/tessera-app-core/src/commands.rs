@@ -1927,6 +1927,23 @@ mod tests {
             |_, _, _| false,
         );
         assert_eq!((found, budget), (Scan::Capped, 0));
+        // A budget that runs out on the oldest line reached its bound: the
+        // last window (5000 = 19 * 256 + 136) is both, and it is Exhausted.
+        let mut budget = 5000;
+        let found = scan(&source, epoch, top - 1, Bound::Up, &mut budget, |_, _| {
+            false
+        });
+        assert_eq!((found, budget), (Scan::Exhausted, 0));
+        let mut budget = 5000;
+        let found = scan_marks(
+            &source,
+            epoch,
+            top - 1,
+            Bound::Up,
+            &mut budget,
+            |_, _, _| false,
+        );
+        assert_eq!((found, budget), (Scan::Exhausted, 0));
         // A resize between holds gives up.
         source.term.lock().unwrap().resize(5, 10);
         let mut budget = MAX_PROMPT_SCAN_LINES;

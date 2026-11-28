@@ -50,8 +50,9 @@ use crate::session::{SessionEvent, SessionId, SessionObserver, lock, run_thread_
 use tessera_term::shown_in_title;
 
 /// Plugin ids read from `[plugins] enabled`; later ones are ignored. The
-/// configuration loader warns of them, once per load (tessera-config owns
-/// the cap so that it can); the host does not warn again.
+/// configuration loader reports them in one warning (tessera-config owns
+/// the cap so that it can), which the configuration store logs once per
+/// appearance; the host does not warn again.
 pub use tessera_config::MAX_ENABLED_PLUGINS;
 /// Longest plugin id, in bytes, read from `[plugins] enabled`; a longer
 /// one is ignored with a warning that gives its length only.

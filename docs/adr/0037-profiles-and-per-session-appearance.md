@@ -206,20 +206,20 @@ same date.
 ## Amendment: the notice for a refused `#!` script, and polling (#489, #526, 2026-11-18)
 
 - **The errno of a refused script.** `tessera-pty` refuses a `#!` script
-  whose interpreter cannot run, and the fallback notice takes its errno
-  text from that refusal. A script with CRLF line endings is `ENOEXEC`
-  (`Exec format error`), not the `ENOENT` of its `/bin/sh\r`, which said
-  "No such file or directory" about a file that is there. Only a CRLF
-  script whose `#!` line ends at the interpreter is refused: with an
-  argument or through `env` (`#!/bin/sh -e\r`, `#!/usr/bin/env bash\r`) the
-  `\r` is in the argument, the interpreter exists, and the script starts;
-  the interpreter or `env` then fails on that argument, with no notice
-  (#526). An interpreter that is not a regular file or not executable is
-  `EACCES`, a missing one or a line naming none `ENOENT`, and one that
-  cannot be reached (`ENOTDIR`, `ELOOP`) keeps its own errno. Only the
-  text after the quoted interpreter is read: the path comes from the
-  script and cannot choose the errno. The notice still shows only the
-  sanitised profile name and the errno text (S3, S8).
+  whose interpreter cannot run, and the fallback notice takes its errno text
+  from that refusal. A script with CRLF line endings is `ENOEXEC` (`Exec
+  format error`), not the `ENOENT` of its `/bin/sh\r`, which said "No such
+  file or directory" about a file that is there. Only a CRLF script whose
+  `#!` line ends at the interpreter is refused: with an argument or through
+  `env` (`#!/bin/sh -e\r`, `#!/usr/bin/env bash\r`) the `\r` is in the
+  argument and the interpreter exists, so the exec succeeds; the interpreter
+  or `env` then fails on that argument, with no notice (#526). An
+  interpreter that is not a regular file or not executable is `EACCES`, a
+  missing one or a line naming none `ENOENT`, and one that cannot be reached
+  (`ENOTDIR`, `ELOOP`) keeps its own errno. Only the text after the quoted
+  interpreter is read: the path comes from the script and cannot choose the
+  errno. The notice still shows only the sanitised profile name and the
+  errno text (S3, S8).
 - **Registration errors stay on the fast poll.** The native backend polls
   every `CAPPED_CHAIN_POLL_INTERVAL` only when the chain cannot be walked
   (past a cap, a cycle, a directory it may not search): nothing there can

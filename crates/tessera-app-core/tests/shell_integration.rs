@@ -405,8 +405,10 @@ fn a_profile_fallback_and_the_exec_limit_retry_each_say_so_once() {
     let out = setup.root.join("login.out");
     let locked = setup.root.join("locked");
     std::fs::create_dir(&locked).unwrap();
-    std::fs::set_permissions(&locked, Permissions::from_mode(0o000)).unwrap();
+    // The guard first, so that nothing between the lock and the guard
+    // can leave the directory locked.
     let unlock = Unlock(&locked);
+    std::fs::set_permissions(&locked, Permissions::from_mode(0o000)).unwrap();
     let entered = std::fs::read_dir(&locked).is_ok();
     let with_profile = |dir: &Path, setting: &str| {
         let text = format!(

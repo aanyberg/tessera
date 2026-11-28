@@ -238,8 +238,9 @@ impl NativePty {
     /// allocated (an open that lost the kernel's pty allocation race to a
     /// concurrent one, in this or another process, is retried a few times
     /// first, #563) or the `pty-open` helper thread could not be started
-    /// (`EAGAIN` when the process is out of threads), [`PtyError::Spawn`] if the program is missing, a
-    /// directory or not executable, if it is a `#!` script whose
+    /// (`EAGAIN` when the process is out of threads), [`PtyError::Spawn`]
+    /// if the program is missing, a directory or not executable, if it is
+    /// a `#!` script whose
     /// interpreter is missing, not a regular file or not executable
     /// (checked before anything is opened or forked; a script with CRLF
     /// line endings names `/bin/sh\r` and is refused with a hint), or if
@@ -2289,17 +2290,17 @@ mod tests {
         // killed, so give that a moment; `sleep 30` would take far longer.
         while !reaped(pid) {
             assert!(
-                started.elapsed() < std::time::Duration::from_secs(5),
+                started.elapsed() < Duration::from_secs(5),
                 "the child {pid} of a failed spawn at {step:?} was not reaped"
             );
-            thread::sleep(std::time::Duration::from_millis(10));
+            thread::sleep(Duration::from_millis(10));
         }
         while alone && thread_count() > threads {
             assert!(
-                started.elapsed() < std::time::Duration::from_secs(5),
+                started.elapsed() < Duration::from_secs(5),
                 "a thread outlived the failed spawn at {step:?}"
             );
-            thread::sleep(std::time::Duration::from_millis(10));
+            thread::sleep(Duration::from_millis(10));
         }
         if alone {
             assert_eq!(
@@ -2351,14 +2352,14 @@ mod tests {
                 // The child writes the marker after its output, so the
                 // output is queued on the terminal once the marker exists.
                 let started = std::time::Instant::now();
-                while !wait_for.exists() && started.elapsed() < std::time::Duration::from_secs(10) {
-                    thread::sleep(std::time::Duration::from_millis(10));
+                while !wait_for.exists() && started.elapsed() < Duration::from_secs(10) {
+                    thread::sleep(Duration::from_millis(10));
                 }
             });
             let result = NativePty::spawn(&options).map(|_| ());
             let _ = done_tx.send((result, fault::take_forked()));
         });
-        let outcome = done_rx.recv_timeout(std::time::Duration::from_secs(20));
+        let outcome = done_rx.recv_timeout(Duration::from_secs(20));
         let printed = marker.exists();
         let (result, pid) = outcome.expect("the spawn did not return after its reader failed");
         assert!(printed, "the child never got to print before the failure");
@@ -2539,7 +2540,7 @@ mod tests {
         let max = arg_max - arg_max / ARG_MAX_HEADROOM_DIVISOR;
         let (_pty, events) = NativePty::spawn(&sized_to(max)).expect("the limit itself spawns");
         let status = loop {
-            match events.recv_timeout(std::time::Duration::from_secs(10)) {
+            match events.recv_timeout(Duration::from_secs(10)) {
                 Ok(PtyEvent::Exited(status)) => break status,
                 Ok(PtyEvent::Output(_)) => {}
                 Err(err) => panic!("no exit: {err}"),
@@ -3573,10 +3574,10 @@ mod tests {
         let started = std::time::Instant::now();
         while !process_state(child.id()).starts_with('Z') {
             assert!(
-                started.elapsed() < std::time::Duration::from_secs(10),
+                started.elapsed() < Duration::from_secs(10),
                 "the child never became a zombie"
             );
-            thread::sleep(std::time::Duration::from_millis(5));
+            thread::sleep(Duration::from_millis(5));
         }
         #[cfg(target_os = "macos")]
         assert_eq!(
@@ -3614,7 +3615,7 @@ mod tests {
             thread::spawn(move || queue.push_blocking(b"b"))
         };
         // Give the producer time to block on the full queue.
-        thread::sleep(std::time::Duration::from_millis(50));
+        thread::sleep(Duration::from_millis(50));
         queue.close();
         assert_eq!(
             producer.join().unwrap().unwrap_err().kind(),

@@ -333,11 +333,12 @@ fn wait_until_asleep(pid: u32) {
 }
 
 /// The processes of the shell `pid` (itself and its children) with their
-/// state, for a failure message: a child of an interactive bash that
-/// sleeps for ever is the bash 3.2 lock of [`wait_until_asleep`].
+/// state and command name, for a failure message: a child of an
+/// interactive bash that sleeps for ever is the bash 3.2 lock of
+/// [`wait_until_asleep`].
 fn processes(pid: u32) -> String {
     std::process::Command::new("/bin/ps")
-        .args(["-A", "-o", "pid=,ppid=,stat=,etime="])
+        .args(["-A", "-o", "pid=,ppid=,stat=,etime=,comm="])
         .output()
         .map_or_else(
             |error| format!("ps: {error}"),

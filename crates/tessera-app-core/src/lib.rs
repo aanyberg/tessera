@@ -4497,17 +4497,19 @@ mod tests {
         let errno = fallback_errno(&Error::Pty(PtyError::OpenTimedOut));
         assert_eq!(errno, Ok(Some(nix::errno::Errno::ETIMEDOUT as i32)));
         let notice = String::from_utf8(profile::fallback_notice("p", errno.unwrap())).unwrap();
-        // `strerror(ETIMEDOUT)`: macOS and Linux word it differently.
-        let timed_out = if cfg!(target_os = "macos") {
-            "Operation timed out"
+        // `strerror(ETIMEDOUT)`: macOS and musl say "Operation timed out",
+        // glibc "Connection timed out".
+        let words: &[&str] = if cfg!(target_os = "macos") {
+            &["Operation timed out"]
         } else {
-            "Connection timed out"
+            &["Connection timed out", "Operation timed out"]
         };
-        assert_eq!(
-            notice,
-            format!(
-                "[Tessera] profile \"p\" could not start ({timed_out}); started the default shell.\r\n"
-            )
+        assert!(
+            words.iter().any(|timed_out| notice
+                == format!(
+                    "[Tessera] profile \"p\" could not start ({timed_out}); started the default shell.\r\n"
+                )),
+            "{notice:?}"
         );
         assert_eq!(
             fallback_errno(&Error::Pty(PtyError::ArgumentsTooLong { bytes: 2, max: 1 })),

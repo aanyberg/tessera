@@ -48,23 +48,22 @@ that holds the atfork lock. In #443 that was AppKit's `NSPersistentUI` queue (`a
 `-[NSPersistentUIWindowInfo initWithWindowID:]`); other samples show a CoreSpotlight queue. On macOS 27 (CI run
 44917832924) the main thread waited in libobjc's atfork handler while 71 workqueue threads waited in the runtime's
 allocator (`__tsan::ProcCreate` and `__sanitizer::InternalAlloc` on an unfair lock), and the retry hung the same way;
-the watchdog classifies that shape too. Terminal windows are not
-restorable by AppKit (the window state store restores them), which removes the `NSPersistentUI` partner but not the
-others. `scripts/app-test-watchdog.sh` kills such a host and reruns the hung test once; the run fails anyway when
-another test failed in it. The watchdog does not see the same hang in a child copy of the host, so
-`TerminationSignalTests` handles it itself (#525). A loaded child that is still not ready 20 s after launch is
-sampled, and again every 20 s after that. If one thread spent the whole sample in `wrap_fork` with an atfork prepare
-handler or `__tsan::` frames on the same stack (only the sample is read, never the child's output), the child is killed
-and started once more. The deadlock never resolves, so a retry costs about 25 s and the test stays within the default
-120 s allowance and the watchdog's 150 s limit. A second hang fails the test as the second try. A child that stays at
-the stage "the test bundle started" for 20 s without that fork hang is also killed and started once more, and
-a second such stall fails the test (#640). Under load, such a child's main thread and AppKit's
-`NSPersistentUILocalStorageClient` queue had spun in TSan's `dispatch_once` for 60 s while another thread sat in the
-runtime's allocator (`__tsan::MetaMap::AllocBlock`). The child now starts with `-ApplePersistence NO`, so AppKit
-keeps no restorable state there. xcodebuild's `-ApplePersistenceIgnoreState YES` only moves that state to a
-`<bundle id>.savedState` in the temporary directory, which every host and child of the bundle id shares. Other
-partners may remain, hence the relaunch. A test that waits for
-a child's output should wait for all of it and allow 30 s, so that it does not fail on its own on a loaded host. To
+the watchdog classifies that shape too. Terminal windows are not restorable by AppKit (the window state store restores
+them), which removes the `NSPersistentUI` partner but not the others. `scripts/app-test-watchdog.sh` kills such a host
+and reruns the hung test once; the run fails anyway when another test failed in it. The watchdog does not see the same
+hang in a child copy of the host, so `TerminationSignalTests` handles it itself (#525). A loaded child that is still not
+ready 20 s after launch is sampled, and again every 20 s after that. If one thread spent the whole sample in `wrap_fork`
+with an atfork prepare handler or `__tsan::` frames on the same stack (only the sample is read, never the child's
+output), the child is killed and started once more. The deadlock never resolves, so the retry costs about 25 s (a hung
+first try and its retry about 45-50 s in all) and the test stays within the default 120 s allowance and the watchdog's
+150 s limit. A second hang fails the test as the second try. A child that stays at the stage "the test bundle started"
+for 20 s without that fork hang is also killed and started once more, and a second such stall fails the test (#640).
+Under load, such a child's main thread and AppKit's `NSPersistentUILocalStorageClient` queue had spun in TSan's
+`dispatch_once` for 60 s while another thread sat in the runtime's allocator (`__tsan::MetaMap::AllocBlock`). The child
+now starts with `-ApplePersistence NO`, so AppKit keeps no restorable state there. xcodebuild's
+`-ApplePersistenceIgnoreState YES` only moves that state to a `<bundle id>.savedState` in the temporary directory, which
+every host and child of the bundle id shares. Other partners may remain, hence the relaunch. A test that waits for a
+child's output should wait for all of it and allow 30 s, so that it does not fail on its own on a loaded host. To
 reproduce locally, run the affected classes under TSan with `-test-iterations 20` through the watchdog (`taskpolicy -b`
 and a concurrent `cargo build`). On main that gave 1 hang in 60 iterations of `TabVisibilityTests` and
 `PromptNavigationTests`, and none in 40 with terminal windows not restorable.
@@ -110,7 +109,8 @@ A hosted test that cannot exercise what it checks on this host skips with the re
   the macOS 15 SDK (Xcode 16); linked against SDK 27, as CI and releases are since #584, it is SwiftUI's own control
   with no AppKit control to drive. They stay as coverage of older-SDK builds (#583). The binding tests in the same
   file drive the field's `doubleBinding` and `editingChanged` directly and cover the hold and hand-edit logic on every
-  SDK. On the macOS 15 runner most of them skipped too, because its synthetic drags did not move the knob.
+  SDK. On the macOS 15 runner 5 of the 8 skipped there too (the synthetic drag did not move the knob, or the press had
+  no gesture recognizer).
 - **Tests that need a visible window or a full screen transition** (`FullScreenToggleTests`, `ResizeFootprintTests`)
   skip on a locked console, where nothing is drawn and no transition finishes; CI runs them.
 
@@ -158,8 +158,10 @@ core busy, efficiency cores). The reasoning and the measurements are beside the 
 issue set it. The groups today cover the config reload (with the profile-file bound, #656), shaping, close and writer
 bounds, the DECSCUSR flood, the theme-edit bound, the search caps (including
 `the_kept_copy_and_its_spares_stay_within_the_cap`, which failed at load 35 before it fixed its budget), the plugin host
-throughput and the rectangle cost bars: the `b02_*` tests of `tests/rect.rs` and the two cluster bars of
-`tests/rect_fixes.rs`. Release-only bars are also listed in the quality gate's release timing step (`release_timing` in
+throughput, the rectangle cost bars (the `b02_*` tests of `tests/rect.rs` and the two cluster bars of
+`tests/rect_fixes.rs`), the reload capture against a plain one (#412), the alternate-screen carry's cost bar
+(`tests/stuck_modes.rs`), the DECFRA differential (`tests/rect_fixes.rs`) and the OSC 4 query flood
+(`tests/osc_color.rs`, #617); `.config/nextest.toml` has the full list. Release-only bars are also listed in the quality gate's release timing step (`release_timing` in
 `scripts/quality-gate.sh`); a bar added to one place belongs in the other, and
 `cargo nextest list --release --run-ignored all -E 'test(<name>)'` shows that the filter finds it.
 `scripts/verify-branch.sh` runs the suites such an override names, in a changed package, ten times each, so a new bar is

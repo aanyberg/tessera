@@ -146,8 +146,9 @@ a low-risk change.
 
 What runs today: allocation-counting tests (`crates/tessera-render/tests/alloc.rs`,
 `crates/tessera-grid/tests/reset.rs`), the release-only timing bars under an output flood
-(`docs/software-factory.md`, "Hang protection"), Thread Sanitizer on the app's XCTest suites, and nightly
-libFuzzer runs of the vt, grid and term targets.
+(`docs/software-factory.md`, "Hang protection"), the heap and startup budgets of `crates/tessera-ffi/tests/budgets.rs`
+(#216: an idle session, a full scrollback, startup to the first frame), Thread Sanitizer on the app's XCTest suites,
+and nightly libFuzzer runs of the vt, grid and term targets.
 
 What every change must keep:
 
@@ -157,7 +158,7 @@ What every change must keep:
 - A per-session structure that grows with output is capped (S5) and its cap is in the table above.
 
 Tracked: churn and leak checks for Rust, FFI and the app (#214); FFI fuzzing, ASan and Miri for the `unsafe` crates
-(#215); memory-per-session and startup budgets (#216).
+(#215).
 
 ## Known gaps and open decisions
 
