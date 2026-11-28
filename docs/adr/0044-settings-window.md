@@ -409,11 +409,10 @@ Known limits:
   configuration the core has applied (the escape from a stuck list in
   "Consequences", and from the hand edit's locked pane in the #344
   amendment's "The profile list's lock", now needs those 2 s after the
-  close). One timer runs at a time: Settings
-  opened again takes the model with its timer, so a model closed again
-  waits the whole 2 s of that close. The wave 22 generation token, which tells a
-  snapshot that has the window's edits from one that does not, can
-  replace this.
+  close). One timer runs at a time: Settings opened again takes the model
+  with its timer, so a model closed again waits the whole 2 s of that
+  close. The wave 22 generation token, which tells a snapshot that has the
+  window's edits from one that does not, can replace this.
 - **A pane switch commits typed text.** The panes' tab view controller
   commits the text typed into a field and not yet committed before another
   pane shows (`tabView(_:willSelect:)`): the switch takes the field away

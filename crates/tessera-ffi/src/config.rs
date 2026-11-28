@@ -812,8 +812,9 @@ fn new_profile(json: &[u8]) -> Result<NewProfile, Failure> {
 ///   (a value out of range or of the wrong type, an unknown key, a theme
 ///   that does not exist), as for `tessera_config_set`;
 /// * `TESSERA_ERROR_INVALID_ARGUMENT` when `name_cap` is below
-///   `TESSERA_MAX_PROFILE_NAME_LEN` (checked after the pointers), `profile_json` is too
-///   long, not a JSON object, has no string `"name"`, more keys than
+///   `TESSERA_MAX_PROFILE_NAME_LEN` (checked after the pointers),
+///   `profile_json` is too long, not a JSON object, has no string
+///   `"name"`, more keys than
 ///   `TESSERA_MAX_ADDED_PROFILE_KEYS`, a `null` value or a key path that
 ///   does not parse; when the app reads `MAX_PROFILES` (256) profiles
 ///   already, counting `config.toml`'s and `profiles/`'s together; when the
