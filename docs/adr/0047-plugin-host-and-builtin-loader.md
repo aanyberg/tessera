@@ -112,12 +112,13 @@ storage and a status bar in the app.
 
 `MAX_ENABLED_PLUGINS` (64) is tessera-config's, next to `[plugins]`:
 `tessera_app_core::plugins::MAX_ENABLED_PLUGINS` re-exports it and the C
-ABI exports it as `TESSERA_MAX_ENABLED_PLUGINS` (a test ties the two;
-the Settings pane reads it from there, ADR 0044). The config loader warns
-once per load of a `[plugins] enabled` past the cap, naming the cap only
-(S8), and keeps the list whole; the host still reads the first 64 ids
-and no longer warns of the rest. Its warnings for an id past 128 bytes
-or an unknown id stay as they were.
+ABI exports it as `TESSERA_MAX_ENABLED_PLUGINS` (a compile-time
+assertion in tessera-ffi and a test tie the two, #590; the Settings pane
+reads it from there, ADR 0044). The config loader warns once per load of
+a `[plugins] enabled` past the cap, naming the cap only (S8), and keeps
+the list whole; the host still reads the first 64 ids and no longer
+warns of the rest. Its warnings for an id past 128 bytes or an unknown
+id stay as they were.
 
 ## Amendment: the cap warning is logged once (#590, 2026-11-25)
 

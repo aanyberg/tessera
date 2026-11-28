@@ -383,10 +383,10 @@ any other quit event asks to quit with the quit alert over Close All's
 
 ## Amendment 2026-11-18: how Close All is reached, and a quit during its alert (#526)
 
-- **Option-click on a close button is Close All.** AppKit does not send `closeAll:` for it (corrected by the 2026-11-22
-  amendment below, which has the trace: AppKit does send `closeAll:`, in place of the `windowShouldClose` round for a
-  window without tabs and after it for a window with tabs): the button's `_close:` becomes `-[NSWindow _batchClose]` for
-  every window, which reaches each tab's `windowShouldClose`. The window controller asks its delegate there; for the
+- **Option-click on a close button is Close All.** *Correction (2026-11-22 amendment below, with the trace): this
+  amendment said AppKit sends no `closeAll:` for it. It does, in place of the `windowShouldClose` round for a window
+  without tabs and after that round for a window with tabs.* The button's `_close:` becomes `-[NSWindow _batchClose]`
+  for every window, which reaches each tab's `windowShouldClose`. The window controller asks its delegate there; for the
   release of an Option-click on a window's close button (checked against `NSApp.currentEvent`) every tab refuses, and
   the delegate runs `closeAllWindows` once, after AppKit's round, by a zero-delay `perform` so that the alert's modal
   loop does not sit inside a main-queue block. No method is swizzled. The close buttons of the tab bar's tabs are other
