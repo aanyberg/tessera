@@ -34,7 +34,9 @@
 # a run with no output and no CPU progress in the command, its descendants or its hosts for TESSERA_APP_TEST_IDLE_SECONDS
 # (default 900: 6x the 150 s limit above and 3x xcodebuild's 300 s per-test maximum, so a loaded machine does not trip it;
 # this also covers a host that died before any test started, when no test line ever arms the clock) and a run that lasts
-# more than TESSERA_APP_TEST_HARD_SECONDS (default 5400; a normal run of one suite is 7 minutes). Either trip samples the
+# more than TESSERA_APP_TEST_HARD_SECONDS (default 5400; a normal run of one suite is 7 minutes). CPU time rising by
+# more than 50 ms is progress, so a host that spins keeps the idle clock from tripping: before the first test (no test
+# clock yet) only the hard limit ends such a run. Both clocks start again with the rerun. Either trip samples the
 # command's processes and hosts, appends the last 30 output lines and the reason to the sample log, kills only the
 # command's own tree and the hosts of this run, and exits 97 with a one-line message that says HANG. Any other hang
 # this script ends exits 97 too. Any command works, not only xcodebuild (`just test` runs nextest through it): the

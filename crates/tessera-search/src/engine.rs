@@ -807,8 +807,12 @@ pub struct PieceScan {
 /// is therefore not handed to `found` (#531): it may be such a part. A
 /// literal query's match is the query's whole text, never a part, so it is
 /// kept (#569: dropping it lost a match at every cut once a stall halved
-/// the limit). The caller reports such a segment as not searched whole: a
-/// match across the cut is not found either way.
+/// the limit). A self-overlapping literal (`aa` in `aaaa`) cut inside an
+/// occurrence may be found at a shifted occurrence behind the cut, but the
+/// pieces' matches are disjoint occurrences of the query, so they never
+/// count more than the full limit's leftmost matches. The caller reports
+/// such a segment as not searched whole: a match across the cut is not
+/// found either way.
 pub fn scan_piece(
     query: &Query,
     rows: &[Line],
@@ -1162,6 +1166,37 @@ mod tests {
             let whole = query_matches(&rows, &query, PieceLimit::FULL);
             let pieces = query_matches(&rows, &query, limit(bytes, cells));
             prop_assert_eq!(pieces, whole, "{:?} in {:?}", needle, text);
+        }
+
+        /// #569, #526: a longer literal is lost where a cut splits it, and
+        /// the pieces never count more than the whole segment (their
+        /// matches are disjoint occurrences). One that cannot overlap
+        /// itself has only the whole segment's occurrences to find, so
+        /// every match piece by piece is one of the whole segment's; a
+        /// self-overlapping one (`aa`) may be found shifted behind a cut.
+        #[test]
+        fn pieces_below_the_full_limit_find_no_more_of_a_longer_literal(
+            cols in 2u16..12,
+            text in "[01a ]{0,90}",
+            bytes in 1usize..24,
+            cells in 1usize..16,
+            needle in "[01a]{2,4}",
+        ) {
+            let rows = rows(cols, &text);
+            let options = QueryOptions { regex: false, case_sensitive: true };
+            let query = Query::new(&needle, options).unwrap().unwrap();
+            let whole = query_matches(&rows, &query, PieceLimit::FULL);
+            let pieces = query_matches(&rows, &query, limit(bytes, cells));
+            prop_assert!(
+                pieces.len() <= whole.len(),
+                "{:?} in {:?}: {:?} against {:?}", needle, text, pieces, whole
+            );
+            let overlaps = (1..needle.len()).any(|n| needle[..n] == needle[needle.len() - n..]);
+            if !overlaps {
+                for m in &pieces {
+                    prop_assert!(whole.contains(m), "{m:?} not in {whole:?} ({needle:?} in {text:?})");
+                }
+            }
         }
 
         /// The run-length cell map gives every byte the cell the per-cell

@@ -645,14 +645,14 @@ rule now runs at the release.
   press's own, and an earlier one does not replace the last at the release.
   Any other new value of the key is a hand edit: at the release the model
   reloads, the control shows the edit, and the next step starts from it.
-- **What looks like no edit.** A configuration applied during the press
-  can leave the key as it was, or on an earlier value of the press: another
-  app saved over the step before the watch read it. (A profile row that
-  moved ends the press instead: the #534 and #536 amendment.) That cannot be told from the press's own values on their way, so if one
-  applied since the last write, the model reloads
-  `profileSettleTimeout` (2 s) after the release, unless the key is pressed
-  again, and the control shows what is applied. A watch slower than that
-  shows the earlier value until the last one applies.
+- **What looks like no edit.** A configuration applied during the press can
+  leave the key as it was, or on an earlier value of the press: another app
+  saved over the step before the watch read it. (A profile row that moved
+  ends the press instead: the #534 and #536 amendment.) That cannot be told
+  from the press's own values on their way, so if one applied since the last
+  write, the model reloads `profileSettleTimeout` (2 s) after the release,
+  unless the key is pressed again, and the control shows what is applied. A
+  watch slower than that shows the earlier value until the last one applies.
 - **Which value wins.** A step held back by the coalescing when the edit
   applies was taken before it and is dropped. A step taken after it, in the
   same press, is written over it: the last act wins, as for two edits in

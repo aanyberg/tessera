@@ -539,17 +539,17 @@ line (#516): it blanks the newest `C` and the prompt above it, so the older
 output in the history is refused, as after `ESC[2J`. A shell's redraw of a
 line from the history is the same erase and blanks only what is on the
 screen: a `C` above the top row stays, and its output is still offered.
-Otherwise an edit the log does not
-see moved the rows or erased the `C`, and the marks decide: the older `C`
-is offered unless a `D` with an exit status follows its next prompt's `A`
-(a command ran there, whose `C` is gone). Tessera's scripts send a bare `D`
-for a prompt that ran nothing. Limits: an edit that erases the prompt after
-the last output (its `D` with it) and moves or erases that output's `C` (a
-DL over both, a scroll region scrolled down over that prompt), or fish's
-output row, which carries both `C` and `D` (`printf abc`, a DL of exactly
-that row), makes the output above look like the last one, and it is
-selected. The other two err towards refusing: another integration that
-sends `D;status` after an empty Enter reads as a command that ran, so output
-moved off its recorded line is refused; and any `C` on the recorded line
-counts as the one recorded, so a DL whose shift equals the distance from a
-running command's `C` to that line refuses the moved output too.
+Otherwise an edit the log does not see moved the rows or erased the `C`,
+and the marks decide: the older `C` is offered unless a `D` with an exit
+status follows its next prompt's `A` (a command ran there, whose `C` is
+gone). Tessera's scripts send a bare `D` for a prompt that ran nothing.
+Limits: an edit that erases the prompt after the last output (its `D` with
+it) and moves or erases that output's `C` (a DL over both, a scroll region
+scrolled down over that prompt), or fish's output row, which carries both
+`C` and `D` (`printf abc`, a DL of exactly that row), makes the output
+above look like the last one, and it is selected. The other two err towards
+refusing: another integration that sends `D;status` after an empty Enter
+reads as a command that ran, so output moved off its recorded line is
+refused; and any `C` on the recorded line counts as the one recorded, so a
+DL whose shift equals the distance from a running command's `C` to that
+line refuses the moved output too.

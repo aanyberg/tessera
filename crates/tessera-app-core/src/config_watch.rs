@@ -2500,6 +2500,53 @@ mod tests {
         app.set_observer(None);
     }
 
+    /// #547, staged without a watcher (#526, the critic's surviving
+    /// mutants): a reconcile that finds the store's load error announces
+    /// it once, a reconcile that finds the same error again stays quiet,
+    /// and the same failure after a good load is announced again.
+    #[test]
+    fn reconcile_announces_a_load_error_once_while_it_lasts() {
+        #[derive(Clone, Default)]
+        struct Invalid(Arc<Mutex<usize>>);
+        impl SessionObserver for Invalid {
+            fn on_session_event(&self, _: SessionId, _: SessionEvent) {}
+            fn on_config_invalid(&self) {
+                *lock(&self.0) += 1;
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::new(root.path());
+        std::fs::write(paths.config_file(), "[terminal]\nscrollback_lines = 1000\n").unwrap();
+        let store = ConfigStore::open(paths.clone()).unwrap();
+        let app = App::new((*store.config()).clone(), paths.clone());
+        let heard = Invalid::default();
+        app.set_observer(Some(Box::new(heard.clone())));
+        let live = app.live();
+        live.reconcile(&store);
+        assert_eq!(*lock(&heard.0), 0, "the file loads");
+
+        let broken = "[terminal]\nscrollback_lines = 2000\nnot toml\n";
+        std::fs::write(paths.config_file(), broken).unwrap();
+        assert!(store.reload().is_err());
+        live.reconcile(&store);
+        assert_eq!(*lock(&heard.0), 1, "a new load error is announced");
+        live.reconcile(&store);
+        assert_eq!(*lock(&heard.0), 1, "the same error is not announced again");
+
+        std::fs::write(paths.config_file(), "[terminal]\nscrollback_lines = 2000\n").unwrap();
+        assert!(store.reload().is_ok());
+        live.reconcile(&store);
+        std::fs::write(paths.config_file(), broken).unwrap();
+        assert!(store.reload().is_err());
+        live.reconcile(&store);
+        assert_eq!(
+            *lock(&heard.0),
+            2,
+            "the same failure after a good load is announced again"
+        );
+        app.set_observer(None);
+    }
+
     /// #43 (R3): an edit that only reorders `[keys]` changes the chord a
     /// command's menu item shows (the first), so the watch applies it and
     /// tells the observer.

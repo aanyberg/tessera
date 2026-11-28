@@ -754,6 +754,32 @@ mod tests {
         assert!(!detail.contains(pattern), "{detail}");
     }
 
+    /// #526 (26.5): where the size advice does not help, as ADR 0042
+    /// states. Under `(?-u)` a class that can match a byte outside ASCII
+    /// could match invalid UTF-8, so the pattern becomes invalid; an ASCII
+    /// class spelled out loads. Nested repetition is too large either way.
+    #[test]
+    fn the_size_advice_does_not_fit_every_pattern() {
+        let detail_of = |pattern: &str| {
+            let loaded = Config::from_toml_lenient(&rules_toml(&[pattern.into()])).unwrap();
+            let [Warning::OutOfRange { detail, .. }] = &loaded.warnings[..] else {
+                panic!("{pattern}: {:?}", loaded.warnings);
+            };
+            detail.clone()
+        };
+        let too_big = RuleError::TooBig.to_string();
+        let invalid = RuleError::Invalid.to_string();
+        for pattern in [".{5000}", r"\W{100}", r"\D{500}"] {
+            assert_eq!(detail_of(pattern), too_big, "{pattern}");
+            assert_eq!(detail_of(&format!("(?-u){pattern}")), invalid, "{pattern}");
+        }
+        let loaded = Config::from_toml_lenient(&rules_toml(&["[ -~]{5000}".into()])).unwrap();
+        assert_eq!(loaded.warnings, []);
+        for pattern in ["a{1000}{1000}", "(?-u)a{1000}{1000}"] {
+            assert_eq!(detail_of(pattern), too_big, "{pattern}");
+        }
+    }
+
     /// Every built-in rule compiles within half the bound, so a user's copy
     /// of one, or of one with a class added, still loads.
     #[test]

@@ -2480,8 +2480,9 @@ mod tests {
                 if pattern == NO_MATCH {
                     assert_eq!(status.matches, 0, "{name}: {status:?}");
                 } else if pattern != COSTLY_RUN {
-                    // A one-cell match touching a halved cut is dropped
-                    // (#531): at most two per cut, fewer than two per piece.
+                    // A one-cell regex match touching a halved cut is
+                    // dropped (#531): at most two per cut, fewer than two
+                    // per piece.
                     assert!(
                         skips > 0 || status.matches + 2 * pieces_run >= cells,
                         "{name}, budget {budget:?}: {status:?}, {cells} cells, \
@@ -2582,8 +2583,8 @@ mod tests {
         );
         assert!(status.matches <= cells, "{status:?}: counted twice");
         let skips = search.active.as_ref().unwrap().skips;
-        // A one-cell match touching a halved cut is dropped (#531): at
-        // most two per cut, so fewer than two per piece run.
+        // A one-cell regex match touching a halved cut is dropped
+        // (#531): at most two per cut, so fewer than two per piece run.
         assert!(
             skips > 0 || (status.matches < cells && status.matches + 2 * pieces >= cells),
             "{status:?}, {pieces} pieces"
