@@ -730,10 +730,11 @@ escape(c):
 
 ### 7c ROWS  (input cells -> expected strings; colours given as resolved #rrggbb)
 ### RT-1 plain                    cells: "hi"
-html: <!DOCTYPE html><html><head><meta charset="utf-8"></head><body><pre style="font-family:Menlo,monospace">\nhi</pre></body></html>        (\n = one LF byte)
+    # In the RT rows, \n in an expected string stands for one LF byte.
+html: <!DOCTYPE html><html><head><meta charset="utf-8"></head><body><pre style="font-family:Menlo,monospace">\nhi</pre></body></html>
 rtf:  {\rtf1\ansi\ansicpg1252\deff0{\fonttbl{\f0\fmodern Menlo;}}{\colortbl;}\f0\fs24 hi}
 ### RT-2 red bold then newline     cells: line1 "a" fg #ff0000 bold ; line2 "b" default
-html body: <span style="color:#ff0000;font-weight:bold">a</span>\nb          (\n = one LF byte)
+html body: <span style="color:#ff0000;font-weight:bold">a</span>\nb
 rtf:  {\rtf1\ansi\ansicpg1252\deff0{\fonttbl{\f0\fmodern Menlo;}}{\colortbl;\red255\green0\blue0;}\f0\fs24 {\cf1 \b a}\par b}
 ### RT-3 hostile text              cells: <script>&"'\{}é😀   (plain style)
 html body: &lt;script&gt;&amp;&quot;&#39;&#92;&#123;&#125;&#xe9;&#x1f600;
