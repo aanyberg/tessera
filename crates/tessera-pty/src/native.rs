@@ -232,32 +232,28 @@ impl NativePty {
     /// # Errors
     ///
     /// [`PtyError::InvalidSize`] if the requested size has zero rows or
-    /// columns, [`PtyError::ArgumentsTooLong`] if the arguments and
-    /// environment exceed what `execve(2)` accepts (checked before
-    /// anything is opened or forked), [`PtyError::Open`] if no PTY could be
-    /// allocated (an open that lost the kernel's pty allocation race to a
-    /// concurrent one, in this or another process, is retried a few times
-    /// first, #563) or the `pty-open` helper thread could not be started
-    /// (`EAGAIN` when the process is out of threads), [`PtyError::Spawn`]
-    /// if the program is missing, a directory or not executable, if it is
-    /// a `#!` script whose
-    /// interpreter is missing, not a regular file or not executable
-    /// (checked before anything is opened or forked; a script with CRLF
-    /// line endings names `/bin/sh\r` and is refused with a hint), or if
-    /// an argument or variable contains a NUL byte,
-    /// [`PtyError::ProgramTimedOut`] if the file system gave no answer
-    /// within 5 s while the program was looked up (see below; the error
-    /// names the step that got no answer: the working directory, `$SHELL`
-    /// or the program),
-    /// [`PtyError::ProgramLookupBusy`] if the lookup was not made because
-    /// four earlier lookups or checks are still stuck (see below),
-    /// [`PtyError::OpenTimedOut`] if opening the PTY gave no answer within
-    /// 5 s, four earlier opens are still without one, or every open helper
-    /// stayed busy with earlier opens for the whole 5 s (the open runs on
-    /// a helper thread, so a `grantpt(3)` that never returns fails this
-    /// spawn only), [`PtyError::Io`] if the
-    /// reader or writer side of the master or one of their threads could
-    /// not be set up.
+    /// columns, [`PtyError::ArgumentsTooLong`] if the arguments and environment
+    /// exceed what `execve(2)` accepts (checked before anything is opened or
+    /// forked), [`PtyError::Open`] if no PTY could be allocated (an open that
+    /// lost the kernel's pty allocation race to a concurrent one, in this or
+    /// another process, is retried a few times first, #563) or the `pty-open`
+    /// helper thread could not be started (`EAGAIN` when the process is out of
+    /// threads), [`PtyError::Spawn`] if the program is missing, a directory or
+    /// not executable, if it is a `#!` script whose interpreter is missing, not
+    /// a regular file or not executable (checked before anything is opened or
+    /// forked; a script with CRLF line endings names `/bin/sh\r` and is refused
+    /// with a hint), or if an argument or variable contains a NUL byte,
+    /// [`PtyError::ProgramTimedOut`] if the file system gave no answer within
+    /// 5 s while the program was looked up (see below; the error names the step
+    /// that got no answer: the working directory, `$SHELL` or the program),
+    /// [`PtyError::ProgramLookupBusy`] if the lookup was not made because four
+    /// earlier lookups or checks are still stuck (see below),
+    /// [`PtyError::OpenTimedOut`] if opening the PTY gave no answer within 5 s,
+    /// four earlier opens are still without one, or every open helper stayed
+    /// busy with earlier opens for the whole 5 s (the open runs on a helper
+    /// thread, so a `grantpt(3)` that never returns fails this spawn only),
+    /// [`PtyError::Io`] if the reader or writer side of the master or one of
+    /// their threads could not be set up.
     ///
     /// Every error leaves nothing behind: a child started before the
     /// failure is killed and reaped, and both ends of the PTY are closed.
