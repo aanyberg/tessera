@@ -194,8 +194,8 @@ fi
 
 # The release timing run selects the b02_* cost bars of tessera-term's rect tests next to tessera-app-core's bars, in a
 # release build.
-if grep -q -- '--release -p tessera-app-core -p tessera-term -p tessera-config -p tessera-ffi -E' "$work/cargo.calls" \
-    && grep -q 'package(tessera-term) & binary(=rect) & test(b02_)' "$work/cargo.calls"; then
+if grep -q -- '--release -p tessera-app-core -p tessera-term -p tessera-config -p tessera-ffi -p tessera-render -E' \
+    "$work/cargo.calls" && grep -q 'package(tessera-term) & binary(=rect) & test(b02_)' "$work/cargo.calls"; then
     ok "the release timing run includes the tessera-term b02_ tests"
 else
     not_ok "the release timing run lacks the b02_ tests: $(< "$work/cargo.calls")"

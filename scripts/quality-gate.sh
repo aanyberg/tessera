@@ -192,9 +192,9 @@ ffi_c_tests_step() {
 # `#[ignore]`d one-MiB run stays out), the two cluster bars of tests/rect_fixes.rs, the config edit among 20 000
 # mark-like lines (tessera-config, tests/edit.rs), the plugin host throughput, the reload capture against a plain one
 # (`a_reload_capture_costs_`, #412), the alternate-screen carry's cost bar (tests/stuck_modes.rs, a ratio of interleaved
-# runs), the ten-million-case DECFRA differential (tests/rect_fixes.rs, no clock), the font index walk of twenty thousand
-# faces sharing one hostile cmap (tessera-render), and the three budgets of tessera-ffi's tests/budgets.rs (#216: an
-# idle session's heap, a full scrollback's heap, startup to the first frame).
+# runs), the ten-million-case DECFRA differential (tests/rect_fixes.rs, no clock), the font index walk of twenty
+# thousand faces sharing one hostile cmap (tessera-render), and the three budgets of tessera-ffi's tests/budgets.rs
+# (#216: an idle session's heap, a full scrollback's heap, startup to the first frame).
 # Every one of them is in the `timing` test group of .config/nextest.toml (one at a time; #603). A failure under load
 # (1-min load average >= the core count) is retried once; a second failure, any failure below that load and any failure
 # of the build (`--no-run`) fail the gate.
