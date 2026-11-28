@@ -200,7 +200,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// `NSApp.orderedWindows` lists its windows in the order they opened
     /// (#414). Weak, so a window closed meanwhile is not kept.
     private var windowsStackedAtHide: [WeakWindow]?
-    /// Takes and clears ``windowsStackedAtHide``.
+    /// Takes and clears ``windowsStackedAtHide``. Never removed: the
+    /// delegate lives as long as the app (#414 m3).
     private var hideObservers: [any NSObjectProtocol] = []
     /// The profile each session was started with, by session id, for the
     /// sessions started with one; the rest have `[general]

@@ -485,7 +485,9 @@ enum FontFamilies {
     }()
 }
 
-/// What `SettingsPanels.present` may do with an open panel: `NSOpenPanel`
+/// The ways `SettingsPanels.present` could run an open panel: as a sheet
+/// or on its own, which it does, and app-modally (`runModal`), which it
+/// must not, listed so a recording panel sees it if it did. `NSOpenPanel`
 /// is the only conformer outside tests. A test seam: a recording panel
 /// shows how `present` ran it without a real panel, whose out-of-process
 /// bridge can block the main thread for a minute (#492).

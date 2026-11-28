@@ -1970,7 +1970,11 @@ extension SettingsTests {
     /// buttons take no synthetic click in a hosted window, so the test
     /// presents a panel as they do: a recording one, since a real panel's
     /// bridge can block the main thread for a minute in a full run, #492.)
-    func testTheOpenPanelsAreSheetsOnTheSettingsWindow() throws {
+    /// Import Theme…'s own wiring last: its sheet is on the Settings window,
+    /// a cancelled one imports nothing, and the file chosen is imported and
+    /// selected (21.6a m1; Choose…'s is
+    /// ``testChooseAfterTypedTextKeepsTheChosenDirectory``).
+    func testTheOpenPanelsAreSheetsOnTheSettingsWindow() async throws {
         let model = try openSettings(config: "")
         let controller = try XCTUnwrap(appDelegate.settingsWindowController)
         let window = try XCTUnwrap(controller.window)
@@ -1995,6 +1999,31 @@ extension SettingsTests {
         let alone = RecordingOpenPanel(url: file)
         SettingsPanels.present(alone, on: nil) { chosen.append($0) }
         XCTAssertEqual(alone.runs, [.alone])
+
+        let dir = try XCTUnwrap(dir)
+        let themes = dir.appendingPathComponent("themes")
+        let scheme = dir.appendingPathComponent("Mine.itermcolors")
+        try itermcolors(at: scheme)
+        // Cancelled: nothing imported. The import is asynchronous, so the
+        // test waits for any write a mutant importing the panel's URL
+        // before the sheet ends would have started.
+        let declined = RecordingOpenPanel(url: scheme)
+        AppearancePane.importTheme(declined, model)
+        XCTAssertEqual(declined.runs, [.sheet(on: ObjectIdentifier(window))], "Import Theme…: a sheet on the window")
+        declined.end(.cancel)
+        try await waitUntil("no write in flight") { !model.isWriting }
+        XCTAssertEqual((try? FileManager.default.contentsOfDirectory(atPath: themes.path)) ?? [], [], "no theme file")
+        XCTAssertFalse(model.themes.contains { $0.source == .user }, "cancelled: nothing imported")
+        XCTAssertEqual(model.value("appearance.theme"), .string("Tessera Dark"), "cancelled: the theme stays")
+
+        let theme = RecordingOpenPanel(url: scheme)
+        AppearancePane.importTheme(theme, model)
+        XCTAssertEqual(theme.runs, [.sheet(on: ObjectIdentifier(window))], "Import Theme…: a sheet on the window")
+        theme.end(.OK)
+        try await waitUntil("Import Theme… imported the file chosen and selected it") {
+            guard !model.isWriting, let id = model.themes.first(where: { $0.source == .user })?.id else { return false }
+            return model.value("appearance.theme") == .string(id)
+        }
     }
 
     /// A real open panel (the directory one) becomes a sheet on the
