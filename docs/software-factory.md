@@ -395,28 +395,28 @@ Agents use these instead of rebuilding the setup in every run:
   because the fuzzers are a development tool that is never distributed.
 - **Performance and memory job (#612, ADR 0049).** `.github/workflows/perf.yml` runs every other day (05:00 UTC on odd
   days of the month, or on demand; `force` measures even when main has not moved) on the `xcode-27` runner and never
-  gates a PR. Its first step (`scripts/perf-job.sh check`) ends the job early when `main`'s head is the SHA of the
-  last run that measured. Otherwise it runs the gate's release timing step (packages and filter read from
+  gates a PR. Its first step (`scripts/perf-job.sh check`) ends the job early when `main`'s head is the SHA of the last
+  run that measured. Otherwise it runs the gate's release timing step (packages and filter read from
   `scripts/quality-gate.sh`, the #216 byte budgets among them, minus the startup wall-time budget a runner cannot meet,
   run with `--no-fail-fast`; what the job enforces is listed in `docs/testing.md`) and the fixed case set of
-  `scripts/perf-cases.rs` (feed,
-  scroll, search, cat, rewrap and vtebench through `cargo xtask ab` against the last measured SHA that had no
-  regression; idle and full-scrollback heap of a `Terminal` only, about a third of an idle session, and the heap of
-  10 000 plain or mixed scrollback lines, through the probe's counting allocator; the peak resident set of 1 000 000
-  lines through `/usr/bin/time -l`; session-level growth is guarded by the #216 budgets in the release timing step). One JSON line per case (`sha`, `base`, `instructions`,
-  `heap_bytes`, `ratio`, `status`) is appended to `perf-state/perf.jsonl`, kept in the Actions cache between runs and
-  uploaded as the `perf-trend` artifact. A case over 1.02 in all three probe builds (the reverse of the review rule
-  above, where all three must be under; ADR 0049 D3), or a heap over 1.02 of the
-  baseline's (or over the bar of an accepted step in `scripts/perf-steps.txt` that the baseline does not have yet), opens or comments on a `type:bug` issue ("perf: the scheduled performance job found a regression")
-  naming the SHA range; a failed timing step does not stop the case set, the state or the trend; it files its own issue ("perf: the scheduled
-  performance job failed"). The job's token is `contents: read` and `issues:
-  write`. Triage the issue like any bug (the lead may bisect with `cargo xtask ab`); a `noisy` line means the machine
-  was too loaded to back a verdict (the case is under the instrument's noise floor), not a regression. The job's logic
-  is `scripts/perf-job.sh` (`just perf-job <state dir>` for a local run, `PERF_JOB_GH=echo` to see the issue request
+  `scripts/perf-cases.rs` (feed, scroll, search, cat, rewrap and vtebench through `cargo xtask ab` against the last
+  measured SHA that had no regression; idle and full-scrollback heap of a `Terminal` only, about a third of an idle
+  session, and the heap of 10 000 plain or mixed scrollback lines, through the probe's counting allocator; the peak
+  resident set of 1 000 000 lines through `/usr/bin/time -l`; session-level growth is guarded by the #216 budgets in the
+  release timing step). One JSON line per case (`sha`, `base`, `instructions`, `heap_bytes`, `ratio`, `status`) is
+  appended to `perf-state/perf.jsonl`, kept in the Actions cache between runs and uploaded as the `perf-trend` artifact.
+  A case over 1.02 in all three probe builds (the reverse of the review rule above, where all three must be under; ADR
+  0049 D3), or a heap over 1.02 of the baseline's (or over the bar of an accepted step in `scripts/perf-steps.txt` that
+  the baseline does not have yet), opens or comments on a `type:bug` issue ("perf: the scheduled performance job found a
+  regression") naming the SHA range; a failed timing step does not stop the case set, the state or the trend; it files
+  its own issue ("perf: the scheduled performance job failed"). The job's token is `contents: read` and `issues: write`.
+  Triage the issue like any bug (the lead may bisect with `cargo xtask ab`); a `noisy` line means the machine was too
+  loaded to back a verdict (the case is under the instrument's noise floor), not a regression. The job's logic is
+  `scripts/perf-job.sh` (`just perf-job <state dir>` for a local run, `PERF_JOB_GH=echo` to see the issue request
   instead of sending it) with the offline self-test `just perf-job-test`; run that after changing either script or
   `perf.yml`, next to `actionlint`. Its logs are the `perf-logs` artifact of the run. A dispatch from a branch measures
-  that branch with `PERF_JOB_GH=echo` semantics and saves no state; the dispatch on a fix branch is how a change to
-  the job is verified.
+  that branch with `PERF_JOB_GH=echo` semantics and saves no state; the dispatch on a fix branch is how a change to the
+  job is verified.
 - **Wave stats.** `scripts/factory-stats.sh --since <t> --until <t> <session dir>` prints the per-role and per-agent
   cost tables (output tokens, cache reads, tool calls, span and active minutes) for the retro. (Historical, teammate
   era, waves 18 to 21.) When the session is the lead of an agent team, it counts every sibling transcript of the lead's
