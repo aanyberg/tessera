@@ -221,6 +221,10 @@ final class SettingsModel {
     /// notice it left: a configuration that shows it after all (a watch
     /// slower than the settle time) takes the notice back (#344 m2).
     @ObservationIgnored private var released: (change: ReleasedChange, notice: String)?
+    /// The delete ``profileNotDeletedNotice`` is about, and the profiles it
+    /// was queued against: a configuration that shows it removed after all
+    /// (the hand edit removed the profile) takes the notice back (#590).
+    @ObservationIgnored private var refusedDelete: (key: String, base: [TesseraConfigValue])?
     /// The edits of profiles that met an external edit of the file
     /// (`Conflict`) and wait to be written again, in the order they began
     /// to wait (``awaitProfileRetry(_:name:)``, #549): written again oldest
@@ -301,17 +305,20 @@ final class SettingsModel {
         }
     }
 
-    /// The notice of the profile list for a profile's value not written
-    /// again after a conflict: a hand edit removed or renamed the profile.
+    /// The notice of the profile list for a profile's value not written: a
+    /// hand edit removed or renamed the profile, or (after a conflict) gave
+    /// another profile its name too.
     static let profileGoneNotice =
-        "A profile’s value was not saved: config.toml was changed by hand and that profile is no longer in it."
+        "A profile’s value was not saved: config.toml was changed by hand and that profile is no longer in it "
+        + "under its name, or another profile has that name too."
     /// The notice of the profile list for a delete not written: a hand edit
-    /// renamed the profile (it is still there, under another name) or
-    /// removed it, and the configuration applied does not show which yet
-    /// (#590).
+    /// renamed the profile (it is still there, under another name), gave
+    /// another profile its name too, or removed it, and the configuration
+    /// applied does not show which yet (#590). Taken back once it shows
+    /// the profile removed (``withdrawNotDeletedNotice()``).
     static let profileNotDeletedNotice =
         "A profile was not deleted: config.toml was changed by hand and that profile is no longer in it under "
-        + "its name. If it is still listed, delete it again."
+        + "its name, or another profile has that name too. If it is still listed, delete it again."
 
     /// A profile being added.
     private struct Addition {
@@ -434,6 +441,7 @@ final class SettingsModel {
         }
         endAdditionIfApplied(masking: masks)
         withdrawReleaseNotice()
+        withdrawNotDeletedNotice()
         if messages[Self.pluginsKey] == Self.pluginsFullRefusal,
             value(Self.pluginsKey)?.array != pluginsRefusedAt
         {
@@ -528,6 +536,29 @@ final class SettingsModel {
         }
         self.released = nil
         if messages[Self.profilesKey] == released.notice { messages[Self.profilesKey] = nil }
+    }
+
+    /// Shows ``profileNotDeletedNotice`` for the delete of `key`, not
+    /// written, and keeps what it was queued against for
+    /// ``withdrawNotDeletedNotice()``.
+    private func showNotDeletedNotice(_ key: String) {
+        messages[Self.profilesKey] = Self.profileNotDeletedNotice
+        refusedDelete = movedFrom[key].map { (key, $0) }
+    }
+
+    /// Takes back ``profileNotDeletedNotice`` once the applied
+    /// configuration shows the profiles its delete was queued against
+    /// without that profile: a hand edit removed it, and there is nothing
+    /// left to delete. Another notice in its place ends this, and is kept.
+    private func withdrawNotDeletedNotice() {
+        guard let refusedDelete else { return }
+        guard messages[Self.profilesKey] == Self.profileNotDeletedNotice else {
+            self.refusedDelete = nil
+            return
+        }
+        guard deleteShown(refusedDelete.key, .null, from: refusedDelete.base) else { return }
+        self.refusedDelete = nil
+        messages[Self.profilesKey] = nil
     }
 
     /// Ends the written add of a profile once the configuration lists it
@@ -950,6 +981,7 @@ final class SettingsModel {
             profileSettle?.cancel()
             profileSettle = nil
             released = nil
+            refusedDelete = nil
         }
         let edits = addressed(edits).map { edit in
             var edit = edit
@@ -1147,7 +1179,7 @@ final class SettingsModel {
                 if !deletes {
                     messages[Self.profilesKey] = Self.profileGoneNotice
                 } else if !deleteShown(key, .null, from: movedFrom[key]) {
-                    messages[Self.profilesKey] = Self.profileNotDeletedNotice
+                    showNotDeletedNotice(key)
                 }
             } else {
                 messages[key] = Self.displayMessage(error)
@@ -1246,7 +1278,7 @@ final class SettingsModel {
             } else if !movesProfiles(key, retry.edits.first?.value ?? .null) {
                 messages[Self.profilesKey] = Self.profileGoneNotice
             } else if !deleteShown(key, .null, from: movedFrom[key]) {
-                messages[Self.profilesKey] = Self.profileNotDeletedNotice
+                showNotDeletedNotice(key)
             }
             // Queued again before the old keys finish, so a key written
             // again where it was keeps its value shown.
@@ -1662,6 +1694,7 @@ final class SettingsModel {
         profileSettle?.cancel()
         profileSettle = nil
         released = nil
+        refusedDelete = nil
         addition = Addition(
             listed: snapshot["profiles"]?.array ?? [],
             keys: Dictionary(keys, uniquingKeysWith: { $1 }), masks: pending, added: nil,

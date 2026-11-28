@@ -949,10 +949,22 @@ This corrects "a delete has nothing left to do" in the #549 amendment and
   if it is still listed it can be deleted again. A delete again addresses
   the name the list shows by then. The list is not locked, and no message
   goes by the row at the old index.
+- **Notice text and withdrawal (#590 review minors).** The notice, and
+  `profileGoneNotice` for a value, say that the profile is no longer in
+  `config.toml` under its name or that another profile has that name too:
+  after a conflict, an edit is not written again when more than one
+  profile has its name either. A configuration applied after the refusal
+  that shows the delete's profiles without that one (the hand edit removed
+  it) takes the notice back, as for the #344 release notice; another
+  notice in the list's slot by then is kept, and a new add or delete ends
+  the watch.
 - **Tests.** `SettingsTests.testADeleteOfAProfileRenamedByHandShowsTheListsNotice`,
   `testADeleteRetriedAfterAHandEditRenamedItsProfileShowsTheListsNotice`
   and, on the core, `testADeleteOfAProfileRenamedInTheFileDeletesNothingAndSaysSo`
   show the notice and no write; `testADeleteOfAProfileRemovedByHandAndAppliedSaysNothing`
   and `testAProfileEditRetriedAfterAHandEditRemovedItsProfileIsDropped`
   keep a delete of a profile the applied configuration shows removed
-  silent.
+  silent; `testAnEditRetriedWhenTwoProfilesHaveItsNameShowsTheListsNotice`
+  covers the notices after a hand edit that leaves two profiles of the
+  name, and `testTheNotDeletedNoticeIsWithdrawnOnceTheRemovalApplies` and
+  `testTheNotDeletedNoticeWithdrawalKeepsAnotherNotice` the withdrawal.
