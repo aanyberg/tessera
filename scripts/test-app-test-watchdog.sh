@@ -507,6 +507,8 @@ spinner_idle=$(( 4 * idle_scale )) spinner_secs=$(( 4 * idle_scale + 5 ))
 # At most 25 s: the rerun rows run two attempts, and each case has a 120 s alarm.
 scaled_limit=$(( limit * idle_scale > 25 ? 25 : limit * idle_scale ))
 chat_idle=$(( 6 * idle_scale )) chat_ticks=$(( 3 * idle_scale + 2 ))
+# By construction 2 * chat_ticks - 1 > chat_idle and spinner_secs > spinner_idle, so a run that lasts its full length has
+# outlasted its idle limit; the asserts below test the duration only.
 # One process spinning without a byte of output, past its idle limit: only its CPU time is progress (a bounded single
 # process, no load generator). Time::HiRes: the core `time` is whole seconds, which cuts the spin short by up to 1 s.
 start_direct spinner "TESSERA_APP_TEST_IDLE_SECONDS=$spinner_idle" - perl -MTime::HiRes=time -e '$t = time + shift; 1 while time < $t' "$spinner_secs"
@@ -598,14 +600,14 @@ else
     not_ok "a passing command: exit $st: $out / $err"
 fi
 direct slow-chat
-if (( st == 0 && secs >= 2 * chat_ticks - 1 && secs > chat_idle )) && [[ "$err" != *HANG* && "$out" == *"tick $chat_ticks"* ]]; then
+if (( st == 0 && secs >= 2 * chat_ticks - 1 )) && [[ "$err" != *HANG* && "$out" == *"tick $chat_ticks"* ]]; then
     ok "a command that outlasts the idle limit but keeps printing is not a hang"
 else
     not_ok "a chatty command: exit $st after $(sec "$secs") s (${chat_ticks} ticks, idle limit ${chat_idle} s): $err"
 fi
 
 direct spinner
-if (( st == 0 && secs >= spinner_secs && secs > spinner_idle )) && [[ "$err" != *HANG* && "$out" != *HANG* ]]; then
+if (( st == 0 && secs >= spinner_secs )) && [[ "$err" != *HANG* && "$out" != *HANG* ]]; then
     ok "a silent command that keeps using CPU for longer than the idle limit is not a hang (CPU progress)"
 else
     not_ok "a silent spinner: exit $st after $(sec "$secs") s (spin ${spinner_secs} s, idle limit ${spinner_idle} s): $out $err"
