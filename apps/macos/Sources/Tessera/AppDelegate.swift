@@ -1420,6 +1420,10 @@ extension AppDelegate: TerminalWindowControllerDelegate {
         if let unseen = controller.takeUnseenClipboardNotice() {
             let tabBar = (controller.window as? TerminalWindow)?.tabBarAsItClosed ?? []
             let siblings = tabBar.map { WeakWindow(window: $0) }
+            // Defensive: with the tab bar recorded as the tab began to close,
+            // its next selected tab is already picked here on this host (a
+            // synchronous adopt passes the tab tests), but AppKit does not
+            // promise that during `windowWillClose`.
             Task { @MainActor [weak self] in
                 self?.adoptClipboardNotice(unseen, fromTabsOf: siblings)
             }
@@ -1450,7 +1454,9 @@ extension AppDelegate: TerminalWindowControllerDelegate {
             return false
         }
         let windows = windowsFrontToBack()
-        // The first candidate that takes them.
+        // The first candidate that takes them. The minimised filter is belt
+        // and braces: `orderedWindows` already lists minimised windows after
+        // those on screen.
         let candidates = siblings.compactMap(\.window) + windows.filter { !$0.isMiniaturized } + windows
         guard !candidates.contains(where: adopt(into:)) else { return }
         if let controller = controllers.first {

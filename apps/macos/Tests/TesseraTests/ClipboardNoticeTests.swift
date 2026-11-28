@@ -636,6 +636,9 @@ final class ClipboardNoticeTests: XCTestCase {
         try await release(closing)
         try await waitUntil("the notice shows") { closing.clipboardNotice.shownCount == 1 }
         // Away at once, for longer than a notice stays: it has not been seen.
+        // Closing the background tab selects it for a moment, which shows
+        // the notice again before it moves, so this covers the tab path,
+        // not a pane closing while hidden (the maximized-pane test does).
         closingWindow.selectPreviousTab(nil)
         XCTAssertFalse(closing.isShownToUser)
         try await Task.sleep(for: ClipboardNoticeView.holdDuration + .milliseconds(500))
@@ -663,6 +666,28 @@ final class ClipboardNoticeTests: XCTestCase {
         closingWindow.close()
         try await waitUntil("the notice shows on the tab left") { kept.clipboardNotice.shownCount == 1 }
         XCTAssertEqual(kept.clipboardNotice.lastShown, .init(writes: 1, bytes: 5, closedWrites: 1))
+    }
+
+    func testANoticeHiddenBeforeItsTimeMovesWhenItsPaneExits() async throws {
+        let remaining = try openTab("echo kept")
+        let controller = try XCTUnwrap(appDelegate.windowControllers.first)
+        // Writes, shows its notice, then exits 0 once let go: its pane closes.
+        appDelegate.spawnOptions = .init(program: "/bin/sh", arguments: ["-c", "\(Self.hello); read go"])
+        let closing = onScreen(try XCTUnwrap(controller.splitFocusedPane(.right)).view)
+        try await waitUntil("the notice shows") { closing.clipboardNotice.shownCount == 1 }
+        // Behind the maximized pane left at once, for longer than a notice
+        // stays: it has not been seen.
+        controller.focus(try XCTUnwrap(controller.panes.first { $0.view === remaining }))
+        controller.toggleZoomPane(nil)
+        XCTAssertTrue(controller.isZoomed)
+        XCTAssertFalse(closing.isShownToUser)
+        try await Task.sleep(for: ClipboardNoticeView.holdDuration + .milliseconds(500))
+        XCTAssertFalse(closing.isShownToUser)
+        XCTAssertEqual(remaining.clipboardNotice.shownCount, 0)
+        try closing.session.write(Array("\n".utf8))
+        try await waitUntil("the pane closes") { controller.panes.count == 1 }
+        try await waitUntil("the notice shows on the pane left") { remaining.clipboardNotice.shownCount == 1 }
+        XCTAssertEqual(remaining.clipboardNotice.lastShown, .init(writes: 1, bytes: 5, closedWrites: 1))
     }
 
     func testAHeldWriteOfAPaneThatExitsShowsOnThePaneLeft() async throws {
