@@ -305,6 +305,13 @@ final class SettingsModel {
     /// again after a conflict: a hand edit removed or renamed the profile.
     static let profileGoneNotice =
         "A profile’s value was not saved: config.toml was changed by hand and that profile is no longer in it."
+    /// The notice of the profile list for a delete not written: a hand edit
+    /// renamed the profile (it is still there, under another name) or
+    /// removed it, and the configuration applied does not show which yet
+    /// (#590).
+    static let profileNotDeletedNotice =
+        "A profile was not deleted: config.toml was changed by hand and that profile is no longer in it under "
+        + "its name. If it is still listed, delete it again."
 
     /// A profile being added.
     private struct Addition {
@@ -1134,8 +1141,14 @@ final class SettingsModel {
             if error.kind == .noSuchProfile {
                 // A hand edit renamed or removed the profile since it was
                 // listed: the row at its index may be another one's, so the
-                // list says so; a delete has nothing left to do (#565).
-                if !deletes { messages[Self.profilesKey] = Self.profileGoneNotice }
+                // list says so (#565). A delete has nothing left to do only
+                // if the configuration applied shows the profile gone; one
+                // renamed is still there (#590).
+                if !deletes {
+                    messages[Self.profilesKey] = Self.profileGoneNotice
+                } else if !deleteShown(key, .null, from: movedFrom[key]) {
+                    messages[Self.profilesKey] = Self.profileNotDeletedNotice
+                }
             } else {
                 messages[key] = Self.displayMessage(error)
                 if deletes {
@@ -1198,8 +1211,10 @@ final class SettingsModel {
     /// at the index of the one profile listed under the name the edit was
     /// made for (or, for an edit queued behind a rename, under the new
     /// name once the rename applied), each `.show`ing its next conflict. With no such profile,
-    /// they are dropped: a delete has nothing left to do, a value is not
-    /// saved and the list says so. Run while the list is locked by an add
+    /// they are dropped: a value is not saved and the list says so; a
+    /// delete has nothing left to do if the configuration shows its
+    /// profile gone, and if not (a hand edit renamed the profile) the list
+    /// says it was not deleted (#590). Run while the list is locked by an add
     /// or delete, they are not written either, with the list's notice.
     private func retryProfileEdits(due: Int? = nil) {
         for id in profileRetries.keys.sorted() {
@@ -1230,6 +1245,8 @@ final class SettingsModel {
                 }
             } else if !movesProfiles(key, retry.edits.first?.value ?? .null) {
                 messages[Self.profilesKey] = Self.profileGoneNotice
+            } else if !deleteShown(key, .null, from: movedFrom[key]) {
+                messages[Self.profilesKey] = Self.profileNotDeletedNotice
             }
             // Queued again before the old keys finish, so a key written
             // again where it was keeps its value shown.

@@ -931,3 +931,28 @@ not by the app.
   freed within a budget scaled by the load. An async test that must free
   a Settings model opens it, lets a pass run (`Task.sleep`), then closes
   it, as the PluginsPane tests do.
+
+## Amendment: a delete of a profile renamed by hand (#590, 2026-11-28)
+
+This corrects "a delete has nothing left to do" in the #549 amendment and
+"a delete has nothing left to do and says nothing" in the #565 amendment.
+
+- **A delete whose name is gone is not dropped silently.** The core
+  refuses it with `NoSuchProfile` (or, after a `Conflict`, the
+  configuration applied lists no profile, or more than one, of the name it
+  was queued with), and writes nothing. The hand edit may have removed the
+  profile, but it may also have renamed it, and then the profile is still
+  there. Unless the configuration applied already shows the profiles the
+  delete was queued against without that one (the test the model uses to
+  see a delete applied), the list shows
+  `SettingsModel.profileNotDeletedNotice`: the profile was not deleted, and
+  if it is still listed it can be deleted again. A delete again addresses
+  the name the list shows by then. The list is not locked, and no message
+  goes by the row at the old index.
+- **Tests.** `SettingsTests.testADeleteOfAProfileRenamedByHandShowsTheListsNotice`,
+  `testADeleteRetriedAfterAHandEditRenamedItsProfileShowsTheListsNotice`
+  and, on the core, `testADeleteOfAProfileRenamedInTheFileDeletesNothingAndSaysSo`
+  show the notice and no write; `testADeleteOfAProfileRemovedByHandAndAppliedSaysNothing`
+  and `testAProfileEditRetriedAfterAHandEditRemovedItsProfileIsDropped`
+  keep a delete of a profile the applied configuration shows removed
+  silent.

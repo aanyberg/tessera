@@ -3606,7 +3606,7 @@ extension SettingsTests {
     /// edit renamed or removed it, not applied yet) writes nothing, shows
     /// the list's notice and not a message on the row at its index (now
     /// perhaps another profile's), and the row shows the configuration's
-    /// value again; a delete of it has nothing left to do and says nothing.
+    /// value again.
     func testAProfileEditWhoseNameIsGoneShowsTheListsNotice() async throws {
         let (model, _, writer) = try fakeModel(Self.fakeConfig)
         writer.resolveProfile = { name, _ in name == "one" ? 0 : nil }
@@ -3617,15 +3617,104 @@ extension SettingsTests {
         XCTAssertNil(model.message("profiles[1].command"))
         XCTAssertNil(model.value("profiles[1].command"))
         XCTAssertFalse(model.profileEditsUnwritten)
+    }
 
-        let (deleting, _, deleteWriter) = try fakeModel(Self.fakeConfig)
-        deleteWriter.resolveProfile = { name, _ in name == "one" ? 0 : nil }
-        XCTAssertTrue(deleting.deleteProfile(1))
-        try await waitUntil("written") { !deleting.isWriting }
-        XCTAssertEqual(deleteWriter.calls, [.init(key: FakeWriter.missingKey("two", ""), value: nil)])
-        XCTAssertNil(deleting.message(SettingsModel.profilesKey), "a delete of a profile gone says nothing")
-        XCTAssertFalse(deleting.profilesChanging, "the list is not locked")
-        XCTAssertEqual(deleting.value("profiles[1].name"), .string("two"))
+    /// #590: a delete of a profile whose name the file no longer has (a
+    /// hand edit renamed it, not applied yet) writes nothing and is not
+    /// dropped silently: the list says the profile was not deleted, and is
+    /// not locked. Once the rename applies, a delete again deletes it by
+    /// its new name.
+    func testADeleteOfAProfileRenamedByHandShowsTheListsNotice() async throws {
+        let renamed = Self.fakeConfig.replacingOccurrences(of: #""name": "two""#, with: #""name": "deux""#)
+        let (model, source, writer) = try fakeModel(Self.fakeConfig)
+        writer.resolveProfile = { name, _ in ["one": 0, "deux": 1][name] }
+        XCTAssertTrue(model.deleteProfile(1))
+        try await waitUntil("written") { !model.isWriting }
+        XCTAssertEqual(writer.calls, [.init(key: FakeWriter.missingKey("two", ""), value: nil)], "nothing written")
+        XCTAssertEqual(model.message(SettingsModel.profilesKey), SettingsModel.profileNotDeletedNotice)
+        XCTAssertNil(model.message("profiles[1]"), "no message by the row at its index")
+        XCTAssertFalse(model.profilesChanging, "the list is not locked")
+        XCTAssertEqual(model.value("profiles[1].name"), .string("two"))
+
+        source.snapshot = TesseraConfigSnapshot(generation: 1, config: try Self.json(renamed))
+        model.reload()
+        XCTAssertTrue(model.deleteProfile(1))
+        XCTAssertNil(model.message(SettingsModel.profilesKey), "a new delete takes the notice away")
+        try await waitUntil("written") { writer.calls.count == 2 }
+        XCTAssertEqual(writer.calls.last, .init(key: "profiles[1]", value: nil))
+        XCTAssertEqual(writer.profileNames, ["two", "deux"])
+    }
+
+    /// #590: a delete of a profile whose name the file no longer has, where
+    /// the configuration applied while it ran no longer lists that profile
+    /// (a hand edit removed it and the watch applied it), has nothing left
+    /// to do and says nothing.
+    func testADeleteOfAProfileRemovedByHandAndAppliedSaysNothing() async throws {
+        let removed = """
+            {"general": {"default_profile": "one", "confirm_close": true},
+             "appearance": {"opacity": 0.85, "theme": "Tessera Dark", "font_size": 13.0},
+             "terminal": {"scrollback_lines": 10000},
+             "profiles": [{"name": "one", "appearance": null}]}
+            """
+        let (model, source, writer) = try fakeModel(Self.fakeConfig)
+        let gate = DispatchSemaphore(value: 0)
+        writer.resolveProfile = { name, _ in
+            // Held until the hand edit applied on the main actor.
+            _ = gate.wait(timeout: .now() + 10)
+            return name == "one" ? 0 : nil
+        }
+        XCTAssertTrue(model.deleteProfile(1))
+        try await waitUntil("the delete addresses “two”") { writer.profileNames == ["two"] }
+        source.snapshot = TesseraConfigSnapshot(generation: 1, config: try Self.json(removed))
+        model.reload()
+        gate.signal()
+        try await waitUntil("written") { !model.isWriting }
+        XCTAssertEqual(writer.calls, [.init(key: FakeWriter.missingKey("two", ""), value: nil)])
+        XCTAssertNil(model.message(SettingsModel.profilesKey), "the profile is gone: nothing to say")
+        XCTAssertFalse(model.profilesChanging, "the list is not locked")
+        XCTAssertEqual(model.profiles.map(\.name), ["one"])
+    }
+
+    /// #590: a delete that meets a hand edit which renamed its profile
+    /// (`Conflict`) is not written again once the hand edit applies (no
+    /// profile has the name it was queued with), and the list says the
+    /// profile was not deleted; the renamed profile stays listed.
+    func testADeleteRetriedAfterAHandEditRenamedItsProfileShowsTheListsNotice() async throws {
+        let renamed = Self.threeProfiles.replacingOccurrences(of: #""name": "two""#, with: #""name": "deux""#)
+        let (model, source, writer) = try fakeModel(Self.threeProfiles, clock: ManualClock())
+        try await conflictOnFirstAttempt(model, source, writer) {
+            XCTAssertTrue(model.deleteProfile(1))
+        }
+        source.snapshot = TesseraConfigSnapshot(generation: 1, config: try Self.json(renamed))
+        model.reload()
+        try await waitUntil("dropped") { !model.isWriting }
+        XCTAssertEqual(writer.calls.count, 1, "not written again: \(writer.calls)")
+        XCTAssertFalse(model.profilesChanging)
+        XCTAssertEqual(model.profiles.map(\.name), ["one", "deux", "three"])
+        XCTAssertEqual(model.message(SettingsModel.profilesKey), SettingsModel.profileNotDeletedNotice)
+    }
+
+    /// #590 on the core: a delete of a profile renamed by hand in
+    /// config.toml, saved before the watch applied it, deletes nothing and
+    /// says so by the list; once the rename applies, a delete again removes
+    /// the renamed profile.
+    func testADeleteOfAProfileRenamedInTheFileDeletesNothingAndSaysSo() async throws {
+        let model = try openSettings(config: Self.threeProfilesTOML)
+        XCTAssertEqual(model.profiles.map(\.name), ["one", "two", "three"])
+        let renamed = Self.threeProfilesTOML.replacingOccurrences(of: #"name = "two""#, with: #"name = "deux""#)
+        // Saved in the same main-actor turn as the delete: the window
+        // still lists “two”.
+        try renamed.write(to: try configFile, atomically: true, encoding: .utf8)
+        XCTAssertTrue(model.deleteProfile(1))
+        try await waitUntil("the delete ended") { !model.isWriting && !model.profilesChanging }
+        XCTAssertEqual(model.message(SettingsModel.profilesKey), SettingsModel.profileNotDeletedNotice)
+        XCTAssertEqual(try file(), renamed, "nothing written")
+        try await waitUntil("the rename applies") { model.profiles.map(\.name) == ["one", "deux", "three"] }
+
+        XCTAssertTrue(model.deleteProfile(1))
+        try await waitUntil("the delete applies") { model.profiles.map(\.name) == ["one", "three"] }
+        XCTAssertNil(model.message(SettingsModel.profilesKey))
+        XCTAssertFalse(try file().contains("deux"), contents)
     }
 
     /// #565: an edit queued after a rename of its profile addresses the
