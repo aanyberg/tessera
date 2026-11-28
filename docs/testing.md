@@ -94,7 +94,7 @@ hangs, with exit **97** and a line starting `app-test watchdog: HANG` (or `FAILE
 | Variable | Default | Trips when |
 |---|---|---|
 | `TESSERA_APP_TEST_HANG_SECONDS` | 150 | a started test has had no test line for that long (xcodebuild's own allowance is 120 s), or at once when xcodebuild prints that the test `exceeded execution time allowance`: xcodebuild then samples and kills the host, so the watchdog samples it first (#644) |
-| `TESSERA_APP_TEST_IDLE_SECONDS` | 900 | no output and no CPU progress (above 50 ms) in the command, its descendants or its hosts, also when the host died before any test started |
+| `TESSERA_APP_TEST_IDLE_SECONDS` | 900 | no output and no CPU progress (above 50 ms) in the command, its descendants or its hosts, also when the host died before any test started. A hung host that spins keeps making CPU progress, so before the first test starts only the hard limit catches it |
 | `TESSERA_APP_TEST_HARD_SECONDS` | 5400 | the run has lasted that long (a normal suite is about 7 minutes; 5400 s leaves 7x for a loaded machine) |
 
 It kills only the command's own process tree and the hosts under this run's `-derivedDataPath` that started after it

@@ -1793,8 +1793,10 @@ pub const FILE_PROFILE_REFUSED: &str =
 /// or a list of its warnings it cuts there. The loader never checks what
 /// lies past such a cap, so neither can an edit's check: an edit there is
 /// refused ([`past_loader_cap`]) or checked another way. Every such cap is
-/// a row of [`LOADER_CAPS`], and a test iterates the table (a cap added
-/// without a row, or a row without a refusal test, fails it).
+/// a row of [`LOADER_CAPS`], and a test iterates the table (a [`Cap`]
+/// variant added without a row, or a row without a refusal test, fails
+/// it). A new loader cap that gets neither a variant nor a row is not
+/// caught by that test: it cannot see the loader's caps (#526 M9).
 #[derive(Debug, Clone, Copy)]
 struct LoaderCap {
     /// Which cap, for the test that iterates the table.

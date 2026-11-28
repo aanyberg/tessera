@@ -22,19 +22,31 @@ const SPAWNS_PER_THREAD: usize = 16;
 /// Bound on each session's run, so a regression fails instead of hanging.
 const TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Spawns `/bin/echo` and waits for it to exit; `Err` carries the reason.
+/// Spawns `/bin/echo` with a token of its own and waits for it to exit;
+/// `Err` carries the reason. The session must show exactly its own token,
+/// so two sessions handed one terminal (or a child given another's
+/// arguments) fail too, not only a spawn that fails (#526, #563 M3).
 fn echo_once(n: usize) -> Result<(), String> {
-    let options = SpawnOptions::command("/bin/echo", format!("concurrent-{n}")).args(["ok"]);
+    let token = format!("token-{n}");
+    let options =
+        SpawnOptions::command("/bin/echo", format!("concurrent-{n}")).args([token.as_str()]);
     let (_pty, events) = NativePty::spawn(&options).map_err(|err| format!("spawn: {err}"))?;
     let deadline = Instant::now() + TIMEOUT;
+    let mut output = Vec::new();
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         match events.recv_timeout(remaining) {
-            Ok(PtyEvent::Exited(ExitStatus::Exited(0))) => return Ok(()),
+            Ok(PtyEvent::Exited(ExitStatus::Exited(0))) => break,
             Ok(PtyEvent::Exited(status)) => return Err(format!("exited with {status:?}")),
-            Ok(PtyEvent::Output(_)) => {}
+            Ok(PtyEvent::Output(bytes)) => output.extend_from_slice(&bytes),
             Err(err) => return Err(format!("waiting for exit: {err}")),
         }
+    }
+    let shown = String::from_utf8_lossy(&output);
+    if shown == format!("{token}\r\n") {
+        Ok(())
+    } else {
+        Err(format!("{token}: the session showed {shown:?}"))
     }
 }
 
