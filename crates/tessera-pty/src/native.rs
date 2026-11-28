@@ -257,6 +257,10 @@ impl NativePty {
     ///
     /// Every error leaves nothing behind: a child started before the
     /// failure is killed and reaped, and both ends of the PTY are closed.
+    /// Only the reaping can come after the error: when the writer thread
+    /// cannot start, the reader thread already owns the child, so the error
+    /// returns once the child is sent `SIGKILL`, and the reader reaps it a
+    /// moment later (1 to 29 ms measured, #566).
     ///
     /// Finding the program and checking its `#!` line touch the file
     /// system, which can block (a stalled network volume, an iCloud file
@@ -1856,7 +1860,10 @@ const EREDRIVEOPEN: i32 = -6;
 /// Most `openpty` calls one spawn makes while the kernel keeps reporting
 /// [`EREDRIVEOPEN`]. A lost race leaves no state behind, so the next
 /// attempt is a fresh open; at 16 threads opening ptys as fast as they
-/// can, no open needed more than one retry in 160 000.
+/// can, no open needed more than one retry in 160 000. Each lost race
+/// costs about 0.41 s inside the kernel (its ten redrives) before
+/// `openpty` returns, so a spawn that lost every attempt fails after
+/// about 3.3 s (#563).
 const OPEN_ATTEMPTS: u32 = 8;
 
 /// Runs `open` until it succeeds, fails with anything but a lost pty
