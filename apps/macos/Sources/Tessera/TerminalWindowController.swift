@@ -932,6 +932,25 @@ final class TerminalWindow: NSWindow {
         tabGroup?.windows ?? [self]
     }
 
+    /// This window's tab bar as the window began to close (#763), weakly:
+    /// AppKit takes a closing tab out of its tab bar before
+    /// `windowWillClose`, and may keep a closed window.
+    private var tabBarAtClose: [WeakWindow]?
+
+    /// The windows of this window's tab bar, this one included, as they
+    /// were when it began to close, or now if it has not: a closed tab's
+    /// clipboard writes go to the tab its tab bar selects next.
+    var tabBarAsItClosed: [NSWindow] {
+        tabBarAtClose?.compactMap(\.window) ?? tabs
+    }
+
+    override func close() {
+        if tabBarAtClose == nil {
+            tabBarAtClose = tabs.map { WeakWindow(window: $0) }
+        }
+        super.close()
+    }
+
     /// Selects the tab at `index` of this window's tab bar; does nothing if
     /// there is no such tab.
     func selectTab(at index: Int) {
