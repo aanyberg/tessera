@@ -321,16 +321,13 @@ fn wait_until_asleep(pid: u32) {
             "the shell never waited within {STEP_TIMEOUT:?}: {}",
             processes(pid)
         );
-        let state = std::process::Command::new("/bin/ps")
+        // A ps that fails to start (fork pressure) counts as "not asleep"
+        // and is tried again, as live.rs's `asleep` does.
+        let sleeping = std::process::Command::new("/bin/ps")
             .args(["-o", "stat=", "-p", &pid.to_string()])
             .output()
-            .expect("run ps");
-        let state = String::from_utf8_lossy(&state.stdout);
-        asleep = if state.starts_with(['S', 'I']) {
-            asleep + 1
-        } else {
-            0
-        };
+            .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).starts_with(['S', 'I']));
+        asleep = if sleeping { asleep + 1 } else { 0 };
         std::thread::sleep(Duration::from_millis(5));
     }
 }
