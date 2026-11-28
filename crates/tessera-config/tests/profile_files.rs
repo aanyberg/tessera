@@ -405,17 +405,28 @@ fn the_editor_refuses_an_edit_of_a_file_profile() {
     assert_eq!(names(&store), ["entry", "a", "b"]);
 
     let mut editor = ConfigEditor::open(&paths.config_file()).unwrap();
-    for path in ["profiles[1].command", "profiles[2].name"] {
-        match editor.set(path, toml::Value::String("/bin/x".into())) {
+    // A key nested in the profile's tables is the file's too (#489 21.4
+    // r2 M2).
+    for (path, value) in [
+        ("profiles[1].command", toml::Value::String("/bin/x".into())),
+        ("profiles[2].name", toml::Value::String("x".into())),
+        ("profiles[1].appearance.font_size", toml::Value::Float(16.0)),
+        ("profiles[2].appearance.opacity", toml::Value::Float(0.5)),
+    ] {
+        match editor.set(path, value) {
             Err(EditError::Unsupported { reason, .. }) => {
                 assert_eq!(reason, FILE_PROFILE_REFUSED, "{path}");
             }
             other => panic!("{path}: {other:?}"),
         }
     }
-    match editor.remove("profiles[1]") {
-        Err(EditError::Unsupported { reason, .. }) => assert_eq!(reason, FILE_PROFILE_REFUSED),
-        other => panic!("{other:?}"),
+    for path in ["profiles[1]", "profiles[2].appearance.opacity"] {
+        match editor.remove(path) {
+            Err(EditError::Unsupported { reason, .. }) => {
+                assert_eq!(reason, FILE_PROFILE_REFUSED, "{path}");
+            }
+            other => panic!("{path}: {other:?}"),
+        }
     }
     assert!(!editor.is_modified());
 
