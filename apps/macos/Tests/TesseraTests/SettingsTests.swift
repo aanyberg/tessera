@@ -3658,6 +3658,9 @@ extension SettingsTests {
             """
         let (model, source, writer) = try fakeModel(Self.fakeConfig)
         let gate = DispatchSemaphore(value: 0)
+        // A failed wait below must not hold the shared write queue for the
+        // gate's whole timeout (#590 critic M3); a second signal is unused.
+        defer { gate.signal() }
         writer.resolveProfile = { name, _ in
             // Held until the hand edit applied on the main actor.
             _ = gate.wait(timeout: .now() + 10)
@@ -3692,6 +3695,97 @@ extension SettingsTests {
         XCTAssertFalse(model.profilesChanging)
         XCTAssertEqual(model.profiles.map(\.name), ["one", "deux", "three"])
         XCTAssertEqual(model.message(SettingsModel.profilesKey), SettingsModel.profileNotDeletedNotice)
+    }
+
+    /// #590 review minors: an edit or delete that meets a hand edit
+    /// (`Conflict`) which gave another profile its profile's name is not
+    /// written again once the hand edit applies (two profiles have the
+    /// name it was queued with), and the list's notice says so; it stays
+    /// while the profile is listed.
+    func testAnEditRetriedWhenTwoProfilesHaveItsNameShowsTheListsNotice() async throws {
+        let twins = Self.threeProfiles.replacingOccurrences(of: #""name": "three""#, with: #""name": "two""#)
+        for edit in ["command", "delete"] {
+            let (model, source, writer) = try fakeModel(Self.threeProfiles, clock: ManualClock())
+            try await conflictOnFirstAttempt(model, source, writer) {
+                if edit == "command" {
+                    model.set("profiles[1].command", .string("/bin/sh"))
+                } else {
+                    XCTAssertTrue(model.deleteProfile(1))
+                }
+            }
+            source.snapshot = TesseraConfigSnapshot(generation: 1, config: try Self.json(twins))
+            model.reload()
+            try await waitUntil("dropped") { !model.isWriting }
+            XCTAssertEqual(writer.calls.count, 1, "\(edit): not written again: \(writer.calls)")
+            XCTAssertEqual(model.profiles.map(\.name), ["one", "two", "two"], edit)
+            let notice = edit == "delete" ? SettingsModel.profileNotDeletedNotice : SettingsModel.profileGoneNotice
+            XCTAssertEqual(model.message(SettingsModel.profilesKey), notice, edit)
+            XCTAssertTrue(notice.contains("or another profile has that name too"), notice)
+            source.snapshot = TesseraConfigSnapshot(generation: 2, config: try Self.json(twins))
+            model.reload()
+            XCTAssertEqual(model.message(SettingsModel.profilesKey), notice, "\(edit): still listed")
+        }
+    }
+
+    /// #590 review minors: the notice of a delete not written stays while
+    /// the configuration applied still lists the profile (renamed), and is
+    /// taken back once one shows it removed (a hand edit removed it after
+    /// all), whether the core refused the delete or it was not written
+    /// again after a conflict.
+    func testTheNotDeletedNoticeIsWithdrawnOnceTheRemovalApplies() async throws {
+        let renamed = Self.threeProfiles.replacingOccurrences(of: #""name": "two""#, with: #""name": "deux""#)
+        let removed = Self.threeProfiles.replacingOccurrences(
+            of: #"{"name": "two", "command": "/bin/cat"}, "#, with: "")
+        XCTAssertNotEqual(removed, Self.threeProfiles)
+        for path in ["refused", "retried"] {
+            let (model, source, writer) = try fakeModel(Self.threeProfiles, clock: ManualClock())
+            if path == "refused" {
+                writer.resolveProfile = { name, _ in ["one": 0, "deux": 1, "three": 2][name] }
+                XCTAssertTrue(model.deleteProfile(1))
+                try await waitUntil("refused") { !model.isWriting }
+            } else {
+                try await conflictOnFirstAttempt(model, source, writer) {
+                    XCTAssertTrue(model.deleteProfile(1))
+                }
+            }
+            source.snapshot = TesseraConfigSnapshot(generation: 1, config: try Self.json(renamed))
+            model.reload()
+            try await waitUntil("\(path): ended") { !model.isWriting }
+            XCTAssertEqual(writer.calls.count, 1, "\(path): \(writer.calls)")
+            XCTAssertEqual(model.profiles.map(\.name), ["one", "deux", "three"], path)
+            XCTAssertEqual(
+                model.message(SettingsModel.profilesKey), SettingsModel.profileNotDeletedNotice,
+                "\(path): the renamed profile is still listed")
+
+            source.snapshot = TesseraConfigSnapshot(generation: 2, config: try Self.json(removed))
+            model.reload()
+            XCTAssertEqual(model.profiles.map(\.name), ["one", "three"], path)
+            XCTAssertNil(model.message(SettingsModel.profilesKey), "\(path): the profile is gone after all")
+            XCTAssertFalse(model.profilesChanging, path)
+        }
+    }
+
+    /// #590 review minors: another notice in the list's place by the time
+    /// the removal applies is not taken back with the notice of the delete
+    /// not written.
+    func testTheNotDeletedNoticeWithdrawalKeepsAnotherNotice() async throws {
+        let removed = Self.threeProfiles.replacingOccurrences(
+            of: #"{"name": "two", "command": "/bin/cat"}, "#, with: "")
+        let (model, source, writer) = try fakeModel(Self.threeProfiles)
+        writer.resolveProfile = { name, _ in ["one": 0, "three": 2][name] }
+        XCTAssertTrue(model.deleteProfile(1))
+        try await waitUntil("refused") { !model.isWriting }
+        XCTAssertEqual(model.message(SettingsModel.profilesKey), SettingsModel.profileNotDeletedNotice)
+        // A value of “one”, refused the same way, puts its notice there.
+        writer.resolveProfile = { _, _ in nil }
+        model.set("profiles[0].command", .string("/bin/sh"))
+        try await waitUntil("refused") { !model.isWriting }
+        XCTAssertEqual(model.message(SettingsModel.profilesKey), SettingsModel.profileGoneNotice)
+
+        source.snapshot = TesseraConfigSnapshot(generation: 1, config: try Self.json(removed))
+        model.reload()
+        XCTAssertEqual(model.profiles.map(\.name), ["one", "three"])
+        XCTAssertEqual(model.message(SettingsModel.profilesKey), SettingsModel.profileGoneNotice)
     }
 
     /// #590 on the core: a delete of a profile renamed by hand in
