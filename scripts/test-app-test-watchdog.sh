@@ -199,7 +199,9 @@ EOF
 # otherwise; with 15 the main thread waits and another thread is stuck in the runtime as on macOS 15 (CI, PR #294),
 # yielding through libsystem_pthread's `cthread_yield`, while a third thread waits in fork's atfork handler (#443);
 # with 27 the main thread itself forks and waits in libobjc's atfork handler while workqueue threads are stuck
-# creating their TSan state, on the runtime allocator's unfair lock (macOS 27.0.1, CI run 44917832924, #525).
+# creating their TSan state, on the runtime allocator's unfair lock (macOS 27.0.1, CI run 44917832924, #525);
+# with split the stuck thread and the forking thread each split their samples 50/50 between two leaves, so each has
+# two leaves of exactly half its samples and is still named once (#489).
 cat > "$work/bin/sample" <<'EOF'
 #!/bin/sh
 echo "$1" >> "$FAKE_WORK/sampled"
@@ -213,20 +215,23 @@ tsan="$(echo "${FAKE_SAMPLE_TSAN:-0}" | cut -d, -f"$n")"
 extra=""
 main="    +           900 wrap_pthread_cond_wait  (in libclang_rt.tsan_osx_dynamic.dylib) + 20  [0x0]"
 forks=""
+# The frames between the test and $main: a session close, or (27) the window's spawn that forks.
+calls="    +       900 TesseraSession.close()  (in FakeHost) + 52  [0x0]
+    +         900 tessera_session_close  (in FakeHost) + 52  [0x0]"
 if [ "$tsan" = 27 ]; then
     # macOS 27 (CI run 44917832924, AppAppearanceTests): the main thread spawns a shell and forks; libobjc's atfork
     # handler waits on a lock while 71 workqueue threads wait in the runtime's allocator (two shown).
     tsan=0 forks=1
-    main="    +           900 AppDelegate.newWindow  (in FakeHost) + 100  [0x0]
-    +             900 TesseraApp.spawn  (in FakeHost) + 200  [0x0]
-    +               900 Command::spawn  (in FakeHost) + 560  [0x0]
-    +                 900 wrap_fork  (in libclang_rt.tsan_osx_dynamic.dylib) + 128  [0x0]
-    +                   900 fork  (in libsystem_c.dylib) + 36  [0x0]
-    +                     900 libSystem_atfork_prepare  (in libSystem.B.dylib) + 44  [0x0]
-    +                       900 _objc_atfork_prepare  (in libobjc.A.dylib) + 568  [0x0]
-    +                         900 wrap_os_unfair_lock_lock_with_options  (in libclang_rt.tsan_osx_dynamic.dylib) + 236  [0x0]
-    +                           900 _os_unfair_lock_lock_slow  (in libsystem_platform.dylib) + 172  [0x0]
-    +                             900 __ulock_wait2  (in libsystem_kernel.dylib) + 8  [0x0]"
+    calls="    +       900 AppDelegate.newWindow  (in FakeHost) + 100  [0x0]
+    +         900 TesseraApp.spawn  (in FakeHost) + 200  [0x0]"
+    main="    +           900 Command::spawn  (in FakeHost) + 560  [0x0]
+    +             900 wrap_fork  (in libclang_rt.tsan_osx_dynamic.dylib) + 128  [0x0]
+    +               900 fork  (in libsystem_c.dylib) + 36  [0x0]
+    +                 900 libSystem_atfork_prepare  (in libSystem.B.dylib) + 44  [0x0]
+    +                   900 _objc_atfork_prepare  (in libobjc.A.dylib) + 568  [0x0]
+    +                     900 wrap_os_unfair_lock_lock_with_options  (in libclang_rt.tsan_osx_dynamic.dylib) + 236  [0x0]
+    +                       900 _os_unfair_lock_lock_slow  (in libsystem_platform.dylib) + 172  [0x0]
+    +                         900 __ulock_wait2  (in libsystem_kernel.dylib) + 8  [0x0]"
     for t in 4 5; do
         extra="$extra${extra:+
 }    900 Thread_$t
@@ -242,6 +247,26 @@ if [ "$tsan" = 27 ]; then
     +                   900 _os_unfair_lock_lock_slow  (in libsystem_platform.dylib) + 172  [0x0]
     +                     900 __ulock_wait2  (in libsystem_kernel.dylib) + 8  [0x0]"
     done
+fi
+if [ "$tsan" = split ]; then
+    tsan=0
+    extra="    5974 Thread_4   DispatchQueue_99: NSPersistentUI Work  (serial)
+    + 5974 start_wqthread  (in libsystem_pthread.dylib) + 8  [0x0]
+    +   5974 wrap_arc4random_buf  (in libclang_rt.tsan_osx_dynamic.dylib) + 212  [0x0]
+    +     5974 __tsan::SlotLock(__tsan::ThreadState*)  (in libclang_rt.tsan_osx_dynamic.dylib) + 140  [0x0]
+    +       2987 __sanitizer::Semaphore::Wait()  (in libclang_rt.tsan_osx_dynamic.dylib) + 40  [0x0]
+    +       ! 2987 swtch_pri  (in libsystem_kernel.dylib) + 8  [0x0]
+    +       2987 __sanitizer::FutexWait(__sanitizer::atomic_uint32_t*, unsigned int)  (in libclang_rt.tsan_osx_dynamic.dylib) + 40  [0x0]
+    +         2987 __ulock_wait  (in libsystem_kernel.dylib) + 8  [0x0]
+    5974 Thread_5: tessera-spawn
+    + 5974 thread_start  (in libsystem_pthread.dylib) + 8  [0x0]
+    +   5974 wrap_fork  (in libclang_rt.tsan_osx_dynamic.dylib) + 128  [0x0]
+    +     5974 fork  (in libsystem_c.dylib) + 36  [0x0]
+    +       5974 libSystem_atfork_prepare  (in libSystem.B.dylib) + 56  [0x0]
+    +         2987 ccrng_process_atfork_prepare  (in libcorecrypto.dylib) + 28  [0x0]
+    +         ! 2987 __ulock_wait2  (in libsystem_kernel.dylib) + 8  [0x0]
+    +         2987 _objc_atfork_prepare  (in libobjc.A.dylib) + 568  [0x0]
+    +           2987 __ulock_wait2  (in libsystem_kernel.dylib) + 8  [0x0]"
 fi
 if [ "$tsan" = 15 ]; then
     # macOS 15 (CI's PR #294 sample): the runtime semaphore yields through libsystem_pthread's cthread_yield.
@@ -296,8 +321,7 @@ Call graph:
     + 900 start  (in dyld) + 6652  [0x0]
     +   900 main  (in FakeHost) + 40  [0x0]
     +     900 -[FakeTests.HangTests testHangs]  (in FakeTests) + 52  [0x0]
-    +       900 TesseraSession.close()  (in FakeHost) + 52  [0x0]
-    +         900 tessera_session_close  (in FakeHost) + 52  [0x0]
+$calls
 $main
     900 Thread_2
     + 900 thread_start  (in libsystem_pthread.dylib) + 8  [0x0]
@@ -532,6 +556,7 @@ start_case stuck hang-stuck 0
 start_case tsan-pass hang,pass 1 scaled
 start_case tsan-macos15 hang,pass 15 scaled
 start_case tsan-macos27 hang,pass 27 scaled
+start_case tsan-split hang,pass split scaled
 start_case tsan-other hang-fail,pass 1 scaled
 start_case tsan-unlisted hang-unlisted,pass 1 scaled
 start_case tsan-stuck hang-stuck,pass 1 scaled
@@ -788,12 +813,22 @@ check_no_strays "a macOS 15 TSan hang"
 load_case tsan-macos27
 if (( st == 0 )) && [[ "$(runs)" == 2 && "$tail" == *"TSan hang in -[FakeTests.HangTests testHangs] (#278), retried"* \
     && "$out" == *"Thread_1"*"main-thread"*"is forking"*"_objc_atfork_prepare"* \
-    && "$out" == *"Thread_4 stuck in the TSan runtime"*"__sanitizer::InternalAlloc"* ]]; then
+    && "$out" == *"Thread_4 stuck in the TSan runtime"*"__sanitizer::InternalAlloc"* \
+    && "$out" == *"Thread_5 stuck in the TSan runtime"* ]]; then
     ok "a macOS 27 TSan hang (the main thread forking, threads waiting in the runtime's allocator) is classified TSan and rerun"
 else
     not_ok "a macOS 27 TSan hang: exit $st, $(runs) runs: $out"
 fi
 check_no_strays "a macOS 27 TSan hang"
+
+load_case tsan-split
+if (( st == 0 )) && [[ "$(runs)" == 2 && "$(grep -c 'Thread_5: tessera-spawn is forking' "$w/out")" == 1 \
+    && "$(grep -c 'Thread_4 .* stuck in the TSan runtime' "$w/out")" == 1 ]]; then
+    ok "a TSan hang whose threads split their samples 50/50 between two leaves names each thread once"
+else
+    not_ok "a TSan hang with 50/50 leaves: exit $st, $(runs) runs: $out"
+fi
+check_no_strays "a TSan hang with 50/50 leaves"
 
 load_case tsan-unlisted
 if (( st == 0 )) && [[ "$(runs)" == 2 && "$tail" == *"TSan hang in -[FakeTests.HangTests testHangs] (#278), retried"* ]]; then

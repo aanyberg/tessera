@@ -366,7 +366,7 @@ keep_sample() {
 hangs() { cut -f2 "$state/test" | paste -s -d ';' - | sed 's/;/; /g'; }
 
 # Succeeds when a thread in the samples file $1 is stuck inside the Thread Sanitizer runtime, and prints that thread
-# and its innermost frames. Every TSan process has `__tsan::` frames (its background thread, the trampolines of each
+# and its innermost frames, once per thread even when its samples split evenly between two leaves (#489). Every TSan process has `__tsan::` frames (its background thread, the trampolines of each
 # thread and blocking interceptor), so a match on the name alone would retry every hang. A thread counts when the leaf
 # holding at least half its samples, without its trailing wait frames (libsystem_kernel and libsystem_platform, and
 # libsystem_pthread's `cthread_yield` and its `swtch_pri` stub, through which macOS 15's runtime semaphore yields),
@@ -376,13 +376,15 @@ hangs() { cut -f2 "$state/test" | paste -s -d ';' - | sed 's/;/; /g'; }
 tsan_hang() {
     perl -e '
         use strict; use warnings;
-        my ($in, $thread, $total, @stack, $found) = (0, "", 0);
+        # $forking and $stuck: this thread was reported already (samples split 50/50 make two leaves of half each).
+        my ($in, $thread, $total, @stack, $found, $forking, $stuck) = (0, "", 0);
         sub leaf {
             my @path = @stack;
             return if !@path || $path[-1]{count} * 2 < $total;
             # The thread inside fork (TSan holds its locks there) waits outside the runtime, in an atfork handler:
             # named so the report shows both sides of the #278 deadlock, not only the threads parked in the runtime.
-            if (grep { $_->{text} =~ /^wrap_fork / } @path) {
+            if (!$forking && grep { $_->{text} =~ /^wrap_fork / } @path) {
+                $forking = 1;
                 print "$thread is forking (the #278 deadlock: it waits in an atfork handler while TSan holds its locks):\n";
                 print "    $_->{text}\n" for reverse @stack[($#stack > 7 ? $#stack - 7 : 0) .. $#stack];
             }
@@ -390,6 +392,7 @@ tsan_hang() {
                 || $path[-1]{text} =~ /^(cthread_yield|DYLD-STUB\$\$\w+) .*\(in libsystem_pthread\.dylib\)/);
             return unless @path && $path[-1]{text} =~ /^(__tsan::|__sanitizer::|_ZN6__tsan|_ZN11__sanitizer)/;
             $found = 1;
+            return if $stuck++;
             print "$thread stuck in the TSan runtime ($stack[-1]{count} of $total samples):\n";
             print "    $_->{text}\n" for reverse @stack[($#stack > 7 ? $#stack - 7 : 0) .. $#stack];
         }
@@ -400,7 +403,7 @@ tsan_hang() {
             if ($in && /^\s*$/) { flush(); $in = 0; next; }
             next unless $in && /^([\s+!:|]*)(\d+)\s+(.*?)\s*$/;
             my ($depth, $count, $text) = (length $1, $2, $3);
-            if ($text =~ /^Thread_/) { flush(); ($thread, $total) = ($text, $count); next; }
+            if ($text =~ /^Thread_/) { flush(); ($thread, $total, $forking, $stuck) = ($text, $count, 0, 0); next; }
             while (@stack && $stack[-1]{depth} >= $depth) { leaf() unless $stack[-1]{kids}; pop @stack; }
             $stack[-1]{kids} = 1 if @stack;
             push @stack, { depth => $depth, count => $count, text => $text };
