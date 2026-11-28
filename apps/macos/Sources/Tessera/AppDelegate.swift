@@ -510,6 +510,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             switch result {
             case .failure(let error):
                 pending.dropTyped()
+                // Held clipboard writes (#763) pass on only from a placed
+                // tab. An unplaced one cannot hold any today: a session
+                // started on the main thread settles before this call
+                // returns, and one started in the background is placed as
+                // soon as it does, before a closed tab's writes can move.
                 if pending.isPlaced, !pending.isClosed {
                     window.delegate = nil
                     passOnClipboardNotice(of: pending)
@@ -559,7 +564,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// is left with instead, once AppKit has picked it.
     private func passOnClipboardNotice(of pending: PendingTerminal) {
         guard let notice = pending.takeClipboardNotice() else { return }
-        let siblings = (pending.window.tabGroup?.windows ?? []).map { WeakWindow(window: $0) }
+        let siblings = pending.window.tabBarAsItClosed.map { WeakWindow(window: $0) }
         Task { @MainActor [weak self] in
             self?.adoptClipboardNotice(notice, fromTabsOf: siblings)
         }
@@ -1413,7 +1418,8 @@ extension AppDelegate: TerminalWindowControllerDelegate {
         // pane's program wrote and exited, #763) shows on the tab the user
         // is left with, once AppKit has picked it.
         if let unseen = controller.takeUnseenClipboardNotice() {
-            let siblings = (controller.window?.tabGroup?.windows ?? []).map { WeakWindow(window: $0) }
+            let tabBar = (controller.window as? TerminalWindow)?.tabBarAsItClosed ?? []
+            let siblings = tabBar.map { WeakWindow(window: $0) }
             Task { @MainActor [weak self] in
                 self?.adoptClipboardNotice(unseen, fromTabsOf: siblings)
             }
@@ -1510,6 +1516,6 @@ struct WorkspaceOpener: ExternalOpener {
 }
 
 /// A window not kept alive by being listed.
-private struct WeakWindow {
+struct WeakWindow {
     weak var window: NSWindow?
 }

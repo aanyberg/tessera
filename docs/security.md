@@ -168,9 +168,10 @@ Tracked: churn and leak checks for Rust, FFI and the app (#214); FFI fuzzing, AS
   `crates/tessera-config/src/store.rs`); each write shows a notice in its pane, at most one a second, after the fact
   (#471), held while the pane is hidden or a sheet covers its tab, and moved to the pane left when its pane closes
   first (#763). A write whose pane closes when no terminal window is left (the last window's program wrote and exited)
-  shows no notice; the paste guard below is the defence there. A multi-line paste without bracketed paste asks first unless `paste_guard = "off"` (#471). The guard trusts
-  the program's DECSET 2004 state: output that leaves 2004 on (a `cat` of `ESC[?2004h`, a remote tmux that died)
-  lets a multi-line paste into a shell that reads no bracketed paste through without asking.
+  shows no notice; the paste guard below is the defence there. A multi-line paste without bracketed paste asks first
+  unless `paste_guard = "off"` (#471). The guard trusts the program's DECSET 2004 state: output that leaves 2004 on (a
+  `cat` of `ESC[?2004h`, a remote tmux that died) lets a multi-line paste into a shell that reads no bracketed paste
+  through without asking.
 - Link opening (ADR 0027, #437): a local file whose default handler is a regular third-party app opens with it,
   whatever that app does with it (a `.torrent`, a `.skill`); only system apps that run, install or import, and agent
   apps, are judged risky by name. Also trusted by that rule, so not named: Excel for macro add-ins (`.xlam`, `.xla`,
