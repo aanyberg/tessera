@@ -163,9 +163,8 @@ throughput, the rectangle cost bars (the `b02_*` tests of `tests/rect.rs` and th
 (`tests/stuck_modes.rs`), the DECFRA differential (`tests/rect_fixes.rs`), the OSC 4 query flood
 (`tests/osc_color.rs`, #617) and the font index bar (`twenty_thousand_faces_of_one_hostile_cmap_walk_it_once` in
 `tessera-render`'s `font` module, #716); `.config/nextest.toml` has the full list. Release-only bars are also listed in
-the quality gate's release timing step (`release_timing` in `scripts/quality-gate.sh`); a bar added to one place
-belongs in the other, and `cargo nextest list --release --run-ignored all -E 'test(<name>)'` shows that the filter
-finds it.
+the quality gate's release timing step (`release_timing` in `scripts/quality-gate.sh`); a bar added to one place belongs
+in the other, and `cargo nextest list --release --run-ignored all -E 'test(<name>)'` shows that the filter finds it.
 `scripts/verify-branch.sh` runs the suites such an override names, in a changed package, ten times each, so a new bar is
 exercised under load before it merges.
 
